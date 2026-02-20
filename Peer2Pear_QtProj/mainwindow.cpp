@@ -5,9 +5,12 @@
 #include <QPixmap>
 #include <QImage>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QScrollBar>
+#include <QTextDocument>
+#include <QResizeEvent>
 
-static QPixmap removeWhiteBackground(const QPixmap &src, int threshold = 30)
+static QPixmap removeWhiteBackground(const QPixmap &src, int threshold = 80)
 {
     QImage img = src.toImage().convertToFormat(QImage::Format_ARGB32);
     for (int y = 0; y < img.height(); ++y) {
@@ -44,12 +47,10 @@ MainWindow::MainWindow(QWidget *parent)
 
     connect(ui->chatList, &QListWidget::currentRowChanged,
             this, &MainWindow::onChatSelected);
-
     connect(ui->sendBtn, &QPushButton::clicked,
             this, &MainWindow::onSendMessage);
     connect(ui->messageInput, &QLineEdit::returnPressed,
             this, &MainWindow::onSendMessage);
-
     connect(ui->searchEdit_12, &QLineEdit::textChanged,
             this, &MainWindow::onSearchChanged);
 
@@ -112,14 +113,11 @@ void MainWindow::onSearchChanged(const QString &text)
         bool matches = false;
 
         if (query.isEmpty()) {
-            // Empty search — show everything
             matches = true;
         } else {
-            // Check chat name
             if (chat.name.toLower().contains(query))
                 matches = true;
 
-            // Check every message in this chat
             if (!matches) {
                 for (const auto &msg : chat.messages) {
                     if (msg.second.toLower().contains(query)) {
@@ -133,7 +131,6 @@ void MainWindow::onSearchChanged(const QString &text)
         item->setHidden(!matches);
     }
 
-    // Deselect if current chat is now hidden
     if (m_currentChat >= 0) {
         QListWidgetItem *current = ui->chatList->item(m_currentChat);
         if (current && current->isHidden())
@@ -195,10 +192,27 @@ void MainWindow::clearMessages()
 
 void MainWindow::addMessageBubble(const QString &text, bool sent)
 {
-    QLabel *bubble = new QLabel(text, ui->scrollAreaWidgetContents);
+    // Outer row widget — full width, aligns bubble left or right
+    QWidget *row = new QWidget(ui->scrollAreaWidgetContents);
+    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+
+    QHBoxLayout *rowLayout = new QHBoxLayout(row);
+    rowLayout->setContentsMargins(0, 0, 0, 0);
+    rowLayout->setSpacing(0);
+
+    // The bubble label itself
+    QLabel *bubble = new QLabel(text, row);
     bubble->setWordWrap(true);
+    bubble->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
     bubble->setMaximumWidth(480);
-    bubble->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Minimum);
+
+    // Use QTextDocument to calculate exact height needed
+    QTextDocument doc;
+    doc.setDefaultFont(bubble->font());
+    doc.setPlainText(text);
+    doc.setTextWidth(480);
+    int textHeight = static_cast<int>(doc.size().height()) + 24; // +24 for padding
+    bubble->setMinimumHeight(textHeight);
 
     if (sent) {
         bubble->setStyleSheet(
@@ -208,6 +222,8 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
             "padding: 10px 14px;"
             "font-size: 13px;"
             );
+        rowLayout->addStretch();
+        rowLayout->addWidget(bubble);
     } else {
         bubble->setStyleSheet(
             "background-color: #222222;"
@@ -216,6 +232,8 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
             "padding: 10px 14px;"
             "font-size: 13px;"
             );
+        rowLayout->addWidget(bubble);
+        rowLayout->addStretch();
     }
 
     QVBoxLayout *layout = qobject_cast<QVBoxLayout *>(
@@ -224,11 +242,12 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
     if (!layout)
         return;
 
+    // Insert before the bottom spacer
     int insertPos = layout->count() - 1;
-    layout->insertWidget(insertPos, bubble,
-                         0,
-                         sent ? Qt::AlignRight : Qt::AlignLeft);
+    layout->insertWidget(insertPos, row);
 
+    // Scroll to bottom
+    QApplication::processEvents();
     ui->messageScroll->verticalScrollBar()->setValue(
         ui->messageScroll->verticalScrollBar()->maximum()
         );
