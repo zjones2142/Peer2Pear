@@ -6,21 +6,995 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>800</width>
-    <height>600</height>
+    <width>976</width>
+    <height>701</height>
    </rect>
   </property>
-  <property name="windowTitle">
-   <string>MainWindow</string>
+  <property name="minimumSize">
+   <size>
+    <width>800</width>
+    <height>500</height>
+   </size>
   </property>
-  <widget class="QWidget" name="centralwidget"/>
+  <property name="windowTitle">
+   <string>P2P Chat</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">QMainWindow, QWidget#centralwidget, QWidget#appWidget { background-color: #0d0d0d; color: #ffffff; }
+QWidget#topHeader { background-color: #111111; border-bottom: 1px solid #222222; }
+QLabel#logoLabel { color: #ffffff; font-size: 18px; font-weight: bold; padding-left: 12px; }
+QLineEdit#searchEdit_12 { background-color: #1e1e1e; color: #cccccc; border: 1px solid #333333; border-radius: 16px; padding: 6px 14px; font-size: 13px; }
+QToolButton#settingsBtn_12 { background-color: transparent; border: none; color: #888888; font-size: 18px; padding: 4px; }
+QToolButton#settingsBtn_12:hover { color: #ffffff; }
+QWidget#sidebarWidget { background-color: #111111; border-right: 1px solid #1e1e1e; }
+QWidget#profileWidget { background-color: #111111; border-bottom: 1px solid #1e1e1e; }
+QLabel#profileAvatarLabel { background-color: #2e8b3a; color: #ffffff; font-size: 16px; font-weight: bold; border-radius: 20px; min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; }
+QLabel#profileNameLabel { color: #ffffff; font-size: 13px; font-weight: bold; }
+QLabel#profileHandleLabel { color: #777777; font-size: 11px; }
+QListWidget#chatList { background-color: #111111; border: none; outline: none; font-size: 14px; color: #dddddd; }
+QListWidget#chatList::item { padding: 12px 16px; border-bottom: 1px solid #1a1a1a; }
+QListWidget#chatList::item:selected { background-color: #1e1e1e; color: #ffffff; }
+QListWidget#chatList::item:hover { background-color: #181818; }
+QWidget#contentWidget { background-color: #0d0d0d; }
+QWidget#chatHeader { background-color: #0d0d0d; border-bottom: 1px solid #1e1e1e; }
+QLabel#chatTitleLabel { color: #ffffff; font-size: 16px; font-weight: bold; }
+QLabel#chatSubLabel { color: #777777; font-size: 12px; }
+QWidget#contentContainer { background-color: #0d0d0d; }
+QTabWidget#mainTabs { background-color: #0d0d0d; }
+QTabWidget#mainTabs::pane { border: none; background-color: #0d0d0d; }
+QTabBar::tab { background-color: transparent; color: #888888; font-size: 13px; padding: 8px 16px; border: none; border-bottom: 2px solid transparent; margin-right: 4px; }
+QTabBar::tab:selected { color: #4caf50; border-bottom: 2px solid #4caf50; }
+QTabBar::tab:hover { color: #cccccc; }
+QScrollArea#messageScroll { background-color: #0d0d0d; border: none; }
+QWidget#scrollAreaWidgetContents { background-color: #0d0d0d; }
+QScrollArea#filesScroll { background-color: #0d0d0d; border: none; }
+QWidget#filesScrollContents { background-color: #0d0d0d; }
+QFrame#fileCard1, QFrame#fileCard2, QFrame#fileCard3 { background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; }
+QLabel#fileThumb1, QLabel#fileThumb2, QLabel#fileThumb3 { background-color: #222222; color: #555555; font-size: 36px; border-radius: 6px; min-height: 140px; }
+QLabel#fileName1, QLabel#fileName2, QLabel#fileName3 { color: #eeeeee; font-size: 13px; font-weight: bold; }
+QLabel#fileSize1, QLabel#fileSize2, QLabel#fileSize3 { color: #888888; font-size: 11px; }
+QLabel#fileSender1, QLabel#fileSender2, QLabel#fileSender3 { color: #666666; font-size: 11px; }
+QPushButton#dlBtn1, QPushButton#dlBtn2, QPushButton#dlBtn3 { background-color: #2e8b3a; color: #ffffff; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; padding: 8px; min-height: 36px; }
+QPushButton#dlBtn1:hover, QPushButton#dlBtn2:hover, QPushButton#dlBtn3:hover { background-color: #36a344; }
+QWidget#inputBar { background-color: #111111; border-top: 1px solid #1e1e1e; }
+QToolButton#attachBtn { background-color: #1e1e1e; border: 1px solid #2a2a2a; border-radius: 8px; color: #888888; font-size: 16px; min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; }
+QToolButton#attachBtn:hover { background-color: #252525; color: #cccccc; }
+QLineEdit#messageInput { background-color: #1e1e1e; color: #ffffff; border: 1px solid #2a2a2a; border-radius: 20px; padding: 10px 18px; font-size: 13px; }
+QPushButton#sendBtn { background-color: #2e8b3a; color: #ffffff; border: none; border-radius: 20px; font-size: 14px; font-weight: bold; min-width: 80px; max-width: 80px; min-height: 40px; max-height: 40px; }
+QPushButton#sendBtn:hover { background-color: #36a344; }
+QPushButton#sendBtn:pressed { background-color: #266e2e; }</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="centralLayout">
+    <property name="spacing">
+     <number>0</number>
+    </property>
+    <property name="margin" stdset="0">
+     <number>0</number>
+    </property>
+    <item>
+     <widget class="QWidget" name="appWidget" native="true">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+       </sizepolicy>
+      </property>
+      <layout class="QVBoxLayout" name="verticalLayout_13">
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <property name="margin" stdset="0">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QWidget" name="topHeader" native="true">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>56</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>56</height>
+          </size>
+         </property>
+         <layout class="QHBoxLayout" name="horizontalLayout_13">
+          <property name="leftMargin">
+           <number>16</number>
+          </property>
+          <property name="topMargin">
+           <number>8</number>
+          </property>
+          <property name="rightMargin">
+           <number>16</number>
+          </property>
+          <property name="bottomMargin">
+           <number>8</number>
+          </property>
+          <item>
+           <widget class="QLabel" name="logoLabel">
+            <property name="text">
+             <string/>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="headerSpacer">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+            <property name="sizeType">
+             <enum>QSizePolicy::Policy::Expanding</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QLineEdit" name="searchEdit_12">
+            <property name="minimumSize">
+             <size>
+              <width>180</width>
+              <height>36</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>280</width>
+              <height>36</height>
+             </size>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
+            <property name="placeholderText">
+             <string>Search</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QToolButton" name="settingsBtn_12">
+            <property name="minimumSize">
+             <size>
+              <width>36</width>
+              <height>36</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>36</width>
+              <height>36</height>
+             </size>
+            </property>
+            <property name="styleSheet">
+             <string notr="true">font-size: 25px;</string>
+            </property>
+            <property name="text">
+             <string>⚙</string>
+            </property>
+            <property name="iconSize">
+             <size>
+              <width>25</width>
+              <height>25</height>
+             </size>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QWidget" name="rootWidget" native="true">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <layout class="QHBoxLayout" name="horizontalLayout">
+          <property name="spacing">
+           <number>0</number>
+          </property>
+          <property name="margin" stdset="0">
+           <number>0</number>
+          </property>
+          <item>
+           <widget class="QWidget" name="sidebarWidget" native="true">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Fixed" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="minimumSize">
+             <size>
+              <width>240</width>
+              <height>0</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>240</width>
+              <height>16777215</height>
+             </size>
+            </property>
+            <layout class="QVBoxLayout" name="sidebarLayout">
+             <property name="spacing">
+              <number>0</number>
+             </property>
+             <property name="margin" stdset="0">
+              <number>0</number>
+             </property>
+             <item>
+              <widget class="QWidget" name="profileWidget" native="true">
+               <property name="minimumSize">
+                <size>
+                 <width>0</width>
+                 <height>80</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>16777215</width>
+                 <height>80</height>
+                </size>
+               </property>
+               <layout class="QHBoxLayout" name="profileLayout">
+                <property name="spacing">
+                 <number>12</number>
+                </property>
+                <property name="leftMargin">
+                 <number>16</number>
+                </property>
+                <property name="topMargin">
+                 <number>16</number>
+                </property>
+                <property name="rightMargin">
+                 <number>16</number>
+                </property>
+                <property name="bottomMargin">
+                 <number>16</number>
+                </property>
+                <item>
+                 <widget class="QLabel" name="profileAvatarLabel">
+                  <property name="text">
+                   <string>Y</string>
+                  </property>
+                  <property name="alignment">
+                   <set>Qt::AlignmentFlag::AlignCenter</set>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QWidget" name="profileTextWidget" native="true">
+                  <layout class="QVBoxLayout" name="profileTextLayout">
+                   <property name="spacing">
+                    <number>2</number>
+                   </property>
+                   <property name="margin" stdset="0">
+                    <number>0</number>
+                   </property>
+                   <item>
+                    <widget class="QLabel" name="profileNameLabel">
+                     <property name="text">
+                      <string>You</string>
+                     </property>
+                    </widget>
+                   </item>
+                   <item>
+                    <widget class="QLabel" name="profileHandleLabel">
+                     <property name="text">
+                      <string>@handle</string>
+                     </property>
+                    </widget>
+                   </item>
+                  </layout>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
+             </item>
+             <item>
+              <widget class="QListWidget" name="chatList">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <item>
+                <property name="text">
+                 <string>  Alice</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>  Bob</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>  Charlie</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>  Group Chat</string>
+                </property>
+               </item>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+          <item>
+           <widget class="QWidget" name="contentWidget" native="true">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_2">
+             <property name="spacing">
+              <number>0</number>
+             </property>
+             <property name="margin" stdset="0">
+              <number>0</number>
+             </property>
+             <item>
+              <widget class="QWidget" name="chatHeader" native="true">
+               <property name="minimumSize">
+                <size>
+                 <width>0</width>
+                 <height>72</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>16777215</width>
+                 <height>72</height>
+                </size>
+               </property>
+               <layout class="QVBoxLayout" name="verticalLayout_14">
+                <property name="spacing">
+                 <number>2</number>
+                </property>
+                <property name="leftMargin">
+                 <number>20</number>
+                </property>
+                <property name="topMargin">
+                 <number>12</number>
+                </property>
+                <property name="rightMargin">
+                 <number>20</number>
+                </property>
+                <property name="bottomMargin">
+                 <number>4</number>
+                </property>
+                <item>
+                 <widget class="QLabel" name="chatTitleLabel">
+                  <property name="font">
+                   <font>
+                    <pointsize>-1</pointsize>
+                    <bold>true</bold>
+                   </font>
+                  </property>
+                  <property name="text">
+                   <string>Alice</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QLabel" name="chatSubLabel">
+                  <property name="text">
+                   <string>Secure chat</string>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
+             </item>
+             <item>
+              <widget class="QWidget" name="contentContainer" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <layout class="QVBoxLayout" name="verticalLayout_3">
+                <property name="spacing">
+                 <number>0</number>
+                </property>
+                <property name="margin" stdset="0">
+                 <number>0</number>
+                </property>
+                <item>
+                 <widget class="QTabWidget" name="mainTabs">
+                  <property name="sizePolicy">
+                   <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
+                  <property name="currentIndex">
+                   <number>0</number>
+                  </property>
+                  <property name="documentMode">
+                   <bool>true</bool>
+                  </property>
+                  <widget class="QWidget" name="Messages">
+                   <attribute name="title">
+                    <string>Messages</string>
+                   </attribute>
+                   <layout class="QVBoxLayout" name="verticalLayout_Messages">
+                    <property name="spacing">
+                     <number>0</number>
+                    </property>
+                    <property name="margin" stdset="0">
+                     <number>0</number>
+                    </property>
+                    <item>
+                     <widget class="QScrollArea" name="messageScroll">
+                      <property name="sizePolicy">
+                       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                        <horstretch>0</horstretch>
+                        <verstretch>0</verstretch>
+                       </sizepolicy>
+                      </property>
+                      <property name="frameShape">
+                       <enum>QFrame::Shape::NoFrame</enum>
+                      </property>
+                      <property name="verticalScrollBarPolicy">
+                       <enum>Qt::ScrollBarPolicy::ScrollBarAsNeeded</enum>
+                      </property>
+                      <property name="horizontalScrollBarPolicy">
+                       <enum>Qt::ScrollBarPolicy::ScrollBarAlwaysOff</enum>
+                      </property>
+                      <property name="widgetResizable">
+                       <bool>true</bool>
+                      </property>
+                      <widget class="QWidget" name="scrollAreaWidgetContents">
+                       <property name="geometry">
+                        <rect>
+                         <x>0</x>
+                         <y>0</y>
+                         <width>736</width>
+                         <height>431</height>
+                        </rect>
+                       </property>
+                       <property name="sizePolicy">
+                        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                         <horstretch>0</horstretch>
+                         <verstretch>0</verstretch>
+                        </sizepolicy>
+                       </property>
+                       <layout class="QVBoxLayout" name="verticalLayout_scrollContents">
+                        <property name="spacing">
+                         <number>8</number>
+                        </property>
+                        <property name="leftMargin">
+                         <number>16</number>
+                        </property>
+                        <property name="topMargin">
+                         <number>16</number>
+                        </property>
+                        <property name="rightMargin">
+                         <number>16</number>
+                        </property>
+                        <property name="bottomMargin">
+                         <number>16</number>
+                        </property>
+                        <item alignment="Qt::AlignmentFlag::AlignLeft">
+                         <widget class="QLabel" name="msgRecv1">
+                          <property name="maximumSize">
+                           <size>
+                            <width>480</width>
+                            <height>16777215</height>
+                           </size>
+                          </property>
+                          <property name="styleSheet">
+                           <string notr="true">background-color: #222222; color: #eeeeee; border-radius: 14px; padding: 10px 14px; font-size: 13px;</string>
+                          </property>
+                          <property name="text">
+                           <string>Hey! How are you?</string>
+                          </property>
+                          <property name="wordWrap">
+                           <bool>true</bool>
+                          </property>
+                         </widget>
+                        </item>
+                        <item alignment="Qt::AlignmentFlag::AlignRight">
+                         <widget class="QLabel" name="msgSent1">
+                          <property name="maximumSize">
+                           <size>
+                            <width>480</width>
+                            <height>16777215</height>
+                           </size>
+                          </property>
+                          <property name="styleSheet">
+                           <string notr="true">background-color: #2e8b3a; color: #ffffff; border-radius: 14px; padding: 10px 14px; font-size: 13px;</string>
+                          </property>
+                          <property name="text">
+                           <string>I'm doing great, thanks!</string>
+                          </property>
+                          <property name="wordWrap">
+                           <bool>true</bool>
+                          </property>
+                         </widget>
+                        </item>
+                        <item alignment="Qt::AlignmentFlag::AlignLeft">
+                         <widget class="QLabel" name="msgRecv2">
+                          <property name="maximumSize">
+                           <size>
+                            <width>480</width>
+                            <height>16777215</height>
+                           </size>
+                          </property>
+                          <property name="styleSheet">
+                           <string notr="true">background-color: #222222; color: #eeeeee; border-radius: 14px; padding: 10px 14px; font-size: 13px;</string>
+                          </property>
+                          <property name="text">
+                           <string>That's wonderful to hear</string>
+                          </property>
+                          <property name="wordWrap">
+                           <bool>true</bool>
+                          </property>
+                         </widget>
+                        </item>
+                        <item>
+                         <spacer name="messageSpacer">
+                          <property name="orientation">
+                           <enum>Qt::Orientation::Vertical</enum>
+                          </property>
+                          <property name="sizeType">
+                           <enum>QSizePolicy::Policy::Expanding</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                           <size>
+                            <width>20</width>
+                            <height>40</height>
+                           </size>
+                          </property>
+                         </spacer>
+                        </item>
+                       </layout>
+                      </widget>
+                     </widget>
+                    </item>
+                   </layout>
+                  </widget>
+                  <widget class="QWidget" name="Files">
+                   <attribute name="title">
+                    <string>Files</string>
+                   </attribute>
+                   <layout class="QVBoxLayout" name="verticalLayout_Files">
+                    <property name="spacing">
+                     <number>0</number>
+                    </property>
+                    <property name="margin" stdset="0">
+                     <number>0</number>
+                    </property>
+                    <item>
+                     <widget class="QScrollArea" name="filesScroll">
+                      <property name="sizePolicy">
+                       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                        <horstretch>0</horstretch>
+                        <verstretch>0</verstretch>
+                       </sizepolicy>
+                      </property>
+                      <property name="frameShape">
+                       <enum>QFrame::Shape::NoFrame</enum>
+                      </property>
+                      <property name="widgetResizable">
+                       <bool>true</bool>
+                      </property>
+                      <widget class="QWidget" name="filesScrollContents">
+                       <property name="geometry">
+                        <rect>
+                         <x>0</x>
+                         <y>0</y>
+                         <width>736</width>
+                         <height>431</height>
+                        </rect>
+                       </property>
+                       <layout class="QVBoxLayout" name="filesOuterLayout">
+                        <property name="spacing">
+                         <number>16</number>
+                        </property>
+                        <property name="leftMargin">
+                         <number>16</number>
+                        </property>
+                        <property name="topMargin">
+                         <number>16</number>
+                        </property>
+                        <property name="rightMargin">
+                         <number>16</number>
+                        </property>
+                        <property name="bottomMargin">
+                         <number>16</number>
+                        </property>
+                        <item>
+                         <layout class="QHBoxLayout" name="fileCardsLayout">
+                          <property name="spacing">
+                           <number>16</number>
+                          </property>
+                          <item>
+                           <widget class="QFrame" name="fileCard1">
+                            <property name="sizePolicy">
+                             <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+                              <horstretch>0</horstretch>
+                              <verstretch>0</verstretch>
+                             </sizepolicy>
+                            </property>
+                            <property name="styleSheet">
+                             <string notr="true">QFrame#fileCard1 { background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; }</string>
+                            </property>
+                            <layout class="QVBoxLayout" name="fileCard1Layout">
+                             <property name="spacing">
+                              <number>8</number>
+                             </property>
+                             <property name="leftMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="topMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="rightMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="bottomMargin">
+                              <number>12</number>
+                             </property>
+                             <item>
+                              <widget class="QLabel" name="fileThumb1">
+                               <property name="styleSheet">
+                                <string notr="true">background-color: #222222; color: #555555; font-size: 24px; border-radius: 6px; min-height: 140px;</string>
+                               </property>
+                               <property name="text">
+                                <string>Doc</string>
+                               </property>
+                               <property name="alignment">
+                                <set>Qt::AlignmentFlag::AlignCenter</set>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileName1">
+                               <property name="styleSheet">
+                                <string notr="true">color: #eeeeee; font-size: 13px; font-weight: bold;</string>
+                               </property>
+                               <property name="text">
+                                <string>Project_Proposal.pdf</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileSize1">
+                               <property name="styleSheet">
+                                <string notr="true">color: #888888; font-size: 11px;</string>
+                               </property>
+                               <property name="text">
+                                <string>2.4 MB</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileSender1">
+                               <property name="styleSheet">
+                                <string notr="true">color: #666666; font-size: 11px;</string>
+                               </property>
+                               <property name="text">
+                                <string>From other</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QPushButton" name="dlBtn1">
+                               <property name="styleSheet">
+                                <string notr="true">background-color: #2e8b3a; color: #ffffff; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; padding: 8px; min-height: 36px;</string>
+                               </property>
+                               <property name="text">
+                                <string>Download</string>
+                               </property>
+                              </widget>
+                             </item>
+                            </layout>
+                           </widget>
+                          </item>
+                          <item>
+                           <widget class="QFrame" name="fileCard2">
+                            <property name="sizePolicy">
+                             <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+                              <horstretch>0</horstretch>
+                              <verstretch>0</verstretch>
+                             </sizepolicy>
+                            </property>
+                            <property name="styleSheet">
+                             <string notr="true">QFrame#fileCard2 { background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; }</string>
+                            </property>
+                            <layout class="QVBoxLayout" name="fileCard2Layout">
+                             <property name="spacing">
+                              <number>8</number>
+                             </property>
+                             <property name="leftMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="topMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="rightMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="bottomMargin">
+                              <number>12</number>
+                             </property>
+                             <item>
+                              <widget class="QLabel" name="fileThumb2">
+                               <property name="styleSheet">
+                                <string notr="true">background-color: #222222; color: #555555; font-size: 24px; border-radius: 6px; min-height: 140px;</string>
+                               </property>
+                               <property name="text">
+                                <string>Img</string>
+                               </property>
+                               <property name="alignment">
+                                <set>Qt::AlignmentFlag::AlignCenter</set>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileName2">
+                               <property name="styleSheet">
+                                <string notr="true">color: #eeeeee; font-size: 13px; font-weight: bold;</string>
+                               </property>
+                               <property name="text">
+                                <string>Design_Mockups.png</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileSize2">
+                               <property name="styleSheet">
+                                <string notr="true">color: #888888; font-size: 11px;</string>
+                               </property>
+                               <property name="text">
+                                <string>1.8 MB</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileSender2">
+                               <property name="styleSheet">
+                                <string notr="true">color: #666666; font-size: 11px;</string>
+                               </property>
+                               <property name="text">
+                                <string>You sent this</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QPushButton" name="dlBtn2">
+                               <property name="styleSheet">
+                                <string notr="true">background-color: #2e8b3a; color: #ffffff; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; padding: 8px; min-height: 36px;</string>
+                               </property>
+                               <property name="text">
+                                <string>Download</string>
+                               </property>
+                              </widget>
+                             </item>
+                            </layout>
+                           </widget>
+                          </item>
+                          <item>
+                           <widget class="QFrame" name="fileCard3">
+                            <property name="sizePolicy">
+                             <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+                              <horstretch>0</horstretch>
+                              <verstretch>0</verstretch>
+                             </sizepolicy>
+                            </property>
+                            <property name="styleSheet">
+                             <string notr="true">QFrame#fileCard3 { background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; }</string>
+                            </property>
+                            <layout class="QVBoxLayout" name="fileCard3Layout">
+                             <property name="spacing">
+                              <number>8</number>
+                             </property>
+                             <property name="leftMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="topMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="rightMargin">
+                              <number>12</number>
+                             </property>
+                             <property name="bottomMargin">
+                              <number>12</number>
+                             </property>
+                             <item>
+                              <widget class="QLabel" name="fileThumb3">
+                               <property name="styleSheet">
+                                <string notr="true">background-color: #222222; color: #555555; font-size: 24px; border-radius: 6px; min-height: 140px;</string>
+                               </property>
+                               <property name="text">
+                                <string>Doc</string>
+                               </property>
+                               <property name="alignment">
+                                <set>Qt::AlignmentFlag::AlignCenter</set>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileName3">
+                               <property name="styleSheet">
+                                <string notr="true">color: #eeeeee; font-size: 13px; font-weight: bold;</string>
+                               </property>
+                               <property name="text">
+                                <string>Contract_2024.pdf</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileSize3">
+                               <property name="styleSheet">
+                                <string notr="true">color: #888888; font-size: 11px;</string>
+                               </property>
+                               <property name="text">
+                                <string>856 KB</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QLabel" name="fileSender3">
+                               <property name="styleSheet">
+                                <string notr="true">color: #666666; font-size: 11px;</string>
+                               </property>
+                               <property name="text">
+                                <string>From other</string>
+                               </property>
+                              </widget>
+                             </item>
+                             <item>
+                              <widget class="QPushButton" name="dlBtn3">
+                               <property name="styleSheet">
+                                <string notr="true">background-color: #2e8b3a; color: #ffffff; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; padding: 8px; min-height: 36px;</string>
+                               </property>
+                               <property name="text">
+                                <string>Download</string>
+                               </property>
+                              </widget>
+                             </item>
+                            </layout>
+                           </widget>
+                          </item>
+                         </layout>
+                        </item>
+                        <item>
+                         <spacer name="filesSpacer">
+                          <property name="orientation">
+                           <enum>Qt::Orientation::Vertical</enum>
+                          </property>
+                          <property name="sizeType">
+                           <enum>QSizePolicy::Policy::Expanding</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                           <size>
+                            <width>20</width>
+                            <height>40</height>
+                           </size>
+                          </property>
+                         </spacer>
+                        </item>
+                       </layout>
+                      </widget>
+                     </widget>
+                    </item>
+                   </layout>
+                  </widget>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
+             </item>
+             <item>
+              <widget class="QWidget" name="inputBar" native="true">
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="minimumSize">
+                <size>
+                 <width>0</width>
+                 <height>64</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>16777215</width>
+                 <height>64</height>
+                </size>
+               </property>
+               <layout class="QHBoxLayout" name="inputLayout">
+                <property name="spacing">
+                 <number>10</number>
+                </property>
+                <property name="leftMargin">
+                 <number>16</number>
+                </property>
+                <property name="topMargin">
+                 <number>12</number>
+                </property>
+                <property name="rightMargin">
+                 <number>16</number>
+                </property>
+                <property name="bottomMargin">
+                 <number>12</number>
+                </property>
+                <item>
+                 <widget class="QToolButton" name="attachBtn">
+                  <property name="text">
+                   <string>^</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QLineEdit" name="messageInput">
+                  <property name="sizePolicy">
+                   <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
+                  <property name="placeholderText">
+                   <string>Type your message...</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="sendBtn">
+                  <property name="text">
+                   <string>Send</string>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+   </layout>
+  </widget>
   <widget class="QMenuBar" name="menubar">
    <property name="geometry">
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>800</width>
-     <height>22</height>
+     <width>976</width>
+     <height>21</height>
     </rect>
    </property>
   </widget>
