@@ -7,7 +7,8 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QScrollBar>
-#include <QTextDocument>
+#include <QFontMetrics>
+#include <QApplication>
 #include <QResizeEvent>
 
 static QPixmap removeWhiteBackground(const QPixmap &src, int threshold = 80)
@@ -33,7 +34,6 @@ MainWindow::MainWindow(QWidget *parent)
 {
     ui->setupUi(this);
 
-    // Load logo
     QPixmap raw(":/logo.png");
     if (!raw.isNull()) {
         QPixmap logo = removeWhiteBackground(raw);
@@ -60,6 +60,14 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow()
 {
     delete ui;
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event)
+{
+    QMainWindow::resizeEvent(event);
+    // Reflow bubbles at new width whenever the window is resized
+    if (m_currentChat >= 0)
+        loadChat(m_currentChat);
 }
 
 void MainWindow::initChats()
@@ -192,27 +200,76 @@ void MainWindow::clearMessages()
 
 void MainWindow::addMessageBubble(const QString &text, bool sent)
 {
-    // Outer row widget — full width, aligns bubble left or right
+    // Font matches stylesheet font-size: 13px exactly
+    QFont bubbleFont = QApplication::font();
+    bubbleFont.setPixelSize(13);
+    QFontMetrics fm(bubbleFont);
+
+    // Dynamic max width — 65% of the scroll area viewport, like iMessage
+    int viewportWidth = ui->messageScroll->viewport()->width();
+    int maxBubbleWidth = static_cast<int>(viewportWidth * 0.65);
+    // Clamp to a sensible minimum so tiny windows don't break
+    maxBubbleWidth = qMax(maxBubbleWidth, 120);
+
+    const int hPadding = 28;  // 14px left + 14px right
+    const int vPadding = 28;  // 10px top + 10px bottom
+    const int availableTextWidth = maxBubbleWidth - hPadding;
+
+    // Elide any word too long to wrap (URLs etc)
+    bool hasLongWord = false;
+    for (const QString &word : text.split(' ')) {
+        if (fm.horizontalAdvance(word) > availableTextWidth) {
+            hasLongWord = true;
+            break;
+        }
+    }
+
+    QString displayText = hasLongWord
+                              ? fm.elidedText(text, Qt::ElideRight, availableTextWidth)
+                              : text;
+
+    // Measure natural single-line width
+    int singleLineTextWidth = fm.horizontalAdvance(displayText);
+    bool needsWrap = (singleLineTextWidth > availableTextWidth);
+
+    // Bubble width: tight for short, max for long
+    int bubbleWidth = needsWrap
+                          ? maxBubbleWidth
+                          : qMin(singleLineTextWidth + hPadding + 4, maxBubbleWidth);
+
+    // Bubble height: count wrapped lines for accurate height
+    int bubbleHeight;
+    if (needsWrap) {
+        int lineWidth = 0;
+        int lines = 1;
+        for (const QString &word : displayText.split(' ')) {
+            int w = fm.horizontalAdvance(word + " ");
+            if (lineWidth + w > availableTextWidth && lineWidth > 0) {
+                lines++;
+                lineWidth = w;
+            } else {
+                lineWidth += w;
+            }
+        }
+        bubbleHeight = (fm.height() * lines) + vPadding + ((lines - 1) * fm.leading());
+    } else {
+        bubbleHeight = fm.height() + vPadding;
+    }
+
+    // Row — full viewport width, aligns bubble to correct side
     QWidget *row = new QWidget(ui->scrollAreaWidgetContents);
-    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    row->setFixedHeight(bubbleHeight + 4);
 
     QHBoxLayout *rowLayout = new QHBoxLayout(row);
-    rowLayout->setContentsMargins(0, 0, 0, 0);
+    rowLayout->setContentsMargins(0, 2, 0, 2);
     rowLayout->setSpacing(0);
 
-    // The bubble label itself
-    QLabel *bubble = new QLabel(text, row);
-    bubble->setWordWrap(true);
-    bubble->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
-    bubble->setMaximumWidth(480);
-
-    // Use QTextDocument to calculate exact height needed
-    QTextDocument doc;
-    doc.setDefaultFont(bubble->font());
-    doc.setPlainText(text);
-    doc.setTextWidth(480);
-    int textHeight = static_cast<int>(doc.size().height()) + 24; // +24 for padding
-    bubble->setMinimumHeight(textHeight);
+    QLabel *bubble = new QLabel(displayText, row);
+    bubble->setFont(bubbleFont);
+    bubble->setFixedSize(bubbleWidth, bubbleHeight);
+    bubble->setWordWrap(needsWrap);
+    bubble->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
 
     if (sent) {
         bubble->setStyleSheet(
@@ -242,11 +299,8 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
     if (!layout)
         return;
 
-    // Insert before the bottom spacer
-    int insertPos = layout->count() - 1;
-    layout->insertWidget(insertPos, row);
+    layout->insertWidget(layout->count() - 1, row);
 
-    // Scroll to bottom
     QApplication::processEvents();
     ui->messageScroll->verticalScrollBar()->setValue(
         ui->messageScroll->verticalScrollBar()->maximum()
