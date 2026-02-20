@@ -198,6 +198,7 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
     QLabel *bubble = new QLabel(text, ui->scrollAreaWidgetContents);
     bubble->setWordWrap(true);
     bubble->setMaximumWidth(480);
+    bubble->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Minimum);
 
     if (sent) {
         bubble->setStyleSheet(
