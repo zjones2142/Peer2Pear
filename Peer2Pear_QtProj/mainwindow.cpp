@@ -28,6 +28,44 @@ static QPixmap removeWhiteBackground(const QPixmap &src, int threshold = 80)
     return QPixmap::fromImage(img);
 }
 
+// Break a long unbreakable word into hyphenated chunks that fit within maxWidth
+static QString hyphenateWord(const QString &word, const QFontMetrics &fm, int maxWidth)
+{
+    QString result;
+    QString current;
+
+    for (int i = 0; i < word.length(); ++i) {
+        QString test = current + word[i];
+        // Check if adding a hyphen would still fit
+        QString testWithHyphen = test + "-";
+        if (fm.horizontalAdvance(testWithHyphen) >= maxWidth && !current.isEmpty()) {
+            result += current + "-\n";
+            current = word[i];
+        } else {
+            current = test;
+        }
+    }
+    result += current;
+    return result;
+}
+
+// Process text — hyphenate any word that won't fit on one line
+static QString processText(const QString &text, const QFontMetrics &fm, int maxWidth)
+{
+    QStringList words = text.split(' ');
+    QStringList processed;
+
+    for (const QString &word : words) {
+        if (fm.horizontalAdvance(word) > maxWidth) {
+            processed << hyphenateWord(word, fm, maxWidth);
+        } else {
+            processed << word;
+        }
+    }
+
+    return processed.join(' ');
+}
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
@@ -65,7 +103,6 @@ MainWindow::~MainWindow()
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
-    // Reflow bubbles at new width whenever the window is resized
     if (m_currentChat >= 0)
         loadChat(m_currentChat);
 }
@@ -200,63 +237,60 @@ void MainWindow::clearMessages()
 
 void MainWindow::addMessageBubble(const QString &text, bool sent)
 {
-    // Font matches stylesheet font-size: 13px exactly
     QFont bubbleFont = QApplication::font();
     bubbleFont.setPixelSize(13);
     QFontMetrics fm(bubbleFont);
 
-    // Dynamic max width — 65% of the scroll area viewport, like iMessage
+    // Dynamic max width — 65% of viewport like iMessage
     int viewportWidth = ui->messageScroll->viewport()->width();
-    int maxBubbleWidth = static_cast<int>(viewportWidth * 0.65);
-    // Clamp to a sensible minimum so tiny windows don't break
-    maxBubbleWidth = qMax(maxBubbleWidth, 120);
+    int maxBubbleWidth = qMax(static_cast<int>(viewportWidth * 0.65), 120);
 
-    const int hPadding = 28;  // 14px left + 14px right
-    const int vPadding = 28;  // 10px top + 10px bottom
+    const int hPadding = 28;
+    const int vPadding = 28;
     const int availableTextWidth = maxBubbleWidth - hPadding;
 
-    // Elide any word too long to wrap (URLs etc)
-    bool hasLongWord = false;
-    for (const QString &word : text.split(' ')) {
-        if (fm.horizontalAdvance(word) > availableTextWidth) {
-            hasLongWord = true;
-            break;
-        }
-    }
+    // Process text — hyphenate any word too long to fit
+    QString displayText = processText(text, fm, availableTextWidth);
 
-    QString displayText = hasLongWord
-                              ? fm.elidedText(text, Qt::ElideRight, availableTextWidth)
-                              : text;
-
-    // Measure natural single-line width
+    // Measure natural single-line width of processed text
     int singleLineTextWidth = fm.horizontalAdvance(displayText);
-    bool needsWrap = (singleLineTextWidth > availableTextWidth);
+    bool needsWrap = (singleLineTextWidth > availableTextWidth)
+                     || displayText.contains('\n');
 
     // Bubble width: tight for short, max for long
     int bubbleWidth = needsWrap
                           ? maxBubbleWidth
                           : qMin(singleLineTextWidth + hPadding + 4, maxBubbleWidth);
 
-    // Bubble height: count wrapped lines for accurate height
+    // Count lines for height calculation
     int bubbleHeight;
     if (needsWrap) {
-        int lineWidth = 0;
-        int lines = 1;
-        for (const QString &word : displayText.split(' ')) {
-            int w = fm.horizontalAdvance(word + " ");
-            if (lineWidth + w > availableTextWidth && lineWidth > 0) {
+        // Split on explicit newlines first (from hyphenation), then count word-wrap lines
+        int lines = 0;
+        for (const QString &para : displayText.split('\n')) {
+            if (para.isEmpty()) {
                 lines++;
-                lineWidth = w;
-            } else {
-                lineWidth += w;
+                continue;
             }
+            int lineWidth = 0;
+            int paraLines = 1;
+            for (const QString &word : para.split(' ')) {
+                int w = fm.horizontalAdvance(word + " ");
+                if (lineWidth + w > availableTextWidth && lineWidth > 0) {
+                    paraLines++;
+                    lineWidth = w;
+                } else {
+                    lineWidth += w;
+                }
+            }
+            lines += paraLines;
         }
-        bubbleHeight = (fm.height() * lines) + vPadding + ((lines - 1) * fm.leading());
+        bubbleHeight = (fm.height() * lines) + vPadding + ((lines - 1) * fm.leading()) + 1;
     } else {
-        bubbleHeight = fm.height() + vPadding;
+        bubbleHeight = fm.height() + vPadding + 1;
     }
 
-    // Row — full viewport width, aligns bubble to correct side
+    // Row — full viewport width
     QWidget *row = new QWidget(ui->scrollAreaWidgetContents);
     row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     row->setFixedHeight(bubbleHeight + 4);
