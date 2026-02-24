@@ -6,6 +6,7 @@
 #include <QWidget>
 #include <QVector>
 #include <QResizeEvent>
+#include "ChatController.hpp"
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -16,6 +17,7 @@ QT_END_NAMESPACE
 struct ChatData {
     QString name;
     QString subtitle;
+    QString peerIdB64u;                 // NEW: peer identity key (base64url)
     QVector<QPair<bool, QString>> messages;
 };
 
@@ -35,6 +37,9 @@ private slots:
     void onSendMessage();
     void onSearchChanged(const QString &text);
 
+    void onIncomingMessage(const QString& fromPeerIdB64u, const QString& text); // NEW
+    void onStatus(const QString& s);
+
 private:
     Ui::MainWindow *ui;
 
@@ -45,6 +50,10 @@ private:
     void loadChat(int index);
     void clearMessages();
     void addMessageBubble(const QString &text, bool sent);
+
+    ChatController m_controller; // NEW
 };
 
 #endif // MAINWINDOW_H
+
+

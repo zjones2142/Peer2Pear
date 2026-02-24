@@ -72,6 +72,19 @@ MainWindow::MainWindow(QWidget *parent)
 {
     ui->setupUi(this);
 
+    // Point to your Python server (change to EC2 URL when ready)
+    m_controller.setServerBaseUrl(QUrl("http://127.0.0.1:8080"));
+    m_controller.startPolling(2000);
+
+    connect(&m_controller, &ChatController::messageReceived,
+            this, &MainWindow::onIncomingMessage);
+
+    connect(&m_controller, &ChatController::status,
+            this, &MainWindow::onStatus);
+
+    // show identity in sidebar
+    ui->profileHandleLabel->setText(m_controller.myIdB64u());
+
     QPixmap raw(":/logo.png");
     if (!raw.isNull()) {
         QPixmap logo = removeWhiteBackground(raw);
@@ -109,9 +122,13 @@ void MainWindow::resizeEvent(QResizeEvent *event)
 
 void MainWindow::initChats()
 {
+    // NOTE: Replace these with REAL peer IDs (base64url ed25519 pub) from other devices.
+    // For quick testing, run two clients and copy each "profileHandleLabel" to the other's peerIdB64u.
+
     ChatData alice;
     alice.name     = "Alice";
     alice.subtitle = "Secure chat";
+    alice.peerIdB64u = ""; // <-- paste Alice pubkey here on your device
     alice.messages = {
                       {false, "Hey! How are you?"},
                       {true,  "I'm doing great, thanks!"},
@@ -122,6 +139,7 @@ void MainWindow::initChats()
     ChatData bob;
     bob.name     = "Bob";
     bob.subtitle = "Secure chat";
+    bob.peerIdB64u = ""; // <-- paste Bob pubkey
     bob.messages = {
                     {false, "Did you see the game last night?"},
                     {true,  "Yeah, incredible finish!"},
@@ -131,6 +149,7 @@ void MainWindow::initChats()
     ChatData charlie;
     charlie.name     = "Charlie";
     charlie.subtitle = "Secure chat";
+    charlie.peerIdB64u = "";
     charlie.messages = {
                         {true,  "Hey, sending over those files soon"},
                         {false, "Sounds good, no rush"},
@@ -139,12 +158,19 @@ void MainWindow::initChats()
 
     ChatData group;
     group.name     = "Group Chat";
-    group.subtitle = "Secure chat";
+    group.subtitle = "MVP (no MLS yet)";
+    group.peerIdB64u = ""; // unused for now
     group.messages = {
                       {false, "Welcome everyone!"},
                       {true,  "Thanks for having us"},
                       };
     m_chats.append(group);
+
+    // Populate sidebar list items from chats vector
+    ui->chatList->clear();
+    for (const auto& c : m_chats) {
+        ui->chatList->addItem(c.name);
+    }
 }
 
 void MainWindow::onSearchChanged(const QString &text)
@@ -185,16 +211,24 @@ void MainWindow::onSearchChanged(const QString &text)
 
 void MainWindow::onSendMessage()
 {
-    if (m_currentChat < 0)
-        return;
+    if (m_currentChat < 0) return;
 
     QString text = ui->messageInput->text().trimmed();
-    if (text.isEmpty())
-        return;
+    if (text.isEmpty()) return;
 
+    const QString peerId = m_chats[m_currentChat].peerIdB64u.trimmed();
+    if (peerId.isEmpty()) {
+        addMessageBubble("Peer ID missing for this chat (set peerIdB64u).", false);
+        return;
+    }
+
+    // UI update (sent bubble)
     m_chats[m_currentChat].messages.append({true, text});
     addMessageBubble(text, true);
     ui->messageInput->clear();
+
+    // Send encrypted via mailbox
+    m_controller.sendTextViaMailbox(peerId, text);
 }
 
 void MainWindow::onChatSelected(int index)
@@ -339,4 +373,28 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
     ui->messageScroll->verticalScrollBar()->setValue(
         ui->messageScroll->verticalScrollBar()->maximum()
         );
+}
+
+void MainWindow::onIncomingMessage(const QString& fromPeerIdB64u, const QString& text)
+{
+    // Find matching chat by peer id
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].peerIdB64u.trimmed() == fromPeerIdB64u.trimmed()) {
+            m_chats[i].messages.append({false, text});
+            if (i == m_currentChat) addMessageBubble(text, false);
+            return;
+        }
+    }
+
+    // If unknown peer, drop into current chat (or create new chat in real app)
+    if (m_currentChat >= 0) {
+        m_chats[m_currentChat].messages.append({false, text});
+        addMessageBubble(QString("[Unknown sender] %1").arg(text), false);
+    }
+}
+
+void MainWindow::onStatus(const QString& s)
+{
+    // could log to console for now
+    qDebug() << "[status]" << s;
 }
