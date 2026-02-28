@@ -34,6 +34,10 @@ private slots:
     void onChatSelected(int index);
     void onSendMessage();
     void onSearchChanged(const QString &text);
+    void onEditProfile();
+    void onEditContact(int index);
+    void onAddContact();
+    void onOpenSettings();
 
 private:
     Ui::MainWindow *ui;
@@ -45,6 +49,7 @@ private:
     void loadChat(int index);
     void clearMessages();
     void addMessageBubble(const QString &text, bool sent);
+    void rebuildChatList();
 };
 
 #endif // MAINWINDOW_H
