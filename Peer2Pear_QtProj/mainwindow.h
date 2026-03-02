@@ -6,6 +6,7 @@
 #include <QWidget>
 #include <QVector>
 #include <QResizeEvent>
+#include <QStackedWidget>
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -34,6 +35,12 @@ private slots:
     void onChatSelected(int index);
     void onSendMessage();
     void onSearchChanged(const QString &text);
+    void onEditProfile();
+    void onEditContact(int index);
+    void onAddContact();
+    //void onOpenSettings();//delete function later ? Unused currently
+    void onSettingsClicked();//slot for settings button click
+    void onSettingsBackClicked();//slot for settings back button click
 
 private:
     Ui::MainWindow *ui;
@@ -45,6 +52,11 @@ private:
     void loadChat(int index);
     void clearMessages();
     void addMessageBubble(const QString &text, bool sent);
+    void buildSettingsPanel();//builds settings panel and assigns it to m_settingsPanel
+
+    QStackedWidget *m_mainStack   = nullptr;
+    QWidget        *m_settingsPanel = nullptr;
+    void rebuildChatList();
 };
 
 #endif // MAINWINDOW_H
