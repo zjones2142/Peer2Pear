@@ -21,7 +21,7 @@ if (NOT SODIUM_LIB)
     include(FetchContent)
     FetchContent_Declare(
       libsodium_fetched
-      GIT_REPOSITORY https://github.com
+      GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
       GIT_TAG        main
     )
     # The robinlinden wrapper creates a target named 'sodium'
