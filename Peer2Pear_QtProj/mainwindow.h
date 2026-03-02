@@ -38,7 +38,7 @@ private slots:
     void onEditProfile();
     void onEditContact(int index);
     void onAddContact();
-    void onOpenSettings();//delete function later
+    //void onOpenSettings();//delete function later ? Unused currently
     void onSettingsClicked();//slot for settings button click
     void onSettingsBackClicked();//slot for settings back button click
 

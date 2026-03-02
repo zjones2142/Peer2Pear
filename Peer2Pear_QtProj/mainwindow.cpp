@@ -341,42 +341,42 @@ void MainWindow::onAddContact()
     }
 }
 
-void MainWindow::onOpenSettings()
-{
-    QDialog dlg(this);
-    dlg.setWindowTitle("Preferences");
-    dlg.setStyleSheet(kDialogStyle);
-    dlg.setMinimumSize(400, 300);
-    dlg.setModal(true);
+// void MainWindow::onOpenSettings()
+// {
+//     QDialog dlg(this);
+//     dlg.setWindowTitle("Preferences");
+//     dlg.setStyleSheet(kDialogStyle);
+//     dlg.setMinimumSize(400, 300);
+//     dlg.setModal(true);
 
-    auto *root = new QVBoxLayout(&dlg);
-    root->setContentsMargins(24, 24, 24, 24);
-    root->setSpacing(12);
+//     auto *root = new QVBoxLayout(&dlg);
+//     root->setContentsMargins(24, 24, 24, 24);
+//     root->setSpacing(12);
 
-    auto *title = new QLabel("Preferences", &dlg);
-    title->setObjectName("dlgTitle");
-    root->addWidget(title);
+//     auto *title = new QLabel("Preferences", &dlg);
+//     title->setObjectName("dlgTitle");
+//     root->addWidget(title);
 
-    auto *sep = new QFrame(&dlg);
-    sep->setFrameShape(QFrame::HLine);
-    sep->setStyleSheet("color: #2a2a2a;");
-    root->addWidget(sep);
+//     auto *sep = new QFrame(&dlg);
+//     sep->setFrameShape(QFrame::HLine);
+//     sep->setStyleSheet("color: #2a2a2a;");
+//     root->addWidget(sep);
 
-    auto *placeholder = new QLabel("Settings coming soon...", &dlg);
-    placeholder->setAlignment(Qt::AlignCenter);
-    placeholder->setStyleSheet("color: #444444; font-size: 13px;");
-    root->addWidget(placeholder, 1);
+//     auto *placeholder = new QLabel("Settings coming soon...", &dlg);
+//     placeholder->setAlignment(Qt::AlignCenter);
+//     placeholder->setStyleSheet("color: #444444; font-size: 13px;");
+//     root->addWidget(placeholder, 1);
 
-    auto *closeBtn = new QPushButton("Close", &dlg);
-    closeBtn->setObjectName("cancelBtn");
-    auto *btnRow = new QHBoxLayout;
-    btnRow->addStretch();
-    btnRow->addWidget(closeBtn);
-    root->addLayout(btnRow);
+//     auto *closeBtn = new QPushButton("Close", &dlg);
+//     closeBtn->setObjectName("cancelBtn");
+//     auto *btnRow = new QHBoxLayout;
+//     btnRow->addStretch();
+//     btnRow->addWidget(closeBtn);
+//     root->addLayout(btnRow);
 
-    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
-    dlg.exec();
-}
+//     connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+//     dlg.exec();
+// }
 
 MainWindow::~MainWindow()
 {
