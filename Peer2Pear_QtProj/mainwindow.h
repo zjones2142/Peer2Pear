@@ -35,6 +35,10 @@ private slots:
     void onChatSelected(int index);
     void onSendMessage();
     void onSearchChanged(const QString &text);
+    void onEditProfile();
+    void onEditContact(int index);
+    void onAddContact();
+    void onOpenSettings();//delete function later
     void onSettingsClicked();//slot for settings button click
     void onSettingsBackClicked();//slot for settings back button click
 
@@ -52,6 +56,7 @@ private:
 
     QStackedWidget *m_mainStack   = nullptr;
     QWidget        *m_settingsPanel = nullptr;
+    void rebuildChatList();
 };
 
 #endif // MAINWINDOW_H
