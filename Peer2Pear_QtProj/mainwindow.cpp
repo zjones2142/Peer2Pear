@@ -259,6 +259,10 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onSettingsClicked);
     connect(m_settingsPanel, &SettingsPanel::backClicked,
             this, &MainWindow::onSettingsBackClicked);
+    connect(m_settingsPanel, &SettingsPanel::notificationsToggled,
+            this, [](bool enabled) {
+                qDebug() << "[settings] notifications enabled:" << enabled;//not working cause we really don't have chat yet figured out will use this debug for later(it just lets me know the button works)
+            });
 
     rebuildChatList();
     ui->chatList->setCurrentRow(0);
