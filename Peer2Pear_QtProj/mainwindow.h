@@ -8,6 +8,7 @@
 #include <QResizeEvent>
 #include <QStackedWidget>
 #include "ChatController.hpp"
+#include "settingspanel.h"   //new settings fils are added here
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -62,7 +63,7 @@ private:
     void buildSettingsPanel();//builds settings panel and assigns it to m_settingsPanel
 
     QStackedWidget *m_mainStack   = nullptr;
-    QWidget        *m_settingsPanel = nullptr;
+    SettingsPanel  *m_settingsPanel = nullptr; //SettingsPanel
     void rebuildChatList();
 };
 
