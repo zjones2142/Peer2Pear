@@ -5,14 +5,22 @@
 ChatController::ChatController(QObject* parent)
     : QObject(parent),
     m_rvz(&m_crypto, this),
-    m_mbox(&m_crypto, this) {
-
-    m_crypto.ensureIdentity();
+    m_mbox(&m_crypto, this)
+{
+    // IMPORTANT: Do not call ensureIdentity() here.
+    // Identity is unlocked/created after setPassphrase() is called.
 
     connect(&m_mbox, &MailboxClient::status, this, &ChatController::status);
-    connect(&m_rvz, &RendezvousClient::status, this, &ChatController::status);
+    connect(&m_rvz,  &RendezvousClient::status, this, &ChatController::status);
     connect(&m_mbox, &MailboxClient::envelopeReceived, this, &ChatController::onEnvelope);
     connect(&m_pollTimer, &QTimer::timeout, this, &ChatController::pollOnce);
+}
+
+void ChatController::setPassphrase(const QString& pass)
+{
+    // CryptoEngine::ensureIdentity() should be strict and may throw.
+    m_crypto.setPassphrase(pass);
+    m_crypto.ensureIdentity();
 }
 
 void ChatController::setServerBaseUrl(const QUrl& base) {
@@ -26,6 +34,11 @@ QString ChatController::myIdB64u() const {
 
 void ChatController::startPolling(int intervalMs) {
     if (!m_pollTimer.isActive()) m_pollTimer.start(intervalMs);
+}
+
+void ChatController::stopPolling()
+{
+    m_pollTimer.stop();
 }
 
 void ChatController::pollOnce() {

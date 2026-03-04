@@ -8,6 +8,9 @@ public:
 
     void ensureIdentity();
 
+    void setPassphrase(const QString& pass);
+    bool hasPassphrase() const;
+
     const QByteArray& identityPub() const { return m_edPub; }
     const QByteArray& identityPriv() const { return m_edPriv; }
 
@@ -29,6 +32,13 @@ public:
                            const QByteArray& aad = {}) const;
 
 private:
+    // NEW: encrypted persistence helpers
+    bool loadIdentityFromDisk();
+    bool saveIdentityToDisk() const;
+    void deriveCurveKeysFromEd();
+
+    QString m_passphrase;
+
     QByteArray m_edPub;   // 32
     QByteArray m_edPriv;  // 64
 

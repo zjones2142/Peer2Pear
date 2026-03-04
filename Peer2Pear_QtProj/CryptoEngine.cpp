@@ -1,31 +1,105 @@
 #include "CryptoEngine.hpp"
 #include <sodium.h>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QStandardPaths>
+#include <QDir>
+#include <QFile>
+#include <QDebug>
+#include <QFileInfo>
 #include <stdexcept>
+#include <cstring>
 
+// ---------------------------
+// Helpers
+// ---------------------------
+static QString identityPath() {
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(base + "/keys");
+    return base + "/keys/identity.json";
+}
+
+static constexpr int kIdentityVersion = 2;
+
+static constexpr int SALT_BYTES  = crypto_pwhash_SALTBYTES;        // 16
+static constexpr int KEY_BYTES   = crypto_secretbox_KEYBYTES;      // 32
+static constexpr int NONCE_BYTES = crypto_secretbox_NONCEBYTES;    // 24
+
+static QByteArray deriveKeyFromPassphrase(const QString& pass, const QByteArray& salt) {
+    if (salt.size() != SALT_BYTES) return {};
+    QByteArray key(KEY_BYTES, 0);
+
+    const QByteArray passUtf8 = pass.toUtf8();
+
+    // INTERACTIVE is a good MVP setting; can bump later.
+    if (crypto_pwhash(reinterpret_cast<unsigned char*>(key.data()), KEY_BYTES,
+                      passUtf8.constData(), (unsigned long long)passUtf8.size(),
+                      reinterpret_cast<const unsigned char*>(salt.constData()),
+                      crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                      crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                      crypto_pwhash_ALG_DEFAULT) != 0) {
+        return {};
+    }
+    return key;
+}
+
+static bool secretboxEncrypt(const QByteArray& key32,
+                             const QByteArray& plaintext,
+                             QByteArray& outSalt,
+                             QByteArray& outNonce,
+                             QByteArray& outCiphertext) {
+    if (key32.size() != KEY_BYTES) return false;
+
+    outNonce.resize(NONCE_BYTES);
+    randombytes_buf(outNonce.data(), NONCE_BYTES);
+
+    outCiphertext.resize(plaintext.size() + crypto_secretbox_MACBYTES);
+
+    if (crypto_secretbox_easy(reinterpret_cast<unsigned char*>(outCiphertext.data()),
+                              reinterpret_cast<const unsigned char*>(plaintext.constData()),
+                              (unsigned long long)plaintext.size(),
+                              reinterpret_cast<const unsigned char*>(outNonce.constData()),
+                              reinterpret_cast<const unsigned char*>(key32.constData())) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static QByteArray secretboxDecrypt(const QByteArray& key32,
+                                   const QByteArray& nonce,
+                                   const QByteArray& ciphertext) {
+    if (key32.size() != KEY_BYTES) return {};
+    if (nonce.size() != NONCE_BYTES) return {};
+    if (ciphertext.size() < crypto_secretbox_MACBYTES) return {};
+
+    QByteArray pt(ciphertext.size() - crypto_secretbox_MACBYTES, 0);
+
+    if (crypto_secretbox_open_easy(reinterpret_cast<unsigned char*>(pt.data()),
+                                   reinterpret_cast<const unsigned char*>(ciphertext.constData()),
+                                   (unsigned long long)ciphertext.size(),
+                                   reinterpret_cast<const unsigned char*>(nonce.constData()),
+                                   reinterpret_cast<const unsigned char*>(key32.constData())) != 0) {
+        return {}; // wrong passphrase or file tampered
+    }
+    return pt;
+}
+
+// ---------------------------
+// CryptoEngine
+// ---------------------------
 CryptoEngine::CryptoEngine() {
     if (sodium_init() < 0) throw std::runtime_error("libsodium init failed");
 }
 
-void CryptoEngine::ensureIdentity() {
-    if (!m_edPub.isEmpty()) return;
-
-    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
-    unsigned char sk[crypto_sign_SECRETKEYBYTES];
-    crypto_sign_keypair(pk, sk);
-
-    m_edPub  = QByteArray(reinterpret_cast<const char*>(pk), sizeof(pk));
-    m_edPriv = QByteArray(reinterpret_cast<const char*>(sk), sizeof(sk));
-
-    unsigned char cpk[crypto_box_PUBLICKEYBYTES];
-    unsigned char csk[crypto_box_SECRETKEYBYTES];
-
-    crypto_sign_ed25519_pk_to_curve25519(cpk, pk);
-    crypto_sign_ed25519_sk_to_curve25519(csk, sk);
-
-    m_curvePub  = QByteArray(reinterpret_cast<const char*>(cpk), sizeof(cpk));
-    m_curvePriv = QByteArray(reinterpret_cast<const char*>(csk), sizeof(csk));
+void CryptoEngine::setPassphrase(const QString& pass) {
+    m_passphrase = pass;
 }
 
+bool CryptoEngine::hasPassphrase() const {
+    return !m_passphrase.isEmpty();
+}
+
+// base64url helpers
 QString CryptoEngine::toBase64Url(const QByteArray& data) {
     const size_t maxlen = sodium_base64_ENCODED_LEN(data.size(), sodium_base64_VARIANT_URLSAFE_NO_PADDING);
     QByteArray out;
@@ -51,6 +125,154 @@ QByteArray CryptoEngine::fromBase64Url(const QString& s) {
     return out;
 }
 
+// ---------------------------
+// Persistence (encrypted private key)
+// ---------------------------
+bool CryptoEngine::loadIdentityFromDisk() {
+
+    QString path = identityPath();
+    QFile f(path);
+
+    if (!f.exists())
+        return false;
+
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+
+    const auto doc = QJsonDocument::fromJson(f.readAll());
+    f.close();
+
+    if (!doc.isObject())
+        return false;
+
+    const auto o = doc.object();
+
+    const QByteArray pub = fromBase64Url(o.value("ed_pub_b64u").toString());
+    if (pub.size() != crypto_sign_PUBLICKEYBYTES)
+        return false;
+
+    if (!hasPassphrase())
+        return false;
+
+    const auto enc = o.value("ed_priv_enc").toObject();
+
+    const QByteArray salt  = fromBase64Url(enc.value("salt_b64u").toString());
+    const QByteArray nonce = fromBase64Url(enc.value("nonce_b64u").toString());
+    const QByteArray ct    = fromBase64Url(enc.value("ct_b64u").toString());
+
+    const QByteArray key32 = deriveKeyFromPassphrase(m_passphrase, salt);
+    if (key32.isEmpty())
+        return false;
+
+    const QByteArray priv = secretboxDecrypt(key32, nonce, ct);
+    if (priv.size() != crypto_sign_SECRETKEYBYTES)
+        return false;
+
+    m_edPub = pub;
+    m_edPriv = priv;
+
+    qDebug() << "[CryptoEngine] Identity loaded from:" << path;
+
+    return true;
+}
+
+bool CryptoEngine::saveIdentityToDisk() const {
+    if (m_edPub.size() != crypto_sign_PUBLICKEYBYTES) return false;
+    if (m_edPriv.size() != crypto_sign_SECRETKEYBYTES) return false;
+    if (!hasPassphrase()) return false;
+
+    // Generate salt
+    QByteArray salt(SALT_BYTES, 0);
+    randombytes_buf(salt.data(), SALT_BYTES);
+
+    // Derive key
+    const QByteArray key32 = deriveKeyFromPassphrase(m_passphrase, salt);
+    if (key32.isEmpty()) return false;
+
+    // Encrypt private key
+    QByteArray nonce, ct;
+    QByteArray dummySalt; // not used; kept signature compatible
+    if (!secretboxEncrypt(key32, m_edPriv, dummySalt, nonce, ct)) return false;
+
+    QJsonObject enc;
+    enc["salt_b64u"]  = toBase64Url(salt);
+    enc["nonce_b64u"] = toBase64Url(nonce);
+    enc["ct_b64u"]    = toBase64Url(ct);
+
+    QJsonObject j;
+    j["v"] = kIdentityVersion;
+    j["ed_pub_b64u"] = toBase64Url(m_edPub);
+    j["ed_priv_enc"] = enc;
+
+    QString path = identityPath();
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    f.write(QJsonDocument(j).toJson(QJsonDocument::Compact));
+    f.close();
+
+    // Print path to Qt console
+    qDebug() << "[CryptoEngine] Identity saved to:" << path;
+    return true;
+}
+
+void CryptoEngine::deriveCurveKeysFromEd() {
+    unsigned char cpk[crypto_box_PUBLICKEYBYTES];
+    unsigned char csk[crypto_box_SECRETKEYBYTES];
+
+    crypto_sign_ed25519_pk_to_curve25519(cpk,
+                                         reinterpret_cast<const unsigned char*>(m_edPub.constData()));
+    crypto_sign_ed25519_sk_to_curve25519(csk,
+                                         reinterpret_cast<const unsigned char*>(m_edPriv.constData()));
+
+    m_curvePub  = QByteArray(reinterpret_cast<const char*>(cpk), sizeof(cpk));
+    m_curvePriv = QByteArray(reinterpret_cast<const char*>(csk), sizeof(csk));
+}
+
+void CryptoEngine::ensureIdentity() {
+    if (!m_edPub.isEmpty()) return;
+
+    const QString path = identityPath();
+    const bool identityExists = QFileInfo::exists(path);
+
+    // If identity exists, REQUIRE passphrase and successful decrypt.
+    if (identityExists) {
+        if (!hasPassphrase()) {
+            throw std::runtime_error("Identity exists but no passphrase provided");
+        }
+        if (!loadIdentityFromDisk()) {
+            // Wrong passphrase OR file tampered
+            throw std::runtime_error("Failed to decrypt identity (wrong passphrase or corrupted file)");
+        }
+        deriveCurveKeysFromEd();
+        return;
+    }
+
+    // If no identity exists, REQUIRE passphrase to create encrypted identity
+    if (!hasPassphrase()) {
+        throw std::runtime_error("No identity exists yet, but no passphrase provided to create one");
+    }
+
+    // First-run: generate new keypair
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    unsigned char sk[crypto_sign_SECRETKEYBYTES];
+    crypto_sign_keypair(pk, sk);
+
+    m_edPub  = QByteArray(reinterpret_cast<const char*>(pk), sizeof(pk));
+    m_edPriv = QByteArray(reinterpret_cast<const char*>(sk), sizeof(sk));
+
+    deriveCurveKeysFromEd();
+
+    if (!saveIdentityToDisk()) {
+        throw std::runtime_error("Failed to save encrypted identity to disk");
+    }
+}
+
+// ---------------------------
+// Signing + key agreement + AEAD
+// ---------------------------
 QString CryptoEngine::signB64u(const QByteArray& msgUtf8) const {
     unsigned char sig[crypto_sign_BYTES];
     crypto_sign_detached(sig, nullptr,
@@ -73,21 +295,22 @@ QByteArray CryptoEngine::deriveSharedKey32(const QByteArray& peerEd25519Pub) con
                           reinterpret_cast<const unsigned char*>(m_curvePriv.constData()),
                           peerCurvePk) != 0) return {};
 
-    // Hash shared secret to 32 bytes key
     unsigned char key[32];
     crypto_generichash(key, sizeof(key), shared, sizeof(shared), nullptr, 0);
     sodium_memzero(shared, sizeof(shared));
     return QByteArray(reinterpret_cast<const char*>(key), sizeof(key));
 }
 
-QByteArray CryptoEngine::aeadEncrypt(const QByteArray& key32, const QByteArray& plaintext, const QByteArray& aad) const {
+QByteArray CryptoEngine::aeadEncrypt(const QByteArray& key32,
+                                     const QByteArray& plaintext,
+                                     const QByteArray& aad) const {
     if (key32.size() != 32) return {};
 
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
     randombytes_buf(nonce, sizeof(nonce));
 
     QByteArray out;
-    out.resize(sizeof(nonce) + plaintext.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    out.resize(int(sizeof(nonce) + plaintext.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES));
 
     unsigned long long clen = 0;
     crypto_aead_xchacha20poly1305_ietf_encrypt(
@@ -98,15 +321,17 @@ QByteArray CryptoEngine::aeadEncrypt(const QByteArray& key32, const QByteArray& 
         reinterpret_cast<const unsigned char*>(key32.constData())
         );
 
-    memcpy(out.data(), nonce, sizeof(nonce));
-    out.resize(sizeof(nonce) + int(clen));
+    std::memcpy(out.data(), nonce, sizeof(nonce));
+    out.resize(int(sizeof(nonce) + clen));
     return out;
 }
 
-QByteArray CryptoEngine::aeadDecrypt(const QByteArray& key32, const QByteArray& nonceAndCiphertext, const QByteArray& aad) const {
+QByteArray CryptoEngine::aeadDecrypt(const QByteArray& key32,
+                                     const QByteArray& nonceAndCiphertext,
+                                     const QByteArray& aad) const {
     if (key32.size() != 32) return {};
-    if (nonceAndCiphertext.size() < crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-                                        crypto_aead_xchacha20poly1305_ietf_ABYTES) return {};
+    if (nonceAndCiphertext.size() <
+        crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + crypto_aead_xchacha20poly1305_ietf_ABYTES) return {};
 
     const unsigned char* nonce =
         reinterpret_cast<const unsigned char*>(nonceAndCiphertext.constData());
@@ -128,6 +353,7 @@ QByteArray CryptoEngine::aeadDecrypt(const QByteArray& key32, const QByteArray& 
             ) != 0) {
         return {};
     }
+
     out.resize(int(plen));
     return out;
 }

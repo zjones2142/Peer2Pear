@@ -11,6 +11,7 @@ class ChatController : public QObject {
 public:
     explicit ChatController(QObject* parent=nullptr);
 
+    void setPassphrase(const QString& pass);        // NEW
     void setServerBaseUrl(const QUrl& base);
 
     QString myIdB64u() const;
@@ -20,6 +21,7 @@ public:
 
     // Start periodic mailbox fetch
     void startPolling(int intervalMs = 2000);
+    void stopPolling();
 
 signals:
     void status(const QString& s);

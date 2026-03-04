@@ -14,9 +14,23 @@ find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network)
 
 # --- 2. Handle libsodium (Find System OR Fetch) ---
-find_library(SODIUM_LIB sodium)
 
-if (NOT SODIUM_LIB)
+# Find headers
+find_path(SODIUM_INCLUDE_DIR sodium.h
+    PATHS /opt/homebrew/include /usr/local/include /usr/include
+)
+
+# Find library
+find_library(SODIUM_LIB sodium
+    PATHS /opt/homebrew/lib /usr/local/lib /usr/lib
+)
+
+if (SODIUM_LIB AND SODIUM_INCLUDE_DIR)
+    message(STATUS "Found system libsodium: ${SODIUM_LIB}")
+    message(STATUS "Found libsodium headers: ${SODIUM_INCLUDE_DIR}")
+    set(SODIUM_LINK_TARGET ${SODIUM_LIB})
+    set(SODIUM_INCLUDE_TARGET ${SODIUM_INCLUDE_DIR})
+else()
     message(STATUS "System libsodium not found. Fetching via community CMake wrapper...")
     include(FetchContent)
     FetchContent_Declare(
@@ -24,12 +38,11 @@ if (NOT SODIUM_LIB)
       GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
       GIT_TAG        master
     )
-    # The robinlinden wrapper creates a target named 'sodium'
     FetchContent_MakeAvailable(libsodium_fetched)
+
+    # Wrapper creates target named 'sodium'
     set(SODIUM_LINK_TARGET sodium)
-else()
-    message(STATUS "Found system libsodium: ${SODIUM_LIB}")
-    set(SODIUM_LINK_TARGET ${SODIUM_LIB})
+    set(SODIUM_INCLUDE_TARGET "") # not needed if wrapper exports include dirs
 endif()
 
 # --- 3. Define Project Sources (Unified List) ---
@@ -70,6 +83,10 @@ target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Network
     ${SODIUM_LINK_TARGET}
 )
+
+if (SODIUM_INCLUDE_TARGET)
+    target_include_directories(Peer2Pear_QtProj PRIVATE ${SODIUM_INCLUDE_TARGET})
+endif()
 
 # --- 6. Bundle and Platform Properties ---
 if(${QT_VERSION} VERSION_LESS 6.1.0)
