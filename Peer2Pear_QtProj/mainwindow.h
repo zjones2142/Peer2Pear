@@ -1,14 +1,21 @@
-#ifndef MAINWINDOW_H
-#define MAINWINDOW_H
+#pragma once
 
 #include <QMainWindow>
 #include <QLabel>
 #include <QWidget>
 #include <QVector>
+#include <QPair>
+#include <QString>
+#include <QStringList>
+
 #include <QResizeEvent>
 #include <QStackedWidget>
+
+class QListWidgetItem;
+class QStackedWidget;
+
 #include "ChatController.hpp"
-#include "settingspanel.h"   //new settings fils are added here
+#include "settingspanel.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -39,9 +46,11 @@ private slots:
     void onChatSelected(int index);
     void onSendMessage();
     void onSearchChanged(const QString &text);
+
     void onEditProfile();
     void onEditContact(int index);
     void onAddContact();
+
     //void onOpenSettings();//delete function later ? Unused currently
     void onSettingsClicked();//slot for settings button click
     void onSettingsBackClicked();//slot for settings back button click
@@ -50,24 +59,21 @@ private slots:
     void onStatus(const QString& s);
 
 private:
+    void initChats();
+    void rebuildChatList();
+    void loadChat(int index);
+
+    void clearMessages();
+    void addMessageBubble(const QString &text, bool sent);
+
+private:
     Ui::MainWindow *ui;
+
+    ChatController m_controller;
 
     QVector<ChatData> m_chats;
     int m_currentChat = -1;
 
-    void initChats();
-    void loadChat(int index);
-    void clearMessages();
-    void addMessageBubble(const QString &text, bool sent);
-
-    ChatController m_controller; // NEW
-    void buildSettingsPanel();//builds settings panel and assigns it to m_settingsPanel
-
-    QStackedWidget *m_mainStack   = nullptr;
-    SettingsPanel  *m_settingsPanel = nullptr; //SettingsPanel
-    void rebuildChatList();
+    QStackedWidget *m_mainStack = nullptr;
+    SettingsPanel  *m_settingsPanel = nullptr;
 };
-
-#endif // MAINWINDOW_H
-
-
