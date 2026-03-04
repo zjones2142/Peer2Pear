@@ -7,6 +7,7 @@
 #include <QStringList>
 
 #include "ChatController.hpp"
+#include "ChatNotifier.h"
 
 // Forward-declare the generated UI class so we don't pull in the whole header here
 namespace Ui { class MainWindow; }
@@ -33,6 +34,9 @@ public:
 
     // Called by MainWindow::resizeEvent so bubbles re-flow on resize
     void reloadCurrentChat();
+
+    // Called by MainWindow after it creates the ChatNotifier
+    void setNotifier(ChatNotifier *notifier) { m_notifier = notifier; }
 
 public slots:
     // Wired to ChatController signals by MainWindow
@@ -61,6 +65,7 @@ private:
     // ── Members ──
     Ui::MainWindow  *m_ui         = nullptr;
     ChatController  *m_controller = nullptr;
+    ChatNotifier *m_notifier = nullptr;
 
     QVector<ChatData> m_chats;
     int               m_currentChat = -1;

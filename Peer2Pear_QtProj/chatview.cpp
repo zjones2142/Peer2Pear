@@ -205,6 +205,11 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
         if (m_chats[i].peerIdB64u.trimmed() == from) {
             m_chats[i].messages.append({false, text});
             if (i == m_currentChat) addMessageBubble(text, false);
+
+            // Notify only if this isn't the chat the user is looking at
+            if (i != m_currentChat && m_notifier)
+                m_notifier->notify(m_chats[i].name, text);
+
             return;
         }
         // Check all stored keys, not just peerIdB64u
@@ -212,6 +217,11 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
             if (key.trimmed() == from) {
                 m_chats[i].messages.append({false, text});
                 if (i == m_currentChat) addMessageBubble(text, false);
+
+                // Notify only if this isn't the chat the user is looking at
+                if (i != m_currentChat && m_notifier)
+                    m_notifier->notify(m_chats[i].name, text);
+
                 return;
             }
         }
@@ -232,6 +242,8 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
     int newIndex = m_chats.size() - 1;
     if (newIndex == m_currentChat)
         addMessageBubble(text, false);
+    else if (m_notifier)
+        m_notifier->notify(newChat.name, text);
 }
 
 void ChatView::onStatus(const QString &s)

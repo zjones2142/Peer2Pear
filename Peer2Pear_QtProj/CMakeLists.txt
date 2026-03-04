@@ -69,6 +69,7 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         ${PROJECT_SOURCES}
         settingspanel.h settingspanel.cpp
         chatview.h chatview.cpp
+        ChatNotifier.h
     )
 else()
     if(ANDROID)

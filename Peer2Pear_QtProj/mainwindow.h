@@ -11,6 +11,7 @@ class QStackedWidget;
 #include "ChatController.hpp"
 #include "settingspanel.h"
 #include "chatview.h"
+#include "ChatNotifier.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -39,6 +40,7 @@ private:
     ChatController m_controller;
 
     ChatView *m_chatView = nullptr;
+    ChatNotifier   *m_notifier    = nullptr;
 
     QStackedWidget *m_mainStack = nullptr;
     SettingsPanel  *m_settingsPanel = nullptr;

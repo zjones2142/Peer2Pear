@@ -108,15 +108,18 @@ MainWindow::MainWindow(QWidget *parent)
     connect(&m_controller, &ChatController::status,
             m_chatView,    &ChatView::onStatus);
 
+    // ── Create notifier and hand it to ChatView ───────────────────────────────
+    m_notifier = new ChatNotifier(this);
+    m_chatView->setNotifier(m_notifier);
+
+
     // ── Settings connections ───────────────────────────────────────────────────
     connect(ui->settingsBtn_12, &QToolButton::clicked,
             this, &MainWindow::onSettingsClicked);
     connect(m_settingsPanel, &SettingsPanel::backClicked,
             this, &MainWindow::onSettingsBackClicked);
     connect(m_settingsPanel, &SettingsPanel::notificationsToggled,
-            this, [](bool enabled) {
-                qDebug() << "[settings] notifications enabled:" << enabled;//test qDebug delete later
-            });
+            m_notifier,      &ChatNotifier::setEnabled);
 }
 
 MainWindow::~MainWindow()
