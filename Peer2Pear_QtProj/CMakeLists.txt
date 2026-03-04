@@ -54,6 +54,7 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     qt_add_executable(Peer2Pear_QtProj
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
+        settingspanel.h settingspanel.cpp
     )
 else()
     if(ANDROID)
