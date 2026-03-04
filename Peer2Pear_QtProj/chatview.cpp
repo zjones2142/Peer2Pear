@@ -314,13 +314,15 @@ void ChatView::onSearchChanged(const QString &text)
 void ChatView::onEditProfile()
 {
     QString name = m_ui->profileNameLabel->text();
-    QStringList keys;
+    QStringList keys = m_profileKeys;
     const QString myKey = m_controller->myIdB64u();
-    if (!myKey.isEmpty()) keys << myKey;
+    if (!myKey.isEmpty() && !keys.contains(myKey))
+        keys << myKey;
 
     if (openContactEditor(m_ui->centralwidget, "Edit Your Profile", name, keys)) {
         m_ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         m_ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
+        m_profileKeys = keys;
     }
 }
 

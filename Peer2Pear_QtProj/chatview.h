@@ -69,4 +69,6 @@ private:
 
     QVector<ChatData> m_chats;
     int               m_currentChat = -1;
+
+    QStringList m_profileKeys;
 };
