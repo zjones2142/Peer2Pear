@@ -321,8 +321,12 @@ void MainWindow::onEditProfile()
     // For profile we reuse the same dialog; keys are empty placeholders for now
     QString name = ui->profileNameLabel->text();
     QStringList keys;
+    const QString myKey = m_controller.myIdB64u();//<----------------------THIS IS A TEST FUNCTION UNTIL JOSEPH IMPLEMENTS THIS
+    if (!myKey.isEmpty())
+        keys << myKey;
+
     if (openContactEditor(this, "Edit Your Profile", name, keys)) {
-        ui->profileNameLabel->setText(name.isEmpty() ? "You" : name);
+        ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
     }
 }
@@ -332,10 +336,15 @@ void MainWindow::onEditContact(int index)
     if (index < 0 || index >= m_chats.size()) return;
 
     QString name = m_chats[index].name;
-    QStringList keys; // placeholder — real keys would live in ChatData
+    //QStringList keys; // placeholder — real keys would live in ChatData
+    QStringList keys = m_chats[index].keys;  // load existing keys
     if (openContactEditor(this, "Edit Contact", name, keys)) {
         if (!name.isEmpty()) {
             m_chats[index].name = name;
+            m_chats[index].keys = keys;       // save updated keys back
+            // If peerIdB64u is still empty, use first key as routing id
+            if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
+                m_chats[index].peerIdB64u = keys.first();
             rebuildChatList();
             if (m_currentChat == index) {
                 ui->chatTitleLabel->setText(name);
@@ -354,6 +363,10 @@ void MainWindow::onAddContact()
             ChatData newChat;
             newChat.name     = name;
             newChat.subtitle = "Secure chat";
+            newChat.keys     = keys;
+            // Use first key as the routing peer id if provided
+            if (!keys.isEmpty())
+                newChat.peerIdB64u = keys.first();
             m_chats.append(newChat);
             rebuildChatList();
             ui->chatList->setCurrentRow(m_chats.size() - 1);
