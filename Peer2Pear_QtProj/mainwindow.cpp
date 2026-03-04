@@ -12,23 +12,6 @@
 #include <QToolButton>
 #include <QDebug>
 
-static QPixmap removeWhiteBackground(const QPixmap &src, int threshold = 80)
-{
-    QImage img = src.toImage().convertToFormat(QImage::Format_ARGB32);
-    for (int y = 0; y < img.height(); ++y) {
-        for (int x = 0; x < img.width(); ++x) {
-            QColor c = img.pixelColor(x, y);
-            if (c.red()   > (255 - threshold) &&
-                c.green() > (255 - threshold) &&
-                c.blue()  > (255 - threshold))
-            {
-                img.setPixelColor(x, y, Qt::transparent);
-            }
-        }
-    }
-    return QPixmap::fromImage(img);
-}
-
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
@@ -77,9 +60,9 @@ MainWindow::MainWindow(QWidget *parent)
     // Logo
     QPixmap raw(":/logo.png");
     if (!raw.isNull()) {
-        QPixmap logo = removeWhiteBackground(raw);
+        QPixmap logo = raw;
         ui->logoLabel->setPixmap(
-            logo.scaled(44, 44, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+            logo.scaled(50, 50, Qt::KeepAspectRatio, Qt::SmoothTransformation)
             );
         ui->logoLabel->setText("");
     }
