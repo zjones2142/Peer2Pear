@@ -13,6 +13,7 @@
 #include <QPushButton>
 #include <QListWidget>
 #include <QToolButton>
+#include <QMessageBox>
 #include <QDebug>
 
 // ── Text-layout helpers ───────────────────────────────────────────────────────
@@ -129,7 +130,23 @@ static bool openContactEditor(QWidget *parent,
 
     QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
         QString k = keyInput->text().trimmed();
-        if (!k.isEmpty()) { keyList->addItem(k); keyInput->clear(); }
+        if (!k.isEmpty()) {
+            // Check for duplicate key
+            bool duplicate = false;
+            for (int i = 0; i < keyList->count(); ++i) {
+                if (keyList->item(i)->text() == k) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                QMessageBox::warning(&dlg, "Duplicate Key",
+                                     "This key already exists and was not added.");
+            } else {
+                keyList->addItem(k);
+                keyInput->clear();
+            }
+        }
     });
     QObject::connect(removeKeyBtn, &QPushButton::clicked, [&]() {
         delete keyList->currentItem();
