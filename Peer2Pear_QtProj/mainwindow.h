@@ -26,7 +26,8 @@ QT_END_NAMESPACE
 struct ChatData {
     QString name;
     QString subtitle;
-    QString peerIdB64u;
+    QString peerIdB64u;                 // NEW: peer identity key (base64url)
+    QStringList keys;                   // public keys for this contact
     QVector<QPair<bool, QString>> messages;
 };
 

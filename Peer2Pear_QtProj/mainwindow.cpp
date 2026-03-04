@@ -234,7 +234,7 @@ MainWindow::MainWindow(QWidget *parent)
 
 
     // Point to your Python server (change to EC2 URL when ready)
-    m_controller.setServerBaseUrl(QUrl("http://3.141.14.234:8080"));
+    m_controller.setServerBaseUrl(QUrl("http://3.141.14.234"));
     m_controller.startPolling(2000);
 
     connect(&m_controller, &ChatController::messageReceived,
@@ -356,8 +356,12 @@ void MainWindow::onEditProfile()
     // For profile we reuse the same dialog; keys are empty placeholders for now
     QString name = ui->profileNameLabel->text();
     QStringList keys;
+    const QString myKey = m_controller.myIdB64u();//<----------------------THIS IS A TEST FUNCTION UNTIL JOSEPH IMPLEMENTS THIS
+    if (!myKey.isEmpty())
+        keys << myKey;
+
     if (openContactEditor(this, "Edit Your Profile", name, keys)) {
-        ui->profileNameLabel->setText(name.isEmpty() ? "You" : name);
+        ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
     }
 }
@@ -367,10 +371,15 @@ void MainWindow::onEditContact(int index)
     if (index < 0 || index >= m_chats.size()) return;
 
     QString name = m_chats[index].name;
-    QStringList keys; // placeholder — real keys would live in ChatData
+    //QStringList keys; // placeholder — real keys would live in ChatData
+    QStringList keys = m_chats[index].keys;  // load existing keys
     if (openContactEditor(this, "Edit Contact", name, keys)) {
         if (!name.isEmpty()) {
             m_chats[index].name = name;
+            m_chats[index].keys = keys;       // save updated keys back
+            // If peerIdB64u is still empty, use first key as routing id
+            if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
+                m_chats[index].peerIdB64u = keys.first();
             rebuildChatList();
             if (m_currentChat == index) {
                 ui->chatTitleLabel->setText(name);
@@ -389,6 +398,10 @@ void MainWindow::onAddContact()
             ChatData newChat;
             newChat.name     = name;
             newChat.subtitle = "Secure chat";
+            newChat.keys     = keys;
+            // Use first key as the routing peer id if provided
+            if (!keys.isEmpty())
+                newChat.peerIdB64u = keys.first();
             m_chats.append(newChat);
             rebuildChatList();
             ui->chatList->setCurrentRow(m_chats.size() - 1);
@@ -716,6 +729,8 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
 
 void MainWindow::onIncomingMessage(const QString& fromPeerIdB64u, const QString& text)
 {
+    const QString from = fromPeerIdB64u.trimmed();
+
     // Find matching chat by peer id
     for (int i = 0; i < m_chats.size(); ++i) {
         if (m_chats[i].peerIdB64u.trimmed() == fromPeerIdB64u.trimmed()) {
@@ -723,12 +738,33 @@ void MainWindow::onIncomingMessage(const QString& fromPeerIdB64u, const QString&
             if (i == m_currentChat) addMessageBubble(text, false);
             return;
         }
+        //checks all the keys instead of just the first one
+        for(const QString &key : m_chats[i].keys) {
+            if (key.trimmed() == fromPeerIdB64u.trimmed()) {
+                m_chats[i].messages.append({false, text});
+                if (i == m_currentChat) addMessageBubble(text, false);
+                return;
+            }
+        }
     }
 
-    // If unknown peer, drop into current chat (or create new chat in real app)
-    if (m_currentChat >= 0) {
-        m_chats[m_currentChat].messages.append({false, text});
-        addMessageBubble(QString("[Unknown sender] %1").arg(text), false);
+    // Unknown sender — auto-create a new chat for them
+    qDebug() << "Received message from unknown peer:" << fromPeerIdB64u;//test to see if it works
+
+    ChatData newChat;
+    newChat.name       = "Unknown contact";
+    newChat.subtitle   = "Secure chat";
+    newChat.peerIdB64u = from;
+    newChat.keys.append(from); // add the sender's peer ID as a key for routing
+    newChat.messages.append({false, text});
+    m_chats.append(newChat);
+
+    rebuildChatList();
+
+    // Show the bubble only if the new chat is currently selected
+    int newIndex = m_chats.size() - 1;
+    if (newIndex == m_currentChat) {
+        addMessageBubble(text, false);
     }
 }
 
