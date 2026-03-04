@@ -199,7 +199,7 @@ MainWindow::MainWindow(QWidget *parent)
     ui->setupUi(this);
 
     // Point to your Python server (change to EC2 URL when ready)
-    m_controller.setServerBaseUrl(QUrl("http://3.141.14.234:8080"));
+    m_controller.setServerBaseUrl(QUrl("http://3.141.14.234"));
     m_controller.startPolling(2000);
 
     connect(&m_controller, &ChatController::messageReceived,
