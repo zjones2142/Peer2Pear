@@ -11,6 +11,9 @@
 #include <QApplication>
 #include <QResizeEvent>
 #include <QDialog>
+#include <QTimer>
+#include <QInputDialog>
+#include <QMessageBox>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QListWidget>
@@ -197,6 +200,38 @@ MainWindow::MainWindow(QWidget *parent)
     , ui(new Ui::MainWindow)
 {
     ui->setupUi(this);
+
+    // --- Strict identity unlock (wrong passphrase => do not create new identity) ---
+    while (true) {
+        bool ok = false;
+        QString pass = QInputDialog::getText(
+            this,
+            "Unlock Identity",
+            "Enter passphrase to unlock this device identity:",
+            QLineEdit::Password,
+            "",
+            &ok
+            );
+
+        if (!ok) {
+            QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+            return;
+        }
+
+        if (pass.isEmpty()) {
+            QMessageBox::warning(this, "Passphrase Required",
+                                 "Passphrase cannot be empty.");
+            continue;
+        }
+
+        try {
+            m_controller.setPassphrase(pass);
+            break; // success
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, "Identity Unlock Failed", e.what());
+        }
+    }
+
 
     // Point to your Python server (change to EC2 URL when ready)
     m_controller.setServerBaseUrl(QUrl("http://3.141.14.234:8080"));
