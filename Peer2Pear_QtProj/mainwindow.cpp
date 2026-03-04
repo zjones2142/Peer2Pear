@@ -694,6 +694,8 @@ void MainWindow::addMessageBubble(const QString &text, bool sent)
 
 void MainWindow::onIncomingMessage(const QString& fromPeerIdB64u, const QString& text)
 {
+    const QString from = fromPeerIdB64u.trimmed();
+
     // Find matching chat by peer id
     for (int i = 0; i < m_chats.size(); ++i) {
         if (m_chats[i].peerIdB64u.trimmed() == fromPeerIdB64u.trimmed()) {
@@ -701,12 +703,33 @@ void MainWindow::onIncomingMessage(const QString& fromPeerIdB64u, const QString&
             if (i == m_currentChat) addMessageBubble(text, false);
             return;
         }
+        //checks all the keys instead of just the first one
+        for(const QString &key : m_chats[i].keys) {
+            if (key.trimmed() == fromPeerIdB64u.trimmed()) {
+                m_chats[i].messages.append({false, text});
+                if (i == m_currentChat) addMessageBubble(text, false);
+                return;
+            }
+        }
     }
 
-    // If unknown peer, drop into current chat (or create new chat in real app)
-    if (m_currentChat >= 0) {
-        m_chats[m_currentChat].messages.append({false, text});
-        addMessageBubble(QString("[Unknown sender] %1").arg(text), false);
+    // Unknown sender — auto-create a new chat for them
+    qDebug() << "Received message from unknown peer:" << fromPeerIdB64u;//test to see if it works
+
+    ChatData newChat;
+    newChat.name       = "Unknown contact";
+    newChat.subtitle   = "Secure chat";
+    newChat.peerIdB64u = from;
+    newChat.keys.append(from); // add the sender's peer ID as a key for routing
+    newChat.messages.append({false, text});
+    m_chats.append(newChat);
+
+    rebuildChatList();
+
+    // Show the bubble only if the new chat is currently selected
+    int newIndex = m_chats.size() - 1;
+    if (newIndex == m_currentChat) {
+        addMessageBubble(text, false);
     }
 }
 
