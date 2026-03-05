@@ -5,6 +5,7 @@
 #include <QPair>
 #include <QString>
 #include <QStringList>
+#include <functional>
 
 #include "ChatController.hpp"
 #include "ChatNotifier.h"
@@ -35,6 +36,9 @@ public:
     // Called by MainWindow::resizeEvent so bubbles re-flow on resize
     void reloadCurrentChat();
 
+    // Called by MainWindow to tell ChatView when to show a system toast
+    void setShouldToastFn(std::function<bool()> fn) { m_shouldToastFn = std::move(fn);}
+
     // Called by MainWindow after it creates the ChatNotifier
     void setNotifier(ChatNotifier *notifier) { m_notifier = notifier; }
 
@@ -42,6 +46,10 @@ public slots:
     // Wired to ChatController signals by MainWindow
     void onIncomingMessage(const QString &fromPeerIdB64u, const QString &text);
     void onStatus(const QString &s);
+
+signals:
+    // NEW: emitted whenever unread counts change (for dot + badge)
+    void unreadChanged(int totalUnread);
 
 private slots:
     void onChatSelected(int index);
@@ -67,8 +75,15 @@ private:
     ChatController  *m_controller = nullptr;
     ChatNotifier *m_notifier = nullptr;
 
+    std::function<bool()> m_shouldToastFn;
+
     QVector<ChatData> m_chats;
     int               m_currentChat = -1;
 
     QStringList m_profileKeys;
+    // NEW: unread counts per chat
+    QVector<int> m_unread;
+
+    int totalUnread() const;
+    void ensureUnreadSize();
 };

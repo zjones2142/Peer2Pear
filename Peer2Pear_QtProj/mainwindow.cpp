@@ -85,6 +85,11 @@ MainWindow::MainWindow(QWidget *parent)
     // ── Create ChatView (owns all chat logic) ─────────────────────────────────
     m_chatView = new ChatView(ui, &m_controller, this);
 
+    m_chatView->setShouldToastFn([this]() -> bool {
+        // toast when not actively viewing the app
+        return this->isMinimized() || !this->isVisible() || !this->isActiveWindow();
+    });
+
     // Wire ChatController signals → ChatView slots
     connect(&m_controller, &ChatController::messageReceived,
             m_chatView,    &ChatView::onIncomingMessage);

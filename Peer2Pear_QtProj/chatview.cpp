@@ -187,6 +187,8 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller, QObject *pare
 {
     initChats();
 
+    ensureUnreadSize();
+
     connect(m_ui->chatList, &QListWidget::currentRowChanged,
             this, &ChatView::onChatSelected);
     connect(m_ui->sendBtn, &QPushButton::clicked,
@@ -217,30 +219,41 @@ void ChatView::reloadCurrentChat()
 void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &text)
 {
     const QString from = fromPeerIdB64u.trimmed();
+    ensureUnreadSize();
+
+    auto shouldToast = [&]() -> bool {
+        return m_shouldToastFn ? m_shouldToastFn() : true; // default: toast if not provided
+    };
 
     for (int i = 0; i < m_chats.size(); ++i) {
+        auto matchesChat = [&](int idx) {
+            return m_chats[idx].peerIdB64u.trimmed() == from;
+        };
+
+        bool hit = false;
+
         if (m_chats[i].peerIdB64u.trimmed() == from) {
-            m_chats[i].messages.append({false, text});
-            if (i == m_currentChat) addMessageBubble(text, false);
-
-            // Notify only if this isn't the chat the user is looking at
-            if (i != m_currentChat && m_notifier)
-                m_notifier->notify(m_chats[i].name, text);
-
-            return;
-        }
-        // Check all stored keys, not just peerIdB64u
-        for (const QString &key : m_chats[i].keys) {
-            if (key.trimmed() == from) {
-                m_chats[i].messages.append({false, text});
-                if (i == m_currentChat) addMessageBubble(text, false);
-
-                // Notify only if this isn't the chat the user is looking at
-                if (i != m_currentChat && m_notifier)
-                    m_notifier->notify(m_chats[i].name, text);
-
-                return;
+            hit = true;
+        } else {
+            for (const QString &key : m_chats[i].keys) {
+                if (key.trimmed() == from) { hit = true; break; }
             }
+        }
+
+        if (hit) {
+            m_chats[i].messages.append({false, text});
+
+            if (i == m_currentChat) {
+                addMessageBubble(text, false);
+            } else {
+                m_unread[i] += 1;                       // ← ADD unread increment
+                emit unreadChanged(totalUnread());      // ← ADD
+                rebuildChatList();                         // ← ADD: update sidebar with new unread count
+
+                if (m_notifier && shouldToast())        // ← CHANGE: only toast when minimized/not active
+                    m_notifier->notify(m_chats[i].name, text);
+            }
+            return;
         }
     }
 
@@ -254,13 +267,20 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
     newChat.keys.append(from);
     newChat.messages.append({false, text});
     m_chats.append(newChat);
-    rebuildChatList();
+
+    ensureUnreadSize();
 
     int newIndex = m_chats.size() - 1;
-    if (newIndex == m_currentChat)
+    if (newIndex == m_currentChat) {
         addMessageBubble(text, false);
-    else if (m_notifier)
-        m_notifier->notify(newChat.name, text);
+    } else {
+        m_unread[newIndex] += 1;              // ← ADD
+        emit unreadChanged(totalUnread());    // ← ADD
+        if (m_notifier && shouldToast())      // ← CHANGE
+            m_notifier->notify("Unknown contact", text);
+    }
+
+    rebuildChatList();
 }
 
 void ChatView::onStatus(const QString &s)
@@ -276,6 +296,14 @@ void ChatView::onChatSelected(int index)
     if (index == m_currentChat) return;
     m_currentChat = index;
     loadChat(index);
+
+    // ── Mark as read ──────────────────────────────────────────────────────────
+    ensureUnreadSize();
+    if (m_unread[index] > 0) {
+        m_unread[index] = 0;
+        emit unreadChanged(totalUnread()); // clears dot + taskbar badge
+        rebuildChatList();                 // removes the dot from the sidebar row
+    }
 }
 
 void ChatView::onSendMessage()
@@ -449,6 +477,17 @@ void ChatView::rebuildChatList()
         nameLbl->setStyleSheet("color: #d0d0d0; font-size: 14px; background: transparent;");
         hl->addWidget(nameLbl, 1);
 
+        // ── Unread dot ────────────────────────────────────────────────────────
+        ensureUnreadSize();
+        if (m_unread[i] > 0) {
+            auto *dot = new QLabel(row);
+            dot->setFixedSize(8, 8);
+            dot->setStyleSheet(
+                "QLabel { background-color: #5dd868; border-radius: 4px; }"
+                );
+            hl->addWidget(dot);
+        }
+
         auto *editBtn = new QToolButton(row);
         editBtn->setText("✎");
         editBtn->setFixedSize(28, 28);
@@ -580,4 +619,17 @@ void ChatView::addMessageBubble(const QString &text, bool sent)
     m_ui->messageScroll->verticalScrollBar()->setValue(
         m_ui->messageScroll->verticalScrollBar()->maximum()
         );
+}
+
+void ChatView::ensureUnreadSize()
+{
+    if (m_unread.size() < m_chats.size())
+        m_unread.resize(m_chats.size());
+}
+
+int ChatView::totalUnread() const
+{
+    int sum = 0;
+    for (int n : m_unread) sum += n;
+    return sum;
 }
