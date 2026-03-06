@@ -244,14 +244,18 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
             m_chats[i].messages.append({false, text});
 
             if (i == m_currentChat) {
+                // Currently open — just show the bubble, then promote to top
                 addMessageBubble(text, false);
+                promoteChatToTop(i);
+                rebuildChatList();
             } else {
-                m_unread[i] += 1;                       // ← ADD unread increment
-                emit unreadChanged(totalUnread());      // ← ADD
-                rebuildChatList();                         // ← ADD: update sidebar with new unread count
+                m_unread[i] += 1;
+                emit unreadChanged(totalUnread());
+                promoteChatToTop(i);
+                rebuildChatList();
 
-                if (m_notifier && shouldToast())        // ← CHANGE: only toast when minimized/not active
-                    m_notifier->notify(m_chats[i].name, text);
+                if (m_notifier && shouldToast())
+                    m_notifier->notify(m_chats[0].name, text);
             }
             return;
         }
@@ -266,19 +270,20 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
     newChat.peerIdB64u = from;
     newChat.keys.append(from);
     newChat.messages.append({false, text});
-    m_chats.append(newChat);
+    m_chats.prepend(newChat);
 
     ensureUnreadSize();
+    m_unread.prepend(0);
 
-    int newIndex = m_chats.size() - 1;
-    if (newIndex == m_currentChat) {
-        addMessageBubble(text, false);
-    } else {
-        m_unread[newIndex] += 1;              // ← ADD
-        emit unreadChanged(totalUnread());    // ← ADD
-        if (m_notifier && shouldToast())      // ← CHANGE
-            m_notifier->notify("Unknown contact", text);
-    }
+    // New chat is always at index 0; m_currentChat shifts down by 1
+    if (m_currentChat >= 0)
+        m_currentChat += 1;
+
+    m_unread[0] += 1;
+    emit unreadChanged(totalUnread());
+
+    if (m_notifier && shouldToast())
+        m_notifier->notify("Unknown contact", text);
 
     rebuildChatList();
 }
@@ -523,6 +528,29 @@ void ChatView::loadChat(int index)
     clearMessages();
     for (const auto &msg : chat.messages)
         addMessageBubble(msg.second, msg.first);
+}
+
+void ChatView::promoteChatToTop(int index)
+{
+    if (index <= 0 || index >= m_chats.size())
+        return; // already at top or invalid
+
+    // Move the chat data to front
+    ChatData promoted = m_chats.takeAt(index);
+    m_chats.prepend(promoted);
+
+    // Mirror the unread vector
+    ensureUnreadSize();
+    int unreadCount = m_unread[index];
+    m_unread.remove(index);
+    m_unread.prepend(unreadCount);
+
+    // Keep m_currentChat pointing at the same chat
+    if (m_currentChat == index) {
+        m_currentChat = 0;
+    } else if (m_currentChat >= 0 && m_currentChat < index) {
+        m_currentChat += 1; // everything above index shifted down by one
+    }
 }
 
 void ChatView::clearMessages()

@@ -65,6 +65,7 @@ private:
     void initChats();
     void rebuildChatList();
     void loadChat(int index);
+    void promoteChatToTop(int index);
 
     // Message-area helpers
     void clearMessages();
