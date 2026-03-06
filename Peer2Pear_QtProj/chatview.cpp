@@ -206,10 +206,11 @@ static bool openContactEditor(QWidget *parent,
 
 // ── ChatView implementation ───────────────────────────────────────────────────
 
-ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller, QObject *parent)
+ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,DatabaseManager *db, QObject *parent)
     : QObject(parent)
     , m_ui(ui)
     , m_controller(controller)
+    , m_db(db)
 {
     initChats();
 
@@ -273,7 +274,10 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
                 m_chats[i].messages.isEmpty() ||
                 m_chats[i].messages.last().timestamp.secsTo(now) >= kDateSeparatorThresholdSecs;
 
-            m_chats[i].messages.append({ false, text, now });
+            Message msg{ false, text, now };
+            m_chats[i].messages.append(msg);
+
+            if (m_db) m_db->saveMessage(m_chats[i].peerIdB64u, msg);//database save
 
             if (i == m_currentChat) {
                 // Currently open — insert separator if needed, then the bubble
@@ -297,13 +301,21 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
     // Unknown sender — auto-create a chat for them
     qDebug() << "Received message from unknown peer:" << fromPeerIdB64u;
 
+    const QDateTime now = QDateTime::currentDateTime();
+    Message msg{ false, text, now };
+
     ChatData newChat;
     newChat.name       = "Unknown contact";
     newChat.subtitle   = "Secure chat";
     newChat.peerIdB64u = from;
     newChat.keys.append(from);
-    newChat.messages.append({ false, text, QDateTime::currentDateTime() });
+    newChat.messages.append(msg);
     m_chats.prepend(newChat);
+
+    if (m_db) {//database save for new contact and message
+        m_db->saveContact(newChat);
+        m_db->saveMessage(from, msg);
+    }
 
     ensureUnreadSize();
     m_unread.prepend(0);
@@ -367,7 +379,17 @@ void ChatView::onSendMessage()
     if (needsSeparator)
         addDateSeparator(now);
 
-    m_chats[m_currentChat].messages.append({ true, text, now });
+    Message msg{ true, text, now };
+    m_chats[m_currentChat].messages.append(msg);
+
+    if (m_db) {
+        const QString key = peerId.isEmpty()
+        ? "name:" + m_chats[m_currentChat].name
+        : peerId;
+        m_db->saveMessage(key, msg);
+    }
+
+
     addMessageBubble(text, true);
     m_ui->messageInput->clear();
 
@@ -416,6 +438,8 @@ void ChatView::onEditProfile()
         m_ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         m_ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
         m_profileKeys = keys;
+
+        if (m_db) m_db->saveSetting("displayName", name);//database save for profile display name
     }
 }
 
@@ -432,6 +456,9 @@ void ChatView::onEditContact(int index)
             m_chats[index].keys = keys;
             if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
                 m_chats[index].peerIdB64u = keys.first();
+
+            if (m_db) m_db->saveContact(m_chats[index]);//database save for edited contact
+
             rebuildChatList();
             if (m_currentChat == index) {
                 m_ui->chatTitleLabel->setText(name);
@@ -453,6 +480,9 @@ void ChatView::onAddContact()
             newChat.keys       = keys;
             if (!keys.isEmpty()) newChat.peerIdB64u = keys.first();
             m_chats.append(newChat);
+
+            if (m_db) m_db->saveContact(newChat);//database save for new contact
+
             rebuildChatList();
             m_ui->chatList->setCurrentRow(m_chats.size() - 1);
         }
@@ -463,6 +493,27 @@ void ChatView::onAddContact()
 
 void ChatView::initChats()
 {
+    // ── DB: load saved display name and restore it to the profile labels ──────
+    if (m_db) {
+        const QString savedName = m_db->loadSetting("displayName");
+        if (!savedName.isEmpty()) {
+            m_ui->profileNameLabel->setText(savedName);
+            m_ui->profileAvatarLabel->setText(QString(savedName[0]).toUpper());
+        }
+    }
+
+    // ── DB: if the DB has contacts, load from there instead of dummy data ─────
+    if (m_db) {
+        QVector<ChatData> saved = m_db->loadAllContacts();
+        if (!saved.isEmpty()) {
+            m_chats = saved;
+            m_ui->chatList->clear();
+            for (const auto &c : m_chats)
+                m_ui->chatList->addItem(c.name);
+            return;
+        }
+    }
+
     // NOTE: Replace peerIdB64u with REAL peer IDs (base64url ed25519 pub) from other devices.
     // For quick testing, run two clients and copy each "profileHandleLabel" to the other's peerIdB64u.
 
@@ -501,6 +552,16 @@ void ChatView::initChats()
                       { true,  "Thanks for having us", base.addSecs(10) } };
     m_chats.append(group);
 
+    // ── DB: save the demo contacts on first run ───────────────────────────────
+    if (m_db) {
+        for (const auto &c : m_chats) {
+            m_db->saveContact(c);
+            // Use the same key logic as saveContact for message storage
+            const QString key = c.peerIdB64u.isEmpty() ? "name:" + c.name : c.peerIdB64u;
+            for (const auto &msg : c.messages)
+                m_db->saveMessage(key, msg);
+        }
+    }
     m_ui->chatList->clear();
     for (const auto &c : m_chats)
         m_ui->chatList->addItem(c.name);

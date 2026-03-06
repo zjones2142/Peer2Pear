@@ -18,6 +18,13 @@ MainWindow::MainWindow(QWidget *parent)
 {
     ui->setupUi(this);
 
+    // ── DB: open the database as early as possible ────────────────────────────
+    if (!m_db.open()) {
+        QMessageBox::critical(this, "Database Error",
+                              "Could not open the local chat database.\n"
+                              "Chat history will not be saved this session.");
+    }
+
     // --- Strict identity unlock (wrong passphrase => do not create new identity) ---
     while (true) {
         bool ok = false;
@@ -83,7 +90,7 @@ MainWindow::MainWindow(QWidget *parent)
     rootLayout->addWidget(m_mainStack);
 
     // ── Create ChatView (owns all chat logic) ─────────────────────────────────
-    m_chatView = new ChatView(ui, &m_controller, this);
+    m_chatView = new ChatView(ui, &m_controller, &m_db, this);
 
     m_chatView->setShouldToastFn([this]() -> bool {
         // toast when not actively viewing the app

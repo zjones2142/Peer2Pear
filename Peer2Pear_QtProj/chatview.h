@@ -10,25 +10,12 @@
 
 #include "ChatController.hpp"
 #include "ChatNotifier.h"
+#include "chattypes.h"
+#include "databasemanager.h"
 
 // Forward-declare the generated UI class so we don't pull in the whole header here
 namespace Ui { class MainWindow; }
 
-// ── DATE SEPARATOR: message now carries a timestamp ──────────────────────────
-struct Message {
-    bool      sent;
-    QString   text;
-    QDateTime timestamp;  // when the message was sent/received
-};
-
-// ── Data model ────────────────────────────────────────────────────────────────
-struct ChatData {
-    QString     name;
-    QString     subtitle;
-    QString     peerIdB64u;   // peer identity key (base64url ed25519 pub)
-    QStringList keys;         // all public keys for this contact
-    QVector<Message> messages;
-};
 
 // ── ChatView ──────────────────────────────────────────────────────────────────
 // Owns all chat-list and message-bubble logic.
@@ -39,7 +26,10 @@ class ChatView : public QObject
     Q_OBJECT
 
 public:
-    explicit ChatView(Ui::MainWindow *ui, ChatController *controller, QObject *parent = nullptr);
+    explicit ChatView(Ui::MainWindow *ui,
+                      ChatController *controller,
+                      DatabaseManager *db,
+                      QObject *parent = nullptr);
 
     // Called by MainWindow::resizeEvent so bubbles re-flow on resize
     void reloadCurrentChat();
@@ -84,6 +74,7 @@ private:
     Ui::MainWindow  *m_ui         = nullptr;
     ChatController  *m_controller = nullptr;
     ChatNotifier *m_notifier = nullptr;
+    DatabaseManager *m_db         = nullptr;
 
     std::function<bool()> m_shouldToastFn;
 
