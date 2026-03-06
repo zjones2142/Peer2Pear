@@ -14,7 +14,33 @@
 #include <QListWidget>
 #include <QToolButton>
 #include <QMessageBox>
+#include <QDateTime>
 #include <QDebug>
+
+// ── DATE SEPARATOR: how many seconds of silence before we show a divider ─────
+static constexpr int kDateSeparatorThresholdSecs = 60 * 60 * 2; // 2 hour(changed the multiplier at the end to incr hours of time
+
+// ── DATE SEPARATOR: format a QDateTime into label text ─────────
+// Produces e.g.  "Thu, Feb 26 at 1:39 PM"
+// If the message is from today we just show "Today at 1:39 PM".
+// If it was yesterday we show "Yesterday at 1:39 PM".
+static QString formatSeparatorLabel(const QDateTime &dt)
+{
+    const QDate today     = QDate::currentDate();
+    const QDate yesterday = today.addDays(-1);
+    const QDate msgDate   = dt.toLocalTime().date();
+
+    QString datePart;
+    if (msgDate == today)
+        datePart = "Today";
+    else if (msgDate == yesterday)
+        datePart = "Yesterday";
+    else
+        datePart = dt.toLocalTime().toString("ddd, MMM d");   // "Thu, Feb 26"
+
+    const QString timePart = dt.toLocalTime().toString("h:mm AP"); // "1:39 PM"
+    return datePart + " at " + timePart;
+}
 
 // ── Text-layout helpers ───────────────────────────────────────────────────────
 
@@ -241,10 +267,18 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
         }
 
         if (hit) {
-            m_chats[i].messages.append({false, text});
+            const QDateTime now = QDateTime::currentDateTime();
+
+            const bool needsSeparator =
+                m_chats[i].messages.isEmpty() ||
+                m_chats[i].messages.last().timestamp.secsTo(now) >= kDateSeparatorThresholdSecs;
+
+            m_chats[i].messages.append({ false, text, now });
 
             if (i == m_currentChat) {
-                // Currently open — just show the bubble, then promote to top
+                // Currently open — insert separator if needed, then the bubble
+                if (needsSeparator)
+                    addDateSeparator(now);
                 addMessageBubble(text, false);
                 promoteChatToTop(i);
                 rebuildChatList();
@@ -253,7 +287,6 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
                 emit unreadChanged(totalUnread());
                 promoteChatToTop(i);
                 rebuildChatList();
-
                 if (m_notifier && shouldToast())
                     m_notifier->notify(m_chats[0].name, text);
             }
@@ -269,7 +302,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
     newChat.subtitle   = "Secure chat";
     newChat.peerIdB64u = from;
     newChat.keys.append(from);
-    newChat.messages.append({false, text});
+    newChat.messages.append({ false, text, QDateTime::currentDateTime() });
     m_chats.prepend(newChat);
 
     ensureUnreadSize();
@@ -324,7 +357,17 @@ void ChatView::onSendMessage()
         return;
     }
 
-    m_chats[m_currentChat].messages.append({true, text});
+    const QDateTime now = QDateTime::currentDateTime();//updates the date on the message, and also used for date separator logic
+
+    const auto &msgs = m_chats[m_currentChat].messages;
+    const bool needsSeparator =
+        msgs.isEmpty() ||
+        msgs.last().timestamp.secsTo(now) >= kDateSeparatorThresholdSecs;
+
+    if (needsSeparator)
+        addDateSeparator(now);
+
+    m_chats[m_currentChat].messages.append({ true, text, now });
     addMessageBubble(text, true);
     m_ui->messageInput->clear();
 
@@ -347,7 +390,7 @@ void ChatView::onSearchChanged(const QString &text)
                 matches = true;
             if (!matches) {
                 for (const auto &msg : chat.messages) {
-                    if (msg.second.toLower().contains(query)) { matches = true; break; }
+                    if (msg.text.toLower().contains(query)) { matches = true; break; }
                 }
             }
         }
@@ -423,37 +466,39 @@ void ChatView::initChats()
     // NOTE: Replace peerIdB64u with REAL peer IDs (base64url ed25519 pub) from other devices.
     // For quick testing, run two clients and copy each "profileHandleLabel" to the other's peerIdB64u.
 
+    const QDateTime base = QDateTime::currentDateTime().addSecs(-6 * 3600); // 6 h ago
+
     ChatData alice;
     alice.name       = "Alice";
     alice.subtitle   = "Secure chat";
-    alice.peerIdB64u = ""; // <-- paste Alice pubkey here on your device
-    alice.messages   = { {false, "Hey! How are you?"},
-                      {true,  "I'm doing great, thanks!"},
-                      {false, "That's wonderful to hear"} };
+    alice.peerIdB64u = "";
+    alice.messages   = { { false, "Hey! How are you?",            base },
+                      { true,  "I'm doing great, thanks!",     base.addSecs(30) },
+                      { false, "That's wonderful to hear",     base.addSecs(60) } };
     m_chats.append(alice);
 
     ChatData bob;
     bob.name       = "Bob";
     bob.subtitle   = "Secure chat";
-    bob.peerIdB64u = ""; // <-- paste Bob pubkey
-    bob.messages   = { {false, "Did you see the game last night?"},
-                    {true,  "Yeah, incredible finish!"} };
+    bob.peerIdB64u = "";
+    bob.messages   = { { false, "Did you see the game last night?", base },
+                    { true,  "Yeah, incredible finish!",         base.addSecs(120) } };
     m_chats.append(bob);
 
     ChatData charlie;
     charlie.name       = "Charlie";
     charlie.subtitle   = "Secure chat";
     charlie.peerIdB64u = "";
-    charlie.messages   = { {true,  "Hey, sending over those files soon"},
-                        {false, "Sounds good, no rush"} };
+    charlie.messages   = { { true,  "Hey, sending over those files soon", base },
+                        { false, "Sounds good, no rush",               base.addSecs(45) } };
     m_chats.append(charlie);
 
     ChatData group;
     group.name       = "Group Chat";
     group.subtitle   = "MVP (no MLS yet)";
-    group.peerIdB64u = ""; // unused for now
-    group.messages   = { {false, "Welcome everyone!"},
-                      {true,  "Thanks for having us"} };
+    group.peerIdB64u = "";
+    group.messages   = { { false, "Welcome everyone!", base },
+                      { true,  "Thanks for having us", base.addSecs(10) } };
     m_chats.append(group);
 
     m_ui->chatList->clear();
@@ -524,10 +569,21 @@ void ChatView::loadChat(int index)
     m_ui->chatTitleLabel->setText(chat.name);
     m_ui->chatSubLabel->setText("● " + chat.subtitle);
     m_ui->chatAvatarLabel->setText(chat.name.isEmpty() ? "?" : QString(chat.name[0]).toUpper());
-
     clearMessages();
-    for (const auto &msg : chat.messages)
-        addMessageBubble(msg.second, msg.first);
+
+    QDateTime lastShown;
+    for (const Message &msg : chat.messages) {
+        const bool needsSeparator =
+            !lastShown.isValid() ||
+            lastShown.secsTo(msg.timestamp) >= kDateSeparatorThresholdSecs;
+
+        if (needsSeparator) {
+            addDateSeparator(msg.timestamp);
+            lastShown = msg.timestamp;
+        }
+
+        addMessageBubble(msg.text, msg.sent);
+    }
 }
 
 void ChatView::promoteChatToTop(int index)
@@ -563,6 +619,37 @@ void ChatView::clearMessages()
         if (item->widget()) delete item->widget();
         delete item;
     }
+}
+
+// ── DATE SEPARATOR: insert a centered iMessage-style date label ───────────────
+void ChatView::addDateSeparator(const QDateTime &dt)
+{
+    QVBoxLayout *layout = qobject_cast<QVBoxLayout *>(
+        m_ui->scrollAreaWidgetContents->layout());
+    if (!layout) return;
+
+    // Outer row — full width, centered
+    QWidget *row = new QWidget(m_ui->scrollAreaWidgetContents);
+    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    row->setFixedHeight(28);
+
+    QHBoxLayout *hl = new QHBoxLayout(row);
+    hl->setContentsMargins(0, 4, 0, 4);
+    hl->setSpacing(0);
+
+    QLabel *lbl = new QLabel(formatSeparatorLabel(dt), row);
+    lbl->setAlignment(Qt::AlignCenter);
+    lbl->setStyleSheet(
+        "color: #666666;"          //gray muted color
+        "font-size: 11px;"
+        "background: transparent;"
+        );
+
+    hl->addStretch();
+    hl->addWidget(lbl);
+    hl->addStretch();
+
+    layout->insertWidget(layout->count() - 1, row);
 }
 
 void ChatView::addMessageBubble(const QString &text, bool sent)

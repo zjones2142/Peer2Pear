@@ -5,6 +5,7 @@
 #include <QPair>
 #include <QString>
 #include <QStringList>
+#include <QDateTime>
 #include <functional>
 
 #include "ChatController.hpp"
@@ -13,13 +14,20 @@
 // Forward-declare the generated UI class so we don't pull in the whole header here
 namespace Ui { class MainWindow; }
 
+// ── DATE SEPARATOR: message now carries a timestamp ──────────────────────────
+struct Message {
+    bool      sent;
+    QString   text;
+    QDateTime timestamp;  // when the message was sent/received
+};
+
 // ── Data model ────────────────────────────────────────────────────────────────
 struct ChatData {
     QString     name;
     QString     subtitle;
     QString     peerIdB64u;   // peer identity key (base64url ed25519 pub)
     QStringList keys;         // all public keys for this contact
-    QVector<QPair<bool, QString>> messages;
+    QVector<Message> messages;
 };
 
 // ── ChatView ──────────────────────────────────────────────────────────────────
@@ -70,6 +78,7 @@ private:
     // Message-area helpers
     void clearMessages();
     void addMessageBubble(const QString &text, bool sent);
+    void addDateSeparator(const QDateTime &dt);
 
     // ── Members ──
     Ui::MainWindow  *m_ui         = nullptr;
