@@ -10,8 +10,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- 1. Find Qt Packages ---
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Sql)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network Sql)
 
 # --- 2. Handle libsodium (Find System OR Fetch) ---
 
@@ -70,6 +70,8 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         settingspanel.h settingspanel.cpp
         chatview.h chatview.cpp
         ChatNotifier.h
+        databasemanager.h databasemanager.cpp
+        chattypes.h
     )
 else()
     if(ANDROID)
@@ -83,6 +85,7 @@ endif()
 target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
+    Qt${QT_VERSION_MAJOR}::Sql
     ${SODIUM_LINK_TARGET}
 )
 

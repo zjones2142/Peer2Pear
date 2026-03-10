@@ -1,6 +1,8 @@
 #include "ChatController.hpp"
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QDateTime>
+#include <QTimeZone>
 
 ChatController::ChatController(QObject* parent)
     : QObject(parent),
@@ -59,6 +61,7 @@ void ChatController::sendTextViaMailbox(const QString& peerIdB64u, const QString
     payload["from"] = myIdB64u();
     payload["type"] = "text";
     payload["text"] = text;
+    payload["ts"]   = QDateTime::currentSecsSinceEpoch();
 
     const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     const QByteArray ct = m_crypto.aeadEncrypt(key32, pt);
@@ -96,6 +99,11 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
     const auto o = doc.object();
 
     if (o.value("type").toString() == "text") {
-        emit messageReceived(fromId, o.value("text").toString());
+        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        const QDateTime ts = tsSecs > 0
+                                 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
+                                 : QDateTime::currentDateTime();
+
+        emit messageReceived(fromId, o.value("text").toString(), ts);
     }
 }

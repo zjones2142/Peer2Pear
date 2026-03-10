@@ -14,7 +14,33 @@
 #include <QListWidget>
 #include <QToolButton>
 #include <QMessageBox>
+#include <QDateTime>
 #include <QDebug>
+
+// ── DATE SEPARATOR: how many seconds of silence before we show a divider ─────
+static constexpr int kDateSeparatorThresholdSecs = 60 * 60 * 2; // 2 hour(changed the multiplier at the end to incr hours of time
+
+// ── DATE SEPARATOR: format a QDateTime into label text ─────────
+// Produces e.g.  "Thu, Feb 26 at 1:39 PM"
+// If the message is from today we just show "Today at 1:39 PM".
+// If it was yesterday we show "Yesterday at 1:39 PM".
+static QString formatSeparatorLabel(const QDateTime &dt)
+{
+    const QDate today     = QDate::currentDate();
+    const QDate yesterday = today.addDays(-1);
+    const QDate msgDate   = dt.toLocalTime().date();
+
+    QString datePart;
+    if (msgDate == today)
+        datePart = "Today";
+    else if (msgDate == yesterday)
+        datePart = "Yesterday";
+    else
+        datePart = dt.toLocalTime().toString("ddd, MMM d");   // "Thu, Feb 26"
+
+    const QString timePart = dt.toLocalTime().toString("h:mm AP"); // "1:39 PM"
+    return datePart + " at " + timePart;
+}
 
 // ── Text-layout helpers ───────────────────────────────────────────────────────
 
@@ -180,12 +206,15 @@ static bool openContactEditor(QWidget *parent,
 
 // ── ChatView implementation ───────────────────────────────────────────────────
 
-ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller, QObject *parent)
+ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,DatabaseManager *db, QObject *parent)
     : QObject(parent)
     , m_ui(ui)
     , m_controller(controller)
+    , m_db(db)
 {
     initChats();
+
+    ensureUnreadSize();
 
     connect(m_ui->chatList, &QListWidget::currentRowChanged,
             this, &ChatView::onChatSelected);
@@ -214,53 +243,94 @@ void ChatView::reloadCurrentChat()
 
 // ── Slots (public — wired by MainWindow) ─────────────────────────────────────
 
-void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &text)
+void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &text, const QDateTime &timestamp)
 {
     const QString from = fromPeerIdB64u.trimmed();
+    ensureUnreadSize();
+
+    auto shouldToast = [&]() -> bool {
+        return m_shouldToastFn ? m_shouldToastFn() : true; // default: toast if not provided
+    };
 
     for (int i = 0; i < m_chats.size(); ++i) {
+        auto matchesChat = [&](int idx) {
+            return m_chats[idx].peerIdB64u.trimmed() == from;
+        };
+
+        bool hit = false;
+
         if (m_chats[i].peerIdB64u.trimmed() == from) {
-            m_chats[i].messages.append({false, text});
-            if (i == m_currentChat) addMessageBubble(text, false);
-
-            // Notify only if this isn't the chat the user is looking at
-            if (i != m_currentChat && m_notifier)
-                m_notifier->notify(m_chats[i].name, text);
-
-            return;
-        }
-        // Check all stored keys, not just peerIdB64u
-        for (const QString &key : m_chats[i].keys) {
-            if (key.trimmed() == from) {
-                m_chats[i].messages.append({false, text});
-                if (i == m_currentChat) addMessageBubble(text, false);
-
-                // Notify only if this isn't the chat the user is looking at
-                if (i != m_currentChat && m_notifier)
-                    m_notifier->notify(m_chats[i].name, text);
-
-                return;
+            hit = true;
+        } else {
+            for (const QString &key : m_chats[i].keys) {
+                if (key.trimmed() == from) { hit = true; break; }
             }
+        }
+
+        if (hit) {
+            const QDateTime now = timestamp;
+
+            const bool needsSeparator =
+                m_chats[i].messages.isEmpty() ||
+                m_chats[i].messages.last().timestamp.secsTo(now) >= kDateSeparatorThresholdSecs;
+
+            Message msg{ false, text, now };
+            m_chats[i].messages.append(msg);
+
+            if (m_db) m_db->saveMessage(m_chats[i].peerIdB64u, msg);//database save
+
+            if (i == m_currentChat) {
+                // Currently open — insert separator if needed, then the bubble
+                if (needsSeparator)
+                    addDateSeparator(now);
+                addMessageBubble(text, false);
+                promoteChatToTop(i);
+                rebuildChatList();
+            } else {
+                m_unread[i] += 1;
+                emit unreadChanged(totalUnread());
+                promoteChatToTop(i);
+                rebuildChatList();
+                if (m_notifier && shouldToast())
+                    m_notifier->notify(m_chats[0].name, text);
+            }
+            return;
         }
     }
 
     // Unknown sender — auto-create a chat for them
     qDebug() << "Received message from unknown peer:" << fromPeerIdB64u;
 
+    const QDateTime now = timestamp;
+    Message msg{ false, text, now };
+
     ChatData newChat;
     newChat.name       = "Unknown contact";
     newChat.subtitle   = "Secure chat";
     newChat.peerIdB64u = from;
     newChat.keys.append(from);
-    newChat.messages.append({false, text});
-    m_chats.append(newChat);
-    rebuildChatList();
+    newChat.messages.append(msg);
+    m_chats.prepend(newChat);
 
-    int newIndex = m_chats.size() - 1;
-    if (newIndex == m_currentChat)
-        addMessageBubble(text, false);
-    else if (m_notifier)
-        m_notifier->notify(newChat.name, text);
+    if (m_db) {//database save for new contact and message
+        m_db->saveContact(newChat);
+        m_db->saveMessage(from, msg);
+    }
+
+    ensureUnreadSize();
+    m_unread.prepend(0);
+
+    // New chat is always at index 0; m_currentChat shifts down by 1
+    if (m_currentChat >= 0)
+        m_currentChat += 1;
+
+    m_unread[0] += 1;
+    emit unreadChanged(totalUnread());
+
+    if (m_notifier && shouldToast())
+        m_notifier->notify("Unknown contact", text);
+
+    rebuildChatList();
 }
 
 void ChatView::onStatus(const QString &s)
@@ -276,6 +346,14 @@ void ChatView::onChatSelected(int index)
     if (index == m_currentChat) return;
     m_currentChat = index;
     loadChat(index);
+
+    // ── Mark as read ──────────────────────────────────────────────────────────
+    ensureUnreadSize();
+    if (m_unread[index] > 0) {
+        m_unread[index] = 0;
+        emit unreadChanged(totalUnread()); // clears dot + taskbar badge
+        rebuildChatList();                 // removes the dot from the sidebar row
+    }
 }
 
 void ChatView::onSendMessage()
@@ -291,7 +369,27 @@ void ChatView::onSendMessage()
         return;
     }
 
-    m_chats[m_currentChat].messages.append({true, text});
+    const QDateTime now = QDateTime::currentDateTime();//updates the date on the message, and also used for date separator logic
+
+    const auto &msgs = m_chats[m_currentChat].messages;
+    const bool needsSeparator =
+        msgs.isEmpty() ||
+        msgs.last().timestamp.secsTo(now) >= kDateSeparatorThresholdSecs;
+
+    if (needsSeparator)
+        addDateSeparator(now);
+
+    Message msg{ true, text, now };
+    m_chats[m_currentChat].messages.append(msg);
+
+    if (m_db) {
+        const QString key = peerId.isEmpty()
+        ? "name:" + m_chats[m_currentChat].name
+        : peerId;
+        m_db->saveMessage(key, msg);
+    }
+
+
     addMessageBubble(text, true);
     m_ui->messageInput->clear();
 
@@ -314,7 +412,7 @@ void ChatView::onSearchChanged(const QString &text)
                 matches = true;
             if (!matches) {
                 for (const auto &msg : chat.messages) {
-                    if (msg.second.toLower().contains(query)) { matches = true; break; }
+                    if (msg.text.toLower().contains(query)) { matches = true; break; }
                 }
             }
         }
@@ -340,6 +438,8 @@ void ChatView::onEditProfile()
         m_ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         m_ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
         m_profileKeys = keys;
+
+        if (m_db) m_db->saveSetting("displayName", name);//database save for profile display name
     }
 }
 
@@ -356,6 +456,9 @@ void ChatView::onEditContact(int index)
             m_chats[index].keys = keys;
             if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
                 m_chats[index].peerIdB64u = keys.first();
+
+            if (m_db) m_db->saveContact(m_chats[index]);//database save for edited contact
+
             rebuildChatList();
             if (m_currentChat == index) {
                 m_ui->chatTitleLabel->setText(name);
@@ -377,6 +480,9 @@ void ChatView::onAddContact()
             newChat.keys       = keys;
             if (!keys.isEmpty()) newChat.peerIdB64u = keys.first();
             m_chats.append(newChat);
+
+            if (m_db) m_db->saveContact(newChat);//database save for new contact
+
             rebuildChatList();
             m_ui->chatList->setCurrentRow(m_chats.size() - 1);
         }
@@ -387,42 +493,75 @@ void ChatView::onAddContact()
 
 void ChatView::initChats()
 {
+    // ── DB: load saved display name and restore it to the profile labels ──────
+    if (m_db) {
+        const QString savedName = m_db->loadSetting("displayName");
+        if (!savedName.isEmpty()) {
+            m_ui->profileNameLabel->setText(savedName);
+            m_ui->profileAvatarLabel->setText(QString(savedName[0]).toUpper());
+        }
+    }
+
+    // ── DB: if the DB has contacts, load from there instead of dummy data ─────
+    if (m_db) {
+        QVector<ChatData> saved = m_db->loadAllContacts();
+        if (!saved.isEmpty()) {
+            m_chats = saved;
+            m_ui->chatList->clear();
+            for (const auto &c : m_chats)
+                m_ui->chatList->addItem(c.name);
+            return;
+        }
+    }
+
     // NOTE: Replace peerIdB64u with REAL peer IDs (base64url ed25519 pub) from other devices.
     // For quick testing, run two clients and copy each "profileHandleLabel" to the other's peerIdB64u.
+
+    const QDateTime base = QDateTime::currentDateTime().addSecs(-6 * 3600); // 6 h ago
 
     ChatData alice;
     alice.name       = "Alice";
     alice.subtitle   = "Secure chat";
-    alice.peerIdB64u = ""; // <-- paste Alice pubkey here on your device
-    alice.messages   = { {false, "Hey! How are you?"},
-                      {true,  "I'm doing great, thanks!"},
-                      {false, "That's wonderful to hear"} };
+    alice.peerIdB64u = "";
+    alice.messages   = { { false, "Hey! How are you?",            base },
+                      { true,  "I'm doing great, thanks!",     base.addSecs(30) },
+                      { false, "That's wonderful to hear",     base.addSecs(60) } };
     m_chats.append(alice);
 
     ChatData bob;
     bob.name       = "Bob";
     bob.subtitle   = "Secure chat";
-    bob.peerIdB64u = ""; // <-- paste Bob pubkey
-    bob.messages   = { {false, "Did you see the game last night?"},
-                    {true,  "Yeah, incredible finish!"} };
+    bob.peerIdB64u = "";
+    bob.messages   = { { false, "Did you see the game last night?", base },
+                    { true,  "Yeah, incredible finish!",         base.addSecs(120) } };
     m_chats.append(bob);
 
     ChatData charlie;
     charlie.name       = "Charlie";
     charlie.subtitle   = "Secure chat";
     charlie.peerIdB64u = "";
-    charlie.messages   = { {true,  "Hey, sending over those files soon"},
-                        {false, "Sounds good, no rush"} };
+    charlie.messages   = { { true,  "Hey, sending over those files soon", base },
+                        { false, "Sounds good, no rush",               base.addSecs(45) } };
     m_chats.append(charlie);
 
     ChatData group;
     group.name       = "Group Chat";
     group.subtitle   = "MVP (no MLS yet)";
-    group.peerIdB64u = ""; // unused for now
-    group.messages   = { {false, "Welcome everyone!"},
-                      {true,  "Thanks for having us"} };
+    group.peerIdB64u = "";
+    group.messages   = { { false, "Welcome everyone!", base },
+                      { true,  "Thanks for having us", base.addSecs(10) } };
     m_chats.append(group);
 
+    // ── DB: save the demo contacts on first run ───────────────────────────────
+    if (m_db) {
+        for (const auto &c : m_chats) {
+            m_db->saveContact(c);
+            // Use the same key logic as saveContact for message storage
+            const QString key = c.peerIdB64u.isEmpty() ? "name:" + c.name : c.peerIdB64u;
+            for (const auto &msg : c.messages)
+                m_db->saveMessage(key, msg);
+        }
+    }
     m_ui->chatList->clear();
     for (const auto &c : m_chats)
         m_ui->chatList->addItem(c.name);
@@ -448,6 +587,17 @@ void ChatView::rebuildChatList()
         auto *nameLbl = new QLabel(m_chats[i].name, row);
         nameLbl->setStyleSheet("color: #d0d0d0; font-size: 14px; background: transparent;");
         hl->addWidget(nameLbl, 1);
+
+        // ── Unread dot ────────────────────────────────────────────────────────
+        ensureUnreadSize();
+        if (m_unread[i] > 0) {
+            auto *dot = new QLabel(row);
+            dot->setFixedSize(8, 8);
+            dot->setStyleSheet(
+                "QLabel { background-color: #5dd868; border-radius: 4px; }"
+                );
+            hl->addWidget(dot);
+        }
 
         auto *editBtn = new QToolButton(row);
         editBtn->setText("✎");
@@ -480,10 +630,44 @@ void ChatView::loadChat(int index)
     m_ui->chatTitleLabel->setText(chat.name);
     m_ui->chatSubLabel->setText("● " + chat.subtitle);
     m_ui->chatAvatarLabel->setText(chat.name.isEmpty() ? "?" : QString(chat.name[0]).toUpper());
-
     clearMessages();
-    for (const auto &msg : chat.messages)
-        addMessageBubble(msg.second, msg.first);
+
+    QDateTime lastShown;
+    for (const Message &msg : chat.messages) {
+        const bool needsSeparator =
+            !lastShown.isValid() ||
+            lastShown.secsTo(msg.timestamp) >= kDateSeparatorThresholdSecs;
+
+        if (needsSeparator) {
+            addDateSeparator(msg.timestamp);
+            lastShown = msg.timestamp;
+        }
+
+        addMessageBubble(msg.text, msg.sent);
+    }
+}
+
+void ChatView::promoteChatToTop(int index)
+{
+    if (index <= 0 || index >= m_chats.size())
+        return; // already at top or invalid
+
+    // Move the chat data to front
+    ChatData promoted = m_chats.takeAt(index);
+    m_chats.prepend(promoted);
+
+    // Mirror the unread vector
+    ensureUnreadSize();
+    int unreadCount = m_unread[index];
+    m_unread.remove(index);
+    m_unread.prepend(unreadCount);
+
+    // Keep m_currentChat pointing at the same chat
+    if (m_currentChat == index) {
+        m_currentChat = 0;
+    } else if (m_currentChat >= 0 && m_currentChat < index) {
+        m_currentChat += 1; // everything above index shifted down by one
+    }
 }
 
 void ChatView::clearMessages()
@@ -496,6 +680,37 @@ void ChatView::clearMessages()
         if (item->widget()) delete item->widget();
         delete item;
     }
+}
+
+// ── DATE SEPARATOR: insert a centered iMessage-style date label ───────────────
+void ChatView::addDateSeparator(const QDateTime &dt)
+{
+    QVBoxLayout *layout = qobject_cast<QVBoxLayout *>(
+        m_ui->scrollAreaWidgetContents->layout());
+    if (!layout) return;
+
+    // Outer row — full width, centered
+    QWidget *row = new QWidget(m_ui->scrollAreaWidgetContents);
+    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    row->setFixedHeight(28);
+
+    QHBoxLayout *hl = new QHBoxLayout(row);
+    hl->setContentsMargins(0, 4, 0, 4);
+    hl->setSpacing(0);
+
+    QLabel *lbl = new QLabel(formatSeparatorLabel(dt), row);
+    lbl->setAlignment(Qt::AlignCenter);
+    lbl->setStyleSheet(
+        "color: #666666;"          //gray muted color
+        "font-size: 11px;"
+        "background: transparent;"
+        );
+
+    hl->addStretch();
+    hl->addWidget(lbl);
+    hl->addStretch();
+
+    layout->insertWidget(layout->count() - 1, row);
 }
 
 void ChatView::addMessageBubble(const QString &text, bool sent)
@@ -580,4 +795,17 @@ void ChatView::addMessageBubble(const QString &text, bool sent)
     m_ui->messageScroll->verticalScrollBar()->setValue(
         m_ui->messageScroll->verticalScrollBar()->maximum()
         );
+}
+
+void ChatView::ensureUnreadSize()
+{
+    if (m_unread.size() < m_chats.size())
+        m_unread.resize(m_chats.size());
+}
+
+int ChatView::totalUnread() const
+{
+    int sum = 0;
+    for (int n : m_unread) sum += n;
+    return sum;
 }

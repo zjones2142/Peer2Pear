@@ -12,6 +12,7 @@ class QStackedWidget;
 #include "settingspanel.h"
 #include "chatview.h"
 #include "ChatNotifier.h"
+#include "databasemanager.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -36,6 +37,8 @@ private slots:
 
 private:
     Ui::MainWindow *ui;
+
+    DatabaseManager m_db;
 
     ChatController m_controller;
 
