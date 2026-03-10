@@ -243,7 +243,7 @@ void ChatView::reloadCurrentChat()
 
 // ── Slots (public — wired by MainWindow) ─────────────────────────────────────
 
-void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &text)
+void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &text, const QDateTime &timestamp)
 {
     const QString from = fromPeerIdB64u.trimmed();
     ensureUnreadSize();
@@ -268,7 +268,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
         }
 
         if (hit) {
-            const QDateTime now = QDateTime::currentDateTime();
+            const QDateTime now = timestamp;
 
             const bool needsSeparator =
                 m_chats[i].messages.isEmpty() ||
@@ -301,7 +301,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
     // Unknown sender — auto-create a chat for them
     qDebug() << "Received message from unknown peer:" << fromPeerIdB64u;
 
-    const QDateTime now = QDateTime::currentDateTime();
+    const QDateTime now = timestamp;
     Message msg{ false, text, now };
 
     ChatData newChat;

@@ -42,7 +42,7 @@ public:
 
 public slots:
     // Wired to ChatController signals by MainWindow
-    void onIncomingMessage(const QString &fromPeerIdB64u, const QString &text);
+    void onIncomingMessage(const QString &fromPeerIdB64u, const QString &text, const QDateTime &timestamp);
     void onStatus(const QString &s);
 
 signals:

@@ -25,7 +25,7 @@ public:
 
 signals:
     void status(const QString& s);
-    void messageReceived(const QString& fromPeerIdB64u, const QString& text);
+    void messageReceived(const QString& fromPeerIdB64u, const QString& text, const QDateTime& timestamp);
 
 private slots:
     void pollOnce();
