@@ -7,6 +7,7 @@
 #include <QStringList>
 #include <QDateTime>
 #include <functional>
+#include <QLabel>
 
 #include "ChatController.hpp"
 #include "ChatNotifier.h"
@@ -62,6 +63,7 @@ private:
     // Chat-list helpers
     void initChats();
     void rebuildChatList();
+    QLabel *m_emptyLabel = nullptr;
     void loadChat(int index);
     void promoteChatToTop(int index);
 

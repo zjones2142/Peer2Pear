@@ -237,8 +237,11 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,DatabaseManage
 
 void ChatView::reloadCurrentChat()
 {
-    if (m_currentChat >= 0)
-        loadChat(m_currentChat);
+    if (m_emptyLabel) {
+        m_emptyLabel->resize(m_ui->contentWidget->size());
+        m_emptyLabel->raise();
+        m_emptyLabel->setVisible(m_chats.isEmpty());
+    }
 }
 
 // ── Slots (public — wired by MainWindow) ─────────────────────────────────────
@@ -583,6 +586,35 @@ void ChatView::rebuildChatList()
 
     if (m_currentChat >= 0 && m_currentChat < m_ui->chatList->count())
         m_ui->chatList->setCurrentRow(m_currentChat);
+
+    // Show/hide empty state overlay
+    if (!m_emptyLabel) {
+        m_emptyLabel = new QLabel(m_ui->contentWidget);
+        m_emptyLabel->setText("💬\n\nNo contacts yet\nClick + to add a contact\nand start chatting");
+        m_emptyLabel->setAlignment(Qt::AlignCenter);
+        m_emptyLabel->setStyleSheet(
+            "color: #555555;"
+            "font-size: 14px;"
+            "background-color: #0a0a0a;"
+            "padding: 40px;"
+            );
+        m_emptyLabel->setWordWrap(true);
+        m_emptyLabel->setAttribute(Qt::WA_TransparentForMouseEvents, false);
+    }
+    m_emptyLabel->resize(m_ui->contentWidget->size());
+    m_emptyLabel->move(0, 0);
+    m_emptyLabel->raise();
+    if (m_chats.isEmpty()) {
+        QTimer::singleShot(0, [this]() {
+            if (m_emptyLabel) {
+                m_emptyLabel->resize(m_ui->contentWidget->size());
+                m_emptyLabel->raise();
+                m_emptyLabel->show();
+            }
+        });
+    } else {
+        if (m_emptyLabel) m_emptyLabel->hide();
+    }
 }
 
 void ChatView::loadChat(int index)
