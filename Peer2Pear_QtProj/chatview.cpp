@@ -109,7 +109,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                                              const QString &title,
                                              QString &nameInOut,
                                              QStringList &keysInOut,
-                                             bool showDestructiveActions = true)
+                                             bool showDestructiveActions = true,
+                                             bool isBlocked = false)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -191,7 +192,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         root->addWidget(actionSep);
 
         auto *actionRow  = new QHBoxLayout;
-        auto *blockBtn   = new QPushButton("Block Contact", &dlg);
+        auto *blockBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
         auto *removeBtn  = new QPushButton("Remove Contact", &dlg);
         const QString destructiveStyle =
             "QPushButton { background-color: #2e1a1a; color: #cc5555;"
@@ -205,10 +206,12 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         root->addLayout(actionRow);
 
         QObject::connect(blockBtn, &QPushButton::clicked, [&]() {
-            if (QMessageBox::question(&dlg, "Block Contact",
-                                      "Block this contact? They won't be able to send you messages.",
-                                      QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-                result = ContactEditorResult::Blocked;
+            const QString msg = isBlocked
+                                    ? "Unblock this contact?"
+                                    : "Block this contact? They won't be able to send you messages.";
+            if (QMessageBox::question(&dlg, isBlocked ? "Unblock Contact" : "Block Contact",
+                                      msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                result = ContactEditorResult::Blocked; // reuse same result, toggle handled in onEditContact
                 dlg.accept();
             }
         });
@@ -510,7 +513,8 @@ void ChatView::onEditContact(int index)
     QStringList keys = m_chats[index].keys;
 
     const ContactEditorResult result =
-        openContactEditor(m_ui->centralwidget, "Edit Contact", name, keys);
+        openContactEditor(m_ui->centralwidget, "Edit Contact", name, keys, true,
+                          m_chats[index].isBlocked);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
         // Update the contact and save to the database
@@ -537,8 +541,7 @@ void ChatView::onEditContact(int index)
             m_ui->chatList->setCurrentRow(0);
 
     } else if (result == ContactEditorResult::Blocked) {
-        // Mark as blocked — incoming messages from this contact will be dropped
-        m_chats[index].isBlocked = true;
+        m_chats[index].isBlocked = !m_chats[index].isBlocked; // toggle block/unblock
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
     }
