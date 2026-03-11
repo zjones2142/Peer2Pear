@@ -34,19 +34,6 @@ QString ChatController::myIdB64u() const {
     return CryptoEngine::toBase64Url(m_crypto.identityPub());
 }
 
-void ChatController::startPolling(int intervalMs) {
-    if (!m_pollTimer.isActive()) m_pollTimer.start(intervalMs);
-}
-
-void ChatController::stopPolling()
-{
-    m_pollTimer.stop();
-}
-
-void ChatController::pollOnce() {
-    m_mbox.fetch(myIdB64u());
-}
-
 void ChatController::sendTextViaMailbox(const QString& peerIdB64u, const QString& text) {
     // Derive shared key
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
@@ -72,6 +59,27 @@ void ChatController::sendTextViaMailbox(const QString& peerIdB64u, const QString
 
     const qint64 ttlMs = 7LL * 24 * 60 * 60 * 1000; // 7 days
     m_mbox.enqueue(peerIdB64u, env, ttlMs);
+}
+
+void ChatController::startPolling(int intervalMs) {
+    if (!m_pollTimer.isActive()) m_pollTimer.start(intervalMs);
+}
+
+void ChatController::stopPolling()
+{
+    m_pollTimer.stop();
+}
+
+void ChatController::pollOnce() {
+    m_mbox.fetch(myIdB64u());
+    for (const QString &key : m_selfKeys) {
+        if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u())
+            m_mbox.fetch(key.trimmed());
+    }
+}
+
+void ChatController::setSelfKeys(const QStringList& keys) {
+    m_selfKeys = keys;
 }
 
 void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {

@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>800</width>
-    <height>662</height>
+    <width>1140</width>
+    <height>707</height>
    </rect>
   </property>
   <property name="minimumSize">
@@ -667,8 +667,8 @@ QToolButton#editProfileBtn:hover, QToolButton#editItemBtn:hover { color: #5dd868
                         <rect>
                          <x>0</x>
                          <y>0</y>
-                         <width>560</width>
-                         <height>388</height>
+                         <width>900</width>
+                         <height>433</height>
                         </rect>
                        </property>
                        <property name="sizePolicy">
@@ -802,8 +802,8 @@ QToolButton#editProfileBtn:hover, QToolButton#editItemBtn:hover { color: #5dd868
                         <rect>
                          <x>0</x>
                          <y>0</y>
-                         <width>560</width>
-                         <height>388</height>
+                         <width>900</width>
+                         <height>433</height>
                         </rect>
                        </property>
                        <layout class="QVBoxLayout" name="filesOuterLayout">
@@ -1199,7 +1199,7 @@ QToolButton#editProfileBtn:hover, QToolButton#editItemBtn:hover { color: #5dd868
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>800</width>
+     <width>1140</width>
      <height>21</height>
     </rect>
    </property>
