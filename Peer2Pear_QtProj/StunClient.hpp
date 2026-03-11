@@ -41,8 +41,16 @@ private:
     void sendRequest(QUdpSocket* sock, const QHostAddress& addr, quint16 port);
     bool parseResponse(const QByteArray& buf);
 
+    static constexpr int kMaxRetries = 2;
+
     QUdpSocket  m_ownSocket;   // used when no shared socket is given
     QUdpSocket* m_socket = nullptr; // points to whichever socket is active
     QTimer      m_timeout;
     QByteArray  m_txId;
+
+    //retry state
+    int          m_retriesLeft = 0;
+    QHostAddress m_stunAddr;
+    quint16      m_stunPort = 19302;
+    QString      m_stunHost;
 };

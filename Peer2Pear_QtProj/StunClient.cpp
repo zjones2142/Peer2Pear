@@ -29,12 +29,16 @@ StunClient::StunClient(QObject* parent) : QObject(parent)
 
 void StunClient::discover(const QString& stunHost, quint16 stunPort)
 {
-    m_socket = &m_ownSocket;
+    m_socket    = &m_ownSocket;
+    m_retriesLeft = kMaxRetries;
+    m_stunHost  = stunHost;
+    m_stunPort  = stunPort;
     m_ownSocket.bind(QHostAddress::Any, 0);
 
     QHostInfo::lookupHost(stunHost, this, [this, stunPort](const QHostInfo& info) {
         if (info.addresses().isEmpty()) { emit failed("STUN: DNS lookup failed"); return; }
-        sendRequest(m_socket, info.addresses().first(), stunPort);
+        m_stunAddr = info.addresses().first();
+        sendRequest(m_socket, m_stunAddr, stunPort);
     });
 }
 
@@ -43,12 +47,15 @@ void StunClient::discover(const QString& stunHost, quint16 stunPort)
 void StunClient::discoverOnSocket(QUdpSocket* sharedSocket,
                                   const QString& stunHost, quint16 stunPort)
 {
-    // Use the provided socket — do NOT rebind it
-    m_socket = sharedSocket;
+    m_socket      = sharedSocket;
+    m_retriesLeft = kMaxRetries;
+    m_stunHost    = stunHost;
+    m_stunPort    = stunPort;
 
     QHostInfo::lookupHost(stunHost, this, [this, stunPort](const QHostInfo& info) {
         if (info.addresses().isEmpty()) { emit failed("STUN: DNS lookup failed"); return; }
-        sendRequest(m_socket, info.addresses().first(), stunPort);
+        m_stunAddr = info.addresses().first();
+        sendRequest(m_socket, m_stunAddr, stunPort);
     });
 }
 
@@ -94,6 +101,7 @@ bool StunClient::parseResponse(const QByteArray& buf)
     if (buf.mid(8, 12) != m_txId) return false;
 
     m_timeout.stop();
+    m_retriesLeft = 0; // success — no more retries needed
 
     int offset = 20;
     while (offset + 4 <= buf.size()) {
@@ -124,5 +132,11 @@ bool StunClient::parseResponse(const QByteArray& buf)
 
 void StunClient::onTimeout()
 {
+    if (m_retriesLeft > 0 && m_socket && !m_stunAddr.isNull()) {
+        --m_retriesLeft;
+        qDebug() << "[STUN] timeout — retrying, attempts left:" << m_retriesLeft;
+        sendRequest(m_socket, m_stunAddr, m_stunPort);
+        return;
+    }
     emit failed("STUN: timed out");
 }

@@ -90,26 +90,70 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
         return;
     }
 
-    // 2. Ask the rendezvous server (async) — result in onLookupResult
-    m_pendingPeer = peerIdB64u;
-    m_pendingText = text;
-    m_rvz.lookup(peerIdB64u);
+    // FIX: Queue the pending send rather than overwriting a single slot.
+    // This prevents a second sendText() call from clobbering m_pendingPeer
+    // while a rendezvous lookup is still in flight for the first one.
+    m_pendingQueue.enqueue({peerIdB64u, text});
+
+    // Only fire a lookup if this is the only item in the queue (i.e. no
+    // lookup already in flight). If a lookup is already in flight,
+    // onLookupResult will drain the rest of the queue.
+    if (m_pendingQueue.size() == 1) {
+        m_rvzLookupRetries = 0;
+        m_rvz.lookup(peerIdB64u);
+    }
 }
 
 void ChatController::onLookupResult(const QString& host, int port)
 {
+    // FIX: Retry the rendezvous lookup once before falling back.
+    // The peer may have just published and the server entry is propagating.
+    if (m_pendingQueue.isEmpty()) return;
+
+    // Peek at the front item — don't pop yet (punch may fail and we need it)
+    const auto& [peerId, text] = m_pendingQueue.head();
+
     if (host.isEmpty() || port <= 0) {
-        emit status("direct: peer offline, using mailbox fallback");
-        sendTextViaMailbox(m_pendingPeer, m_pendingText);
+        // FIX: Retry the rendezvous lookup once before falling back.
+        // The peer may have just published and the server entry is propagating.
+        if (m_rvzLookupRetries < kMaxRvzRetries) {
+            ++m_rvzLookupRetries;
+            emit status(QString("direct: peer not found, retrying rendezvous (%1/%2)...")
+                            .arg(m_rvzLookupRetries).arg(kMaxRvzRetries));
+            // Delay the retry slightly so the server has time to propagate
+            QTimer::singleShot(2000, this, [this, peerId = peerId]() {
+                m_rvz.lookup(peerId);
+            });
+            return;
+        }
+
+        // Retries exhausted — fall back to mailbox
+        emit status("direct: peer offline after retries, using mailbox fallback");
+        const auto [fallbackPeer, fallbackText] = m_pendingQueue.dequeue();
+        sendTextViaMailbox(fallbackPeer, fallbackText);
+
+        // Kick off next queued item if any
+        if (!m_pendingQueue.isEmpty()) {
+            m_rvzLookupRetries = 0;
+            m_rvz.lookup(m_pendingQueue.head().first);
+        }
         return;
     }
 
     const quint16 p = static_cast<quint16>(port);
 
-    // 3. We have the peer's public address — punch through both NATs
+    // We have the peer's public address — punch through both NATs.
+    // Build a unique punchId and move the intent into m_pendingPunches.
     const QString punchId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    m_pendingPunches[punchId] = {m_pendingPeer, m_pendingText};
-    m_punch.punchAndSend(punchId, host, p, buildEnvelope(m_pendingPeer, m_pendingText));
+    const auto [currentPeer, currentText] = m_pendingQueue.dequeue();
+    m_pendingPunches[punchId] = {currentPeer, currentText};
+    m_punch.punchAndSend(punchId, host, p, buildEnvelope(currentPeer, currentText));
+
+    // Kick off next queued item if any
+    if (!m_pendingQueue.isEmpty()) {
+        m_rvzLookupRetries = 0;
+        m_rvz.lookup(m_pendingQueue.head().first);
+    }
 }
 
 void ChatController::onPunchSuccess(const QString& punchId,

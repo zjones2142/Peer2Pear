@@ -3,6 +3,7 @@
 #include <QTimer>
 #include <QMap>
 #include <QPair>
+#include <QQueue>
 
 #include "CryptoEngine.hpp"
 #include "MailboxClient.hpp"
@@ -62,9 +63,10 @@ private:
 
     QMap<QString, QPair<QString, quint16>> m_peerAddressCache;
 
-    // Carry the intent through the async rendezvous lookup.
-    QString m_pendingPeer;
-    QString m_pendingText;
+    QQueue<QPair<QString, QString>> m_pendingQueue;
+
+    static constexpr int kMaxRvzRetries = 2;
+    int m_rvzLookupRetries = 0;
 
     QMap<QString, QPair<QString, QString>> m_pendingPunches;
     QString  m_myPublicHost;
