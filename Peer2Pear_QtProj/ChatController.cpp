@@ -49,16 +49,19 @@ QString ChatController::myIdB64u() const {
 
 void ChatController::discoverAndPublish()
 {
-    // Step 1: bind the UDP punch socket on any free port
+    // Step 1: bind the hole-punch socket first — this port is our identity
     const quint16 boundPort = m_punch.bind(0);
     if (boundPort == 0) {
         emit status("punch: failed to bind — P2P unavailable, mailbox only");
         return;
     }
-    // Step 2: ask a STUN server what our public IP:port looks like
-    // The SAME port must be used for STUN and for hole-punching —
-    // that's what makes the NAT mapping stable.
-    m_stun.discover("stun.l.google.com", 19302);
+
+    // Step 2: wire STUN client to use the SAME socket (Bug 1 fix)
+    // This ensures STUN sees the same NAT mapping as the punch traffic.
+    m_punch.setStunClient(&m_stun);
+
+    // Step 3: run STUN on the shared socket
+    m_stun.discoverOnSocket(m_punch.socket(), "stun.l.google.com", 19302);
 }
 
 void ChatController::onPublicAddressDiscovered(const QString& host, quint16 port)

@@ -5,15 +5,7 @@
 #include <QHostAddress>
 #include <QMap>
 
-// HolePuncher
-// Uses a single shared UDP socket for both sending and receiving.
-// Hole-punching: sends several probe packets to open the NAT hole,
-// then uses the same socket for the actual data exchange.
-//
-// Wire protocol (same framing as DirectPeerLink TCP):
-//   [4-byte big-endian length][payload]
-// Control probe packets use length=0 (no payload) so they're ignored
-// by the envelope handler.
+class StunClient;
 
 class HolePuncher : public QObject
 {
@@ -21,20 +13,26 @@ class HolePuncher : public QObject
 public:
     explicit HolePuncher(QObject* parent = nullptr);
 
-    // Bind on the given port (same port used for STUN — critical for NAT mapping).
-    // Returns actual port, or 0 on failure.
+    // Bind the shared UDP socket. Returns actual port or 0 on failure.
+    // discoverAndPublish() in ChatController calls this first, then passes
+    // the socket to StunClient so both share the same NAT mapping.
     quint16 bind(quint16 port = 0);
-
     quint16 boundPort() const;
 
-    // Start hole-punching to peerHost:peerPort, then send envelope once open.
-    // punchId lets the caller correlate the punchSuccess/punchFailed signals.
+    // Expose the socket so StunClient can share it.
+    QUdpSocket* socket() { return &m_socket; }
+
+    // Start hole-punch + send envelope once open.
     void punchAndSend(const QString& punchId,
                       const QString& peerHost, quint16 peerPort,
                       const QByteArray& envelope);
 
-    // Send directly (use only when hole is already known open).
+    // Send directly (hole already known open).
     void sendTo(const QString& host, quint16 port, const QByteArray& envelope);
+
+    // Feed a datagram to StunClient if it looks like a STUN response.
+    // Called from onReadyRead so STUN replies on the shared socket are handled.
+    void setStunClient(StunClient* stun) { m_stun = stun; }
 
 signals:
     void envelopeReceived(const QByteArray& body, const QString& envId);
@@ -47,17 +45,23 @@ private slots:
 
 private:
     struct PunchAttempt {
-        QString    punchId;
+        QString      punchId;
         QHostAddress host;
-        quint16    port    = 0;
-        QByteArray envelope;
-        int        probes  = 0;
-        QTimer*    timer   = nullptr;
+        quint16      port     = 0;
+        QByteArray   envelope;
+        int          probes   = 0;
+        QTimer*      probeTimer   = nullptr;
+        QTimer*      timeoutTimer = nullptr;
     };
 
     void sendProbe(const QHostAddress& host, quint16 port);
+    void cleanupAttempt(const QString& punchId);
+    // Normalize to IPv4 string for consistent comparison
+    static QString normalizeAddress(const QHostAddress& addr);
 
-    QUdpSocket m_socket;
-    QMap<QString, PunchAttempt*> m_attempts; // punchId → attempt
-    QMap<QString, QByteArray>    m_rxBufs;   // "host:port" → partial buffer
+    QUdpSocket  m_socket;
+    StunClient* m_stun = nullptr;
+
+    QMap<QString, PunchAttempt*> m_attempts;
+    QMap<QString, QByteArray>    m_rxBufs;
 };

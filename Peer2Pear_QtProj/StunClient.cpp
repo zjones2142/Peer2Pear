@@ -1,14 +1,8 @@
 #include "StunClient.hpp"
 #include <QHostInfo>
-#include <QDebug>
 #include <QRandomGenerator>
-
-// Minimal STUN Binding Request (RFC 5389)
-// Header: 20 bytes
-//   [2] Message Type  = 0x0001 (Binding Request)
-//   [2] Message Length = 0x0000 (no attributes)
-//   [4] Magic Cookie  = 0x2112A442
-//   [12] Transaction ID (random)
+#include <QDataStream>
+#include <QDebug>
 
 static QByteArray buildBindingRequest(QByteArray& txIdOut)
 {
@@ -17,91 +11,118 @@ static QByteArray buildBindingRequest(QByteArray& txIdOut)
         txIdOut[i] = static_cast<char>(QRandomGenerator::global()->bounded(256));
 
     QByteArray msg(20, '\0');
-    // Message Type: Binding Request
-    msg[0] = 0x00; msg[1] = 0x01;
-    // Message Length: 0
-    msg[2] = 0x00; msg[3] = 0x00;
-    // Magic Cookie
-    msg[4] = 0x21; msg[5] = 0x12; msg[6] = 0xA4; msg[7] = 0x42;
-    // Transaction ID
+    msg[0] = 0x00; msg[1] = 0x01; // Binding Request
+    msg[2] = 0x00; msg[3] = 0x00; // Length = 0
+    msg[4] = 0x21; msg[5] = 0x12; msg[6] = 0xA4; msg[7] = 0x42; // Magic cookie
     msg.replace(8, 12, txIdOut);
     return msg;
 }
 
 StunClient::StunClient(QObject* parent) : QObject(parent)
 {
-    connect(&m_socket, &QUdpSocket::readyRead, this, &StunClient::onReadyRead);
+    connect(&m_ownSocket, &QUdpSocket::readyRead, this, &StunClient::onReadyRead);
     m_timeout.setSingleShot(true);
     connect(&m_timeout, &QTimer::timeout, this, &StunClient::onTimeout);
 }
 
+// ── Internal socket path (simple IP discovery) ────────────────────────────────
+
 void StunClient::discover(const QString& stunHost, quint16 stunPort)
 {
-    m_socket.bind(QHostAddress::Any, 0);
+    m_socket = &m_ownSocket;
+    m_ownSocket.bind(QHostAddress::Any, 0);
 
-    // Resolve hostname then send
     QHostInfo::lookupHost(stunHost, this, [this, stunPort](const QHostInfo& info) {
-        if (info.addresses().isEmpty()) {
-            emit failed("STUN: DNS lookup failed");
-            return;
-        }
-        const QByteArray req = buildBindingRequest(m_txId);
-        m_socket.writeDatagram(req, info.addresses().first(), stunPort);
-        m_timeout.start(5000); // 5 second timeout
+        if (info.addresses().isEmpty()) { emit failed("STUN: DNS lookup failed"); return; }
+        sendRequest(m_socket, info.addresses().first(), stunPort);
     });
 }
 
+// ── Shared socket path (REQUIRED for hole-punching) ──────────────────────────
+
+void StunClient::discoverOnSocket(QUdpSocket* sharedSocket,
+                                  const QString& stunHost, quint16 stunPort)
+{
+    // Use the provided socket — do NOT rebind it
+    m_socket = sharedSocket;
+
+    QHostInfo::lookupHost(stunHost, this, [this, stunPort](const QHostInfo& info) {
+        if (info.addresses().isEmpty()) { emit failed("STUN: DNS lookup failed"); return; }
+        sendRequest(m_socket, info.addresses().first(), stunPort);
+    });
+}
+
+void StunClient::sendRequest(QUdpSocket* sock, const QHostAddress& addr, quint16 port)
+{
+    const QByteArray req = buildBindingRequest(m_txId);
+    sock->writeDatagram(req, addr, port);
+    m_timeout.start(5000);
+}
+
+// ── Response handling ─────────────────────────────────────────────────────────
+
 void StunClient::onReadyRead()
 {
-    QByteArray buf;
-    QHostAddress sender;
-    quint16 senderPort;
-
-    buf.resize(512);
-    qint64 n = m_socket.readDatagram(buf.data(), buf.size(), &sender, &senderPort);
+    // Only used when m_ownSocket is active (internal path)
+    QByteArray buf(512, '\0');
+    QHostAddress sender; quint16 senderPort;
+    qint64 n = m_ownSocket.readDatagram(buf.data(), buf.size(), &sender, &senderPort);
     if (n < 20) return;
     buf.resize(static_cast<int>(n));
+    parseResponse(buf);
+}
 
-    // Verify magic cookie
+bool StunClient::tryHandleDatagram(const QByteArray& buf)
+{
+    // Returns true if this looks like a STUN response and we handled it
+    if (buf.size() < 20) return false;
+    // Check magic cookie
     if ((quint8)buf[4] != 0x21 || (quint8)buf[5] != 0x12 ||
-        (quint8)buf[6] != 0xA4 || (quint8)buf[7] != 0x42)
-        return;
+        (quint8)buf[6] != 0xA4 || (quint8)buf[7] != 0x42) return false;
+    // Check it's a Binding Response (0x0101) or Success (0x0101)
+    const quint16 msgType = ((quint8)buf[0] << 8) | (quint8)buf[1];
+    if (msgType != 0x0101 && msgType != 0x0111) return false;
+    // Check transaction ID matches
+    if (buf.mid(8, 12) != m_txId) return false;
 
-    // Verify transaction ID
-    if (buf.mid(8, 12) != m_txId) return;
+    return parseResponse(buf);
+}
+
+bool StunClient::parseResponse(const QByteArray& buf)
+{
+    if (buf.size() < 20) return false;
+    if (buf.mid(8, 12) != m_txId) return false;
 
     m_timeout.stop();
 
-    // Parse attributes to find XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
     int offset = 20;
     while (offset + 4 <= buf.size()) {
-        const quint16 attrType   = ((quint8)buf[offset] << 8) | (quint8)buf[offset+1];
-        const quint16 attrLen    = ((quint8)buf[offset+2] << 8) | (quint8)buf[offset+3];
+        const quint16 attrType = ((quint8)buf[offset] << 8) | (quint8)buf[offset+1];
+        const quint16 attrLen  = ((quint8)buf[offset+2] << 8) | (quint8)buf[offset+3];
         offset += 4;
 
-        if (attrType == 0x0020 && attrLen >= 8) { // XOR-MAPPED-ADDRESS (IPv4)
-            // Family byte at offset+1 should be 0x01 for IPv4
+        if (attrType == 0x0020 && attrLen >= 8) { // XOR-MAPPED-ADDRESS
             const quint16 xPort = (((quint8)buf[offset+2] << 8) | (quint8)buf[offset+3]) ^ 0x2112;
             const quint32 xIp   =
                 (((quint8)buf[offset+4] << 24) | ((quint8)buf[offset+5] << 16) |
-                 ((quint8)buf[offset+6] << 8)  |  (quint8)buf[offset+7])
-                ^ 0x2112A442u;
+                 ((quint8)buf[offset+6] << 8)  |  (quint8)buf[offset+7]) ^ 0x2112A442u;
 
             const QString ip = QString("%1.%2.%3.%4")
-                .arg((xIp >> 24) & 0xFF).arg((xIp >> 16) & 0xFF)
-                .arg((xIp >> 8)  & 0xFF).arg(xIp & 0xFF);
+                                   .arg((xIp >> 24) & 0xFF).arg((xIp >> 16) & 0xFF)
+                                   .arg((xIp >> 8) & 0xFF).arg(xIp & 0xFF);
 
             emit publicAddressDiscovered(ip, xPort);
-            return;
+            return true;
         }
         offset += attrLen;
-        if (attrLen % 4) offset += 4 - (attrLen % 4); // 4-byte padding
+        if (attrLen % 4) offset += 4 - (attrLen % 4);
     }
 
-    emit failed("STUN: no MAPPED-ADDRESS found in response");
+    emit failed("STUN: no XOR-MAPPED-ADDRESS in response");
+    return false;
 }
 
 void StunClient::onTimeout()
 {
-    emit failed("STUN: timed out waiting for response");
+    emit failed("STUN: timed out");
 }
