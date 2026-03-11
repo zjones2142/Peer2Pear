@@ -7,7 +7,8 @@
 #include "CryptoEngine.hpp"
 #include "MailboxClient.hpp"
 #include "RendezvousClient.hpp"
-#include "DirectPeerLink.hpp"
+#include "HolePuncher.hpp"
+#include "StunClient.hpp"
 
 class ChatController : public QObject {
     Q_OBJECT
@@ -25,8 +26,7 @@ public:
     // Send encrypted text to peer via mailbox
     void sendTextViaMailbox(const QString& peerIdB64u, const QString& text);//for offline fallback
 
-    void publishMyAddress(const QString& host, quint16 port);
-
+    void discoverAndPublish();
     // Start periodic mailbox fetch
     void startPolling(int intervalMs = 2000);
     void stopPolling();
@@ -43,6 +43,10 @@ private slots:
     void onEnvelope(const QByteArray& body, const QString& envId);
 
     void onLookupResult(const QString& host, int port);
+    void onPublicAddressDiscovered(const QString& host, quint16 port);
+    void onStunFailed(const QString& reason);
+    void onPunchSuccess(const QString& punchId, const QString& host, quint16 port);
+    void onPunchFailed(const QString& punchId);
 
 private:
     QByteArray buildEnvelope(const QString& peerIdB64u, const QString& text);
@@ -50,7 +54,8 @@ private:
     CryptoEngine m_crypto;
     RendezvousClient m_rvz;
     MailboxClient m_mbox;
-    DirectPeerLink m_direct;
+    HolePuncher m_punch;
+    StunClient m_stun;
 
     QTimer m_pollTimer;
     QStringList m_selfKeys;
@@ -60,4 +65,8 @@ private:
     // Carry the intent through the async rendezvous lookup.
     QString m_pendingPeer;
     QString m_pendingText;
+
+    QMap<QString, QPair<QString, QString>> m_pendingPunches;
+    QString  m_myPublicHost;
+    quint16  m_myPublicPort = 0;
 };
