@@ -60,6 +60,8 @@ set(PROJECT_SOURCES
     MailboxClient.hpp
     RendezvousClient.cpp
     RendezvousClient.hpp
+    DirectPeerLink.cpp
+    DirectPeerLink.hpp
 )
 
 # --- 4. Create Executable ---

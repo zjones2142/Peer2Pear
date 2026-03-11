@@ -61,6 +61,12 @@ MainWindow::MainWindow(QWidget *parent)
     m_controller.setServerBaseUrl(QUrl("http://3.141.14.234"));
     m_controller.startPolling(2000);
 
+    // Publish this device to the rendezvous server so peers can reach us directly.
+    // Port 0 = let the OS assign a free port automatically.
+    // Replace "0.0.0.0" with your actual public IP if behind NAT,
+    // or use a STUN lookup to auto-detect it.
+    m_controller.publishMyAddress("0.0.0.0", 0);
+
     // Show identity in sidebar
     ui->profileHandleLabel->setText(m_controller.myIdB64u());
 
