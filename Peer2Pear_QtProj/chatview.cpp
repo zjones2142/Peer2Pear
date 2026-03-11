@@ -320,6 +320,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
         }
 
         if (hit) {
+            if (m_chats[i].isBlocked) return; // silently drop messages from blocked contacts
             const QDateTime now = timestamp;
 
             const bool needsSeparator =
@@ -853,11 +854,11 @@ void ChatView::addMessageBubble(const QString &text, bool sent)
     if (!layout) return;
 
     layout->insertWidget(layout->count() - 1, row);
-
-    QApplication::processEvents();
-    m_ui->messageScroll->verticalScrollBar()->setValue(
-        m_ui->messageScroll->verticalScrollBar()->maximum()
-        );
+    QTimer::singleShot(5, [this]() {
+        m_ui->messageScroll->verticalScrollBar()->setValue(
+            m_ui->messageScroll->verticalScrollBar()->maximum()
+            );
+    });
 }
 
 void ChatView::ensureUnreadSize()
