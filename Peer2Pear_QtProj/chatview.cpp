@@ -277,7 +277,10 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
             Message msg{ false, text, now };
             m_chats[i].messages.append(msg);
 
-            if (m_db) m_db->saveMessage(m_chats[i].peerIdB64u, msg);//database save
+            if (m_db){
+                m_db->saveContact(m_chats[i]);
+                m_db->saveMessage(m_chats[i].peerIdB64u, msg);
+            }
 
             if (i == m_currentChat) {
                 // Currently open — insert separator if needed, then the bubble
@@ -502,66 +505,13 @@ void ChatView::initChats()
         }
     }
 
-    // ── DB: if the DB has contacts, load from there instead of dummy data ─────
+    // -- load contacts from Db - start with empty list if none exists
     if (m_db) {
-        QVector<ChatData> saved = m_db->loadAllContacts();
-        if (!saved.isEmpty()) {
-            m_chats = saved;
-            m_ui->chatList->clear();
-            for (const auto &c : m_chats)
-                m_ui->chatList->addItem(c.name);
-            return;
-        }
+        m_chats = m_db->loadAllContacts(); // returns empty QVector on a fresh DB
     }
 
-    // NOTE: Replace peerIdB64u with REAL peer IDs (base64url ed25519 pub) from other devices.
-    // For quick testing, run two clients and copy each "profileHandleLabel" to the other's peerIdB64u.
 
-    const QDateTime base = QDateTime::currentDateTime().addSecs(-6 * 3600); // 6 h ago
 
-    ChatData alice;
-    alice.name       = "Alice";
-    alice.subtitle   = "Secure chat";
-    alice.peerIdB64u = "";
-    alice.messages   = { { false, "Hey! How are you?",            base },
-                      { true,  "I'm doing great, thanks!",     base.addSecs(30) },
-                      { false, "That's wonderful to hear",     base.addSecs(60) } };
-    m_chats.append(alice);
-
-    ChatData bob;
-    bob.name       = "Bob";
-    bob.subtitle   = "Secure chat";
-    bob.peerIdB64u = "";
-    bob.messages   = { { false, "Did you see the game last night?", base },
-                    { true,  "Yeah, incredible finish!",         base.addSecs(120) } };
-    m_chats.append(bob);
-
-    ChatData charlie;
-    charlie.name       = "Charlie";
-    charlie.subtitle   = "Secure chat";
-    charlie.peerIdB64u = "";
-    charlie.messages   = { { true,  "Hey, sending over those files soon", base },
-                        { false, "Sounds good, no rush",               base.addSecs(45) } };
-    m_chats.append(charlie);
-
-    ChatData group;
-    group.name       = "Group Chat";
-    group.subtitle   = "MVP (no MLS yet)";
-    group.peerIdB64u = "";
-    group.messages   = { { false, "Welcome everyone!", base },
-                      { true,  "Thanks for having us", base.addSecs(10) } };
-    m_chats.append(group);
-
-    // ── DB: save the demo contacts on first run ───────────────────────────────
-    if (m_db) {
-        for (const auto &c : m_chats) {
-            m_db->saveContact(c);
-            // Use the same key logic as saveContact for message storage
-            const QString key = c.peerIdB64u.isEmpty() ? "name:" + c.name : c.peerIdB64u;
-            for (const auto &msg : c.messages)
-                m_db->saveMessage(key, msg);
-        }
-    }
     m_ui->chatList->clear();
     for (const auto &c : m_chats)
         m_ui->chatList->addItem(c.name);
