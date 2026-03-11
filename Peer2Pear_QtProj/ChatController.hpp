@@ -23,6 +23,9 @@ public:
     void startPolling(int intervalMs = 2000);
     void stopPolling();
 
+    // How the app knows which keys are yours
+    void setSelfKeys(const QStringList& keys);
+
 signals:
     void status(const QString& s);
     void messageReceived(const QString& fromPeerIdB64u, const QString& text, const QDateTime& timestamp);
@@ -37,4 +40,5 @@ private:
     MailboxClient m_mbox;
 
     QTimer m_pollTimer;
+    QStringList m_selfKeys;
 };

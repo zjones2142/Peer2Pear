@@ -366,9 +366,8 @@ void ChatView::onSendMessage()
     QString text = m_ui->messageInput->text().trimmed();
     if (text.isEmpty()) return;
 
-    const QString peerId = m_chats[m_currentChat].peerIdB64u.trimmed();
-    if (peerId.isEmpty()) {
-        addMessageBubble("Peer ID missing for this chat (set peerIdB64u).", false);
+    if (m_chats[m_currentChat].keys.isEmpty()) {
+        addMessageBubble("No keys saved for this contact.", false);
         return;
     }
 
@@ -386,9 +385,9 @@ void ChatView::onSendMessage()
     m_chats[m_currentChat].messages.append(msg);
 
     if (m_db) {
-        const QString key = peerId.isEmpty()
+        const QString key = m_chats[m_currentChat].keys.isEmpty()
         ? "name:" + m_chats[m_currentChat].name
-        : peerId;
+        : m_chats[m_currentChat].keys.first();
         m_db->saveMessage(key, msg);
     }
 
@@ -396,7 +395,10 @@ void ChatView::onSendMessage()
     addMessageBubble(text, true);
     m_ui->messageInput->clear();
 
-    m_controller->sendTextViaMailbox(peerId, text);
+    for (const QString &key : m_chats[m_currentChat].keys) {
+        if (!key.trimmed().isEmpty())
+            m_controller->sendTextViaMailbox(key.trimmed(), text);
+    }
 }
 
 void ChatView::onSearchChanged(const QString &text)
@@ -441,8 +443,12 @@ void ChatView::onEditProfile()
         m_ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         m_ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
         m_profileKeys = keys;
+        m_controller->setSelfKeys(m_profileKeys); // poll all self-device mailboxes
 
-        if (m_db) m_db->saveSetting("displayName", name);//database save for profile display name
+        if (m_db) {
+            m_db->saveSetting("displayName", name);
+            m_db->saveSetting("profileKeys", m_profileKeys.join(','));
+        }
     }
 }
 
@@ -510,11 +516,17 @@ void ChatView::initChats()
         m_chats = m_db->loadAllContacts(); // returns empty QVector on a fresh DB
     }
 
-
-
     m_ui->chatList->clear();
     for (const auto &c : m_chats)
         m_ui->chatList->addItem(c.name);
+
+    // Load saved self-device keys and start polling all of them
+    if (m_db) {
+        const QString savedKeys = m_db->loadSetting("profileKeys");
+        if (!savedKeys.isEmpty())
+            m_profileKeys = savedKeys.split(',', Qt::SkipEmptyParts);
+    }
+    m_controller->setSelfKeys(m_profileKeys);
 }
 
 void ChatView::rebuildChatList()

@@ -134,15 +134,20 @@ void DatabaseManager::saveContact(const ChatData &chat)
     if (key.isEmpty()) return;
 
     QSqlQuery q(m_db);
+    // ── Use INSERT ... ON CONFLICT DO UPDATE instead of INSERT OR REPLACE.
+    // INSERT OR REPLACE does a DELETE + INSERT which fires ON DELETE CASCADE
+    // and wipes all messages for that contact. The upsert form updates the
+    // existing row in-place so messages are always preserved.
     q.prepare(
-        "INSERT OR REPLACE INTO contacts (peer_id, name, subtitle, keys, last_active)"
-        " VALUES (:peer_id, :name, :subtitle, :keys,"
-        // Preserve existing last_active if row already exists, else default to 0
-        "  COALESCE((SELECT last_active FROM contacts WHERE peer_id = :peer_id2), 0)"
-        ");"
+        "INSERT INTO contacts (peer_id, name, subtitle, keys, last_active)"
+        " VALUES (:peer_id, :name, :subtitle, :keys, 0)"
+        " ON CONFLICT(peer_id) DO UPDATE SET"
+        "   name        = excluded.name,"
+        "   subtitle    = excluded.subtitle,"
+        "   keys        = excluded.keys;"
+        // last_active is intentionally NOT updated here — only saveMessage touches it
         );
     q.bindValue(":peer_id",  key);
-    q.bindValue(":peer_id2", key);
     q.bindValue(":name",     chat.name);
     q.bindValue(":subtitle", chat.subtitle);
     q.bindValue(":keys",     chat.keys.join('|'));
