@@ -826,8 +826,9 @@ void ChatView::addMessageBubble(const QString &text, bool sent)
     bubble->setFixedSize(bubbleWidth, bubbleHeight);
     bubble->setWordWrap(needsWrap);
     bubble->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+    bubble->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-    if (sent) {
+    if (sent) {bubble->setTextInteractionFlags(Qt::TextSelectableByMouse);
         bubble->setStyleSheet(
             "background-color: #2e8b3a; color: #ffffff;"
             "border-radius: 14px; padding: 10px 14px; font-size: 13px;"
