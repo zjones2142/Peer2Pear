@@ -16,6 +16,7 @@
 #include <QMessageBox>
 #include <QDateTime>
 #include <QDebug>
+#include <QUuid>
 
 // ── DATE SEPARATOR: how many seconds of silence before we show a divider ─────
 static constexpr int kDateSeparatorThresholdSecs = 60 * 60 * 2; // 2 hour(changed the multiplier at the end to incr hours of time
@@ -394,6 +395,63 @@ void ChatView::onStatus(const QString &s)
     qDebug() << "[status]" << s;
 }
 
+void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
+                                      const QString &groupId,
+                                      const QString &groupName,
+                                      const QString &text,
+                                      const QDateTime &ts)
+{
+    // Find existing group chat with matching groupId
+    int targetIndex = -1;
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].isGroup && m_chats[i].groupId == groupId) {
+            targetIndex = i;
+            break;
+        }
+    }
+
+    // Auto-create the group if we haven't seen it before
+    if (targetIndex == -1) {
+        ChatData newGroup;
+        newGroup.isGroup  = true;
+        newGroup.groupId  = groupId;
+        newGroup.name     = groupName.isEmpty() ? "Group Chat" : groupName;
+        newGroup.subtitle = "Group chat";
+        newGroup.keys.append(fromPeerIdB64u); // add sender's key
+        m_chats.append(newGroup);
+        if (m_db) m_db->saveContact(newGroup);
+        targetIndex = m_chats.size() - 1;
+        ensureUnreadSize();
+        rebuildChatList();
+    }
+
+    ChatData &chat = m_chats[targetIndex];
+    if (chat.isBlocked) return;
+
+    const bool needsSeparator =
+        chat.messages.isEmpty() ||
+        chat.messages.last().timestamp.secsTo(ts) >= kDateSeparatorThresholdSecs;
+
+    Message msg{ false, text, ts };
+    chat.messages.append(msg);
+
+    if (m_db) m_db->saveMessage(
+            chat.groupId.isEmpty() ? "name:" + chat.name : chat.groupId, msg);
+
+    if (targetIndex == m_currentChat) {
+        if (needsSeparator) addDateSeparator(ts);
+        addMessageBubble(text, false);
+        promoteChatToTop(targetIndex);
+        rebuildChatList();
+    } else {
+        m_unread[targetIndex] += 1;
+        emit unreadChanged(totalUnread());
+        promoteChatToTop(targetIndex);
+        rebuildChatList();
+        if (m_notifier) m_notifier->notify(chat.name, text);
+    }
+}
+
 // ── Private slots ─────────────────────────────────────────────────────────────
 
 void ChatView::onChatSelected(int index)
@@ -438,9 +496,13 @@ void ChatView::onSendMessage()
     m_chats[m_currentChat].messages.append(msg);
 
     if (m_db) {
-        const QString key = m_chats[m_currentChat].keys.isEmpty()
-        ? "name:" + m_chats[m_currentChat].name
-        : m_chats[m_currentChat].keys.first();
+        const QString key = m_chats[m_currentChat].isGroup
+                                ? (m_chats[m_currentChat].groupId.isEmpty()
+                                       ? "name:" + m_chats[m_currentChat].name
+                                       : m_chats[m_currentChat].groupId)
+                                : (m_chats[m_currentChat].keys.isEmpty()
+                                       ? "name:" + m_chats[m_currentChat].name
+                                       : m_chats[m_currentChat].keys.first());
         m_db->saveMessage(key, msg);
     }
 
@@ -448,9 +510,23 @@ void ChatView::onSendMessage()
     addMessageBubble(text, true);
     m_ui->messageInput->clear();
 
-    for (const QString &key : m_chats[m_currentChat].keys) {
-        if (!key.trimmed().isEmpty())
-            m_controller->sendTextViaMailbox(key.trimmed(), text);
+    if (m_chats[m_currentChat].isGroup) {
+        // Group message — send with groupId so receiver routes to group chat
+        const QString groupId = m_chats[m_currentChat].groupId.isEmpty()
+                                    ? m_chats[m_currentChat].name
+                                    : m_chats[m_currentChat].groupId;
+        m_controller->sendGroupMessageViaMailbox(
+            groupId,
+            m_chats[m_currentChat].name,
+            m_chats[m_currentChat].keys,
+            text
+            );
+    } else {
+        // DM — fan out to all saved keys for this contact
+        for (const QString &key : m_chats[m_currentChat].keys) {
+            if (!key.trimmed().isEmpty())
+                m_controller->sendTextViaMailbox(key.trimmed(), text);
+        }
     }
 }
 
@@ -552,22 +628,202 @@ void ChatView::onAddContact()
 {
     QString name;
     QStringList keys;
-    if (openContactEditor(m_ui->centralwidget, "Add Contact / Group", name, keys, false)
-        == ContactEditorResult::Saved) {
-        if (!name.isEmpty()) {
-            ChatData newChat;
-            newChat.name       = name;
-            newChat.subtitle   = "Secure chat";
-            newChat.keys       = keys;
-            if (!keys.isEmpty()) newChat.peerIdB64u = keys.first();
-            m_chats.append(newChat);
 
-            if (m_db) m_db->saveContact(newChat);//database save for new contact
+    // Build the add contact dialog manually so we can add a "Create Group" button
+    QDialog dlg(m_ui->centralwidget);
+    dlg.setWindowTitle("Add Contact");
+    dlg.setStyleSheet(kDialogStyle);
+    dlg.setMinimumWidth(420);
+    dlg.setModal(true);
 
-            rebuildChatList();
-            m_ui->chatList->setCurrentRow(m_chats.size() - 1);
+    auto *layout = new QVBoxLayout(&dlg);
+    layout->setSpacing(14);
+    layout->setContentsMargins(24, 24, 24, 24);
+
+    auto *titleLbl = new QLabel("Add Contact", &dlg);
+    titleLbl->setObjectName("dlgTitle");
+    layout->addWidget(titleLbl);
+
+    auto *sep = new QFrame(&dlg);
+    sep->setFrameShape(QFrame::HLine);
+    sep->setStyleSheet("color: #2a2a2a;");
+    layout->addWidget(sep);
+
+    layout->addWidget(new QLabel("Display Name", &dlg));
+    auto *nameEdit = new QLineEdit(&dlg);
+    layout->addWidget(nameEdit);
+
+    layout->addWidget(new QLabel("Public Keys", &dlg));
+    auto *keyList = new QListWidget(&dlg);
+    keyList->setFixedHeight(130);
+    layout->addWidget(keyList);
+
+    auto *keyInputRow = new QHBoxLayout;
+    auto *keyInput    = new QLineEdit(&dlg);
+    keyInput->setPlaceholderText("Paste public key...");
+    auto *addKeyBtn    = new QPushButton("Add Key", &dlg);
+    auto *removeKeyBtn = new QPushButton("Remove", &dlg);
+    removeKeyBtn->setObjectName("removeKeyBtn");
+    keyInputRow->addWidget(keyInput, 1);
+    keyInputRow->addWidget(addKeyBtn);
+    keyInputRow->addWidget(removeKeyBtn);
+    layout->addLayout(keyInputRow);
+
+    QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
+        const QString key = keyInput->text().trimmed();
+        if (key.isEmpty()) return;
+        for (int i = 0; i < keyList->count(); ++i) {
+            if (keyList->item(i)->text() == key) {
+                QMessageBox::warning(&dlg, "Duplicate Key",
+                                     "This key already exists and was not added.");
+                return;
+            }
         }
+        keyList->addItem(key);
+        keyInput->clear();
+    });
+    QObject::connect(removeKeyBtn, &QPushButton::clicked, [&]() {
+        delete keyList->currentItem();
+    });
+
+    layout->addStretch();
+
+    auto *btnRow     = new QHBoxLayout;
+    auto *groupBtn   = new QPushButton("Create Group Chat", &dlg);
+    auto *cancelBtn  = new QPushButton("Cancel", &dlg);
+    auto *saveBtn    = new QPushButton("Save", &dlg);
+    cancelBtn->setObjectName("cancelBtn");
+    saveBtn->setObjectName("saveBtn");
+    groupBtn->setStyleSheet(
+        "QPushButton { background-color: #1a2e1c; color: #5dd868;"
+        "  border: 1px solid #2e5e30; border-radius: 8px; padding: 8px 16px; }"
+        "QPushButton:hover { background-color: #223a24; }"
+        );
+    btnRow->setSpacing(10);
+    btnRow->addWidget(groupBtn);
+    btnRow->addStretch();
+    btnRow->addWidget(cancelBtn);
+    btnRow->addWidget(saveBtn);
+    layout->addLayout(btnRow);
+
+    bool createGroup = false;
+    QObject::connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    QObject::connect(saveBtn,   &QPushButton::clicked, &dlg, &QDialog::accept);
+    QObject::connect(groupBtn,  &QPushButton::clicked, [&]() {
+        createGroup = true;
+        dlg.accept();
+    });
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    if (createGroup) {
+        // ── Group creation dialog ─────────────────────────────────────────────
+        if (m_chats.isEmpty()) {
+            QMessageBox::information(m_ui->centralwidget, "No Contacts",
+                                     "Add some contacts first before creating a group.");
+            return;
+        }
+
+        QDialog grpDlg(m_ui->centralwidget);
+        grpDlg.setWindowTitle("New Group Chat");
+        grpDlg.setStyleSheet(kDialogStyle);
+        grpDlg.setMinimumWidth(380);
+
+        auto *grpLayout = new QVBoxLayout(&grpDlg);
+        grpLayout->setSpacing(12);
+        grpLayout->setContentsMargins(24, 24, 24, 24);
+
+        auto *grpTitle = new QLabel("New Group Chat", &grpDlg);
+        grpTitle->setObjectName("dlgTitle");
+        grpLayout->addWidget(grpTitle);
+
+        grpLayout->addWidget(new QLabel("Group Name", &grpDlg));
+        auto *grpNameEdit = new QLineEdit(&grpDlg);
+        grpNameEdit->setPlaceholderText("Enter group name...");
+        grpLayout->addWidget(grpNameEdit);
+
+        grpLayout->addWidget(new QLabel("Select Members", &grpDlg));
+        auto *memberList = new QListWidget(&grpDlg);
+        memberList->setFixedHeight(160);
+        for (const ChatData &c : m_chats) {
+            if (c.isGroup) continue;
+            auto *item = new QListWidgetItem(c.name, memberList);
+            item->setCheckState(Qt::Unchecked);
+        }
+        grpLayout->addWidget(memberList);
+
+        auto *grpBtnRow  = new QHBoxLayout;
+        auto *grpCancel  = new QPushButton("Cancel", &grpDlg);
+        auto *grpCreate  = new QPushButton("Create", &grpDlg);
+        grpCancel->setObjectName("cancelBtn");
+        grpCreate->setObjectName("saveBtn");
+        grpBtnRow->addStretch();
+        grpBtnRow->addWidget(grpCancel);
+        grpBtnRow->addWidget(grpCreate);
+        grpLayout->addLayout(grpBtnRow);
+
+        QObject::connect(grpCancel, &QPushButton::clicked, &grpDlg, &QDialog::reject);
+        QObject::connect(grpCreate, &QPushButton::clicked, &grpDlg, &QDialog::accept);
+
+        if (grpDlg.exec() != QDialog::Accepted) return;
+
+        const QString groupName = grpNameEdit->text().trimmed();
+        if (groupName.isEmpty()) return;
+
+        // Collect keys from checked members
+        QStringList groupKeys;
+        QStringList memberNames;
+        for (int i = 0; i < memberList->count(); ++i) {
+            auto *item = memberList->item(i);
+            if (item->checkState() == Qt::Checked) {
+                for (const ChatData &c : m_chats) {
+                    if (c.name == item->text() && !c.isGroup) {
+                        groupKeys << c.keys;
+                        memberNames << c.name;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (groupKeys.isEmpty()) {
+            QMessageBox::warning(m_ui->centralwidget, "No Members",
+                                 "Select at least one member for the group.");
+            return;
+        }
+
+        ChatData newGroup;
+        newGroup.name     = groupName;
+        newGroup.subtitle = QString("Group · %1 member%2")
+                                .arg(memberNames.size())
+                                .arg(memberNames.size() == 1 ? "" : "s");
+        newGroup.isGroup  = true;
+        newGroup.keys     = groupKeys;
+        newGroup.groupId  = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        newGroup.peerIdB64u = newGroup.groupId;
+        m_chats.append(newGroup);
+        if (m_db) m_db->saveContact(newGroup);
+        rebuildChatList();
+        m_ui->chatList->setCurrentRow(m_chats.size() - 1);
+        return;
     }
+
+    // ── Save new contact ──────────────────────────────────────────────────────
+    name = nameEdit->text().trimmed();
+    if (name.isEmpty()) return;
+
+    for (int i = 0; i < keyList->count(); ++i)
+        keys << keyList->item(i)->text();
+
+    ChatData newChat;
+    newChat.name       = name;
+    newChat.subtitle   = "Secure chat";
+    newChat.keys       = keys;
+    if (!keys.isEmpty()) newChat.peerIdB64u = keys.first();
+    m_chats.append(newChat);
+    if (m_db) m_db->saveContact(newChat);
+    rebuildChatList();
+    m_ui->chatList->setCurrentRow(m_chats.size() - 1);
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

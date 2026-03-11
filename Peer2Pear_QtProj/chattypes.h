@@ -20,4 +20,6 @@ struct ChatData {
     QStringList keys;
     QVector<Message> messages;
     bool isBlocked = false;
+    bool    isGroup = false;
+    QString groupId;
 };

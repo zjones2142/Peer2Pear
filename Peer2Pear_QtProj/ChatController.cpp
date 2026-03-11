@@ -17,7 +17,7 @@ ChatController::ChatController(QObject* parent)
     connect(&m_mbox, &MailboxClient::envelopeReceived, this, &ChatController::onEnvelope);
     connect(&m_pollTimer, &QTimer::timeout, this, &ChatController::pollOnce);
 }
-
+// Public
 void ChatController::setPassphrase(const QString& pass)
 {
     // CryptoEngine::ensureIdentity() should be strict and may throw.
@@ -70,16 +70,49 @@ void ChatController::stopPolling()
     m_pollTimer.stop();
 }
 
+void ChatController::setSelfKeys(const QStringList& keys) {
+    m_selfKeys = keys;
+}
+
+void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
+                                                const QString& groupName,
+                                                const QStringList& memberPeerIds,
+                                                const QString& text)
+{
+    const QString myId = myIdB64u();
+    const qint64 ts = QDateTime::currentSecsSinceEpoch();
+
+    for (const QString& peerId : memberPeerIds) {
+        if (peerId.trimmed().isEmpty()) continue;
+        if (peerId.trimmed() == myId) continue; // don't send to yourself
+
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
+        QJsonObject payload;
+        payload["from"]      = myId;
+        payload["type"]      = "group_msg";
+        payload["groupId"]   = groupId;
+        payload["groupName"] = groupName;
+        payload["text"]      = text;
+        payload["ts"]        = ts;
+
+        const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
+        const QByteArray env = QByteArray("FROM:") + myId.toUtf8() + "\n" + ct;
+
+        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+    }
+}
+
+// Private
 void ChatController::pollOnce() {
     m_mbox.fetch(myIdB64u());
     for (const QString &key : m_selfKeys) {
         if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u())
             m_mbox.fetch(key.trimmed());
     }
-}
-
-void ChatController::setSelfKeys(const QStringList& keys) {
-    m_selfKeys = keys;
 }
 
 void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
@@ -113,5 +146,18 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
                                  : QDateTime::currentDateTime();
 
         emit messageReceived(fromId, o.value("text").toString(), ts);
+    }
+    else if (o.value("type").toString() == "group_msg") {
+        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        const QDateTime ts = tsSecs > 0
+                                 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
+                                 : QDateTime::currentDateTime();
+        emit groupMessageReceived(
+            fromId,
+            o.value("groupId").toString(),
+            o.value("groupName").toString(),
+            o.value("text").toString(),
+            ts
+            );
     }
 }
