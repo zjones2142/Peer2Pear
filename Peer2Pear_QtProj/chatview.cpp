@@ -306,9 +306,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &t
     };
 
     for (int i = 0; i < m_chats.size(); ++i) {
-        auto matchesChat = [&](int idx) {
-            return m_chats[idx].peerIdB64u.trimmed() == from;
-        };
+        if (m_chats[i].isGroup) continue; // group messages handled by onIncomingGroupMessage
 
         bool hit = false;
 
@@ -398,6 +396,7 @@ void ChatView::onStatus(const QString &s)
 void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
                                       const QString &groupId,
                                       const QString &groupName,
+                                      const QStringList &memberKeys,
                                       const QString &text,
                                       const QDateTime &ts)
 {
@@ -415,6 +414,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         ChatData newGroup;
         newGroup.isGroup  = true;
         newGroup.groupId  = groupId;
+        newGroup.peerIdB64u = groupId;
         newGroup.name     = groupName.isEmpty() ? "Group Chat" : groupName;
         newGroup.subtitle = "Group chat";
         newGroup.keys.append(fromPeerIdB64u); // add sender's key
@@ -427,6 +427,19 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
 
     ChatData &chat = m_chats[targetIndex];
     if (chat.isBlocked) return;
+
+    // Merge any new member keys we didn't know about before
+    // This is how members discover each other without manual key exchange
+    bool keysUpdated = false;
+    for (const QString &key : memberKeys) {
+        if (key.trimmed().isEmpty()) continue;
+        if (!chat.keys.contains(key)) {
+            chat.keys << key;
+            keysUpdated = true;
+        }
+    }
+    if (keysUpdated && m_db)
+        m_db->saveContact(chat); // persist the updated key list
 
     const bool needsSeparator =
         chat.messages.isEmpty() ||

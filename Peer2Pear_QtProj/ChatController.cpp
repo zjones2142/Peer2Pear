@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QDateTime>
 #include <QTimeZone>
+#include <QJsonArray>
 
 ChatController::ChatController(QObject* parent)
     : QObject(parent),
@@ -82,6 +83,11 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
     const QString myId = myIdB64u();
     const qint64 ts = QDateTime::currentSecsSinceEpoch();
 
+    // Build member key list once — included in every message so receivers discover each other
+    QJsonArray membersArray;
+    for (const QString &key : memberPeerIds)
+        membersArray.append(key);
+
     for (const QString& peerId : memberPeerIds) {
         if (peerId.trimmed().isEmpty()) continue;
         if (peerId.trimmed() == myId) continue; // don't send to yourself
@@ -95,6 +101,7 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         payload["type"]      = "group_msg";
         payload["groupId"]   = groupId;
         payload["groupName"] = groupName;
+        payload["members"]   = membersArray;
         payload["text"]      = text;
         payload["ts"]        = ts;
 
@@ -152,10 +159,17 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
         const QDateTime ts = tsSecs > 0
                                  ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
                                  : QDateTime::currentDateTime();
+
+
+        // Parse member keys from payload so receiver can discover all group members
+        QStringList memberKeys;
+        for (const QJsonValue &v : o.value("members").toArray())
+            memberKeys << v.toString();
         emit groupMessageReceived(
             fromId,
             o.value("groupId").toString(),
             o.value("groupName").toString(),
+            memberKeys,
             o.value("text").toString(),
             ts
             );

@@ -49,6 +49,7 @@ public slots:
     void onIncomingGroupMessage(const QString &fromPeerIdB64u,
                                 const QString &groupId,
                                 const QString &groupName,
+                                const QStringList &memberKeys,
                                 const QString &text,
                                 const QDateTime &ts);
 
