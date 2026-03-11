@@ -104,10 +104,12 @@ static const char *kDialogStyle =
 
 // Opens a modal dialog to edit a contact name + list of public keys.
 // nameInOut and keysInOut are updated on Save; returns false on Cancel.
-static bool openContactEditor(QWidget *parent,
-                              const QString &title,
-                              QString &nameInOut,
-                              QStringList &keysInOut)
+enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed };
+static ContactEditorResult openContactEditor(QWidget *parent,
+                                             const QString &title,
+                                             QString &nameInOut,
+                                             QStringList &keysInOut,
+                                             bool showDestructiveActions = true)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -179,6 +181,46 @@ static bool openContactEditor(QWidget *parent,
     });
 
     root->addStretch();
+    ContactEditorResult result = ContactEditorResult::Cancelled;
+
+    // ── Block and remove contact ───────────────────────────────────────────────
+    if (showDestructiveActions) {
+        auto *actionSep = new QFrame(&dlg);
+        actionSep->setFrameShape(QFrame::HLine);
+        actionSep->setStyleSheet("color: #2a2a2a;");
+        root->addWidget(actionSep);
+
+        auto *actionRow  = new QHBoxLayout;
+        auto *blockBtn   = new QPushButton("Block Contact", &dlg);
+        auto *removeBtn  = new QPushButton("Remove Contact", &dlg);
+        const QString destructiveStyle =
+            "QPushButton { background-color: #2e1a1a; color: #cc5555;"
+            "  border: 1px solid #5e2e2e; border-radius: 8px; padding: 8px 16px; }"
+            "QPushButton:hover { background-color: #3a2020; }";
+        blockBtn->setStyleSheet(destructiveStyle);
+        removeBtn->setStyleSheet(destructiveStyle);
+        actionRow->addWidget(blockBtn);
+        actionRow->addWidget(removeBtn);
+        actionRow->addStretch();
+        root->addLayout(actionRow);
+
+        QObject::connect(blockBtn, &QPushButton::clicked, [&]() {
+            if (QMessageBox::question(&dlg, "Block Contact",
+                                      "Block this contact? They won't be able to send you messages.",
+                                      QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                result = ContactEditorResult::Blocked;
+                dlg.accept();
+            }
+        });
+        QObject::connect(removeBtn, &QPushButton::clicked, [&]() {
+            if (QMessageBox::question(&dlg, "Remove Contact",
+                                      "Remove this contact? This cannot be undone.",
+                                      QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                result = ContactEditorResult::Removed;
+                dlg.accept();
+            }
+        });
+    }
 
     auto *btnRow   = new QHBoxLayout;
     auto *cancelBtn = new QPushButton("Cancel", &dlg);
@@ -192,16 +234,20 @@ static bool openContactEditor(QWidget *parent,
     root->addLayout(btnRow);
 
     QObject::connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
-    QObject::connect(saveBtn,   &QPushButton::clicked, &dlg, &QDialog::accept);
+    QObject::connect(saveBtn, &QPushButton::clicked, [&]() {
+        result = ContactEditorResult::Saved;
+        dlg.accept();
+    });
 
-    if (dlg.exec() != QDialog::Accepted)
-        return false;
+    dlg.exec();
 
-    nameInOut = nameEdit->text().trimmed();
-    keysInOut.clear();
-    for (int i = 0; i < keyList->count(); ++i)
-        keysInOut << keyList->item(i)->text();
-    return true;
+    if (result == ContactEditorResult::Saved) {
+        nameInOut = nameEdit->text().trimmed();
+        keysInOut.clear();
+        for (int i = 0; i < keyList->count(); ++i)
+            keysInOut << keyList->item(i)->text();
+    }
+    return result;
 }
 
 // ── ChatView implementation ───────────────────────────────────────────────────
@@ -442,7 +488,8 @@ void ChatView::onEditProfile()
     if (!myKey.isEmpty() && !keys.contains(myKey))
         keys << myKey;
 
-    if (openContactEditor(m_ui->centralwidget, "Edit Your Profile", name, keys)) {
+    if (openContactEditor(m_ui->centralwidget, "Edit Your Profile", name, keys, false)
+        == ContactEditorResult::Saved) {
         m_ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         m_ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
         m_profileKeys = keys;
@@ -462,21 +509,38 @@ void ChatView::onEditContact(int index)
     QString     name = m_chats[index].name;
     QStringList keys = m_chats[index].keys;
 
-    if (openContactEditor(m_ui->centralwidget, "Edit Contact", name, keys)) {
-        if (!name.isEmpty()) {
-            m_chats[index].name = name;
-            m_chats[index].keys = keys;
-            if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
-                m_chats[index].peerIdB64u = keys.first();
+    const ContactEditorResult result =
+        openContactEditor(m_ui->centralwidget, "Edit Contact", name, keys);
 
-            if (m_db) m_db->saveContact(m_chats[index]);//database save for edited contact
-
-            rebuildChatList();
-            if (m_currentChat == index) {
-                m_ui->chatTitleLabel->setText(name);
-                m_ui->chatAvatarLabel->setText(QString(name[0]).toUpper());
-            }
+    if (result == ContactEditorResult::Saved && !name.isEmpty()) {
+        // Update the contact and save to the database
+        m_chats[index].name = name;
+        m_chats[index].keys = keys;
+        if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
+            m_chats[index].peerIdB64u = keys.first();
+        if (m_db) m_db->saveContact(m_chats[index]);
+        rebuildChatList();
+        // Update the chat header if this contact is currently open
+        if (m_currentChat == index) {
+            m_ui->chatTitleLabel->setText(name);
+            m_ui->chatAvatarLabel->setText(QString(name[0]).toUpper());
         }
+
+    } else if (result == ContactEditorResult::Removed) {
+        // Delete from the database and remove from the in-memory list
+        if (m_db) m_db->deleteContact(m_chats[index].peerIdB64u);
+        m_chats.remove(index);
+        m_unread.remove(index);
+        m_currentChat = -1;
+        rebuildChatList();
+        if (!m_chats.isEmpty())
+            m_ui->chatList->setCurrentRow(0);
+
+    } else if (result == ContactEditorResult::Blocked) {
+        // Mark as blocked — incoming messages from this contact will be dropped
+        m_chats[index].isBlocked = true;
+        if (m_db) m_db->saveContact(m_chats[index]);
+        rebuildChatList();
     }
 }
 
@@ -484,7 +548,8 @@ void ChatView::onAddContact()
 {
     QString name;
     QStringList keys;
-    if (openContactEditor(m_ui->centralwidget, "Add Contact / Group", name, keys)) {
+    if (openContactEditor(m_ui->centralwidget, "Add Contact / Group", name, keys, false)
+        == ContactEditorResult::Saved) {
         if (!name.isEmpty()) {
             ChatData newChat;
             newChat.name       = name;

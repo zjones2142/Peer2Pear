@@ -69,6 +69,7 @@ void DatabaseManager::createTables()
     // ── ORDER: if this is an existing DB that predates last_active, add the
     //    column safely — ALTER TABLE ignores errors if it already exists
     q.exec("ALTER TABLE contacts ADD COLUMN last_active INTEGER DEFAULT 0;");
+    q.exec("ALTER TABLE contacts ADD COLUMN is_blocked INTEGER DEFAULT 0;");
     // (the error from "duplicate column" is harmless — we just swallow it)
 
     q.exec(
@@ -100,7 +101,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
     // ── ORDER: sort by last_active descending so the most recently
     //    active chat is at the top — exactly as the user left it
     q.prepare(
-        "SELECT peer_id, name, subtitle, keys"
+        "SELECT peer_id, name, subtitle, keys, is_blocked"
         " FROM contacts"
         " ORDER BY last_active DESC, rowid ASC;"
         );
@@ -116,6 +117,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
         chat.peerIdB64u = storedKey.startsWith("name:") ? QString() : storedKey;
         chat.name       = q.value(1).toString();
         chat.subtitle   = q.value(2).toString();
+        chat.isBlocked = q.value(4).toInt() == 1;
 
         const QString keysStr = q.value(3).toString();
         if (!keysStr.isEmpty())
@@ -138,19 +140,22 @@ void DatabaseManager::saveContact(const ChatData &chat)
     // INSERT OR REPLACE does a DELETE + INSERT which fires ON DELETE CASCADE
     // and wipes all messages for that contact. The upsert form updates the
     // existing row in-place so messages are always preserved.
-    q.prepare(
-        "INSERT INTO contacts (peer_id, name, subtitle, keys, last_active)"
-        " VALUES (:peer_id, :name, :subtitle, :keys, 0)"
+q.prepare(
+        "INSERT INTO contacts (peer_id, name, subtitle, keys, is_blocked, last_active)"
+        " VALUES (:peer_id, :name, :subtitle, :keys, :is_blocked, 0)"
         " ON CONFLICT(peer_id) DO UPDATE SET"
-        "   name        = excluded.name,"
-        "   subtitle    = excluded.subtitle,"
-        "   keys        = excluded.keys;"
+        "   name       = excluded.name,"
+        "   subtitle   = excluded.subtitle,"
+        "   keys       = excluded.keys,"
+        "   is_blocked = excluded.is_blocked;"
+
         // last_active is intentionally NOT updated here — only saveMessage touches it
         );
     q.bindValue(":peer_id",  key);
     q.bindValue(":name",     chat.name);
     q.bindValue(":subtitle", chat.subtitle);
     q.bindValue(":keys",     chat.keys.join('|'));
+    q.bindValue(":is_blocked", chat.isBlocked ? 1 : 0);
 
     if (!q.exec())
         qWarning() << "saveContact error:" << q.lastError().text();

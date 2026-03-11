@@ -19,4 +19,5 @@ struct ChatData {
     QString     peerIdB64u;
     QStringList keys;
     QVector<Message> messages;
+    bool isBlocked = false;
 };
