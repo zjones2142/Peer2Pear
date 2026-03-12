@@ -400,7 +400,7 @@ void ChatView::onSendMessage()
 
     for (const QString &key : m_chats[m_currentChat].keys) {
         if (!key.trimmed().isEmpty())
-            m_controller->sendTextViaMailbox(key.trimmed(), text);
+            m_controller->sendText(key.trimmed(), text);
     }
 }
 

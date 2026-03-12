@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ChatController.hpp"
 #include <QObject>
 #include <QVector>
 #include <QPair>
@@ -9,7 +10,6 @@
 #include <functional>
 #include <QLabel>
 
-#include "ChatController.hpp"
 #include "ChatNotifier.h"
 #include "chattypes.h"
 #include "databasemanager.h"
