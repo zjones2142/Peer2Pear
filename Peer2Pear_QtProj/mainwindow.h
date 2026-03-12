@@ -1,5 +1,5 @@
 #pragma once
-
+#include "ChatController.hpp"
 #include <QMainWindow>
 
 #include <QResizeEvent>
@@ -8,7 +8,6 @@
 class QListWidgetItem;
 class QStackedWidget;
 
-#include "ChatController.hpp"
 #include "settingspanel.h"
 #include "chatview.h"
 #include "ChatNotifier.h"
