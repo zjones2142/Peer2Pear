@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QDateTime>
 #include <QTimeZone>
+#include <QJsonArray>
 
 ChatController::ChatController(QObject* parent)
     : QObject(parent),
@@ -17,7 +18,7 @@ ChatController::ChatController(QObject* parent)
     connect(&m_mbox, &MailboxClient::envelopeReceived, this, &ChatController::onEnvelope);
     connect(&m_pollTimer, &QTimer::timeout, this, &ChatController::pollOnce);
 }
-
+// Public
 void ChatController::setPassphrase(const QString& pass)
 {
     // CryptoEngine::ensureIdentity() should be strict and may throw.
@@ -119,16 +120,55 @@ void ChatController::stopPolling()
     m_pollTimer.stop();
 }
 
+void ChatController::setSelfKeys(const QStringList& keys) {
+    m_selfKeys = keys;
+}
+
+void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
+                                                const QString& groupName,
+                                                const QStringList& memberPeerIds,
+                                                const QString& text)
+{
+    const QString myId = myIdB64u();
+    const qint64 ts = QDateTime::currentSecsSinceEpoch();
+
+    // Build member key list once — included in every message so receivers discover each other
+    QJsonArray membersArray;
+    for (const QString &key : memberPeerIds)
+        membersArray.append(key);
+
+    for (const QString& peerId : memberPeerIds) {
+        if (peerId.trimmed().isEmpty()) continue;
+        if (peerId.trimmed() == myId) continue; // don't send to yourself
+
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
+        QJsonObject payload;
+        payload["from"]      = myId;
+        payload["type"]      = "group_msg";
+        payload["groupId"]   = groupId;
+        payload["groupName"] = groupName;
+        payload["members"]   = membersArray;
+        payload["text"]      = text;
+        payload["ts"]        = ts;
+
+        const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
+        const QByteArray env = QByteArray("FROM:") + myId.toUtf8() + "\n" + ct;
+
+        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+    }
+}
+
+// Private
 void ChatController::pollOnce() {
     m_mbox.fetch(myIdB64u());
     for (const QString &key : m_selfKeys) {
         if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u())
             m_mbox.fetch(key.trimmed());
     }
-}
-
-void ChatController::setSelfKeys(const QStringList& keys) {
-    m_selfKeys = keys;
 }
 
 void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
@@ -186,5 +226,25 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
         if (m_p2pConnections.contains(fromId)) {
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
         }
+    }
+    else if (o.value("type").toString() == "group_msg") {
+        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        const QDateTime ts = tsSecs > 0
+                                 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
+                                 : QDateTime::currentDateTime();
+
+
+        // Parse member keys from payload so receiver can discover all group members
+        QStringList memberKeys;
+        for (const QJsonValue &v : o.value("members").toArray())
+            memberKeys << v.toString();
+        emit groupMessageReceived(
+            fromId,
+            o.value("groupId").toString(),
+            o.value("groupName").toString(),
+            memberKeys,
+            o.value("text").toString(),
+            ts
+            );
     }
 }

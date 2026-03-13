@@ -45,6 +45,13 @@ public slots:
     // Wired to ChatController signals by MainWindow
     void onIncomingMessage(const QString &fromPeerIdB64u, const QString &text, const QDateTime &timestamp);
     void onStatus(const QString &s);
+    // Handle Group message with mailbox
+    void onIncomingGroupMessage(const QString &fromPeerIdB64u,
+                                const QString &groupId,
+                                const QString &groupName,
+                                const QStringList &memberKeys,
+                                const QString &text,
+                                const QDateTime &ts);
 
 signals:
     // NEW: emitted whenever unread counts change (for dot + badge)

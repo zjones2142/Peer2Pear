@@ -29,9 +29,22 @@ public:
     // How the app knows which keys are yours
     void setSelfKeys(const QStringList& keys);
 
+    // Send messages in groupchats
+    void sendGroupMessageViaMailbox(const QString& groupId,
+                                    const QString& groupName,
+                                    const QStringList& memberPeerIds,
+                                    const QString& text);
+
 signals:
     void status(const QString& s);
     void messageReceived(const QString& fromPeerIdB64u, const QString& text, const QDateTime& timestamp);
+    // Signals for groupchats
+    void groupMessageReceived(const QString& fromPeerIdB64u,
+                              const QString& groupId,
+                              const QString& groupName,
+                              const QStringList& memberKeys,
+                              const QString& text,
+                              const QDateTime& ts);
 
 private slots:
     void pollOnce();

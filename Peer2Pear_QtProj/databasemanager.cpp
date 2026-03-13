@@ -69,7 +69,10 @@ void DatabaseManager::createTables()
     // ── ORDER: if this is an existing DB that predates last_active, add the
     //    column safely — ALTER TABLE ignores errors if it already exists
     q.exec("ALTER TABLE contacts ADD COLUMN last_active INTEGER DEFAULT 0;");
-    // (the error from "duplicate column" is harmless — we just swallow it)
+    // Safely add new columns to existing databases — duplicate column errors are harmless
+    q.exec("ALTER TABLE contacts ADD COLUMN is_blocked INTEGER DEFAULT 0;");
+    q.exec("ALTER TABLE contacts ADD COLUMN is_group   INTEGER DEFAULT 0;"); // true if this is a group chat
+    q.exec("ALTER TABLE contacts ADD COLUMN group_id   TEXT    DEFAULT '';"); // stable UUID for group routing
 
     q.exec(
         "CREATE TABLE IF NOT EXISTS messages ("
@@ -100,7 +103,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
     // ── ORDER: sort by last_active descending so the most recently
     //    active chat is at the top — exactly as the user left it
     q.prepare(
-        "SELECT peer_id, name, subtitle, keys"
+        "SELECT peer_id, name, subtitle, keys, is_blocked, is_group, group_id"
         " FROM contacts"
         " ORDER BY last_active DESC, rowid ASC;"
         );
@@ -116,6 +119,9 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
         chat.peerIdB64u = storedKey.startsWith("name:") ? QString() : storedKey;
         chat.name       = q.value(1).toString();
         chat.subtitle   = q.value(2).toString();
+        chat.isBlocked = q.value(4).toInt() == 1;  // restore blocked state
+        chat.isGroup   = q.value(5).toInt() == 1;  // restore group flag
+        chat.groupId   = q.value(6).toString();    // restore group UUID for routing incoming messages
 
         const QString keysStr = q.value(3).toString();
         if (!keysStr.isEmpty())
@@ -139,18 +145,26 @@ void DatabaseManager::saveContact(const ChatData &chat)
     // and wipes all messages for that contact. The upsert form updates the
     // existing row in-place so messages are always preserved.
     q.prepare(
-        "INSERT INTO contacts (peer_id, name, subtitle, keys, last_active)"
-        " VALUES (:peer_id, :name, :subtitle, :keys, 0)"
+        // Use upsert to avoid DELETE + INSERT which would cascade-delete all messages
+        "INSERT INTO contacts (peer_id, name, subtitle, keys, is_blocked, is_group, group_id, last_active)"
+        " VALUES (:peer_id, :name, :subtitle, :keys, :is_blocked, :is_group, :group_id, 0)"
         " ON CONFLICT(peer_id) DO UPDATE SET"
-        "   name        = excluded.name,"
-        "   subtitle    = excluded.subtitle,"
-        "   keys        = excluded.keys;"
-        // last_active is intentionally NOT updated here — only saveMessage touches it
+        "   name       = excluded.name,"
+        "   subtitle   = excluded.subtitle,"
+        "   keys       = excluded.keys,"
+        "   is_blocked = excluded.is_blocked,"
+        "   is_group   = excluded.is_group,"
+        "   group_id   = excluded.group_id;"
+        // last_active is intentionally not updated here — only saveMessage touches it
         );
     q.bindValue(":peer_id",  key);
     q.bindValue(":name",     chat.name);
     q.bindValue(":subtitle", chat.subtitle);
     q.bindValue(":keys",     chat.keys.join('|'));
+    q.bindValue(":is_blocked", chat.isBlocked ? 1 : 0);
+    q.bindValue(":is_group",  chat.isGroup ? 1 : 0);  // persist group flag
+    q.bindValue(":group_id",  chat.groupId);           // persist group UUID for message routing
+
 
     if (!q.exec())
         qWarning() << "saveContact error:" << q.lastError().text();
