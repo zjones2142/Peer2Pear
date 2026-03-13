@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Force the vcpkg toolchain using CMake's native forward-slash paths
+# This must come BEFORE the project() command.
+set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
+
 project(Peer2Pear_QtProj VERSION 0.1 LANGUAGES CXX)
 
 set(CMAKE_AUTOUIC ON)
@@ -13,37 +17,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Sql)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network Sql)
 
-# --- 2. Handle libsodium (Find System OR Fetch) ---
+# --- 2. Find vcpkg Dependencies ---
+# libsodium uses an unofficial wrapper name in vcpkg
+find_package(unofficial-sodium CONFIG REQUIRED)
 
-# Find headers
-find_path(SODIUM_INCLUDE_DIR sodium.h
-    PATHS /opt/homebrew/include /usr/local/include /usr/include
-)
-
-# Find library
-find_library(SODIUM_LIB sodium
-    PATHS /opt/homebrew/lib /usr/local/lib /usr/lib
-)
-
-if (SODIUM_LIB AND SODIUM_INCLUDE_DIR)
-    message(STATUS "Found system libsodium: ${SODIUM_LIB}")
-    message(STATUS "Found libsodium headers: ${SODIUM_INCLUDE_DIR}")
-    set(SODIUM_LINK_TARGET ${SODIUM_LIB})
-    set(SODIUM_INCLUDE_TARGET ${SODIUM_INCLUDE_DIR})
-else()
-    message(STATUS "System libsodium not found. Fetching via community CMake wrapper...")
-    include(FetchContent)
-    FetchContent_Declare(
-      libsodium_fetched
-      GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
-      GIT_TAG        master
-    )
-    FetchContent_MakeAvailable(libsodium_fetched)
-
-    # Wrapper creates target named 'sodium'
-    set(SODIUM_LINK_TARGET sodium)
-    set(SODIUM_INCLUDE_TARGET "") # not needed if wrapper exports include dirs
-endif()
+# libnice and glib use pkg-config instead of standard CMake configs
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
+pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0 gobject-2.0 gio-2.0)
 
 # --- 3. Define Project Sources (Unified List) ---
 set(PROJECT_SOURCES
@@ -72,6 +53,8 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         ChatNotifier.h
         databasemanager.h databasemanager.cpp
         chattypes.h
+        NiceConnection.hpp
+        NiceConnection.cpp
     )
 else()
     if(ANDROID)
@@ -86,12 +69,10 @@ target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
     Qt${QT_VERSION_MAJOR}::Sql
-    ${SODIUM_LINK_TARGET}
+    unofficial-sodium::sodium
+    PkgConfig::NICE
+    PkgConfig::GLIB
 )
-
-if (SODIUM_INCLUDE_TARGET)
-    target_include_directories(Peer2Pear_QtProj PRIVATE ${SODIUM_INCLUDE_TARGET})
-endif()
 
 # --- 6. Bundle and Platform Properties ---
 if(${QT_VERSION} VERSION_LESS 6.1.0)

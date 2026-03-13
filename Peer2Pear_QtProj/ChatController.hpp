@@ -1,10 +1,13 @@
 #pragma once
+
+#include "NiceConnection.hpp"
 #include <QObject>
 #include <QTimer>
 
 #include "CryptoEngine.hpp"
 #include "MailboxClient.hpp"
 #include "RendezvousClient.hpp"
+
 
 class ChatController : public QObject {
     Q_OBJECT
@@ -17,7 +20,7 @@ public:
     QString myIdB64u() const;
 
     // Send encrypted text to peer via mailbox
-    void sendTextViaMailbox(const QString& peerIdB64u, const QString& text);
+    void sendText(const QString& peerIdB64u, const QString& text);
 
     // Start periodic mailbox fetch
     void startPolling(int intervalMs = 2000);
@@ -46,12 +49,18 @@ signals:
 private slots:
     void pollOnce();
     void onEnvelope(const QByteArray& body, const QString& envId);
+    void onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data);
 
 private:
+    void sendSignalingMessage(const QString& peerIdB64u, const QJsonObject& payload); // NEW
+    void initiateP2PConnection(const QString& peerIdB64u); // NEW
+
     CryptoEngine m_crypto;
     RendezvousClient m_rvz;
     MailboxClient m_mbox;
 
     QTimer m_pollTimer;
     QStringList m_selfKeys;
+
+    QMap<QString, NiceConnection*> m_p2pConnections;
 };
