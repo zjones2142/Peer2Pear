@@ -33,6 +33,14 @@ set(PROJECT_SOURCES
     mainwindow.h
     mainwindow.ui
     resources.qrc
+    chattypes.h
+    chatview.h
+    chatview.cpp
+    settingspanel.h
+    settingspanel.cpp
+    databasemanager.cpp
+    databasemanager.h
+    ChatNotifier.h
     ChatController.cpp
     ChatController.hpp
     CryptoEngine.cpp
@@ -41,6 +49,8 @@ set(PROJECT_SOURCES
     MailboxClient.hpp
     RendezvousClient.cpp
     RendezvousClient.hpp
+    NiceConnection.cpp
+    NiceConnection.hpp
 )
 
 # --- 4. Create Executable ---
