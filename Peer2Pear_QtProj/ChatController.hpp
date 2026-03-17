@@ -34,6 +34,9 @@ public:
                                     const QString& groupName,
                                     const QStringList& memberPeerIds,
                                     const QString& text);
+    void sendGroupLeaveNotification(const QString& groupId,
+                                    const QString& groupName,
+                                    const QStringList& memberPeerIds);
 
 signals:
     void status(const QString& s);
@@ -45,6 +48,11 @@ signals:
                               const QStringList& memberKeys,
                               const QString& text,
                               const QDateTime& ts);
+    void groupMemberLeft(const QString& fromPeerIdB64u,
+                         const QString& groupId,
+                         const QString& groupName,
+                         const QStringList& memberKeys,
+                         const QDateTime& ts);
 
 private slots:
     void pollOnce();

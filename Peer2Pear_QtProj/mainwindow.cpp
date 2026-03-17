@@ -104,6 +104,8 @@ MainWindow::MainWindow(QWidget *parent)
             m_chatView,    &ChatView::onStatus);
     connect(&m_controller, &ChatController::groupMessageReceived,
             m_chatView,    &ChatView::onIncomingGroupMessage);
+    connect(&m_controller, &ChatController::groupMemberLeft,
+            m_chatView,    &ChatView::onGroupMemberLeft);
 
     // ── Create notifier and hand it to ChatView ───────────────────────────────
     m_notifier = new ChatNotifier(this);

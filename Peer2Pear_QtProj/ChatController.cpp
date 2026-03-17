@@ -162,6 +162,41 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
     }
 }
 
+void ChatController::sendGroupLeaveNotification(const QString& groupId,
+                                                const QString& groupName,
+                                                const QStringList& memberPeerIds)
+{
+    const QString myId = myIdB64u();
+    const qint64 ts = QDateTime::currentSecsSinceEpoch();
+
+    // Include member list so receivers can update their local group member list
+    QJsonArray membersArray;
+    for (const QString &key : memberPeerIds)
+        membersArray.append(key);
+
+    for (const QString& peerId : memberPeerIds) {
+        if (peerId.trimmed().isEmpty()) continue;
+        if (peerId.trimmed() == myId) continue;
+
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
+        QJsonObject payload;
+        payload["from"]      = myId;
+        payload["type"]      = "group_leave";
+        payload["groupId"]   = groupId;
+        payload["groupName"] = groupName;
+        payload["members"]   = membersArray;
+        payload["ts"]        = ts;
+
+        const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
+        const QByteArray env = QByteArray("FROM:") + myId.toUtf8() + "\n" + ct;
+
+        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+    }
+}
 // Private
 void ChatController::pollOnce() {
     m_mbox.fetch(myIdB64u());
@@ -244,6 +279,23 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
             o.value("groupName").toString(),
             memberKeys,
             o.value("text").toString(),
+            ts
+            );
+    } else if (o.value("type").toString() == "group_leave") {
+        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        const QDateTime ts = tsSecs > 0
+                                 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
+                                 : QDateTime::currentDateTime();
+
+        QStringList memberKeys;
+        for (const QJsonValue &v : o.value("members").toArray())
+            memberKeys << v.toString();
+
+        emit groupMemberLeft(
+            fromId,
+            o.value("groupId").toString(),
+            o.value("groupName").toString(),
+            memberKeys,
             ts
             );
     }

@@ -487,7 +487,53 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         if (m_notifier) m_notifier->notify(chat.name, text);
     }
 }
+void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
+                                 const QString& groupId,
+                                 const QString& groupName,
+                                 const QStringList& memberKeys,
+                                 const QDateTime& ts)
+{
+    // Find the group
+    int targetIndex = -1;
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].isGroup && m_chats[i].groupId == groupId) {
+            targetIndex = i;
+            break;
+        }
+    }
+    if (targetIndex == -1) return;
 
+    ChatData &chat = m_chats[targetIndex];
+
+    // Remove the leaver's key from our local group member list
+    chat.keys.removeAll(fromPeerIdB64u);
+    if (m_db) m_db->saveContact(chat);
+
+    // Find a display name for the leaver
+    QString leaverName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
+    for (const ChatData &c : m_chats) {
+        if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
+            leaverName = c.name;
+            break;
+        }
+    }
+
+    // Show system message like Snapchat
+    const QString systemText = leaverName + " left the group";
+    Message systemMsg{ false, systemText, ts };
+    chat.messages.append(systemMsg);
+    if (m_db) m_db->saveMessage(
+            chat.groupId.isEmpty() ? "name:" + chat.name : chat.groupId, systemMsg);
+
+    if (targetIndex == m_currentChat) {
+        addMessageBubble(systemText, false);
+        rebuildChatList();
+    } else {
+        m_unread[targetIndex] += 1;
+        emit unreadChanged(totalUnread());
+        rebuildChatList();
+    }
+}
 // ── Private slots ─────────────────────────────────────────────────────────────
 
 void ChatView::onChatSelected(int index)
@@ -665,29 +711,26 @@ void ChatView::onEditContact(int index)
         rebuildChatList();
 
     } else if (result == ContactEditorResult::Left) {
-    // Remove our own key from the group's key list
-    const QString myKey = m_controller->myIdB64u();
-    m_chats[index].keys.removeAll(myKey);
+        // Notify all members you're leaving
+        const QString groupId = m_chats[index].groupId;
+        m_controller->sendGroupLeaveNotification(
+            groupId,
+            m_chats[index].name,
+            m_chats[index].keys
+            );
 
-    // Also remove all self-device keys
-    for (const QString &selfKey : m_profileKeys)
-        m_chats[index].keys.removeAll(selfKey);
-
-    // Save updated key list — we stay in the group locally but won't send/receive
-    if (m_db) m_db->saveContact(m_chats[index]);
-
-    // Optionally remove the group from the sidebar entirely
-    const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
-                              ? "name:" + m_chats[index].name
-                              : m_chats[index].peerIdB64u;
-    if (m_db) m_db->deleteContact(dbKey);
-    m_chats.remove(index);
-    m_unread.remove(index);
-    m_currentChat = -1;
-    rebuildChatList();
-    if (!m_chats.isEmpty())
-        m_ui->chatList->setCurrentRow(0);
-}
+        // Remove group locally
+        const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
+                                  ? "name:" + m_chats[index].name
+                                  : m_chats[index].peerIdB64u;
+        if (m_db) m_db->deleteContact(dbKey);
+        m_chats.remove(index);
+        m_unread.remove(index);
+        m_currentChat = -1;
+        rebuildChatList();
+        if (!m_chats.isEmpty())
+            m_ui->chatList->setCurrentRow(0);
+    }
 }
 
 void ChatView::onAddContact()

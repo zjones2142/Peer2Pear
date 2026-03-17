@@ -52,6 +52,11 @@ public slots:
                                 const QStringList &memberKeys,
                                 const QString &text,
                                 const QDateTime &ts);
+    void onGroupMemberLeft(const QString& fromPeerIdB64u,
+                           const QString& groupId,
+                           const QString& groupName,
+                           const QStringList& memberKeys,
+                           const QDateTime& ts);
 
 signals:
     // NEW: emitted whenever unread counts change (for dot + badge)
