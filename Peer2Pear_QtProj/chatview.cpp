@@ -105,13 +105,14 @@ static const char *kDialogStyle =
 
 // Opens a modal dialog to edit a contact name + list of public keys.
 // nameInOut and keysInOut are updated on Save; returns false on Cancel.
-enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed };
+enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed, Left };
 static ContactEditorResult openContactEditor(QWidget *parent,
                                              const QString &title,
                                              QString &nameInOut,
                                              QStringList &keysInOut,
                                              bool showDestructiveActions = true,
-                                             bool isBlocked = false)
+                                             bool isBlocked = false,
+                                             bool isGroup = false)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -193,29 +194,51 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         root->addWidget(actionSep);
 
         auto *actionRow  = new QHBoxLayout;
-        auto *blockBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
-        auto *removeBtn  = new QPushButton("Remove Contact", &dlg);
+        auto *removeBtn = new QPushButton(isGroup ? "Delete Group" : "Remove Contact", &dlg);
         const QString destructiveStyle =
             "QPushButton { background-color: #2e1a1a; color: #cc5555;"
             "  border: 1px solid #5e2e2e; border-radius: 8px; padding: 8px 16px; }"
             "QPushButton:hover { background-color: #3a2020; }";
-        blockBtn->setStyleSheet(destructiveStyle);
         removeBtn->setStyleSheet(destructiveStyle);
-        actionRow->addWidget(blockBtn);
+
+        // Block button only shown for regular contacts, not groups
+        if (!isGroup) {
+            auto *blockBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
+            blockBtn->setStyleSheet(destructiveStyle);
+            actionRow->addWidget(blockBtn);
+
+            QObject::connect(blockBtn, &QPushButton::clicked, [&]() {
+                const QString msg = isBlocked
+                                        ? "Unblock this contact?"
+                                        : "Block this contact? They won't be able to send you messages.";
+                if (QMessageBox::question(&dlg, isBlocked ? "Unblock Contact" : "Block Contact",
+                                          msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                    result = ContactEditorResult::Blocked;
+                    dlg.accept();
+                }
+            });
+        }
+
+        // Leave button only shown for groups
+        if (isGroup) {
+            auto *leaveBtn = new QPushButton("Leave Group", &dlg);
+            leaveBtn->setStyleSheet(destructiveStyle);
+            actionRow->addWidget(leaveBtn);
+
+            QObject::connect(leaveBtn, &QPushButton::clicked, [&]() {
+                if (QMessageBox::question(&dlg, "Leave Group",
+                                          "Leave this group? You will stop receiving messages.",
+                                          QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                    result = ContactEditorResult::Left;
+                    dlg.accept();
+                }
+            });
+        }
+
         actionRow->addWidget(removeBtn);
         actionRow->addStretch();
         root->addLayout(actionRow);
 
-        QObject::connect(blockBtn, &QPushButton::clicked, [&]() {
-            const QString msg = isBlocked
-                                    ? "Unblock this contact?"
-                                    : "Block this contact? They won't be able to send you messages.";
-            if (QMessageBox::question(&dlg, isBlocked ? "Unblock Contact" : "Block Contact",
-                                      msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-                result = ContactEditorResult::Blocked; // reuse same result, toggle handled in onEditContact
-                dlg.accept();
-            }
-        });
         QObject::connect(removeBtn, &QPushButton::clicked, [&]() {
             if (QMessageBox::question(&dlg, "Remove Contact",
                                       "Remove this contact? This cannot be undone.",
@@ -603,8 +626,11 @@ void ChatView::onEditContact(int index)
     QStringList keys = m_chats[index].keys;
 
     const ContactEditorResult result =
-        openContactEditor(m_ui->centralwidget, "Edit Contact", name, keys, true,
-                          m_chats[index].isBlocked);
+        openContactEditor(m_ui->centralwidget,
+                          m_chats[index].isGroup ? "Edit Group" : "Edit Contact",
+                          name, keys, true,
+                          m_chats[index].isBlocked,
+                          m_chats[index].isGroup);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
         // Update the contact and save to the database
@@ -621,8 +647,11 @@ void ChatView::onEditContact(int index)
         }
 
     } else if (result == ContactEditorResult::Removed) {
-        // Delete from the database and remove from the in-memory list
-        if (m_db) m_db->deleteContact(m_chats[index].peerIdB64u);
+        // Use the same key logic as saveContact
+        const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
+                                  ? "name:" + m_chats[index].name
+                                  : m_chats[index].peerIdB64u;
+        if (m_db) m_db->deleteContact(dbKey);
         m_chats.remove(index);
         m_unread.remove(index);
         m_currentChat = -1;
@@ -634,7 +663,31 @@ void ChatView::onEditContact(int index)
         m_chats[index].isBlocked = !m_chats[index].isBlocked; // toggle block/unblock
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
-    }
+
+    } else if (result == ContactEditorResult::Left) {
+    // Remove our own key from the group's key list
+    const QString myKey = m_controller->myIdB64u();
+    m_chats[index].keys.removeAll(myKey);
+
+    // Also remove all self-device keys
+    for (const QString &selfKey : m_profileKeys)
+        m_chats[index].keys.removeAll(selfKey);
+
+    // Save updated key list — we stay in the group locally but won't send/receive
+    if (m_db) m_db->saveContact(m_chats[index]);
+
+    // Optionally remove the group from the sidebar entirely
+    const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
+                              ? "name:" + m_chats[index].name
+                              : m_chats[index].peerIdB64u;
+    if (m_db) m_db->deleteContact(dbKey);
+    m_chats.remove(index);
+    m_unread.remove(index);
+    m_currentChat = -1;
+    rebuildChatList();
+    if (!m_chats.isEmpty())
+        m_ui->chatList->setCurrentRow(0);
+}
 }
 
 void ChatView::onAddContact()
