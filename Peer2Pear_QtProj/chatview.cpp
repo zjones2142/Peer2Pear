@@ -113,7 +113,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                                              bool showDestructiveActions = true,
                                              bool isBlocked = false,
                                              bool isGroup = false,
-                                             const QVector<ChatData> *allContacts = nullptr)
+                                             const QVector<ChatData> *allContacts = nullptr,
+                                             std::function<void(const ChatData&)> onNewContact = nullptr)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -185,23 +186,39 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                 box.addButton("Cancel", QMessageBox::RejectRole);
                 box.exec();
                 if (box.clickedButton() == addBtn) {
-                    // Pre-populate the add contact dialog with their key
+                    // Pre-populate with their key already filled in
                     QString newName;
                     QStringList newKeys = { key };
                     if (openContactEditor(parent, "Add Contact", newName, newKeys, false)
-                            == ContactEditorResult::Saved && !newName.isEmpty() && allContacts) {
-                        // Update the item display name now that they're named
+                            == ContactEditorResult::Saved && !newName.isEmpty()) {
+                        // Update display name in member list
                         item->setText(newName);
+                        // Save via callback
+                        if (onNewContact) {
+                            ChatData newContact;
+                            newContact.name       = newName;
+                            newContact.subtitle   = "Secure chat";
+                            newContact.keys       = newKeys;
+                            newContact.peerIdB64u = newKeys.isEmpty() ? QString() : newKeys.first();
+                            onNewContact(newContact);
+                        }
                     }
                 }
             } else {
-                // Known contact — just show their name
-                QMessageBox box(&dlg);
-                box.setWindowTitle(name);
-                box.setText(name);
-                box.setStyleSheet(kDialogStyle);
-                box.addButton("OK", QMessageBox::AcceptRole);
-                box.exec();
+                // Known contact — open their contact editor
+                if (allContacts) {
+                    for (const ChatData &c : *allContacts) {
+                        if (!c.isGroup && c.keys.contains(key)) {
+                            QString contactName = c.name;
+                            QStringList contactKeys = c.keys;
+                            openContactEditor(parent, "Edit Contact", contactName, contactKeys,
+                                              false); // no destructive actions from inside group editor
+                            // Update display name in case they were renamed
+                            item->setText(contactName);
+                            break;
+                        }
+                    }
+                }
             }
         });
 
@@ -815,7 +832,13 @@ void ChatView::onEditContact(int index)
                           name, keys, true,
                           m_chats[index].isBlocked,
                           m_chats[index].isGroup,
-                          &m_chats); // pass all contacts for name lookup
+                          &m_chats,
+                          [this](const ChatData &newContact) {
+                              // Save new contact discovered from group member list
+                              m_chats.append(newContact);
+                              if (m_db) m_db->saveContact(newContact);
+                              rebuildChatList();
+                          });
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
         // Update the contact and save to the database
