@@ -609,8 +609,11 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     // Merge any new member keys we didn't know about before
     // This is how members discover each other without manual key exchange
     bool keysUpdated = false;
+    const QString myKey = m_controller->myIdB64u();
     for (const QString &key : memberKeys) {
         if (key.trimmed().isEmpty()) continue;
+        if (key.trimmed() == myKey) continue; // don't add own key to group member list
+        if (m_profileKeys.contains(key.trimmed())) continue; // Also skip any of our self-device keys
         if (!chat.keys.contains(key)) {
             chat.keys << key;
             keysUpdated = true;

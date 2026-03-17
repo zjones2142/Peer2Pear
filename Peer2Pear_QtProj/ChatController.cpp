@@ -134,9 +134,10 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
 
     // Build member key list once — included in every message so receivers discover each other
     QJsonArray membersArray;
-    for (const QString &key : memberPeerIds)
+    for (const QString &key : memberPeerIds) {
+        if (key.trimmed() == myId) continue; // don't include yourself in member list
         membersArray.append(key);
-
+    }
     for (const QString& peerId : memberPeerIds) {
         if (peerId.trimmed().isEmpty()) continue;
         if (peerId.trimmed() == myId) continue; // don't send to yourself
