@@ -1,145 +1,202 @@
 #include "ChatController.hpp"
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QDateTime>
 #include <QTimeZone>
-#include <QJsonArray>
+#include <QUuid>
+
+// ── Chunk size ────────────────────────────────────────────────────────────────
+// The server enforces MAX_ENVELOPE_BYTES = 256 KB (262 144 bytes).
+//
+// Per-envelope overhead budget:
+//   "FROMFC:<43-char-key>\n"          =  51 bytes  (header)
+//   4-byte big-endian metaLen field   =   4 bytes
+//   encMeta (JSON ~250 B + AEAD 40 B) = ~290 bytes
+//   encChunk AEAD overhead            =  40 bytes
+//   ─────────────────────────────────────────────
+//   Total fixed overhead              = ~385 bytes
+//
+// Max plaintext chunk = 262 144 - 385 = ~261 759 bytes.
+// We use 240 KB = 245 760 bytes for a comfortable margin.
+// An 8 MB file therefore travels in at most ceil(8192 / 240) = 35 chunks.
+static constexpr qint64 kChunkBytes   = 240LL * 1024;   // 245 760 bytes
+static constexpr qint64 kMaxFileBytes =   8LL * 1024 * 1024;
+
+// Envelope header prefixes
+static const QByteArray kMsgPrefix  = "FROM:";
+static const QByteArray kFilePrefix = "FROMFC:";
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+static QByteArray pack32(quint32 v)
+{
+    QByteArray b(4, 0);
+    b[0] = char((v >> 24) & 0xFF);
+    b[1] = char((v >> 16) & 0xFF);
+    b[2] = char((v >>  8) & 0xFF);
+    b[3] = char( v        & 0xFF);
+    return b;
+}
+
+static quint32 unpack32(const QByteArray &b, int offset = 0)
+{
+    return (quint8(b[offset])   << 24)
+    | (quint8(b[offset+1]) << 16)
+        | (quint8(b[offset+2]) <<  8)
+        |  quint8(b[offset+3]);
+}
+
+static QDateTime tsFromSecs(qint64 secs)
+{
+    return secs > 0
+               ? QDateTime::fromSecsSinceEpoch(secs, QTimeZone::utc()).toLocalTime()
+               : QDateTime::currentDateTime();
+}
+
+// ── ChatController ────────────────────────────────────────────────────────────
 
 ChatController::ChatController(QObject* parent)
-    : QObject(parent),
-    m_rvz(&m_crypto, this),
-    m_mbox(&m_crypto, this)
+    : QObject(parent)
+    , m_rvz(&m_crypto, this)
+    , m_mbox(&m_crypto, this)
 {
-    // IMPORTANT: Do not call ensureIdentity() here.
-    // Identity is unlocked/created after setPassphrase() is called.
-
-    connect(&m_mbox, &MailboxClient::status, this, &ChatController::status);
-    connect(&m_rvz,  &RendezvousClient::status, this, &ChatController::status);
+    connect(&m_mbox, &MailboxClient::status,           this, &ChatController::status);
+    connect(&m_rvz,  &RendezvousClient::status,        this, &ChatController::status);
     connect(&m_mbox, &MailboxClient::envelopeReceived, this, &ChatController::onEnvelope);
-    connect(&m_pollTimer, &QTimer::timeout, this, &ChatController::pollOnce);
+    connect(&m_pollTimer, &QTimer::timeout,            this, &ChatController::pollOnce);
+
+    // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
+    connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
+        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
+    });
+    m_rvzRefreshTimer.setInterval(9 * 60 * 1000);
 }
-// Public
+
 void ChatController::setPassphrase(const QString& pass)
 {
-    // CryptoEngine::ensureIdentity() should be strict and may throw.
     m_crypto.setPassphrase(pass);
     m_crypto.ensureIdentity();
 }
 
-void ChatController::setServerBaseUrl(const QUrl& base) {
+void ChatController::setServerBaseUrl(const QUrl& base)
+{
     m_rvz.setBaseUrl(base);
     m_mbox.setBaseUrl(base);
 }
 
-QString ChatController::myIdB64u() const {
+QString ChatController::myIdB64u() const
+{
     return CryptoEngine::toBase64Url(m_crypto.identityPub());
 }
 
-void ChatController::sendSignalingMessage(const QString& peerIdB64u, const QJsonObject& payload) {
-    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray key32 = m_crypto.deriveSharedKey32(peerPub);
-    if (key32.size() != 32) return;
-
-    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-    const QByteArray ct = m_crypto.aeadEncrypt(key32, pt);
-    const QByteArray env = QByteArray("FROM:") + myIdB64u().toUtf8() + "\n" + ct;
-
-    m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
-}
-
-void ChatController::initiateP2PConnection(const QString& peerIdB64u) {
-    if (m_p2pConnections.contains(peerIdB64u)) return;
-
-    NiceConnection* conn = new NiceConnection(this);
-    m_p2pConnections[peerIdB64u] = conn;
-
-    connect(conn, &NiceConnection::localSdpReady, this, [this, peerIdB64u](const QString& sdp) {
-        QJsonObject payload;
-        payload["type"] = "ice_offer";
-        payload["from"] = myIdB64u();
-        payload["sdp"] = sdp;
-        sendSignalingMessage(peerIdB64u, payload);
-    });
-
-    connect(conn, &NiceConnection::stateChanged, this, [this, peerIdB64u](int state) {
-        if (state == NICE_COMPONENT_STATE_READY) {
-            emit status("P2P Direct Connection Ready with " + peerIdB64u);
-        } else if (state == NICE_COMPONENT_STATE_FAILED) {
-            emit status("P2P Connection Failed for " + peerIdB64u);
-        }
-    });
-
-    connect(conn, &NiceConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& ct) {
-        onP2PDataReceived(peerIdB64u, ct);
-    });
-
-    emit status("Initiating direct P2P connection to " + peerIdB64u);
-    conn->initIce(true); // Offer side is controlling
-}
-
-void ChatController::sendText(const QString& peerIdB64u, const QString& text) {
+void ChatController::sendText(const QString& peerIdB64u, const QString& text)
+{
     QJsonObject payload;
-    payload["from"] = myIdB64u();
-    payload["type"] = "text";
-    payload["text"] = text;
-    payload["ts"]   = QDateTime::currentSecsSinceEpoch();
+    payload["from"]  = myIdB64u();
+    payload["type"]  = "text";
+    payload["text"]  = text;
+    payload["ts"]    = QDateTime::currentSecsSinceEpoch();
+    payload["msgId"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const QByteArray pt      = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray ct = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
+    const QByteArray ct      = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
 
     if (m_p2pConnections.contains(peerIdB64u) && m_p2pConnections[peerIdB64u]->isReady()) {
-        // Send directly over UDP/ICE
         m_p2pConnections[peerIdB64u]->sendData(ct);
     } else {
-        // Fallback to Mailbox and trigger a connection attempt for next time
         sendSignalingMessage(peerIdB64u, payload);
         initiateP2PConnection(peerIdB64u);
     }
 }
 
-void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& ct) {
-    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), ct);
-    if (pt.isEmpty()) return;
+QString ChatController::sendFile(const QString& peerIdB64u,
+                                 const QString& fileName,
+                                 const QByteArray& fileData)
+{
+    if (fileData.size() > kMaxFileBytes) {
+        emit status(QString("File too large (max %1 MB).")
+                        .arg(kMaxFileBytes / (1024 * 1024)));
+        return {};
+    }
 
-    const auto o = QJsonDocument::fromJson(pt).object();
-    if (o.value("type").toString() == "text") {
-        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
-        const QDateTime ts = tsSecs > 0 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime() : QDateTime::currentDateTime();
-        emit messageReceived(peerIdB64u, o.value("text").toString(), ts);
+    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+    if (key32.size() != 32) {
+        emit status("Cannot derive shared key for: " + peerIdB64u);
+        return {};
+    }
+
+    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const qint64  ts         = QDateTime::currentSecsSinceEpoch();
+    const qint64  fileSize   = fileData.size();
+    const int totalChunks    = int((fileSize + kChunkBytes - 1) / kChunkBytes);
+
+    for (int i = 0; i < totalChunks; ++i) {
+        const qint64     offset   = qint64(i) * kChunkBytes;
+        const QByteArray chunk    = fileData.mid(int(offset), int(kChunkBytes));
+
+        QJsonObject meta;
+        meta["from"]        = myIdB64u();
+        meta["type"]        = "file_chunk";
+        meta["transferId"]  = transferId;
+        meta["chunkIndex"]  = i;
+        meta["totalChunks"] = totalChunks;
+        meta["fileName"]    = fileName;
+        meta["fileSize"]    = fileSize;
+        meta["ts"]          = ts;
+
+        const QByteArray metaJson = QJsonDocument(meta).toJson(QJsonDocument::Compact);
+        const QByteArray encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
+        const QByteArray encChunk = m_crypto.aeadEncrypt(key32, chunk);
+
+        // Wire format: FROMFC:<senderId>\n<4-byte metaLen><encMeta><encChunk>
+        const QByteArray env = kFilePrefix + myIdB64u().toUtf8() + "\n"
+                               + pack32(quint32(encMeta.size()))
+                               + encMeta
+                               + encChunk;
+
+        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+    }
+
+    emit status(QString("'%1' queued in %2 chunk(s) → %3")
+                    .arg(fileName).arg(totalChunks).arg(peerIdB64u));
+    return transferId;
+}
+
+void ChatController::startPolling(int intervalMs)
+{
+    if (!m_pollTimer.isActive()) {
+        m_pollTimer.start(intervalMs);
+        // Publish our identity to the rendezvous server so peers can discover us.
+        // host="0.0.0.0" is a placeholder — the server records the request's source IP.
+        // TTL of 10 minutes; we refresh on every poll start.
+        m_rvz.publish("3.141.14.234", 0, 10LL * 60 * 1000);
+        m_rvzRefreshTimer.start();
+        // Immediately drain the mailbox on startup rather than waiting for first tick
+        pollOnce();
     }
 }
 
-void ChatController::startPolling(int intervalMs) {
-    if (!m_pollTimer.isActive()) m_pollTimer.start(intervalMs);
-}
+void ChatController::stopPolling() { m_pollTimer.stop(); }
 
-void ChatController::stopPolling()
-{
-    m_pollTimer.stop();
-}
-
-void ChatController::setSelfKeys(const QStringList& keys) {
-    m_selfKeys = keys;
-}
+void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
 
 void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
                                                 const QString& groupName,
                                                 const QStringList& memberPeerIds,
                                                 const QString& text)
 {
-    const QString myId = myIdB64u();
-    const qint64 ts = QDateTime::currentSecsSinceEpoch();
+    const QString myId  = myIdB64u();
+    const qint64  ts    = QDateTime::currentSecsSinceEpoch();
+    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    // Build member key list once — included in every message so receivers discover each other
     QJsonArray membersArray;
-    for (const QString &key : memberPeerIds)
-        membersArray.append(key);
+    for (const QString &key : memberPeerIds) membersArray.append(key);
 
     for (const QString& peerId : memberPeerIds) {
-        if (peerId.trimmed().isEmpty()) continue;
-        if (peerId.trimmed() == myId) continue; // don't send to yourself
+        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
 
         const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
         const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
@@ -153,98 +210,218 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         payload["members"]   = membersArray;
         payload["text"]      = text;
         payload["ts"]        = ts;
+        payload["msgId"]     = msgId;
 
         const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
-        const QByteArray env = QByteArray("FROM:") + myId.toUtf8() + "\n" + ct;
-
+        const QByteArray env = kMsgPrefix + myId.toUtf8() + "\n" + ct;
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
     }
 }
 
-// Private
-void ChatController::pollOnce() {
-    m_mbox.fetch(myIdB64u());
-    for (const QString &key : m_selfKeys) {
-        if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u())
-            m_mbox.fetch(key.trimmed());
+// ── Private ───────────────────────────────────────────────────────────────────
+
+bool ChatController::markSeen(const QString& id)
+{
+    if (m_seenIds.contains(id)) return false;
+    if (m_seenOrder.size() >= kSeenIdsCap) {
+        const int prune = kSeenIdsCap / 2;
+        for (int i = 0; i < prune; ++i) m_seenIds.remove(m_seenOrder[i]);
+        m_seenOrder.remove(0, prune);
     }
+    m_seenIds.insert(id);
+    m_seenOrder.append(id);
+    return true;
 }
 
-void ChatController::onEnvelope(const QByteArray& body, const QString& envId) {
-    Q_UNUSED(envId);
+void ChatController::pollOnce()
+{
+    // fetchAll retrieves every pending envelope in one authenticated request.
+    // Falls back to single fetch() automatically if the server doesn't yet
+    // support /mbox/fetch_all (404/405 response).
+    m_mbox.fetchAll(myIdB64u());
+    for (const QString &key : m_selfKeys)
+        if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u())
+            m_mbox.fetchAll(key.trimmed());
+}
 
-    const int nl = body.indexOf('\n');
-    if (nl <= 5) return;
+void ChatController::sendSignalingMessage(const QString& peerIdB64u,
+                                          const QJsonObject& payload)
+{
+    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+    if (key32.size() != 32) return;
 
-    const QByteArray header = body.left(nl);
-    if (!header.startsWith("FROM:")) return;
-    const QString fromId = QString::fromUtf8(header.mid(5)).trimmed();
+    const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
+    const QByteArray env = kMsgPrefix + myIdB64u().toUtf8() + "\n" + ct;
+    m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+}
 
-    const QByteArray ct = body.mid(nl + 1);
-    const QByteArray peerPub = CryptoEngine::fromBase64Url(fromId);
+void ChatController::initiateP2PConnection(const QString& peerIdB64u)
+{
+    if (m_p2pConnections.contains(peerIdB64u)) return;
+
+    NiceConnection* conn = new NiceConnection(this);
+    m_p2pConnections[peerIdB64u] = conn;
+
+    connect(conn, &NiceConnection::localSdpReady, this, [this, peerIdB64u](const QString& sdp) {
+        QJsonObject p; p["type"]="ice_offer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
+        sendSignalingMessage(peerIdB64u, p);
+    });
+    connect(conn, &NiceConnection::stateChanged, this, [this, peerIdB64u](int state) {
+        if      (state == NICE_COMPONENT_STATE_READY)  emit status("P2P ready with " + peerIdB64u);
+        else if (state == NICE_COMPONENT_STATE_FAILED) emit status("P2P failed for " + peerIdB64u);
+    });
+    connect(conn, &NiceConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& ct) {
+        onP2PDataReceived(peerIdB64u, ct);
+    });
+    conn->initIce(true);
+}
+
+void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& ct)
+{
+    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), ct);
-
     if (pt.isEmpty()) return;
 
     const auto o = QJsonDocument::fromJson(pt).object();
+    if (o.value("type").toString() != "text") return;
+
+    const QString msgId = o.value("msgId").toString();
+    if (!msgId.isEmpty() && !markSeen(msgId)) return;
+
+    emit messageReceived(peerIdB64u, o.value("text").toString(),
+                         tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
+}
+
+void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
+{
+    // NOTE: The server pops the envelope on fetch — ACK is a no-op kept only for
+    // forward compatibility.  We do NOT call ack here to avoid the extra HTTP round-trip.
+    Q_UNUSED(envId)
+
+    const int nl = body.indexOf('\n');
+    if (nl < 0) return;
+
+    const QByteArray header = body.left(nl);
+    const QByteArray rest   = body.mid(nl + 1);
+
+    // ── File chunk envelope ───────────────────────────────────────────────────
+    if (header.startsWith(kFilePrefix)) {
+        const QString fromId = QString::fromUtf8(header.mid(kFilePrefix.size())).trimmed();
+        if (rest.size() < 4) return;
+
+        const quint32 metaLen = unpack32(rest, 0);
+        if (rest.size() - 4 < int(metaLen)) return;
+
+        const QByteArray encMeta  = rest.mid(4, int(metaLen));
+        const QByteArray encChunk = rest.mid(4 + int(metaLen));
+
+        const QByteArray peerPub  = CryptoEngine::fromBase64Url(fromId);
+        const QByteArray key32    = m_crypto.deriveSharedKey32(peerPub);
+        const QByteArray metaJson = m_crypto.aeadDecrypt(key32, encMeta);
+        if (metaJson.isEmpty()) return;
+
+        const QJsonObject meta   = QJsonDocument::fromJson(metaJson).object();
+        const QString transferId = meta.value("transferId").toString();
+        const int chunkIndex     = meta.value("chunkIndex").toInt(-1);
+        const int totalChunks    = meta.value("totalChunks").toInt(0);
+        if (transferId.isEmpty() || chunkIndex < 0 || totalChunks <= 0) return;
+
+        // Per-chunk dedup: "<transferId>:<chunkIndex>"
+        if (!markSeen(transferId + ":" + QString::number(chunkIndex))) return;
+
+        const QByteArray chunkData = m_crypto.aeadDecrypt(key32, encChunk);
+        if (chunkData.isEmpty()) return;
+
+        // ── Reassembly ────────────────────────────────────────────────────────
+        IncomingTransfer &xfer = m_incomingTransfers[transferId];
+        if (xfer.totalChunks == 0) {
+            xfer.fromId      = fromId;
+            xfer.fileName    = meta.value("fileName").toString("file");
+            xfer.fileSize    = meta.value("fileSize").toVariant().toLongLong();
+            xfer.totalChunks = totalChunks;
+            xfer.ts          = tsFromSecs(meta.value("ts").toVariant().toLongLong());
+        }
+        xfer.chunks[chunkIndex] = chunkData;
+
+        const int received = xfer.chunks.size();
+
+        if (received < totalChunks) {
+            // Progress update only — no file data yet
+            emit fileChunkReceived(fromId, transferId, xfer.fileName,
+                                   xfer.fileSize, received, totalChunks,
+                                   QByteArray{}, xfer.ts);
+        } else {
+            // Reassemble in chunk order and free reassembly memory immediately
+            QByteArray assembled;
+            assembled.reserve(int(xfer.fileSize));
+            for (int i = 0; i < totalChunks; ++i)
+                assembled.append(xfer.chunks.value(i));
+
+            const IncomingTransfer completed = xfer;
+            m_incomingTransfers.remove(transferId);
+
+            emit fileChunkReceived(fromId, transferId, completed.fileName,
+                                   completed.fileSize, totalChunks, totalChunks,
+                                   assembled, completed.ts);
+        }
+        return;
+    }
+
+    // ── Message envelope ──────────────────────────────────────────────────────
+    if (!header.startsWith(kMsgPrefix)) return;
+
+    const QString fromId = QString::fromUtf8(header.mid(kMsgPrefix.size())).trimmed();
+    const QByteArray peerPub = CryptoEngine::fromBase64Url(fromId);
+    const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), rest);
+    if (pt.isEmpty()) return;
+
+    const auto    o    = QJsonDocument::fromJson(pt).object();
     const QString type = o.value("type").toString();
 
     if (type == "text") {
-        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
-        const QDateTime ts = tsSecs > 0 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime() : QDateTime::currentDateTime();
-        emit messageReceived(fromId, o.value("text").toString(), ts);
+        const QString msgId = o.value("msgId").toString();
+        if (!msgId.isEmpty() && !markSeen(msgId)) return;
+        emit messageReceived(fromId, o.value("text").toString(),
+                             tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
 
     } else if (type == "ice_offer") {
         if (!m_p2pConnections.contains(fromId)) {
             NiceConnection* conn = new NiceConnection(this);
             m_p2pConnections[fromId] = conn;
-
             connect(conn, &NiceConnection::localSdpReady, this, [this, fromId](const QString& sdp) {
-                QJsonObject payload;
-                payload["type"] = "ice_answer";
-                payload["from"] = myIdB64u();
-                payload["sdp"] = sdp;
-                sendSignalingMessage(fromId, payload);
+                QJsonObject p; p["type"]="ice_answer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
+                sendSignalingMessage(fromId, p);
             });
-
             connect(conn, &NiceConnection::stateChanged, this, [this, fromId](int state) {
-                if (state == NICE_COMPONENT_STATE_READY) {
-                    emit status("P2P Direct Connection Ready with " + fromId);
-                }
+                if (state == NICE_COMPONENT_STATE_READY)
+                    emit status("P2P ready with " + fromId);
             });
-
-            connect(conn, &NiceConnection::dataReceived, this, [this, fromId](const QByteArray& data) {
-                onP2PDataReceived(fromId, data);
+            connect(conn, &NiceConnection::dataReceived, this, [this, fromId](const QByteArray& d) {
+                onP2PDataReceived(fromId, d);
             });
-
-            conn->initIce(false); // Answer side is controlled
+            conn->initIce(false);
         }
         m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
 
     } else if (type == "ice_answer") {
-        if (m_p2pConnections.contains(fromId)) {
+        if (m_p2pConnections.contains(fromId))
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
-        }
-    }
-    else if (o.value("type").toString() == "group_msg") {
-        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
-        const QDateTime ts = tsSecs > 0
-                                 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
-                                 : QDateTime::currentDateTime();
 
-
-        // Parse member keys from payload so receiver can discover all group members
+    } else if (type == "group_msg") {
+        const QString msgId = o.value("msgId").toString();
+        if (!msgId.isEmpty() && !markSeen(msgId)) return;
         QStringList memberKeys;
         for (const QJsonValue &v : o.value("members").toArray())
             memberKeys << v.toString();
-        emit groupMessageReceived(
-            fromId,
-            o.value("groupId").toString(),
-            o.value("groupName").toString(),
-            memberKeys,
-            o.value("text").toString(),
-            ts
-            );
+        emit groupMessageReceived(fromId,
+                                  o.value("groupId").toString(),
+                                  o.value("groupName").toString(),
+                                  memberKeys,
+                                  o.value("text").toString(),
+                                  tsFromSecs(o.value("ts").toVariant().toLongLong()),
+                                  msgId);
     }
 }

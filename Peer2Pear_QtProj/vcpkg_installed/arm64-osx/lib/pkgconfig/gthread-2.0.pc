@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/../..
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: GThread
+Description: Thread support for GLib
+Version: 2.86.4
+
+Libs: -L${libdir} -lgthread-2.0 -lintl
+Requires: glib-2.0
+Cflags: -I${includedir}

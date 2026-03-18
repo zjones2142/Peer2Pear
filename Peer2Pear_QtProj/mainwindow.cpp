@@ -2,7 +2,6 @@
 #include "./ui_mainwindow.h"
 
 #include <QPixmap>
-#include <QImage>
 #include <QHBoxLayout>
 #include <QStackedWidget>
 #include <QTimer>
@@ -18,125 +17,108 @@ MainWindow::MainWindow(QWidget *parent)
 {
     ui->setupUi(this);
 
-    // ── DB: open the database as early as possible ────────────────────────────
+    // ── DB ────────────────────────────────────────────────────────────────────
     if (!m_db.open()) {
         QMessageBox::critical(this, "Database Error",
                               "Could not open the local chat database.\n"
                               "Chat history will not be saved this session.");
     }
 
-    // --- Strict identity unlock (wrong passphrase => do not create new identity) ---
+    // ── Identity unlock ───────────────────────────────────────────────────────
     while (true) {
         bool ok = false;
-        QString pass = QInputDialog::getText(
-            this,
-            "Unlock Identity",
-            "Enter passphrase to unlock this device identity:",
-            QLineEdit::Password,
-            "",
-            &ok
-            );
+        QString pass = QInputDialog::getText(this, "Unlock Identity",
+                                             "Enter passphrase to unlock this device identity:",
+                                             QLineEdit::Password, "", &ok);
 
-        if (!ok) {
-            QTimer::singleShot(0, qApp, &QCoreApplication::quit);
-            return;
-        }
-
+        if (!ok) { QTimer::singleShot(0, qApp, &QCoreApplication::quit); return; }
         if (pass.isEmpty()) {
-            QMessageBox::warning(this, "Passphrase Required",
-                                 "Passphrase cannot be empty.");
+            QMessageBox::warning(this, "Passphrase Required", "Passphrase cannot be empty.");
             continue;
         }
-
         try {
             m_controller.setPassphrase(pass);
-            break; // success
-        } catch (const std::exception& e) {
+            break;
+        } catch (const std::exception &e) {
             QMessageBox::warning(this, "Identity Unlock Failed", e.what());
         }
     }
 
-
-    // Point to Python server (change to EC2 URL when ready)
+    // ── Server + polling ──────────────────────────────────────────────────────
     m_controller.setServerBaseUrl(QUrl("http://3.141.14.234"));
     m_controller.startPolling(2000);
 
-    // Show identity in sidebar
-    ui->profileHandleLabel->setText(m_controller.myIdB64u());
+    // ── Profile handle: first 8 chars of public key ───────────────────────────
+    const QString fullKey = m_controller.myIdB64u();
+    ui->profileHandleLabel->setText(fullKey.left(8) + "…");
+    ui->profileHandleLabel->setToolTip(fullKey);
 
-    // Logo
+    // ── Logo ──────────────────────────────────────────────────────────────────
     QPixmap raw(":/logo.png");
     if (!raw.isNull()) {
-        QPixmap logo = raw;
         ui->logoLabel->setPixmap(
-            logo.scaled(50, 50, Qt::KeepAspectRatio, Qt::SmoothTransformation)
-            );
+            raw.scaled(50, 50, Qt::KeepAspectRatio, Qt::SmoothTransformation));
         ui->logoLabel->setText("");
     }
 
-    // ── Build stacked widget (chat view = 0, settings = 1) ───────────────────
-    QHBoxLayout *rootLayout = qobject_cast<QHBoxLayout *>(ui->rootWidget->layout());
-
+    // ── Stacked widget ────────────────────────────────────────────────────────
+    QHBoxLayout *rootLayout = qobject_cast<QHBoxLayout*>(ui->rootWidget->layout());
     rootLayout->removeWidget(ui->contentWidget);
 
     m_mainStack = new QStackedWidget(ui->rootWidget);
     m_mainStack->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     ui->contentWidget->setParent(m_mainStack);
-    m_mainStack->addWidget(ui->contentWidget); // index 0 – chat view
+    m_mainStack->addWidget(ui->contentWidget);  // index 0 – chat
 
     m_settingsPanel = new SettingsPanel(ui->rootWidget);
-    m_mainStack->addWidget(m_settingsPanel);   // index 1 – settings view
+    m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
 
     rootLayout->addWidget(m_mainStack);
 
-    // ── Create ChatView (owns all chat logic) ─────────────────────────────────
+    // ── ChatView ──────────────────────────────────────────────────────────────
     m_chatView = new ChatView(ui, &m_controller, &m_db, this);
 
     m_chatView->setShouldToastFn([this]() -> bool {
-        // toast when not actively viewing the app
-        return this->isMinimized() || !this->isVisible() || !this->isActiveWindow();
+        return isMinimized() || !isVisible() || !isActiveWindow();
     });
 
-    // Wire ChatController signals → ChatView slots
+    // ── Wire signals ──────────────────────────────────────────────────────────
     connect(&m_controller, &ChatController::messageReceived,
             m_chatView,    &ChatView::onIncomingMessage);
     connect(&m_controller, &ChatController::status,
             m_chatView,    &ChatView::onStatus);
     connect(&m_controller, &ChatController::groupMessageReceived,
             m_chatView,    &ChatView::onIncomingGroupMessage);
+    connect(&m_controller, &ChatController::fileChunkReceived,
+            m_chatView,    &ChatView::onFileChunkReceived);
 
-    // ── Create notifier and hand it to ChatView ───────────────────────────────
+    // ── Notifier ──────────────────────────────────────────────────────────────
     m_notifier = new ChatNotifier(this);
     m_chatView->setNotifier(m_notifier);
 
-
-    // ── Settings connections ───────────────────────────────────────────────────
-    connect(ui->settingsBtn_12, &QToolButton::clicked,
+    // ── Settings ──────────────────────────────────────────────────────────────
+    connect(ui->settingsBtn_12,  &QToolButton::clicked,
             this, &MainWindow::onSettingsClicked);
     connect(m_settingsPanel, &SettingsPanel::backClicked,
             this, &MainWindow::onSettingsBackClicked);
     connect(m_settingsPanel, &SettingsPanel::notificationsToggled,
             m_notifier,      &ChatNotifier::setEnabled);
+
+    // ── Resize debounce ───────────────────────────────────────────────────────
+    m_resizeDebounce.setSingleShot(true);
+    m_resizeDebounce.setInterval(100);
+    connect(&m_resizeDebounce, &QTimer::timeout, this, [this]() {
+        if (m_chatView) m_chatView->reloadCurrentChat();
+    });
 }
 
-MainWindow::~MainWindow()
-{
-    delete ui;
-}
+MainWindow::~MainWindow() { delete ui; }
 
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
-    if (m_chatView)
-        m_chatView->reloadCurrentChat();
+    m_resizeDebounce.start(); // coalesce rapid resize events
 }
 
-void MainWindow::onSettingsClicked()
-{
-    m_mainStack->setCurrentIndex(1); // show settings
-}
-
-void MainWindow::onSettingsBackClicked()
-{
-    m_mainStack->setCurrentIndex(0); // back to chat
-}
+void MainWindow::onSettingsClicked()    { m_mainStack->setCurrentIndex(1); }
+void MainWindow::onSettingsBackClicked(){ m_mainStack->setCurrentIndex(0); }

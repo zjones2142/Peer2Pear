@@ -11,6 +11,7 @@
 // Wraps QSystemTrayIcon to deliver chat message balloon notifications.
 // Respects the notifications enabled/disabled setting from SettingsPanel.
 // ─────────────────────────────────────────────────────────────────────────────
+
 class ChatNotifier : public QObject
 {
     Q_OBJECT

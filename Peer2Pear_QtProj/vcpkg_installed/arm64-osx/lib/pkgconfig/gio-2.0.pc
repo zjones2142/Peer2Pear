@@ -1,0 +1,25 @@
+prefix=${pcfiledir}/../..
+bindir=${prefix}/bin
+datadir=${prefix}/share
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+schemasdir=${datadir}/glib-2.0/schemas
+dtdsdir=${datadir}/glib-2.0/dtds
+giomoduledir=${libdir}/gio/modules
+gio=${prefix}/tools/glib/gio
+gio_querymodules=${prefix}/tools/glib/gio-querymodules
+glib_compile_schemas=${prefix}/tools/glib/glib-compile-schemas
+glib_compile_resources=${prefix}/tools/glib/glib-compile-resources
+gdbus=${prefix}/tools/glib/gdbus
+gdbus_codegen=${prefix}/tools/glib/gdbus-codegen
+gresource=${prefix}/tools/glib/gresource
+gsettings=${prefix}/tools/glib/gsettings
+
+Name: GIO
+Description: glib I/O library
+Version: 2.86.4
+
+Libs: -L${libdir} -lgio-2.0 -lintl -framework Foundation -framework CoreFoundation -framework AppKit -lresolv
+Requires: glib-2.0, gobject-2.0, gmodule-no-export-2.0, zlib
+Cflags: -I${includedir}
