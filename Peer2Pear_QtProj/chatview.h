@@ -47,14 +47,14 @@ public slots:
                                 const QString &groupName,
                                 const QStringList &memberKeys,
                                 const QString &text,
-                                const QDateTime &ts);
+                                const QDateTime &ts,
+                                const QString &msgId);
     void onGroupMemberLeft(const QString& fromPeerIdB64u,
                            const QString& groupId,
                            const QString& groupName,
                            const QStringList& memberKeys,
-                           const QDateTime& ts);
-                                const QDateTime &ts,
-                                const QString &msgId);
+                           const QDateTime& ts,
+                           const QString& msgId);
 
     // Fired for every arriving chunk.
     // fileData is non-empty only when chunksReceived == chunksTotal (transfer complete).
