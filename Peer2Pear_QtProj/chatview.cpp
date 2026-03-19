@@ -167,7 +167,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                 QMessageBox box(&dlg);
                 box.setWindowTitle("Unknown Contact");
                 box.setText("This member is not in your contacts.\nWould you like to add them?");
-                box.setStyleSheet(kDialogStyle);
+                box.setStyleSheet(kDlgStyle);
                 QPushButton *addBtn = box.addButton("Add Contact", QMessageBox::AcceptRole);
                 box.addButton("Cancel", QMessageBox::RejectRole);
                 box.exec();
@@ -212,9 +212,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         QObject::connect(addMemberBtn, &QPushButton::clicked, [&]() {
             QDialog picker(&dlg);
             picker.setWindowTitle("Add Member");
-            picker.setStyleSheet(kDialogStyle);
+            picker.setStyleSheet(kDlgStyle);
             picker.setMinimumWidth(340);
-
             auto *pLayout = new QVBoxLayout(&picker);
             pLayout->setSpacing(12);
             pLayout->setContentsMargins(24, 24, 24, 24);
@@ -598,7 +597,8 @@ void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
                                  const QString& groupId,
                                  const QString& groupName,
                                  const QStringList& memberKeys,
-                                 const QDateTime& ts)
+                                 const QDateTime& ts,
+                                 const QString& msgId)
 {
     // Find the group
     int targetIndex = -1;
