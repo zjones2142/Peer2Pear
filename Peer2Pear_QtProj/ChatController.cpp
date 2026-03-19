@@ -256,12 +256,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
     }
 }
-// Private
-void ChatController::pollOnce() {
-    m_mbox.fetch(myIdB64u());
-    for (const QString &key : m_selfKeys) {
-        if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u())
-            m_mbox.fetch(key.trimmed());
+
 // ── Private ───────────────────────────────────────────────────────────────────
 
 bool ChatController::markSeen(const QString& id)
@@ -283,9 +278,9 @@ void ChatController::pollOnce()
     // Falls back to single fetch() automatically if the server doesn't yet
     // support /mbox/fetch_all (404/405 response).
     m_mbox.fetchAll(myIdB64u());
-    for (const QString &key : m_selfKeys)
-        if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u())
-            m_mbox.fetchAll(key.trimmed());
+    for (const QString &key : m_selfKeys) {
+        if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u()) m_mbox.fetchAll(key.trimmed());
+    }
 }
 
 void ChatController::sendSignalingMessage(const QString& peerIdB64u,
@@ -424,12 +419,18 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     const auto    o    = QJsonDocument::fromJson(pt).object();
     const QString type = o.value("type").toString();
 
+    const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+    const QDateTime ts = tsSecs > 0
+                             ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
+                             : QDateTime::currentDateTime();
+
+    const QString msgId = o.value("msgId").toString();
+
     if (type == "text") {
         const QString msgId = o.value("msgId").toString();
         if (!msgId.isEmpty() && !markSeen(msgId)) return;
         emit messageReceived(fromId, o.value("text").toString(),
                              tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
-
     } else if (type == "ice_offer") {
         if (!m_p2pConnections.contains(fromId)) {
             NiceConnection* conn = new NiceConnection(this);
@@ -448,13 +449,11 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             conn->initIce(false);
         }
         m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
-
     } else if (type == "ice_answer") {
         if (m_p2pConnections.contains(fromId))
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
 
     } else if (type == "group_msg") {
-        const QString msgId = o.value("msgId").toString();
         if (!msgId.isEmpty() && !markSeen(msgId)) return;
         QStringList memberKeys;
         for (const QJsonValue &v : o.value("members").toArray())
@@ -468,11 +467,6 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             ts
             );
     } else if (o.value("type").toString() == "group_leave") {
-        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
-        const QDateTime ts = tsSecs > 0
-                                 ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
-                                 : QDateTime::currentDateTime();
-
         QStringList memberKeys;
         for (const QJsonValue &v : o.value("members").toArray())
             memberKeys << v.toString();
@@ -482,7 +476,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             o.value("groupId").toString(),
             o.value("groupName").toString(),
             memberKeys,
-            ts
-            );
+            ts,
+            msgId);
     }
 }
