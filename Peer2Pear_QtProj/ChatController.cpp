@@ -464,7 +464,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             o.value("groupName").toString(),
             memberKeys,
             o.value("text").toString(),
-            ts
+            ts,
+            msgId
             );
     } else if (o.value("type").toString() == "group_leave") {
         QStringList memberKeys;
