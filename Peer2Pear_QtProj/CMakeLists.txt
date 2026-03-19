@@ -33,6 +33,7 @@ set(PROJECT_SOURCES
     mainwindow.h
     mainwindow.ui
     resources.qrc
+    filetransfer.h
     chattypes.h
     chatview.h
     chatview.cpp

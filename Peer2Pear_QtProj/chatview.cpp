@@ -4,6 +4,7 @@
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QScrollBar>
 #include <QFontMetrics>
 #include <QApplication>
@@ -11,78 +12,64 @@
 #include <QFrame>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QListWidget>
 #include <QToolButton>
 #include <QMessageBox>
 #include <QDateTime>
 #include <QDebug>
 #include <QUuid>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QFile>
+#include <QDir>
+#include <QStandardPaths>
+#include <QTimer>
+#include <QDesktopServices>
+#include <QUrl>
 
-// ── DATE SEPARATOR: how many seconds of silence before we show a divider ─────
-static constexpr int kDateSeparatorThresholdSecs = 60 * 60 * 2; // 2 hour(changed the multiplier at the end to incr hours of time
+// ── Constants ─────────────────────────────────────────────────────────────────
+static constexpr int kDateSepSecs = 60 * 60 * 2; // 2-hour gap → date separator
 
-// ── DATE SEPARATOR: format a QDateTime into label text ─────────
-// Produces e.g.  "Thu, Feb 26 at 1:39 PM"
-// If the message is from today we just show "Today at 1:39 PM".
-// If it was yesterday we show "Yesterday at 1:39 PM".
-static QString formatSeparatorLabel(const QDateTime &dt)
+// ── Date separator label ──────────────────────────────────────────────────────
+static QString formatSepLabel(const QDateTime &dt)
 {
     const QDate today     = QDate::currentDate();
     const QDate yesterday = today.addDays(-1);
-    const QDate msgDate   = dt.toLocalTime().date();
+    const QDate d         = dt.toLocalTime().date();
 
-    QString datePart;
-    if (msgDate == today)
-        datePart = "Today";
-    else if (msgDate == yesterday)
-        datePart = "Yesterday";
-    else
-        datePart = dt.toLocalTime().toString("ddd, MMM d");   // "Thu, Feb 26"
-
-    const QString timePart = dt.toLocalTime().toString("h:mm AP"); // "1:39 PM"
-    return datePart + " at " + timePart;
+    QString part = (d == today) ? "Today"
+                   : (d == yesterday) ? "Yesterday"
+                                      : dt.toLocalTime().toString("ddd, MMM d");
+    return part + " at " + dt.toLocalTime().toString("h:mm AP");
 }
 
 // ── Text-layout helpers ───────────────────────────────────────────────────────
-
-// Break a long unbreakable word into hyphenated chunks that fit within maxWidth
-static QString hyphenateWord(const QString &word, const QFontMetrics &fm, int maxWidth)
+static QString hyphenateWord(const QString &word, const QFontMetrics &fm, int maxW)
 {
-    QString result;
-    QString current;
-
-    for (int i = 0; i < word.length(); ++i) {
-        QString test = current + word[i];
-        QString testWithHyphen = test + "-";
-        if (fm.horizontalAdvance(testWithHyphen) >= maxWidth && !current.isEmpty()) {
-            result += current + "-\n";
-            current = word[i];
+    QString result, cur;
+    for (QChar c : word) {
+        QString test = cur + c;
+        if (fm.horizontalAdvance(test + "-") >= maxW && !cur.isEmpty()) {
+            result += cur + "-\n";
+            cur = c;
         } else {
-            current = test;
+            cur = test;
         }
     }
-    result += current;
-    return result;
+    return result + cur;
 }
 
-// Hyphenate any word that won't fit on one line
-static QString processText(const QString &text, const QFontMetrics &fm, int maxWidth)
+static QString processText(const QString &text, const QFontMetrics &fm, int maxW)
 {
-    QStringList words = text.split(' ');
-    QStringList processed;
-
-    for (const QString &word : words) {
-        if (fm.horizontalAdvance(word) > maxWidth)
-            processed << hyphenateWord(word, fm, maxWidth);
-        else
-            processed << word;
-    }
-
-    return processed.join(' ');
+    QStringList out;
+    for (const QString &w : text.split(' '))
+        out << (fm.horizontalAdvance(w) > maxW ? hyphenateWord(w, fm, maxW) : w);
+    return out.join(' ');
 }
 
 // ── Shared dialog stylesheet ──────────────────────────────────────────────────
-static const char *kDialogStyle =
+static const char *kDlgStyle =
     "QDialog { background-color: #111111; color: #f0f0f0; }"
     "QLabel { color: #aaaaaa; font-size: 12px; }"
     "QLabel#dlgTitle { color: #ffffff; font-size: 15px; font-weight: bold; }"
@@ -96,26 +83,26 @@ static const char *kDialogStyle =
     "QPushButton { background-color: #1a2e1c; color: #5dd868; border: 1px solid #2e5e30;"
     "  border-radius: 8px; font-size: 13px; padding: 8px 16px; }"
     "QPushButton:hover { background-color: #223a24; border-color: #3a9e48; }"
-    "QPushButton#saveBtn { background-color: #2e8b3a; color: #ffffff; border: none; }"
+    "QPushButton#saveBtn   { background-color: #2e8b3a; color: #ffffff; border: none; }"
     "QPushButton#saveBtn:hover { background-color: #38a844; }"
     "QPushButton#cancelBtn { background-color: #1e1e1e; color: #888888; border: 1px solid #2a2a2a; }"
     "QPushButton#cancelBtn:hover { background-color: #252525; color: #cccccc; }"
     "QPushButton#removeKeyBtn { background-color: #2e1a1a; color: #cc5555; border: 1px solid #5e2e2e; }"
     "QPushButton#removeKeyBtn:hover { background-color: #3a2020; }";
 
-// Opens a modal dialog to edit a contact name + list of public keys.
-// nameInOut and keysInOut are updated on Save; returns false on Cancel.
+// ── Contact editor dialog ─────────────────────────────────────────────────────
 enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed };
+
 static ContactEditorResult openContactEditor(QWidget *parent,
                                              const QString &title,
                                              QString &nameInOut,
                                              QStringList &keysInOut,
-                                             bool showDestructiveActions = true,
+                                             bool showDestructive = true,
                                              bool isBlocked = false)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
-    dlg.setStyleSheet(kDialogStyle);
+    dlg.setStyleSheet(kDlgStyle);
     dlg.setMinimumWidth(420);
     dlg.setModal(true);
 
@@ -129,118 +116,83 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
     auto *sep = new QFrame(&dlg);
     sep->setFrameShape(QFrame::HLine);
-    sep->setStyleSheet("color: #2a2a2a;");
+    sep->setStyleSheet("color:#2a2a2a;");
     root->addWidget(sep);
 
-    auto *nameLbl = new QLabel("Display Name", &dlg);
-    root->addWidget(nameLbl);
+    root->addWidget(new QLabel("Display Name", &dlg));
     auto *nameEdit = new QLineEdit(nameInOut, &dlg);
     root->addWidget(nameEdit);
 
-    auto *keysLbl = new QLabel("Public Keys", &dlg);
-    root->addWidget(keysLbl);
-
+    root->addWidget(new QLabel("Public Keys", &dlg));
     auto *keyList = new QListWidget(&dlg);
     keyList->setFixedHeight(130);
-    for (const QString &k : keysInOut)
-        keyList->addItem(k);
+    for (const QString &k : keysInOut) keyList->addItem(k);
     root->addWidget(keyList);
 
-    auto *keyRow = new QHBoxLayout;
-    keyRow->setSpacing(8);
-    auto *keyInput    = new QLineEdit(&dlg);
-    keyInput->setPlaceholderText("Paste public key...");
-    auto *addKeyBtn   = new QPushButton("Add Key", &dlg);
-    auto *removeKeyBtn = new QPushButton("Remove", &dlg);
-    removeKeyBtn->setObjectName("removeKeyBtn");
-    keyRow->addWidget(keyInput, 1);
-    keyRow->addWidget(addKeyBtn);
-    keyRow->addWidget(removeKeyBtn);
-    root->addLayout(keyRow);
+    auto *kr    = new QHBoxLayout;
+    auto *keyIn = new QLineEdit(&dlg);
+    keyIn->setPlaceholderText("Paste public key…");
+    auto *addK  = new QPushButton("Add Key", &dlg);
+    auto *remK  = new QPushButton("Remove", &dlg);
+    remK->setObjectName("removeKeyBtn");
+    kr->addWidget(keyIn, 1); kr->addWidget(addK); kr->addWidget(remK);
+    root->addLayout(kr);
 
-    QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
-        QString k = keyInput->text().trimmed();
-        if (!k.isEmpty()) {
-            // Check for duplicate key
-            bool duplicate = false;
-            for (int i = 0; i < keyList->count(); ++i) {
-                if (keyList->item(i)->text() == k) {
-                    duplicate = true;
-                    break;
-                }
+    QObject::connect(addK, &QPushButton::clicked, [&]() {
+        QString k = keyIn->text().trimmed();
+        if (k.isEmpty()) return;
+        for (int i = 0; i < keyList->count(); ++i)
+            if (keyList->item(i)->text() == k) {
+                QMessageBox::warning(&dlg, "Duplicate Key", "Key already present.");
+                return;
             }
-            if (duplicate) {
-                QMessageBox::warning(&dlg, "Duplicate Key",
-                                     "This key already exists and was not added.");
-            } else {
-                keyList->addItem(k);
-                keyInput->clear();
-            }
-        }
+        keyList->addItem(k); keyIn->clear();
     });
-    QObject::connect(removeKeyBtn, &QPushButton::clicked, [&]() {
-        delete keyList->currentItem();
-    });
+    QObject::connect(remK, &QPushButton::clicked, [&]() { delete keyList->currentItem(); });
 
     root->addStretch();
     ContactEditorResult result = ContactEditorResult::Cancelled;
 
-    // ── Block and remove contact ───────────────────────────────────────────────
-    if (showDestructiveActions) {
-        auto *actionSep = new QFrame(&dlg);
-        actionSep->setFrameShape(QFrame::HLine);
-        actionSep->setStyleSheet("color: #2a2a2a;");
-        root->addWidget(actionSep);
+    if (showDestructive) {
+        auto *dsep = new QFrame(&dlg);
+        dsep->setFrameShape(QFrame::HLine);
+        dsep->setStyleSheet("color:#2a2a2a;");
+        root->addWidget(dsep);
 
-        auto *actionRow  = new QHBoxLayout;
-        auto *blockBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
-        auto *removeBtn  = new QPushButton("Remove Contact", &dlg);
-        const QString destructiveStyle =
-            "QPushButton { background-color: #2e1a1a; color: #cc5555;"
-            "  border: 1px solid #5e2e2e; border-radius: 8px; padding: 8px 16px; }"
-            "QPushButton:hover { background-color: #3a2020; }";
-        blockBtn->setStyleSheet(destructiveStyle);
-        removeBtn->setStyleSheet(destructiveStyle);
-        actionRow->addWidget(blockBtn);
-        actionRow->addWidget(removeBtn);
-        actionRow->addStretch();
-        root->addLayout(actionRow);
+        auto *ar    = new QHBoxLayout;
+        auto *blkBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
+        auto *rmBtn  = new QPushButton("Remove Contact", &dlg);
+        const QString ds =
+            "QPushButton{background-color:#2e1a1a;color:#cc5555;border:1px solid #5e2e2e;"
+            "border-radius:8px;padding:8px 16px;}QPushButton:hover{background-color:#3a2020;}";
+        blkBtn->setStyleSheet(ds); rmBtn->setStyleSheet(ds);
+        ar->addWidget(blkBtn); ar->addWidget(rmBtn); ar->addStretch();
+        root->addLayout(ar);
 
-        QObject::connect(blockBtn, &QPushButton::clicked, [&]() {
-            const QString msg = isBlocked
-                                    ? "Unblock this contact?"
-                                    : "Block this contact? They won't be able to send you messages.";
-            if (QMessageBox::question(&dlg, isBlocked ? "Unblock Contact" : "Block Contact",
-                                      msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-                result = ContactEditorResult::Blocked; // reuse same result, toggle handled in onEditContact
-                dlg.accept();
-            }
+        QObject::connect(blkBtn, &QPushButton::clicked, [&]() {
+            if (QMessageBox::question(&dlg, isBlocked?"Unblock":"Block",
+                                      isBlocked?"Unblock this contact?":
+                                          "Block this contact? They won't be able to send you messages.",
+                                      QMessageBox::Yes|QMessageBox::No) == QMessageBox::Yes)
+            { result = ContactEditorResult::Blocked; dlg.accept(); }
         });
-        QObject::connect(removeBtn, &QPushButton::clicked, [&]() {
+        QObject::connect(rmBtn, &QPushButton::clicked, [&]() {
             if (QMessageBox::question(&dlg, "Remove Contact",
                                       "Remove this contact? This cannot be undone.",
-                                      QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
-                result = ContactEditorResult::Removed;
-                dlg.accept();
-            }
+                                      QMessageBox::Yes|QMessageBox::No) == QMessageBox::Yes)
+            { result = ContactEditorResult::Removed; dlg.accept(); }
         });
     }
 
-    auto *btnRow   = new QHBoxLayout;
-    auto *cancelBtn = new QPushButton("Cancel", &dlg);
-    cancelBtn->setObjectName("cancelBtn");
-    auto *saveBtn   = new QPushButton("Save", &dlg);
-    saveBtn->setObjectName("saveBtn");
-    btnRow->setSpacing(10);
-    btnRow->addStretch();
-    btnRow->addWidget(cancelBtn);
-    btnRow->addWidget(saveBtn);
-    root->addLayout(btnRow);
+    auto *br  = new QHBoxLayout;
+    auto *can = new QPushButton("Cancel", &dlg); can->setObjectName("cancelBtn");
+    auto *sav = new QPushButton("Save",   &dlg); sav->setObjectName("saveBtn");
+    br->setSpacing(10); br->addStretch(); br->addWidget(can); br->addWidget(sav);
+    root->addLayout(br);
 
-    QObject::connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
-    QObject::connect(saveBtn, &QPushButton::clicked, [&]() {
-        result = ContactEditorResult::Saved;
-        dlg.accept();
+    QObject::connect(can, &QPushButton::clicked, &dlg, &QDialog::reject);
+    QObject::connect(sav, &QPushButton::clicked, [&]() {
+        result = ContactEditorResult::Saved; dlg.accept();
     });
 
     dlg.exec();
@@ -254,36 +206,35 @@ static ContactEditorResult openContactEditor(QWidget *parent,
     return result;
 }
 
-// ── ChatView implementation ───────────────────────────────────────────────────
+// ── ChatView ──────────────────────────────────────────────────────────────────
 
-ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,DatabaseManager *db, QObject *parent)
-    : QObject(parent)
-    , m_ui(ui)
-    , m_controller(controller)
-    , m_db(db)
+// Returns a stable string key for file-record lookup: peerIdB64u for DMs,
+// groupId for group chats.  Never changes when the chat is reordered.
+QString ChatView::chatKey(const ChatData &c)
+{
+    if (c.isGroup)             return c.groupId;
+    if (!c.peerIdB64u.isEmpty()) return c.peerIdB64u;
+    return "name:" + c.name;
+}
+
+ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
+                   DatabaseManager *db, QObject *parent)
+    : QObject(parent), m_ui(ui), m_controller(controller), m_db(db)
 {
     initChats();
-
     ensureUnreadSize();
 
-    connect(m_ui->chatList, &QListWidget::currentRowChanged,
-            this, &ChatView::onChatSelected);
-    connect(m_ui->sendBtn, &QPushButton::clicked,
-            this, &ChatView::onSendMessage);
-    connect(m_ui->messageInput, &QLineEdit::returnPressed,
-            this, &ChatView::onSendMessage);
-    connect(m_ui->searchEdit_12, &QLineEdit::textChanged,
-            this, &ChatView::onSearchChanged);
-    connect(m_ui->editProfileBtn, &QToolButton::clicked,
-            this, &ChatView::onEditProfile);
-    connect(m_ui->addContactBtn, &QToolButton::clicked,
-            this, &ChatView::onAddContact);
+    connect(m_ui->chatList,      &QListWidget::currentRowChanged, this, &ChatView::onChatSelected);
+    connect(m_ui->sendBtn,       &QPushButton::clicked,           this, &ChatView::onSendMessage);
+    connect(m_ui->messageInput,  &QLineEdit::returnPressed,       this, &ChatView::onSendMessage);
+    connect(m_ui->searchEdit_12, &QLineEdit::textChanged,         this, &ChatView::onSearchChanged);
+    connect(m_ui->editProfileBtn,&QToolButton::clicked,           this, &ChatView::onEditProfile);
+    connect(m_ui->addContactBtn, &QToolButton::clicked,           this, &ChatView::onAddContact);
+    connect(m_ui->attachBtn,     &QToolButton::clicked,           this, &ChatView::onAttachFile);
 
     rebuildChatList();
     m_ui->chatList->setCurrentRow(0);
 }
-
-// ── Public ────────────────────────────────────────────────────────────────────
 
 void ChatView::reloadCurrentChat()
 {
@@ -294,199 +245,322 @@ void ChatView::reloadCurrentChat()
     }
 }
 
-// ── Slots (public — wired by MainWindow) ─────────────────────────────────────
+// ── Incoming messages ─────────────────────────────────────────────────────────
 
-void ChatView::onIncomingMessage(const QString &fromPeerIdB64u, const QString &text, const QDateTime &timestamp)
+void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
+                                 const QString &text,
+                                 const QDateTime &timestamp,
+                                 const QString &msgId)
 {
     const QString from = fromPeerIdB64u.trimmed();
     ensureUnreadSize();
 
-    auto shouldToast = [&]() -> bool {
-        return m_shouldToastFn ? m_shouldToastFn() : true; // default: toast if not provided
-    };
+    auto shouldToast = [&]() { return m_shouldToastFn ? m_shouldToastFn() : true; };
 
     for (int i = 0; i < m_chats.size(); ++i) {
-        if (m_chats[i].isGroup) continue; // group messages handled by onIncomingGroupMessage
+        if (m_chats[i].isGroup) continue;
 
-        bool hit = false;
+        bool hit = (m_chats[i].peerIdB64u.trimmed() == from);
+        if (!hit) for (const QString &k : m_chats[i].keys)
+                if (k.trimmed() == from) { hit = true; break; }
+        if (!hit) continue;
 
-        if (m_chats[i].peerIdB64u.trimmed() == from) {
-            hit = true;
+        if (m_chats[i].isBlocked) return;
+
+        // UI-side dedup against already-stored messages
+        if (!msgId.isEmpty())
+            for (const Message &m : m_chats[i].messages)
+                if (m.msgId == msgId) return;
+
+        const bool needsSep = m_chats[i].messages.isEmpty() ||
+                              m_chats[i].messages.last().timestamp.secsTo(timestamp) >= kDateSepSecs;
+
+        Message msg{false, text, timestamp, msgId};
+        m_chats[i].messages.append(msg);
+        if (m_db) { m_db->saveContact(m_chats[i]); m_db->saveMessage(m_chats[i].peerIdB64u, msg); }
+
+        if (i == m_currentChat) {
+            if (needsSep) addDateSeparator(timestamp);
+            addMessageBubble(text, false);
+            promoteChatToTop(i);
+            rebuildChatList();
         } else {
-            for (const QString &key : m_chats[i].keys) {
-                if (key.trimmed() == from) { hit = true; break; }
-            }
+            m_unread[i] += 1;
+            emit unreadChanged(totalUnread());
+            promoteChatToTop(i);
+            rebuildChatList();
+            if (m_notifier && shouldToast()) m_notifier->notify(m_chats[0].name, text);
         }
-
-        if (hit) {
-            if (m_chats[i].isBlocked) return; // silently drop messages from blocked contacts
-            const QDateTime now = timestamp;
-
-            const bool needsSeparator =
-                m_chats[i].messages.isEmpty() ||
-                m_chats[i].messages.last().timestamp.secsTo(now) >= kDateSeparatorThresholdSecs;
-
-            Message msg{ false, text, now };
-            m_chats[i].messages.append(msg);
-
-            if (m_db){
-                m_db->saveContact(m_chats[i]);
-                m_db->saveMessage(m_chats[i].peerIdB64u, msg);
-            }
-
-            if (i == m_currentChat) {
-                // Currently open — insert separator if needed, then the bubble
-                if (needsSeparator)
-                    addDateSeparator(now);
-                addMessageBubble(text, false);
-                promoteChatToTop(i);
-                rebuildChatList();
-            } else {
-                m_unread[i] += 1;
-                emit unreadChanged(totalUnread());
-                promoteChatToTop(i);
-                rebuildChatList();
-                if (m_notifier && shouldToast())
-                    m_notifier->notify(m_chats[0].name, text);
-            }
-            return;
-        }
+        return;
     }
 
-    // Unknown sender — auto-create a chat for them
-    qDebug() << "Received message from unknown peer:" << fromPeerIdB64u;
-
-    const QDateTime now = timestamp;
-    Message msg{ false, text, now };
-
-    ChatData newChat;
-    newChat.name       = "Unknown contact";
-    newChat.subtitle   = "Secure chat";
-    newChat.peerIdB64u = from;
-    newChat.keys.append(from);
-    newChat.messages.append(msg);
-    m_chats.prepend(newChat);
-
-    if (m_db) {//database save for new contact and message
-        m_db->saveContact(newChat);
-        m_db->saveMessage(from, msg);
-    }
-
+    // Unknown sender — auto-create chat
+    Message msg{false, text, timestamp, msgId};
+    ChatData nc; nc.name = "Unknown contact"; nc.subtitle = "Secure chat";
+    nc.peerIdB64u = from; nc.keys.append(from); nc.messages.append(msg);
+    m_chats.prepend(nc);
+    if (m_db) { m_db->saveContact(nc); m_db->saveMessage(from, msg); }
     ensureUnreadSize();
     m_unread.prepend(0);
-
-    // New chat is always at index 0; m_currentChat shifts down by 1
-    if (m_currentChat >= 0)
-        m_currentChat += 1;
-
+    if (m_currentChat >= 0) m_currentChat += 1;
     m_unread[0] += 1;
     emit unreadChanged(totalUnread());
-
-    if (m_notifier && shouldToast())
-        m_notifier->notify("Unknown contact", text);
-
+    if (m_notifier && shouldToast()) m_notifier->notify("Unknown contact", text);
     rebuildChatList();
 }
 
-void ChatView::onStatus(const QString &s)
-{
-    qDebug() << "[status]" << s;
-}
+void ChatView::onStatus(const QString &s) { qDebug() << "[status]" << s; }
 
 void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
                                       const QString &groupId,
                                       const QString &groupName,
                                       const QStringList &memberKeys,
                                       const QString &text,
-                                      const QDateTime &ts)
+                                      const QDateTime &ts,
+                                      const QString &msgId)
 {
-    // Find existing group chat with matching groupId
-    int targetIndex = -1;
-    for (int i = 0; i < m_chats.size(); ++i) {
-        if (m_chats[i].isGroup && m_chats[i].groupId == groupId) {
-            targetIndex = i;
-            break;
-        }
-    }
+    int idx = -1;
+    for (int i = 0; i < m_chats.size(); ++i)
+        if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { idx = i; break; }
 
-    // Auto-create the group if we haven't seen it before
-    if (targetIndex == -1) {
-        ChatData newGroup;
-        newGroup.isGroup  = true;
-        newGroup.groupId  = groupId;
-        newGroup.peerIdB64u = groupId;
-        newGroup.name     = groupName.isEmpty() ? "Group Chat" : groupName;
-        newGroup.subtitle = "Group chat";
-        newGroup.keys.append(fromPeerIdB64u); // add sender's key
-        m_chats.append(newGroup);
-        if (m_db) m_db->saveContact(newGroup);
-        targetIndex = m_chats.size() - 1;
+    if (idx == -1) {
+        ChatData ng; ng.isGroup = true; ng.groupId = groupId;
+        ng.peerIdB64u = groupId;
+        ng.name = groupName.isEmpty() ? "Group Chat" : groupName;
+        ng.subtitle = "Group chat"; ng.keys.append(fromPeerIdB64u);
+        m_chats.append(ng);
+        if (m_db) m_db->saveContact(ng);
+        idx = m_chats.size() - 1;
         ensureUnreadSize();
         rebuildChatList();
     }
 
-    ChatData &chat = m_chats[targetIndex];
+    ChatData &chat = m_chats[idx];
     if (chat.isBlocked) return;
 
-    // Merge any new member keys we didn't know about before
-    // This is how members discover each other without manual key exchange
-    bool keysUpdated = false;
-    for (const QString &key : memberKeys) {
-        if (key.trimmed().isEmpty()) continue;
-        if (!chat.keys.contains(key)) {
-            chat.keys << key;
-            keysUpdated = true;
-        }
-    }
-    if (keysUpdated && m_db)
-        m_db->saveContact(chat); // persist the updated key list
+    if (!msgId.isEmpty())
+        for (const Message &m : chat.messages)
+            if (m.msgId == msgId) return;
 
-    const bool needsSeparator =
-        chat.messages.isEmpty() ||
-        chat.messages.last().timestamp.secsTo(ts) >= kDateSeparatorThresholdSecs;
+    bool updated = false;
+    for (const QString &k : memberKeys)
+        if (!k.trimmed().isEmpty() && !chat.keys.contains(k)) { chat.keys << k; updated = true; }
+    if (updated && m_db) m_db->saveContact(chat);
 
-    Message msg{ false, text, ts };
+    const bool needsSep = chat.messages.isEmpty() ||
+                          chat.messages.last().timestamp.secsTo(ts) >= kDateSepSecs;
+
+    Message msg{false, text, ts, msgId};
     chat.messages.append(msg);
+    if (m_db) m_db->saveMessage(chat.groupId.isEmpty() ? "name:"+chat.name : chat.groupId, msg);
 
-    if (m_db) m_db->saveMessage(
-            chat.groupId.isEmpty() ? "name:" + chat.name : chat.groupId, msg);
-
-    if (targetIndex == m_currentChat) {
-        if (needsSeparator) addDateSeparator(ts);
+    if (idx == m_currentChat) {
+        if (needsSep) addDateSeparator(ts);
         addMessageBubble(text, false);
-        promoteChatToTop(targetIndex);
+        promoteChatToTop(idx);
         rebuildChatList();
     } else {
-        m_unread[targetIndex] += 1;
+        m_unread[idx] += 1;
         emit unreadChanged(totalUnread());
-        promoteChatToTop(targetIndex);
+        promoteChatToTop(idx);
         rebuildChatList();
         if (m_notifier) m_notifier->notify(chat.name, text);
     }
+}
+
+// ── File chunk received ───────────────────────────────────────────────────────
+
+void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
+                                   const QString &transferId,
+                                   const QString &fileName,
+                                   qint64         fileSize,
+                                   int            chunksReceived,
+                                   int            chunksTotal,
+                                   const QByteArray &fileData,
+                                   const QDateTime  &timestamp)
+{
+    const QString from = fromPeerIdB64u.trimmed();
+
+    // Locate the chat this file belongs to (or create one)
+    const int chatIndex = findOrCreateChatForPeer(from);
+    if (chatIndex < 0) return;
+    const QString key = chatKey(m_chats[chatIndex]);
+
+    // Find an existing in-progress record for this transferId, or create one
+    auto &records = m_filesByKey[key];
+    FileTransferRecord *rec = nullptr;
+    for (auto &r : records)
+        if (r.transferId == transferId) { rec = &r; break; }
+
+    if (!rec) {
+        // First chunk we've heard about — create the record
+        FileTransferRecord newRec;
+        newRec.transferId    = transferId;
+        newRec.fileName      = fileName;
+        newRec.fileSize      = fileSize;
+        newRec.peerIdB64u    = from;
+        newRec.peerName      = m_chats[chatIndex].name;
+        newRec.timestamp     = timestamp;
+        newRec.sent          = false;
+        newRec.status        = FileTransferStatus::Receiving;
+        newRec.chunksTotal   = chunksTotal;
+        newRec.chunksComplete = 0;
+        records.append(newRec);
+        rec = &records.last();
+    }
+
+    rec->chunksComplete = chunksReceived;
+    rec->chunksTotal    = chunksTotal;
+
+    const bool complete = (chunksReceived == chunksTotal);
+
+    if (complete) {
+        rec->status = FileTransferStatus::Complete;
+
+        // Auto-save to Downloads/Peer2Pear/<transferId>/filename
+        const QString saveDir = QStandardPaths::writableLocation(
+                                    QStandardPaths::DownloadLocation)
+                                + "/Peer2Pear/" + transferId;
+        QDir().mkpath(saveDir);
+        const QString savePath = saveDir + "/" + fileName;
+        QFile f(savePath);
+        bool saved = false;
+        if (f.open(QIODevice::WriteOnly)) {
+            f.write(fileData);
+            f.close();
+            saved = true;
+            rec->savedPath = savePath;
+        } else {
+            qWarning() << "Could not auto-save file to" << savePath << ":" << f.errorString();
+            rec->status = FileTransferStatus::Failed;
+        }
+
+        // System tray notification
+        if (m_notifier) {
+            const QString msg = saved
+                                    ? QString("File ready: %1 (%2)").arg(fileName, formatFileSize(fileSize))
+                                    : QString("File received but could not save: %1").arg(fileName);
+            m_notifier->notify(m_chats[chatIndex].name, msg);
+        }
+
+        // Bump unread on the chat if it isn't currently open
+        if (chatIndex != m_currentChat) {
+            m_unread[chatIndex] += 1;
+            emit unreadChanged(totalUnread());
+            promoteChatToTop(chatIndex);
+            rebuildChatList();
+        }
+    }
+
+    // Refresh Files tab if this chat is visible
+    if (chatIndex == m_currentChat)
+        rebuildFilesTab();
+}
+
+// ── Attach / send file ────────────────────────────────────────────────────────
+
+void ChatView::onAttachFile()
+{
+    if (m_currentChat < 0) return;
+
+    const ChatData &chat = m_chats[m_currentChat];
+
+    if (chat.keys.isEmpty()) {
+        QMessageBox::warning(m_ui->centralwidget, "No Keys",
+                             "This contact has no public keys — cannot send a file securely.");
+        return;
+    }
+    if (chat.isGroup) {
+        QMessageBox::information(m_ui->centralwidget, "Not Supported",
+                                 "File sharing to group chats is not yet supported.\n"
+                                 "Send files to individual contacts.");
+        return;
+    }
+
+    const QString path = QFileDialog::getOpenFileName(
+        m_ui->centralwidget, "Send File",
+        QStandardPaths::writableLocation(QStandardPaths::HomeLocation));
+    if (path.isEmpty()) return;
+
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(m_ui->centralwidget, "Error",
+                             "Could not open file: " + f.errorString());
+        return;
+    }
+    const QByteArray data = f.readAll();
+    f.close();
+
+    constexpr qint64 kMax = 8LL * 1024 * 1024;
+    if (data.size() > kMax) {
+        QMessageBox::warning(m_ui->centralwidget, "File Too Large",
+                             "Maximum file size is 8 MB.\nThis file is " + formatFileSize(data.size()) + ".");
+        return;
+    }
+
+    const QString fileName = QFileInfo(path).fileName();
+
+    // ── Send to all keys for this contact ─────────────────────────────────────
+    // Use the first key's transferId for the local record (all keys get the same
+    // file but with their own encrypted copies; only one record shown per send).
+    QString localTransferId;
+    int totalChunks = 0;
+
+    for (const QString &key : chat.keys) {
+        if (key.trimmed().isEmpty()) continue;
+        const QString tid = m_controller->sendFile(key.trimmed(), fileName, data);
+        if (!tid.isEmpty() && localTransferId.isEmpty()) {
+            localTransferId = tid;
+            // Compute chunk count the same way ChatController does
+            constexpr qint64 kChunk = 240LL * 1024;
+            totalChunks = int((data.size() + kChunk - 1) / kChunk);
+        }
+    }
+
+    if (localTransferId.isEmpty()) return; // all keys failed
+
+    // Record sent transfer with accurate chunk count and Sending status.
+    // savedPath stores the original file path so the Download button can re-open it.
+    const QString key = chatKey(chat);
+    FileTransferRecord rec;
+    rec.transferId     = localTransferId;
+    rec.fileName       = fileName;
+    rec.fileSize       = data.size();
+    rec.peerIdB64u     = chat.peerIdB64u;
+    rec.peerName       = chat.name;
+    rec.timestamp      = QDateTime::currentDateTime();
+    rec.sent           = true;
+    rec.status         = FileTransferStatus::Complete;
+    rec.chunksTotal    = totalChunks;
+    rec.chunksComplete = totalChunks;
+    rec.savedPath      = path;   // original file — lets Download open it directly
+    m_filesByKey[key].append(rec);
+
+    rebuildFilesTab();
+
+    // Delivery notice bubble in chat
+    addMessageBubble(
+        QString("📎  %1  (%2)").arg(fileName, formatFileSize(data.size())), true);
 }
 
 // ── Private slots ─────────────────────────────────────────────────────────────
 
 void ChatView::onChatSelected(int index)
 {
-    if (index < 0 || index >= m_chats.size()) return;
-    if (index == m_currentChat) return;
+    if (index < 0 || index >= m_chats.size() || index == m_currentChat) return;
     m_currentChat = index;
     loadChat(index);
-
-    // ── Mark as read ──────────────────────────────────────────────────────────
     ensureUnreadSize();
     if (m_unread[index] > 0) {
         m_unread[index] = 0;
-        emit unreadChanged(totalUnread()); // clears dot + taskbar badge
-        rebuildChatList();                 // removes the dot from the sidebar row
+        emit unreadChanged(totalUnread());
+        rebuildChatList();
     }
 }
 
 void ChatView::onSendMessage()
 {
     if (m_currentChat < 0) return;
-
     QString text = m_ui->messageInput->text().trimmed();
     if (text.isEmpty()) return;
 
@@ -495,81 +569,53 @@ void ChatView::onSendMessage()
         return;
     }
 
-    const QDateTime now = QDateTime::currentDateTime();//updates the date on the message, and also used for date separator logic
-
+    const QDateTime now = QDateTime::currentDateTime();
     const auto &msgs = m_chats[m_currentChat].messages;
-    const bool needsSeparator =
-        msgs.isEmpty() ||
-        msgs.last().timestamp.secsTo(now) >= kDateSeparatorThresholdSecs;
-
-    if (needsSeparator)
+    if (msgs.isEmpty() || msgs.last().timestamp.secsTo(now) >= kDateSepSecs)
         addDateSeparator(now);
 
-    Message msg{ true, text, now };
+    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    Message msg{true, text, now, msgId};
     m_chats[m_currentChat].messages.append(msg);
 
     if (m_db) {
-        const QString key = m_chats[m_currentChat].isGroup
-                                ? (m_chats[m_currentChat].groupId.isEmpty()
-                                       ? "name:" + m_chats[m_currentChat].name
-                                       : m_chats[m_currentChat].groupId)
-                                : (m_chats[m_currentChat].keys.isEmpty()
-                                       ? "name:" + m_chats[m_currentChat].name
-                                       : m_chats[m_currentChat].keys.first());
-        m_db->saveMessage(key, msg);
+        const QString dbKey = m_chats[m_currentChat].isGroup
+                                  ? (m_chats[m_currentChat].groupId.isEmpty()
+                                         ? "name:" + m_chats[m_currentChat].name
+                                         : m_chats[m_currentChat].groupId)
+                                  : (m_chats[m_currentChat].keys.isEmpty()
+                                         ? "name:" + m_chats[m_currentChat].name
+                                         : m_chats[m_currentChat].keys.first());
+        m_db->saveMessage(dbKey, msg);
     }
-
 
     addMessageBubble(text, true);
     m_ui->messageInput->clear();
 
     if (m_chats[m_currentChat].isGroup) {
-        // Group message — send with groupId so receiver routes to group chat
-        const QString groupId = m_chats[m_currentChat].groupId.isEmpty()
-                                    ? m_chats[m_currentChat].name
-                                    : m_chats[m_currentChat].groupId;
+        const QString gid = m_chats[m_currentChat].groupId.isEmpty()
+        ? m_chats[m_currentChat].name : m_chats[m_currentChat].groupId;
         m_controller->sendGroupMessageViaMailbox(
-            groupId,
-            m_chats[m_currentChat].name,
-            m_chats[m_currentChat].keys,
-            text
-            );
+            gid, m_chats[m_currentChat].name, m_chats[m_currentChat].keys, text);
     } else {
-        // DM — fan out to all saved keys for this contact
-        for (const QString &key : m_chats[m_currentChat].keys) {
-            if (!key.trimmed().isEmpty())
-                m_controller->sendText(key.trimmed(), text);
-        }
+        for (const QString &k : m_chats[m_currentChat].keys)
+            if (!k.trimmed().isEmpty()) m_controller->sendText(k.trimmed(), text);
     }
 }
 
 void ChatView::onSearchChanged(const QString &text)
 {
-    QString query = text.trimmed().toLower();
-
+    const QString q = text.trimmed().toLower();
     for (int i = 0; i < m_ui->chatList->count(); ++i) {
-        QListWidgetItem *item = m_ui->chatList->item(i);
-        const ChatData  &chat = m_chats[i];
-        bool matches = false;
-
-        if (query.isEmpty()) {
-            matches = true;
-        } else {
-            if (chat.name.toLower().contains(query))
-                matches = true;
-            if (!matches) {
-                for (const auto &msg : chat.messages) {
-                    if (msg.text.toLower().contains(query)) { matches = true; break; }
-                }
-            }
-        }
-        item->setHidden(!matches);
+        const ChatData &c = m_chats[i];
+        bool match = q.isEmpty() || c.name.toLower().contains(q);
+        if (!match) for (const auto &m : c.messages)
+                if (m.text.toLower().contains(q)) { match = true; break; }
+        m_ui->chatList->item(i)->setHidden(!match);
     }
-
     if (m_currentChat >= 0) {
-        QListWidgetItem *current = m_ui->chatList->item(m_currentChat);
-        if (current && current->isHidden())
-            m_ui->chatList->clearSelection();
+        auto *cur = m_ui->chatList->item(m_currentChat);
+        if (cur && cur->isHidden()) m_ui->chatList->clearSelection();
     }
 }
 
@@ -578,16 +624,14 @@ void ChatView::onEditProfile()
     QString name = m_ui->profileNameLabel->text();
     QStringList keys = m_profileKeys;
     const QString myKey = m_controller->myIdB64u();
-    if (!myKey.isEmpty() && !keys.contains(myKey))
-        keys << myKey;
+    if (!myKey.isEmpty() && !keys.contains(myKey)) keys << myKey;
 
     if (openContactEditor(m_ui->centralwidget, "Edit Your Profile", name, keys, false)
         == ContactEditorResult::Saved) {
         m_ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
         m_ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
         m_profileKeys = keys;
-        m_controller->setSelfKeys(m_profileKeys); // poll all self-device mailboxes
-
+        m_controller->setSelfKeys(m_profileKeys);
         if (m_db) {
             m_db->saveSetting("displayName", name);
             m_db->saveSetting("profileKeys", m_profileKeys.join(','));
@@ -598,40 +642,32 @@ void ChatView::onEditProfile()
 void ChatView::onEditContact(int index)
 {
     if (index < 0 || index >= m_chats.size()) return;
-
     QString     name = m_chats[index].name;
     QStringList keys = m_chats[index].keys;
-
-    const ContactEditorResult result =
-        openContactEditor(m_ui->centralwidget, "Edit Contact", name, keys, true,
-                          m_chats[index].isBlocked);
+    const auto result = openContactEditor(m_ui->centralwidget, "Edit Contact",
+                                          name, keys, true, m_chats[index].isBlocked);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
-        // Update the contact and save to the database
-        m_chats[index].name = name;
-        m_chats[index].keys = keys;
+        m_chats[index].name = name; m_chats[index].keys = keys;
         if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
             m_chats[index].peerIdB64u = keys.first();
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
-        // Update the chat header if this contact is currently open
         if (m_currentChat == index) {
             m_ui->chatTitleLabel->setText(name);
             m_ui->chatAvatarLabel->setText(QString(name[0]).toUpper());
         }
-
     } else if (result == ContactEditorResult::Removed) {
-        // Delete from the database and remove from the in-memory list
+        const QString key = chatKey(m_chats[index]);
         if (m_db) m_db->deleteContact(m_chats[index].peerIdB64u);
+        m_filesByKey.remove(key);
         m_chats.remove(index);
         m_unread.remove(index);
         m_currentChat = -1;
         rebuildChatList();
-        if (!m_chats.isEmpty())
-            m_ui->chatList->setCurrentRow(0);
-
+        if (!m_chats.isEmpty()) m_ui->chatList->setCurrentRow(0);
     } else if (result == ContactEditorResult::Blocked) {
-        m_chats[index].isBlocked = !m_chats[index].isBlocked; // toggle block/unblock
+        m_chats[index].isBlocked = !m_chats[index].isBlocked;
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
     }
@@ -639,211 +675,145 @@ void ChatView::onEditContact(int index)
 
 void ChatView::onAddContact()
 {
-    QString name;
-    QStringList keys;
+    QString name; QStringList keys;
 
-    // Build the add contact dialog manually so we can add a "Create Group" button
     QDialog dlg(m_ui->centralwidget);
-    dlg.setWindowTitle("Add Contact");
-    dlg.setStyleSheet(kDialogStyle);
-    dlg.setMinimumWidth(420);
-    dlg.setModal(true);
+    dlg.setWindowTitle("Add Contact"); dlg.setStyleSheet(kDlgStyle);
+    dlg.setMinimumWidth(420); dlg.setModal(true);
 
     auto *layout = new QVBoxLayout(&dlg);
-    layout->setSpacing(14);
-    layout->setContentsMargins(24, 24, 24, 24);
-
-    auto *titleLbl = new QLabel("Add Contact", &dlg);
-    titleLbl->setObjectName("dlgTitle");
-    layout->addWidget(titleLbl);
-
-    auto *sep = new QFrame(&dlg);
-    sep->setFrameShape(QFrame::HLine);
-    sep->setStyleSheet("color: #2a2a2a;");
-    layout->addWidget(sep);
-
-    layout->addWidget(new QLabel("Display Name", &dlg));
-    auto *nameEdit = new QLineEdit(&dlg);
-    layout->addWidget(nameEdit);
-
-    layout->addWidget(new QLabel("Public Keys", &dlg));
-    auto *keyList = new QListWidget(&dlg);
-    keyList->setFixedHeight(130);
+    layout->setSpacing(14); layout->setContentsMargins(24,24,24,24);
+    auto *ttl = new QLabel("Add Contact",&dlg); ttl->setObjectName("dlgTitle");
+    layout->addWidget(ttl);
+    auto *sp = new QFrame(&dlg); sp->setFrameShape(QFrame::HLine);
+    sp->setStyleSheet("color:#2a2a2a;"); layout->addWidget(sp);
+    layout->addWidget(new QLabel("Display Name",&dlg));
+    auto *nameEdit = new QLineEdit(&dlg); layout->addWidget(nameEdit);
+    layout->addWidget(new QLabel("Public Keys",&dlg));
+    auto *keyList = new QListWidget(&dlg); keyList->setFixedHeight(130);
     layout->addWidget(keyList);
 
-    auto *keyInputRow = new QHBoxLayout;
-    auto *keyInput    = new QLineEdit(&dlg);
-    keyInput->setPlaceholderText("Paste public key...");
-    auto *addKeyBtn    = new QPushButton("Add Key", &dlg);
-    auto *removeKeyBtn = new QPushButton("Remove", &dlg);
-    removeKeyBtn->setObjectName("removeKeyBtn");
-    keyInputRow->addWidget(keyInput, 1);
-    keyInputRow->addWidget(addKeyBtn);
-    keyInputRow->addWidget(removeKeyBtn);
-    layout->addLayout(keyInputRow);
+    auto *kr   = new QHBoxLayout;
+    auto *ki   = new QLineEdit(&dlg); ki->setPlaceholderText("Paste public key…");
+    auto *addK = new QPushButton("Add Key",&dlg);
+    auto *remK = new QPushButton("Remove",&dlg); remK->setObjectName("removeKeyBtn");
+    kr->addWidget(ki,1); kr->addWidget(addK); kr->addWidget(remK);
+    layout->addLayout(kr);
 
-    QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
-        const QString key = keyInput->text().trimmed();
-        if (key.isEmpty()) return;
-        for (int i = 0; i < keyList->count(); ++i) {
-            if (keyList->item(i)->text() == key) {
-                QMessageBox::warning(&dlg, "Duplicate Key",
-                                     "This key already exists and was not added.");
-                return;
-            }
-        }
-        keyList->addItem(key);
-        keyInput->clear();
+    QObject::connect(addK,&QPushButton::clicked,[&](){
+        const QString k = ki->text().trimmed(); if(k.isEmpty()) return;
+        for(int i=0;i<keyList->count();++i) if(keyList->item(i)->text()==k){
+                QMessageBox::warning(&dlg,"Duplicate Key","Key already present."); return; }
+        keyList->addItem(k); ki->clear();
     });
-    QObject::connect(removeKeyBtn, &QPushButton::clicked, [&]() {
-        delete keyList->currentItem();
-    });
+    QObject::connect(remK,&QPushButton::clicked,[&](){ delete keyList->currentItem(); });
 
     layout->addStretch();
 
-    auto *btnRow     = new QHBoxLayout;
-    auto *groupBtn   = new QPushButton("Create Group Chat", &dlg);
-    auto *cancelBtn  = new QPushButton("Cancel", &dlg);
-    auto *saveBtn    = new QPushButton("Save", &dlg);
-    cancelBtn->setObjectName("cancelBtn");
-    saveBtn->setObjectName("saveBtn");
-    groupBtn->setStyleSheet(
-        "QPushButton { background-color: #1a2e1c; color: #5dd868;"
-        "  border: 1px solid #2e5e30; border-radius: 8px; padding: 8px 16px; }"
-        "QPushButton:hover { background-color: #223a24; }"
-        );
-    btnRow->setSpacing(10);
-    btnRow->addWidget(groupBtn);
-    btnRow->addStretch();
-    btnRow->addWidget(cancelBtn);
-    btnRow->addWidget(saveBtn);
-    layout->addLayout(btnRow);
+    auto *br     = new QHBoxLayout;
+    auto *grpBtn = new QPushButton("Create Group Chat",&dlg);
+    auto *can    = new QPushButton("Cancel",&dlg); can->setObjectName("cancelBtn");
+    auto *sav    = new QPushButton("Save",  &dlg); sav->setObjectName("saveBtn");
+    grpBtn->setStyleSheet(
+        "QPushButton{background-color:#1a2e1c;color:#5dd868;border:1px solid #2e5e30;"
+        "border-radius:8px;padding:8px 16px;}QPushButton:hover{background-color:#223a24;}");
+    br->setSpacing(10); br->addWidget(grpBtn); br->addStretch();
+    br->addWidget(can); br->addWidget(sav);
+    layout->addLayout(br);
 
     bool createGroup = false;
-    QObject::connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
-    QObject::connect(saveBtn,   &QPushButton::clicked, &dlg, &QDialog::accept);
-    QObject::connect(groupBtn,  &QPushButton::clicked, [&]() {
-        createGroup = true;
-        dlg.accept();
-    });
+    QObject::connect(can,    &QPushButton::clicked, &dlg, &QDialog::reject);
+    QObject::connect(sav,    &QPushButton::clicked, &dlg, &QDialog::accept);
+    QObject::connect(grpBtn, &QPushButton::clicked, [&](){ createGroup=true; dlg.accept(); });
 
     if (dlg.exec() != QDialog::Accepted) return;
 
     if (createGroup) {
-        // ── Group creation dialog ─────────────────────────────────────────────
         if (m_chats.isEmpty()) {
-            QMessageBox::information(m_ui->centralwidget, "No Contacts",
-                                     "Add some contacts first before creating a group.");
-            return;
-        }
+            QMessageBox::information(m_ui->centralwidget,"No Contacts",
+                                     "Add some contacts first before creating a group."); return; }
 
-        QDialog grpDlg(m_ui->centralwidget);
-        grpDlg.setWindowTitle("New Group Chat");
-        grpDlg.setStyleSheet(kDialogStyle);
-        grpDlg.setMinimumWidth(380);
-
-        auto *grpLayout = new QVBoxLayout(&grpDlg);
-        grpLayout->setSpacing(12);
-        grpLayout->setContentsMargins(24, 24, 24, 24);
-
-        auto *grpTitle = new QLabel("New Group Chat", &grpDlg);
-        grpTitle->setObjectName("dlgTitle");
-        grpLayout->addWidget(grpTitle);
-
-        grpLayout->addWidget(new QLabel("Group Name", &grpDlg));
-        auto *grpNameEdit = new QLineEdit(&grpDlg);
-        grpNameEdit->setPlaceholderText("Enter group name...");
-        grpLayout->addWidget(grpNameEdit);
-
-        grpLayout->addWidget(new QLabel("Select Members", &grpDlg));
-        auto *memberList = new QListWidget(&grpDlg);
-        memberList->setFixedHeight(160);
+        QDialog gd(m_ui->centralwidget);
+        gd.setWindowTitle("New Group Chat"); gd.setStyleSheet(kDlgStyle);
+        gd.setMinimumWidth(380);
+        auto *gl = new QVBoxLayout(&gd); gl->setSpacing(12); gl->setContentsMargins(24,24,24,24);
+        auto *gt = new QLabel("New Group Chat",&gd); gt->setObjectName("dlgTitle");
+        gl->addWidget(gt); gl->addWidget(new QLabel("Group Name",&gd));
+        auto *gn = new QLineEdit(&gd); gn->setPlaceholderText("Enter group name…");
+        gl->addWidget(gn); gl->addWidget(new QLabel("Select Members",&gd));
+        auto *ml = new QListWidget(&gd); ml->setFixedHeight(160);
         for (const ChatData &c : m_chats) {
             if (c.isGroup) continue;
-            auto *item = new QListWidgetItem(c.name, memberList);
-            item->setCheckState(Qt::Unchecked);
+            auto *it = new QListWidgetItem(c.name, ml); it->setCheckState(Qt::Unchecked);
         }
-        grpLayout->addWidget(memberList);
+        gl->addWidget(ml);
+        auto *gbr = new QHBoxLayout;
+        auto *gc  = new QPushButton("Cancel",&gd); gc->setObjectName("cancelBtn");
+        auto *gcr = new QPushButton("Create",&gd); gcr->setObjectName("saveBtn");
+        gbr->addStretch(); gbr->addWidget(gc); gbr->addWidget(gcr);
+        gl->addLayout(gbr);
+        QObject::connect(gc, &QPushButton::clicked, &gd, &QDialog::reject);
+        QObject::connect(gcr,&QPushButton::clicked, &gd, &QDialog::accept);
+        if (gd.exec() != QDialog::Accepted) return;
 
-        auto *grpBtnRow  = new QHBoxLayout;
-        auto *grpCancel  = new QPushButton("Cancel", &grpDlg);
-        auto *grpCreate  = new QPushButton("Create", &grpDlg);
-        grpCancel->setObjectName("cancelBtn");
-        grpCreate->setObjectName("saveBtn");
-        grpBtnRow->addStretch();
-        grpBtnRow->addWidget(grpCancel);
-        grpBtnRow->addWidget(grpCreate);
-        grpLayout->addLayout(grpBtnRow);
-
-        QObject::connect(grpCancel, &QPushButton::clicked, &grpDlg, &QDialog::reject);
-        QObject::connect(grpCreate, &QPushButton::clicked, &grpDlg, &QDialog::accept);
-
-        if (grpDlg.exec() != QDialog::Accepted) return;
-
-        const QString groupName = grpNameEdit->text().trimmed();
-        if (groupName.isEmpty()) return;
-
-        // Collect keys from checked members
-        QStringList groupKeys;
-        QStringList memberNames;
-        for (int i = 0; i < memberList->count(); ++i) {
-            auto *item = memberList->item(i);
-            if (item->checkState() == Qt::Checked) {
-                for (const ChatData &c : m_chats) {
-                    if (c.name == item->text() && !c.isGroup) {
-                        groupKeys << c.keys;
-                        memberNames << c.name;
-                        break;
-                    }
-                }
-            }
+        const QString gname = gn->text().trimmed(); if(gname.isEmpty()) return;
+        QStringList gkeys, mnames;
+        for(int i=0;i<ml->count();++i) {
+            if(ml->item(i)->checkState()==Qt::Checked)
+                for(const ChatData &c:m_chats)
+                    if(c.name==ml->item(i)->text()&&!c.isGroup){
+                        gkeys<<c.keys; mnames<<c.name; break; }
         }
+        if(gkeys.isEmpty()){ QMessageBox::warning(m_ui->centralwidget,"No Members",
+                                 "Select at least one member."); return; }
 
-        if (groupKeys.isEmpty()) {
-            QMessageBox::warning(m_ui->centralwidget, "No Members",
-                                 "Select at least one member for the group.");
-            return;
-        }
-
-        ChatData newGroup;
-        newGroup.name     = groupName;
-        newGroup.subtitle = QString("Group · %1 member%2")
-                                .arg(memberNames.size())
-                                .arg(memberNames.size() == 1 ? "" : "s");
-        newGroup.isGroup  = true;
-        newGroup.keys     = groupKeys;
-        newGroup.groupId  = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        newGroup.peerIdB64u = newGroup.groupId;
-        m_chats.append(newGroup);
-        if (m_db) m_db->saveContact(newGroup);
+        ChatData ng; ng.name = gname;
+        ng.subtitle = QString("Group · %1 member%2").arg(mnames.size())
+                          .arg(mnames.size()==1?"":"s");
+        ng.isGroup = true; ng.keys = gkeys;
+        ng.groupId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ng.peerIdB64u = ng.groupId;
+        m_chats.append(ng);
+        if(m_db) m_db->saveContact(ng);
         rebuildChatList();
-        m_ui->chatList->setCurrentRow(m_chats.size() - 1);
+        m_ui->chatList->setCurrentRow(m_chats.size()-1);
         return;
     }
 
-    // ── Save new contact ──────────────────────────────────────────────────────
-    name = nameEdit->text().trimmed();
-    if (name.isEmpty()) return;
-
-    for (int i = 0; i < keyList->count(); ++i)
-        keys << keyList->item(i)->text();
-
-    ChatData newChat;
-    newChat.name       = name;
-    newChat.subtitle   = "Secure chat";
-    newChat.keys       = keys;
-    if (!keys.isEmpty()) newChat.peerIdB64u = keys.first();
-    m_chats.append(newChat);
-    if (m_db) m_db->saveContact(newChat);
+    name = nameEdit->text().trimmed(); if(name.isEmpty()) return;
+    for(int i=0;i<keyList->count();++i) keys<<keyList->item(i)->text();
+    ChatData nc; nc.name=name; nc.subtitle="Secure chat"; nc.keys=keys;
+    if(!keys.isEmpty()) nc.peerIdB64u=keys.first();
+    m_chats.append(nc);
+    if(m_db) m_db->saveContact(nc);
     rebuildChatList();
-    m_ui->chatList->setCurrentRow(m_chats.size() - 1);
+    m_ui->chatList->setCurrentRow(m_chats.size()-1);
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
+int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
+{
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].isGroup) continue;
+        if (m_chats[i].peerIdB64u.trimmed() == peerIdB64u) return i;
+        for (const QString &k : m_chats[i].keys)
+            if (k.trimmed() == peerIdB64u) return i;
+    }
+    // Unknown sender — auto-create
+    ChatData nc; nc.name = "Unknown contact"; nc.subtitle = "Secure chat";
+    nc.peerIdB64u = peerIdB64u; nc.keys.append(peerIdB64u);
+    m_chats.prepend(nc);
+    if (m_db) m_db->saveContact(nc);
+    ensureUnreadSize();
+    m_unread.prepend(0);
+    if (m_currentChat >= 0) m_currentChat += 1;
+    rebuildChatList();
+    return 0;
+}
+
 void ChatView::initChats()
 {
-    // ── DB: load saved display name and restore it to the profile labels ──────
     if (m_db) {
         const QString savedName = m_db->loadSetting("displayName");
         if (!savedName.isEmpty()) {
@@ -852,104 +822,81 @@ void ChatView::initChats()
         }
     }
 
-    // -- load contacts from Db - start with empty list if none exists
-    if (m_db) {
-        m_chats = m_db->loadAllContacts(); // returns empty QVector on a fresh DB
-    }
+    if (m_db) m_chats = m_db->loadAllContacts();
 
     m_ui->chatList->clear();
-    for (const auto &c : m_chats)
-        m_ui->chatList->addItem(c.name);
+    for (const auto &c : m_chats) m_ui->chatList->addItem(c.name);
 
-    // Load saved self-device keys and start polling all of them
     if (m_db) {
-        const QString savedKeys = m_db->loadSetting("profileKeys");
-        if (!savedKeys.isEmpty())
-            m_profileKeys = savedKeys.split(',', Qt::SkipEmptyParts);
+        const QString sk = m_db->loadSetting("profileKeys");
+        if (!sk.isEmpty()) m_profileKeys = sk.split(',', Qt::SkipEmptyParts);
     }
     m_controller->setSelfKeys(m_profileKeys);
+
+    // Show first 8 chars of public key as handle
+    const QString fullKey = m_controller->myIdB64u();
+    if (!fullKey.isEmpty()) {
+        m_ui->profileHandleLabel->setText(fullKey.left(8) + "…");
+        m_ui->profileHandleLabel->setToolTip(fullKey);
+    }
 }
 
 void ChatView::rebuildChatList()
 {
     disconnect(m_ui->chatList, &QListWidget::currentRowChanged,
                this, &ChatView::onChatSelected);
-
     m_ui->chatList->clear();
 
     for (int i = 0; i < m_chats.size(); ++i) {
         auto *item = new QListWidgetItem(m_ui->chatList);
         item->setSizeHint(QSize(0, 52));
-
         auto *row = new QWidget;
-        row->setStyleSheet("background: transparent;");
+        row->setStyleSheet("background:transparent;");
         auto *hl = new QHBoxLayout(row);
-        hl->setContentsMargins(14, 0, 8, 0);
-        hl->setSpacing(6);
+        hl->setContentsMargins(14,0,8,0); hl->setSpacing(6);
 
         auto *nameLbl = new QLabel(m_chats[i].name, row);
-        nameLbl->setStyleSheet("color: #d0d0d0; font-size: 14px; background: transparent;");
+        nameLbl->setStyleSheet("color:#d0d0d0;font-size:14px;background:transparent;");
         hl->addWidget(nameLbl, 1);
 
-        // ── Unread dot ────────────────────────────────────────────────────────
         ensureUnreadSize();
         if (m_unread[i] > 0) {
-            auto *dot = new QLabel(row);
-            dot->setFixedSize(8, 8);
-            dot->setStyleSheet(
-                "QLabel { background-color: #5dd868; border-radius: 4px; }"
-                );
+            auto *dot = new QLabel(row); dot->setFixedSize(8,8);
+            dot->setStyleSheet("QLabel{background-color:#5dd868;border-radius:4px;}");
             hl->addWidget(dot);
         }
 
         auto *editBtn = new QToolButton(row);
-        editBtn->setText("✎");
-        editBtn->setFixedSize(28, 28);
+        editBtn->setText("✎"); editBtn->setFixedSize(28,28);
         editBtn->setStyleSheet(
-            "QToolButton { background: transparent; border: none; color: #444444; font-size: 15px; border-radius: 6px; }"
-            "QToolButton:hover { color: #5dd868; background: #1a2e1c; }"
-            );
-        editBtn->setToolTip("Edit contact");
+            "QToolButton{background:transparent;border:none;color:#444444;"
+            "font-size:15px;border-radius:6px;}"
+            "QToolButton:hover{color:#5dd868;background:#1a2e1c;}");
         hl->addWidget(editBtn);
-
         m_ui->chatList->setItemWidget(item, row);
-
-        connect(editBtn, &QToolButton::clicked, this, [this, i]() {
-            onEditContact(i);
-        });
+        connect(editBtn, &QToolButton::clicked, this, [this,i](){ onEditContact(i); });
     }
 
     connect(m_ui->chatList, &QListWidget::currentRowChanged,
             this, &ChatView::onChatSelected);
-
     if (m_currentChat >= 0 && m_currentChat < m_ui->chatList->count())
         m_ui->chatList->setCurrentRow(m_currentChat);
 
-    // Show/hide empty state overlay
     if (!m_emptyLabel) {
         m_emptyLabel = new QLabel(m_ui->contentWidget);
         m_emptyLabel->setText("💬\n\nNo contacts yet\nClick + to add a contact\nand start chatting");
         m_emptyLabel->setAlignment(Qt::AlignCenter);
         m_emptyLabel->setStyleSheet(
-            "color: #555555;"
-            "font-size: 14px;"
-            "background-color: #0a0a0a;"
-            "padding: 40px;"
-            );
+            "color:#555555;font-size:14px;background-color:#0a0a0a;padding:40px;");
         m_emptyLabel->setWordWrap(true);
         m_emptyLabel->setAttribute(Qt::WA_TransparentForMouseEvents, false);
     }
     m_emptyLabel->resize(m_ui->contentWidget->size());
-    m_emptyLabel->move(0, 0);
-    m_emptyLabel->raise();
+    m_emptyLabel->move(0,0); m_emptyLabel->raise();
     if (m_chats.isEmpty()) {
-        QTimer::singleShot(0, [this]() {
-            if (m_emptyLabel) {
-                m_emptyLabel->resize(m_ui->contentWidget->size());
-                m_emptyLabel->raise();
-                m_emptyLabel->show();
-            }
-        });
+        QTimer::singleShot(0,[this](){ if(m_emptyLabel){
+            m_emptyLabel->resize(m_ui->contentWidget->size());
+            m_emptyLabel->raise(); m_emptyLabel->show(); } });
     } else {
         if (m_emptyLabel) m_emptyLabel->hide();
     }
@@ -958,7 +905,6 @@ void ChatView::rebuildChatList()
 void ChatView::loadChat(int index)
 {
     const ChatData &chat = m_chats[index];
-
     m_ui->chatTitleLabel->setText(chat.name);
     m_ui->chatSubLabel->setText("● " + chat.subtitle);
     m_ui->chatAvatarLabel->setText(chat.name.isEmpty() ? "?" : QString(chat.name[0]).toUpper());
@@ -966,168 +912,365 @@ void ChatView::loadChat(int index)
 
     QDateTime lastShown;
     for (const Message &msg : chat.messages) {
-        const bool needsSeparator =
-            !lastShown.isValid() ||
-            lastShown.secsTo(msg.timestamp) >= kDateSeparatorThresholdSecs;
-
-        if (needsSeparator) {
+        if (!lastShown.isValid() || lastShown.secsTo(msg.timestamp) >= kDateSepSecs) {
             addDateSeparator(msg.timestamp);
             lastShown = msg.timestamp;
         }
-
         addMessageBubble(msg.text, msg.sent);
     }
+    rebuildFilesTab();
 }
 
 void ChatView::promoteChatToTop(int index)
 {
-    if (index <= 0 || index >= m_chats.size())
-        return; // already at top or invalid
+    // promoteChatToTop does NOT remap m_filesByKey because that map is keyed by
+    // the stable peer ID — not by list index.  Only m_unread needs adjustment.
+    if (index <= 0 || index >= m_chats.size()) return;
 
-    // Move the chat data to front
     ChatData promoted = m_chats.takeAt(index);
     m_chats.prepend(promoted);
 
-    // Mirror the unread vector
     ensureUnreadSize();
-    int unreadCount = m_unread[index];
+    int u = m_unread[index];
     m_unread.remove(index);
-    m_unread.prepend(unreadCount);
+    m_unread.prepend(u);
 
-    // Keep m_currentChat pointing at the same chat
-    if (m_currentChat == index) {
-        m_currentChat = 0;
-    } else if (m_currentChat >= 0 && m_currentChat < index) {
-        m_currentChat += 1; // everything above index shifted down by one
-    }
+    if (m_currentChat == index)              m_currentChat = 0;
+    else if (m_currentChat >= 0 && m_currentChat < index) m_currentChat += 1;
 }
 
 void ChatView::clearMessages()
 {
-    QLayout *layout = m_ui->scrollAreaWidgetContents->layout();
-    if (!layout) return;
-
-    while (layout->count() > 1) {
-        QLayoutItem *item = layout->takeAt(0);
-        if (item->widget()) delete item->widget();
-        delete item;
+    QLayout *l = m_ui->scrollAreaWidgetContents->layout();
+    if (!l) return;
+    while (l->count() > 1) {
+        QLayoutItem *it = l->takeAt(0);
+        if (it->widget()) delete it->widget();
+        delete it;
     }
 }
 
-// ── DATE SEPARATOR: insert a centered iMessage-style date label ───────────────
 void ChatView::addDateSeparator(const QDateTime &dt)
 {
-    QVBoxLayout *layout = qobject_cast<QVBoxLayout *>(
-        m_ui->scrollAreaWidgetContents->layout());
+    auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
     if (!layout) return;
-
-    // Outer row — full width, centered
-    QWidget *row = new QWidget(m_ui->scrollAreaWidgetContents);
+    auto *row = new QWidget(m_ui->scrollAreaWidgetContents);
     row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     row->setFixedHeight(28);
-
-    QHBoxLayout *hl = new QHBoxLayout(row);
-    hl->setContentsMargins(0, 4, 0, 4);
-    hl->setSpacing(0);
-
-    QLabel *lbl = new QLabel(formatSeparatorLabel(dt), row);
+    auto *hl = new QHBoxLayout(row); hl->setContentsMargins(0,4,0,4); hl->setSpacing(0);
+    auto *lbl = new QLabel(formatSepLabel(dt), row);
     lbl->setAlignment(Qt::AlignCenter);
-    lbl->setStyleSheet(
-        "color: #666666;"          //gray muted color
-        "font-size: 11px;"
-        "background: transparent;"
-        );
-
-    hl->addStretch();
-    hl->addWidget(lbl);
-    hl->addStretch();
-
-    layout->insertWidget(layout->count() - 1, row);
+    lbl->setStyleSheet("color:#666666;font-size:11px;background:transparent;");
+    hl->addStretch(); hl->addWidget(lbl); hl->addStretch();
+    layout->insertWidget(layout->count()-1, row);
 }
 
 void ChatView::addMessageBubble(const QString &text, bool sent)
 {
-    QFont bubbleFont = QApplication::font();
-    bubbleFont.setPixelSize(13);
-    QFontMetrics fm(bubbleFont);
+    QFont f = QApplication::font(); f.setPixelSize(13);
+    QFontMetrics fm(f);
+    int vpW   = m_ui->messageScroll->viewport()->width();
+    int maxW  = qMax(int(vpW * 0.65), 120);
+    int hPad  = 28, vPad = 28, avail = maxW - hPad;
 
-    // Dynamic max width — 65% of viewport like iMessage
-    int viewportWidth   = m_ui->messageScroll->viewport()->width();
-    int maxBubbleWidth  = qMax(static_cast<int>(viewportWidth * 0.65), 120);
+    QString disp  = processText(text, fm, avail);
+    int     slw   = fm.horizontalAdvance(disp);
+    bool    wrap  = (slw > avail) || disp.contains('\n');
+    int     bw    = wrap ? maxW : qMin(slw + hPad + 4, maxW);
+    int     bh;
 
-    const int hPadding          = 28;
-    const int vPadding          = 28;
-    const int availableTextWidth = maxBubbleWidth - hPadding;
-
-    QString displayText      = processText(text, fm, availableTextWidth);
-    int singleLineTextWidth  = fm.horizontalAdvance(displayText);
-    bool needsWrap           = (singleLineTextWidth > availableTextWidth)
-                     || displayText.contains('\n');
-
-    int bubbleWidth = needsWrap
-                          ? maxBubbleWidth
-                          : qMin(singleLineTextWidth + hPadding + 4, maxBubbleWidth);
-
-    int bubbleHeight;
-    if (needsWrap) {
+    if (wrap) {
         int lines = 0;
-        for (const QString &para : displayText.split('\n')) {
-            if (para.isEmpty()) { lines++; continue; }
-            int lineWidth = 0, paraLines = 1;
-            for (const QString &word : para.split(' ')) {
-                int w = fm.horizontalAdvance(word + " ");
-                if (lineWidth + w > availableTextWidth && lineWidth > 0) { paraLines++; lineWidth = w; }
-                else lineWidth += w;
+        for (const QString &p : disp.split('\n')) {
+            if (p.isEmpty()) { lines++; continue; }
+            int lw = 0, pl = 1;
+            for (const QString &w : p.split(' ')) {
+                int ww = fm.horizontalAdvance(w + " ");
+                if (lw+ww > avail && lw > 0) { pl++; lw = ww; } else lw += ww;
             }
-            lines += paraLines;
+            lines += pl;
         }
-        bubbleHeight = (fm.height() * lines) + vPadding + ((lines - 1) * fm.leading()) + 1;
+        bh = fm.height()*lines + vPad + (lines-1)*fm.leading() + 1;
     } else {
-        bubbleHeight = fm.height() + vPadding + 1;
+        bh = fm.height() + vPad + 1;
     }
 
-    QWidget *row = new QWidget(m_ui->scrollAreaWidgetContents);
+    auto *row = new QWidget(m_ui->scrollAreaWidgetContents);
     row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    row->setFixedHeight(bubbleHeight + 4);
+    row->setFixedHeight(bh+4);
+    auto *rl = new QHBoxLayout(row); rl->setContentsMargins(0,2,0,2); rl->setSpacing(0);
 
-    QHBoxLayout *rowLayout = new QHBoxLayout(row);
-    rowLayout->setContentsMargins(0, 2, 0, 2);
-    rowLayout->setSpacing(0);
-
-    QLabel *bubble = new QLabel(displayText, row);
-    bubble->setFont(bubbleFont);
-    bubble->setFixedSize(bubbleWidth, bubbleHeight);
-    bubble->setWordWrap(needsWrap);
+    auto *bubble = new QLabel(disp, row);
+    bubble->setFont(f); bubble->setFixedSize(bw, bh);
+    bubble->setWordWrap(wrap);
     bubble->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
     bubble->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-    if (sent) {bubble->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        bubble->setStyleSheet(
-            "background-color: #2e8b3a; color: #ffffff;"
-            "border-radius: 14px; padding: 10px 14px; font-size: 13px;"
-            );
-        rowLayout->addStretch();
-        rowLayout->addWidget(bubble);
+    if (sent) {
+        bubble->setStyleSheet("background-color:#2e8b3a;color:#ffffff;"
+                              "border-radius:14px;padding:10px 14px;font-size:13px;");
+        rl->addStretch(); rl->addWidget(bubble);
     } else {
-        bubble->setStyleSheet(
-            "background-color: #222222; color: #eeeeee;"
-            "border-radius: 14px; padding: 10px 14px; font-size: 13px;"
-            );
-        rowLayout->addWidget(bubble);
-        rowLayout->addStretch();
+        bubble->setStyleSheet("background-color:#222222;color:#eeeeee;"
+                              "border-radius:14px;padding:10px 14px;font-size:13px;");
+        rl->addWidget(bubble); rl->addStretch();
     }
 
-    QVBoxLayout *layout = qobject_cast<QVBoxLayout *>(
-        m_ui->scrollAreaWidgetContents->layout()
-        );
+    auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
     if (!layout) return;
-
-    layout->insertWidget(layout->count() - 1, row);
-    QTimer::singleShot(5, [this]() {
+    layout->insertWidget(layout->count()-1, row);
+    QTimer::singleShot(5,[this](){
         m_ui->messageScroll->verticalScrollBar()->setValue(
-            m_ui->messageScroll->verticalScrollBar()->maximum()
+            m_ui->messageScroll->verticalScrollBar()->maximum()); });
+}
+
+// ── Files tab ─────────────────────────────────────────────────────────────────
+//
+// Layout strategy: we fully replace the contents of filesScrollContents' layout
+// each rebuild so we can switch between an empty placeholder, an in-progress
+// placeholder, and a 3-column QGridLayout of cards without fighting the static
+// QHBoxLayout / spacer that the .ui file placed there at design time.
+
+void ChatView::rebuildFilesTab()
+{
+    QLayout *outerRaw = m_ui->filesScrollContents->layout();
+    if (!outerRaw) return;
+
+    // ── Clear everything currently in the scroll area ─────────────────────────
+    // We need to remove widgets AND sub-layouts recursively.
+    auto clearLayout = [](QLayout *l) {
+        while (l->count() > 0) {
+            QLayoutItem *it = l->takeAt(0);
+            if (it->widget()) {
+                it->widget()->hide();
+                delete it->widget();
+            } else if (it->layout()) {
+                // Clear the sub-layout's own children first
+                QLayout *sub = it->layout();
+                while (sub->count() > 0) {
+                    QLayoutItem *s = sub->takeAt(0);
+                    if (s->widget()) { s->widget()->hide(); delete s->widget(); }
+                    delete s;
+                }
+            }
+            delete it;
+        }
+    };
+    clearLayout(outerRaw);
+
+    auto *outer = qobject_cast<QVBoxLayout*>(outerRaw);
+    if (!outer) return;
+
+    if (m_currentChat < 0) return;
+
+    const QString key     = chatKey(m_chats[m_currentChat]);
+    const auto   &records = m_filesByKey.value(key);
+
+    if (records.isEmpty()) {
+        // ── Empty state ───────────────────────────────────────────────────────
+        auto *ph = new QLabel(m_ui->filesScrollContents);
+        ph->setText("📎\n\nNo files shared yet\n\nClick the  ⬆  button below to send a file");
+        ph->setAlignment(Qt::AlignCenter);
+        ph->setWordWrap(true);
+        ph->setStyleSheet(
+            "color:#444444;font-size:13px;background:transparent;border:none;");
+        outer->addStretch();
+        outer->addWidget(ph);
+        outer->addStretch();
+        return;
+    }
+
+    // ── Grid of cards (3 per row) ─────────────────────────────────────────────
+    auto *gridWidget = new QWidget(m_ui->filesScrollContents);
+    gridWidget->setStyleSheet("background:transparent;");
+    auto *grid = new QGridLayout(gridWidget);
+    grid->setSpacing(16);
+    grid->setContentsMargins(0, 0, 0, 0);
+
+    static constexpr int kCols = 3;
+    for (int i = 0; i < records.size(); ++i)
+        grid->addWidget(buildFileCard(records[i], gridWidget), i / kCols, i % kCols);
+
+    // Equal-width columns so cards fill the available space
+    for (int c = 0; c < kCols; ++c)
+        grid->setColumnStretch(c, 1);
+
+    outer->addWidget(gridWidget);
+    outer->addStretch();
+}
+
+QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
+{
+    const bool inFlight = (rec.status == FileTransferStatus::Sending ||
+                           rec.status == FileTransferStatus::Receiving);
+
+    // ── Card shell ────────────────────────────────────────────────────────────
+    auto *card = new QFrame(parent);
+    card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    card->setStyleSheet(
+        "QFrame#fileCard{"
+        "  background-color:#1a1a1a;"
+        "  border:1px solid #2a2a2a;"
+        "  border-radius:12px;"
+        "}"
+        );
+    card->setObjectName("fileCard");
+
+    auto *vl = new QVBoxLayout(card);
+    vl->setContentsMargins(0, 0, 0, 16);
+    vl->setSpacing(0);
+
+    // ── Thumbnail / icon area ─────────────────────────────────────────────────
+    auto *thumbWidget = new QWidget(card);
+    thumbWidget->setMinimumHeight(220);
+    thumbWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    thumbWidget->setStyleSheet(
+        "background-color:#242424;"
+        "border-radius:10px 10px 0 0;"
+        );
+
+    auto *thumbLayout = new QVBoxLayout(thumbWidget);
+    thumbLayout->setContentsMargins(0, 0, 0, 0);
+
+    auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
+    iconLbl->setAlignment(Qt::AlignCenter);
+    iconLbl->setStyleSheet(
+        "background:transparent;"
+        "color:#555555;"
+        "font-size:64px;"
+        "border:none;"
+        );
+    thumbLayout->addStretch();
+    thumbLayout->addWidget(iconLbl);
+
+    // Progress bar overlaid at the bottom of the thumb area (in-flight only)
+    if (inFlight && rec.chunksTotal > 0) {
+        auto *pb = new QProgressBar(thumbWidget);
+        pb->setRange(0, rec.chunksTotal);
+        pb->setValue(rec.chunksComplete);
+        pb->setFixedHeight(4);
+        pb->setTextVisible(false);
+        pb->setStyleSheet(
+            "QProgressBar{background-color:#333333;border-radius:0;border:none;margin:0;}"
+            "QProgressBar::chunk{background-color:#3a9e48;border-radius:0;}");
+        thumbLayout->addWidget(pb);
+    } else {
+        thumbLayout->addStretch();
+    }
+
+    vl->addWidget(thumbWidget);
+
+    // ── Text block ────────────────────────────────────────────────────────────
+    auto *textWidget = new QWidget(card);
+    textWidget->setStyleSheet("background:transparent;");
+    auto *tl = new QVBoxLayout(textWidget);
+    tl->setContentsMargins(14, 12, 14, 0);
+    tl->setSpacing(3);
+
+    // Filename (elided to one line)
+    auto *nameLbl = new QLabel(textWidget);
+    {
+        QFont nf = nameLbl->font();
+        nf.setBold(true);
+        nf.setPixelSize(13);
+        nameLbl->setFont(nf);
+    }
+    nameLbl->setStyleSheet("color:#eeeeee;background:transparent;border:none;");
+    nameLbl->setToolTip(rec.fileName);
+    // Elide done after card is painted; use a sizePolicy hint for now
+    nameLbl->setText(rec.fileName);
+    nameLbl->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    // Size label
+    auto *sizeLbl = new QLabel(formatFileSize(rec.fileSize), textWidget);
+    sizeLbl->setStyleSheet("color:#888888;font-size:12px;background:transparent;border:none;");
+
+    // Direction / status label
+    QString dirText;
+    if (inFlight) {
+        dirText = QString("%1 / %2 chunks…")
+                      .arg(rec.chunksComplete).arg(rec.chunksTotal);
+    } else {
+        dirText = rec.sent ? "You sent this" : "From other";
+    }
+    auto *dirLbl = new QLabel(dirText, textWidget);
+    dirLbl->setStyleSheet(
+        inFlight ? "color:#5dd868;font-size:12px;background:transparent;border:none;"
+                 : "color:#666666;font-size:12px;background:transparent;border:none;");
+
+    tl->addWidget(nameLbl);
+    tl->addWidget(sizeLbl);
+    tl->addWidget(dirLbl);
+    vl->addWidget(textWidget);
+
+    // ── Download button (complete state only) ─────────────────────────────────
+    if (rec.status == FileTransferStatus::Complete && !rec.savedPath.isEmpty()) {
+        auto *btnContainer = new QWidget(card);
+        btnContainer->setStyleSheet("background:transparent;");
+        auto *bl = new QVBoxLayout(btnContainer);
+        bl->setContentsMargins(14, 10, 14, 0);
+
+        auto *dlBtn = new QPushButton("↓   Download", btnContainer);
+        dlBtn->setFixedHeight(42);
+        dlBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        dlBtn->setStyleSheet(
+            "QPushButton{"
+            "  background-color:#2e8b3a;"
+            "  color:#ffffff;"
+            "  border:none;"
+            "  border-radius:8px;"
+            "  font-size:13px;"
+            "  font-weight:bold;"
+            "}"
+            "QPushButton:hover{ background-color:#38a844; }"
+            "QPushButton:pressed{ background-color:#226228; }"
             );
-    });
+
+        const QString savedPath = rec.savedPath;
+        const QString fileName  = rec.fileName;
+        const bool    isSent    = rec.sent;
+
+        QObject::connect(dlBtn, &QPushButton::clicked, [=]() {
+            if (isSent) {
+                // Sent file: the savedPath IS the original file — just open its folder
+                if (QFile::exists(savedPath)) {
+                    QDesktopServices::openUrl(
+                        QUrl::fromLocalFile(QFileInfo(savedPath).absolutePath()));
+                } else {
+                    QMessageBox::warning(m_ui->centralwidget, "File Not Found",
+                                         "The original file could not be found at:\n" + savedPath);
+                }
+                return;
+            }
+
+            // Received file: offer Save As into a location the user chooses
+            const QString defaultDest =
+                QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)
+                + "/" + fileName;
+            const QString dest = QFileDialog::getSaveFileName(
+                m_ui->centralwidget, "Save File", defaultDest);
+            if (dest.isEmpty()) return;
+
+            if (!QFile::exists(savedPath)) {
+                QMessageBox::warning(m_ui->centralwidget, "File Not Found",
+                                     "The auto-saved copy could not be found:\n" + savedPath);
+                return;
+            }
+            if (QFile::exists(dest)) QFile::remove(dest);
+            if (QFile::copy(savedPath, dest)) {
+                QMessageBox::information(m_ui->centralwidget, "Saved",
+                                         "File saved to:\n" + dest);
+            } else {
+                QMessageBox::warning(m_ui->centralwidget, "Copy Failed",
+                                     "Could not copy file to:\n" + dest);
+            }
+        });
+
+        bl->addWidget(dlBtn);
+        vl->addWidget(btnContainer);
+    }
+
+    return card;
 }
 
 void ChatView::ensureUnreadSize()
@@ -1138,7 +1281,5 @@ void ChatView::ensureUnreadSize()
 
 int ChatView::totalUnread() const
 {
-    int sum = 0;
-    for (int n : m_unread) sum += n;
-    return sum;
+    int s = 0; for (int n : m_unread) s += n; return s;
 }
