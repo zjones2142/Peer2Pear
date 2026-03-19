@@ -68,7 +68,7 @@ ChatController::ChatController(QObject* parent)
 
     // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
     connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
-        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
+        m_rvz.publish("3.141.14.234", 0, 10LL * 60 * 1000);
     });
     m_rvzRefreshTimer.setInterval(9 * 60 * 1000);
 }

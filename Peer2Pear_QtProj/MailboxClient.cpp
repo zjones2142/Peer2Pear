@@ -105,7 +105,7 @@ void MailboxClient::fetch(const QString& myIdB64u)
 // ── fetchAll (batch — uses /mbox/fetch_all) ───────────────────────────────────
 //
 // Retrieves all pending envelopes in one signed HTTP request.
-// Server returns:  { "envelopes": [ {"env_id": "...", "payload_b64": "..."}, ... ] }
+// Server returns a JSON array: [ {"env_id": "...", "payload_b64": "..."}, ... ]
 // Falls back to single fetch() if the server returns 404 or 405 (not yet deployed).
 
 void MailboxClient::fetchAll(const QString& myIdB64u)
@@ -151,23 +151,30 @@ void MailboxClient::fetchAll(const QString& myIdB64u)
                 }
 
                 // ── Parse batch response ──────────────────────────────────────────────
-                const QByteArray     raw = rep->readAll();
+                // Server returns a JSON array directly:
+                //   [ {"env_id": "...", "payload_b64": "..."}, ... ]
+                const QByteArray    raw = rep->readAll();
                 rep->deleteLater();
 
-                const QJsonDocument  doc = QJsonDocument::fromJson(raw);
-                if (!doc.isObject()) return;
+                const QJsonDocument doc = QJsonDocument::fromJson(raw);
 
-                const QJsonArray envelopes = doc.object().value("envelopes").toArray();
-                for (const QJsonValue &v : envelopes) {
-                    const QJsonObject entry  = v.toObject();
-                    const QString     envId  = entry.value("env_id").toString();
-                    const QString     b64u   = entry.value("payload_b64").toString();
+                // If the response is not an array, fall back to single-fetch mode
+                if (!doc.isArray()) {
+                    emit status("fetchAll: unexpected response format, falling back");
+                    fetch(myIdB64u);
+                    return;
+                }
 
-                    // Decode base64url payload
-                    QByteArray padded = b64u.toUtf8();
-                    // Add padding if missing
+                const QJsonArray arr = doc.array();
+                for (const QJsonValue &v : arr) {
+                    const QJsonObject entry = v.toObject();
+                    const QString     envId = entry.value("env_id").toString();
+                    const QString     b64   = entry.value("payload_b64").toString();
+
+                    // Server stores payload as url-safe base64, no padding.
+                    // Qt's fromBase64 needs standard base64 with padding.
+                    QByteArray padded = b64.toUtf8();
                     while (padded.size() % 4) padded.append('=');
-                    // Replace URL-safe chars back to standard base64 for Qt's decoder
                     padded.replace('-', '+');
                     padded.replace('_', '/');
                     const QByteArray body = QByteArray::fromBase64(padded);

@@ -512,7 +512,7 @@ void ChatView::onAttachFile()
         if (!tid.isEmpty() && localTransferId.isEmpty()) {
             localTransferId = tid;
             // Compute chunk count the same way ChatController does
-            constexpr qint64 kChunk = 256LL * 1024;
+            constexpr qint64 kChunk = 240LL * 1024;
             totalChunks = int((data.size() + kChunk - 1) / kChunk);
         }
     }
