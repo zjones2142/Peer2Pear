@@ -13,6 +13,7 @@
 // ---------------------------
 // Helpers
 // ---------------------------
+
 static QString identityPath() {
     const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(base + "/keys");
@@ -87,6 +88,7 @@ static QByteArray secretboxDecrypt(const QByteArray& key32,
 // ---------------------------
 // CryptoEngine
 // ---------------------------
+
 CryptoEngine::CryptoEngine() {
     if (sodium_init() < 0) throw std::runtime_error("libsodium init failed");
 }
@@ -128,6 +130,7 @@ QByteArray CryptoEngine::fromBase64Url(const QString& s) {
 // ---------------------------
 // Persistence (encrypted private key)
 // ---------------------------
+
 bool CryptoEngine::loadIdentityFromDisk() {
 
     QString path = identityPath();
@@ -273,6 +276,7 @@ void CryptoEngine::ensureIdentity() {
 // ---------------------------
 // Signing + key agreement + AEAD
 // ---------------------------
+
 QString CryptoEngine::signB64u(const QByteArray& msgUtf8) const {
     unsigned char sig[crypto_sign_BYTES];
     crypto_sign_detached(sig, nullptr,
