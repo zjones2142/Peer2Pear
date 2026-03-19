@@ -57,7 +57,8 @@ signals:
                               const QString& groupName,
                               const QStringList& memberKeys,
                               const QString& text,
-                              const QDateTime& ts);
+                              const QDateTime& ts,
+                              const QString& msgId);
     void groupMemberLeft(const QString& fromPeerIdB64u,
                          const QString& groupId,
                          const QString& groupName,
