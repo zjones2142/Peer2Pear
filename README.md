@@ -7,7 +7,7 @@ A hybrid peer-to-peer file sharing and messaging application built with Qt, feat
 ## Features
 
 - **End-to-end encrypted messaging** — all messages are encrypted with XChaCha20-Poly1305 (AEAD) using per-contact shared keys derived via X25519 from Ed25519 identity keys.
-- **Encrypted file transfer** — send files up to 8 MB, automatically split into chunks and encrypted before transmission.
+- **Encrypted file transfer** — send files up to 8 MB (likely to increase in future), automatically split into chunks and encrypted before transmission.
 - **Group chats** — create and participate in group conversations.
 - **Hybrid P2P networking** — attempts direct peer-to-peer connections via ICE/NAT traversal (libnice), falling back to a relay mailbox server when a direct path is not available.
 - **Persistent storage** — chat history and contacts are stored locally in a SQLite database.
@@ -43,6 +43,7 @@ Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
 
+#### Run the following before opening in Qt!
 ### Linux / macOS
 
 ```bash
