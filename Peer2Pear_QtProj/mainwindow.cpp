@@ -89,6 +89,8 @@ MainWindow::MainWindow(QWidget *parent)
             m_chatView,    &ChatView::onStatus);
     connect(&m_controller, &ChatController::groupMessageReceived,
             m_chatView,    &ChatView::onIncomingGroupMessage);
+    connect(&m_controller, &ChatController::groupMemberLeft,
+            m_chatView,    &ChatView::onGroupMemberLeft);
     connect(&m_controller, &ChatController::fileChunkReceived,
             m_chatView,    &ChatView::onFileChunkReceived);
 

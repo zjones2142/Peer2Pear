@@ -90,15 +90,18 @@ static const char *kDlgStyle =
     "QPushButton#removeKeyBtn { background-color: #2e1a1a; color: #cc5555; border: 1px solid #5e2e2e; }"
     "QPushButton#removeKeyBtn:hover { background-color: #3a2020; }";
 
-// ── Contact editor dialog ─────────────────────────────────────────────────────
-enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed };
-
+// Opens a modal dialog to edit a contact name + list of public keys.
+// nameInOut and keysInOut are updated on Save; returns false on Cancel.
+enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed, Left };
 static ContactEditorResult openContactEditor(QWidget *parent,
                                              const QString &title,
                                              QString &nameInOut,
                                              QStringList &keysInOut,
-                                             bool showDestructive = true,
-                                             bool isBlocked = false)
+                                             bool showDestructiveActions = true,
+                                             bool isBlocked = false,
+                                             bool isGroup = false,
+                                             const QVector<ChatData> *allContacts = nullptr,
+                                             std::function<void(const ChatData&)> onNewContact = nullptr)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -123,76 +126,281 @@ static ContactEditorResult openContactEditor(QWidget *parent,
     auto *nameEdit = new QLineEdit(nameInOut, &dlg);
     root->addWidget(nameEdit);
 
-    root->addWidget(new QLabel("Public Keys", &dlg));
-    auto *keyList = new QListWidget(&dlg);
-    keyList->setFixedHeight(130);
-    for (const QString &k : keysInOut) keyList->addItem(k);
-    root->addWidget(keyList);
+    // ── Keys / Members section ────────────────────────────────────────────────
+    QListWidget *memberList = nullptr; // only used for groups
+    QListWidget *keyList    = nullptr; // only used for contacts
 
-    auto *kr    = new QHBoxLayout;
-    auto *keyIn = new QLineEdit(&dlg);
-    keyIn->setPlaceholderText("Paste public key…");
-    auto *addK  = new QPushButton("Add Key", &dlg);
-    auto *remK  = new QPushButton("Remove", &dlg);
-    remK->setObjectName("removeKeyBtn");
-    kr->addWidget(keyIn, 1); kr->addWidget(addK); kr->addWidget(remK);
-    root->addLayout(kr);
+    if (isGroup && allContacts) {
+        auto *membersLbl = new QLabel("Members", &dlg);
+        root->addWidget(membersLbl);
 
-    QObject::connect(addK, &QPushButton::clicked, [&]() {
-        QString k = keyIn->text().trimmed();
-        if (k.isEmpty()) return;
-        for (int i = 0; i < keyList->count(); ++i)
-            if (keyList->item(i)->text() == k) {
-                QMessageBox::warning(&dlg, "Duplicate Key", "Key already present.");
-                return;
+        memberList = new QListWidget(&dlg);
+        memberList->setFixedHeight(160);
+
+        for (const QString &key : keysInOut) {
+            QString displayName = "Unknown Contact";
+            for (const ChatData &c : *allContacts) {
+                if (!c.isGroup && c.keys.contains(key)) {
+                    displayName = c.name;
+                    break;
+                }
             }
-        keyList->addItem(k); keyIn->clear();
-    });
-    QObject::connect(remK, &QPushButton::clicked, [&]() { delete keyList->currentItem(); });
+            auto *item = new QListWidgetItem(displayName, memberList);
+            item->setData(Qt::UserRole, key);
+            item->setToolTip(key);
+        }
+        root->addWidget(memberList);
+
+        auto *addMemberRow = new QHBoxLayout;
+        auto *addMemberBtn = new QPushButton("Add Member", &dlg);
+        addMemberRow->addStretch();
+        addMemberRow->addWidget(addMemberBtn);
+        root->addLayout(addMemberRow);
+
+        // Double-click member to remove
+        QObject::connect(memberList, &QListWidget::itemDoubleClicked, [&](QListWidgetItem *item) {
+            const QString key  = item->data(Qt::UserRole).toString();
+            const QString name = item->text();
+
+            if (name == "Unknown Contact") {
+                // Offer to add this unknown key as a contact
+                QMessageBox box(&dlg);
+                box.setWindowTitle("Unknown Contact");
+                box.setText("This member is not in your contacts.\nWould you like to add them?");
+                box.setStyleSheet(kDialogStyle);
+                QPushButton *addBtn = box.addButton("Add Contact", QMessageBox::AcceptRole);
+                box.addButton("Cancel", QMessageBox::RejectRole);
+                box.exec();
+                if (box.clickedButton() == addBtn) {
+                    // Pre-populate with their key already filled in
+                    QString newName;
+                    QStringList newKeys = { key };
+                    if (openContactEditor(parent, "Add Contact", newName, newKeys, false)
+                            == ContactEditorResult::Saved && !newName.isEmpty()) {
+                        // Update display name in member list
+                        item->setText(newName);
+                        // Save via callback
+                        if (onNewContact) {
+                            ChatData newContact;
+                            newContact.name       = newName;
+                            newContact.subtitle   = "Secure chat";
+                            newContact.keys       = newKeys;
+                            newContact.peerIdB64u = newKeys.isEmpty() ? QString() : newKeys.first();
+                            onNewContact(newContact);
+                        }
+                    }
+                }
+            } else {
+                // Known contact — open their contact editor
+                if (allContacts) {
+                    for (const ChatData &c : *allContacts) {
+                        if (!c.isGroup && c.keys.contains(key)) {
+                            QString contactName = c.name;
+                            QStringList contactKeys = c.keys;
+                            openContactEditor(parent, "Edit Contact", contactName, contactKeys,
+                                              false); // no destructive actions from inside group editor
+                            // Update display name in case they were renamed
+                            item->setText(contactName);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Add member — pick from contacts
+        QObject::connect(addMemberBtn, &QPushButton::clicked, [&]() {
+            QDialog picker(&dlg);
+            picker.setWindowTitle("Add Member");
+            picker.setStyleSheet(kDialogStyle);
+            picker.setMinimumWidth(340);
+
+            auto *pLayout = new QVBoxLayout(&picker);
+            pLayout->setSpacing(12);
+            pLayout->setContentsMargins(24, 24, 24, 24);
+
+            auto *pTitle = new QLabel("Select Contact", &picker);
+            pTitle->setObjectName("dlgTitle");
+            pLayout->addWidget(pTitle);
+
+            auto *pList = new QListWidget(&picker);
+            for (const ChatData &c : *allContacts) {
+                if (c.isGroup || c.keys.isEmpty()) continue;
+                bool alreadyIn = false;
+                for (int i = 0; i < memberList->count(); ++i) {
+                    if (memberList->item(i)->data(Qt::UserRole).toString() == c.keys.first()) {
+                        alreadyIn = true;
+                        break;
+                    }
+                }
+                if (alreadyIn) continue;
+                auto *item = new QListWidgetItem(c.name, pList);
+                item->setData(Qt::UserRole, c.keys.join('|'));
+            }
+            pLayout->addWidget(pList);
+
+            auto *pBtnRow = new QHBoxLayout;
+            auto *pCancel = new QPushButton("Cancel", &picker);
+            auto *pAdd    = new QPushButton("Add", &picker);
+            pCancel->setObjectName("cancelBtn");
+            pAdd->setObjectName("saveBtn");
+            pBtnRow->addStretch();
+            pBtnRow->addWidget(pCancel);
+            pBtnRow->addWidget(pAdd);
+            pLayout->addLayout(pBtnRow);
+
+            QObject::connect(pCancel, &QPushButton::clicked, &picker, &QDialog::reject);
+            QObject::connect(pAdd,    &QPushButton::clicked, &picker, &QDialog::accept);
+
+            if (picker.exec() != QDialog::Accepted) return;
+            if (!pList->currentItem()) return;
+
+            const QStringList contactKeys = pList->currentItem()
+                                                ->data(Qt::UserRole).toString().split('|', Qt::SkipEmptyParts);
+            const QString contactName = pList->currentItem()->text();
+
+            for (const QString &key : contactKeys) {
+                bool exists = false;
+                for (int i = 0; i < memberList->count(); ++i) {
+                    if (memberList->item(i)->data(Qt::UserRole).toString() == key) {
+                        exists = true; break;
+                    }
+                }
+                if (!exists) {
+                    auto *newItem = new QListWidgetItem(contactName, memberList);
+                    newItem->setData(Qt::UserRole, key);
+                    newItem->setToolTip(key);
+                }
+            }
+        });
+
+    } else {
+        // ── Regular contact — raw key list ────────────────────────────────────
+        auto *keysLbl = new QLabel("Public Keys", &dlg);
+        root->addWidget(keysLbl);
+
+        keyList = new QListWidget(&dlg);
+        keyList->setFixedHeight(130);
+        for (const QString &k : keysInOut)
+            keyList->addItem(k);
+        root->addWidget(keyList);
+
+        auto *keyRow = new QHBoxLayout;
+        keyRow->setSpacing(8);
+        auto *keyInput     = new QLineEdit(&dlg);
+        keyInput->setPlaceholderText("Paste public key...");
+        auto *addKeyBtn    = new QPushButton("Add Key", &dlg);
+        auto *removeKeyBtn = new QPushButton("Remove", &dlg);
+        removeKeyBtn->setObjectName("removeKeyBtn");
+        keyRow->addWidget(keyInput, 1);
+        keyRow->addWidget(addKeyBtn);
+        keyRow->addWidget(removeKeyBtn);
+        root->addLayout(keyRow);
+
+        QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
+            QString k = keyInput->text().trimmed();
+            if (!k.isEmpty()) {
+                bool duplicate = false;
+                for (int i = 0; i < keyList->count(); ++i) {
+                    if (keyList->item(i)->text() == k) { duplicate = true; break; }
+                }
+                if (duplicate) {
+                    QMessageBox::warning(&dlg, "Duplicate Key",
+                                         "This key already exists and was not added.");
+                } else {
+                    keyList->addItem(k);
+                    keyInput->clear();
+                }
+            }
+        });
+        QObject::connect(removeKeyBtn, &QPushButton::clicked, [&]() {
+            delete keyList->currentItem();
+        });
+    }
 
     root->addStretch();
     ContactEditorResult result = ContactEditorResult::Cancelled;
 
-    if (showDestructive) {
-        auto *dsep = new QFrame(&dlg);
-        dsep->setFrameShape(QFrame::HLine);
-        dsep->setStyleSheet("color:#2a2a2a;");
-        root->addWidget(dsep);
+    // ── Destructive actions ───────────────────────────────────────────────────
+    if (showDestructiveActions) {
+        auto *actionSep = new QFrame(&dlg);
+        actionSep->setFrameShape(QFrame::HLine);
+        actionSep->setStyleSheet("color: #2a2a2a;");
+        root->addWidget(actionSep);
 
-        auto *ar    = new QHBoxLayout;
-        auto *blkBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
-        auto *rmBtn  = new QPushButton("Remove Contact", &dlg);
-        const QString ds =
-            "QPushButton{background-color:#2e1a1a;color:#cc5555;border:1px solid #5e2e2e;"
-            "border-radius:8px;padding:8px 16px;}QPushButton:hover{background-color:#3a2020;}";
-        blkBtn->setStyleSheet(ds); rmBtn->setStyleSheet(ds);
-        ar->addWidget(blkBtn); ar->addWidget(rmBtn); ar->addStretch();
-        root->addLayout(ar);
+        auto *actionRow = new QHBoxLayout;
+        const QString destructiveStyle =
+            "QPushButton { background-color: #2e1a1a; color: #cc5555;"
+            "  border: 1px solid #5e2e2e; border-radius: 8px; padding: 8px 16px; }"
+            "QPushButton:hover { background-color: #3a2020; }";
 
-        QObject::connect(blkBtn, &QPushButton::clicked, [&]() {
-            if (QMessageBox::question(&dlg, isBlocked?"Unblock":"Block",
-                                      isBlocked?"Unblock this contact?":
-                                          "Block this contact? They won't be able to send you messages.",
-                                      QMessageBox::Yes|QMessageBox::No) == QMessageBox::Yes)
-            { result = ContactEditorResult::Blocked; dlg.accept(); }
-        });
-        QObject::connect(rmBtn, &QPushButton::clicked, [&]() {
-            if (QMessageBox::question(&dlg, "Remove Contact",
-                                      "Remove this contact? This cannot be undone.",
-                                      QMessageBox::Yes|QMessageBox::No) == QMessageBox::Yes)
-            { result = ContactEditorResult::Removed; dlg.accept(); }
+        // Block — contacts only
+        if (!isGroup) {
+            auto *blockBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
+            blockBtn->setStyleSheet(destructiveStyle);
+            actionRow->addWidget(blockBtn);
+            QObject::connect(blockBtn, &QPushButton::clicked, [&]() {
+                const QString msg = isBlocked
+                                        ? "Unblock this contact?"
+                                        : "Block this contact? They won't be able to send you messages.";
+                if (QMessageBox::question(&dlg, isBlocked ? "Unblock Contact" : "Block Contact",
+                                          msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                    result = ContactEditorResult::Blocked;
+                    dlg.accept();
+                }
+            });
+        }
+
+        // Leave — groups only
+        if (isGroup) {
+            auto *leaveBtn = new QPushButton("Leave Group", &dlg);
+            leaveBtn->setStyleSheet(destructiveStyle);
+            actionRow->addWidget(leaveBtn);
+            QObject::connect(leaveBtn, &QPushButton::clicked, [&]() {
+                if (QMessageBox::question(&dlg, "Leave Group",
+                                          "Leave this group? You will stop receiving messages.",
+                                          QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                    result = ContactEditorResult::Left;
+                    dlg.accept();
+                }
+            });
+        }
+
+        // Remove/Delete — always shown
+        auto *removeBtn = new QPushButton(isGroup ? "Delete Group" : "Remove Contact", &dlg);
+        removeBtn->setStyleSheet(destructiveStyle);
+        actionRow->addWidget(removeBtn);
+        actionRow->addStretch();
+        root->addLayout(actionRow);
+
+        QObject::connect(removeBtn, &QPushButton::clicked, [&]() {
+            const QString msg = isGroup
+                                    ? "Delete this group? This cannot be undone."
+                                    : "Remove this contact? This cannot be undone.";
+            if (QMessageBox::question(&dlg, isGroup ? "Delete Group" : "Remove Contact",
+                                      msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                result = ContactEditorResult::Removed;
+                dlg.accept();
+            }
         });
     }
 
-    auto *br  = new QHBoxLayout;
-    auto *can = new QPushButton("Cancel", &dlg); can->setObjectName("cancelBtn");
-    auto *sav = new QPushButton("Save",   &dlg); sav->setObjectName("saveBtn");
-    br->setSpacing(10); br->addStretch(); br->addWidget(can); br->addWidget(sav);
-    root->addLayout(br);
+    // ── Save / Cancel ─────────────────────────────────────────────────────────
+    auto *btnRow    = new QHBoxLayout;
+    auto *cancelBtn = new QPushButton("Cancel", &dlg);
+    auto *saveBtn   = new QPushButton("Save", &dlg);
+    cancelBtn->setObjectName("cancelBtn");
+    saveBtn->setObjectName("saveBtn");
+    btnRow->setSpacing(10);
+    btnRow->addStretch();
+    btnRow->addWidget(cancelBtn);
+    btnRow->addWidget(saveBtn);
+    root->addLayout(btnRow);
 
-    QObject::connect(can, &QPushButton::clicked, &dlg, &QDialog::reject);
-    QObject::connect(sav, &QPushButton::clicked, [&]() {
-        result = ContactEditorResult::Saved; dlg.accept();
+    QObject::connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    QObject::connect(saveBtn, &QPushButton::clicked, [&]() {
+        result = ContactEditorResult::Saved;
+        dlg.accept();
     });
 
     dlg.exec();
@@ -200,13 +408,17 @@ static ContactEditorResult openContactEditor(QWidget *parent,
     if (result == ContactEditorResult::Saved) {
         nameInOut = nameEdit->text().trimmed();
         keysInOut.clear();
-        for (int i = 0; i < keyList->count(); ++i)
-            keysInOut << keyList->item(i)->text();
+        if (isGroup && memberList) {
+            for (int i = 0; i < memberList->count(); ++i)
+                keysInOut << memberList->item(i)->data(Qt::UserRole).toString();
+        } else if (keyList) {
+            for (int i = 0; i < keyList->count(); ++i)
+                keysInOut << keyList->item(i)->text();
+        }
     }
     return result;
 }
-
-// ── ChatView ──────────────────────────────────────────────────────────────────
+// ── ChatView implementation ───────────────────────────────────────────────────
 
 // Returns a stable string key for file-record lookup: peerIdB64u for DMs,
 // groupId for group chats.  Never changes when the chat is reordered.
@@ -338,6 +550,21 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     ChatData &chat = m_chats[idx];
     if (chat.isBlocked) return;
 
+    // Merge any new member keys we didn't know about before
+    // This is how members discover each other without manual key exchange
+    bool keysUpdated = false;
+    const QString myKey = m_controller->myIdB64u();
+    for (const QString &key : memberKeys) {
+        if (key.trimmed().isEmpty()) continue;
+        if (key.trimmed() == myKey) continue; // don't add own key to group member list
+        if (m_profileKeys.contains(key.trimmed())) continue; // Also skip any of our self-device keys
+        if (!chat.keys.contains(key)) {
+            chat.keys << key;
+            keysUpdated = true;
+        }
+    }
+    if (keysUpdated && m_db)
+        m_db->saveContact(chat); // persist the updated key list
     if (!msgId.isEmpty())
         for (const Message &m : chat.messages)
             if (m.msgId == msgId) return;
@@ -367,7 +594,53 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         if (m_notifier) m_notifier->notify(chat.name, text);
     }
 }
+void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
+                                 const QString& groupId,
+                                 const QString& groupName,
+                                 const QStringList& memberKeys,
+                                 const QDateTime& ts)
+{
+    // Find the group
+    int targetIndex = -1;
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].isGroup && m_chats[i].groupId == groupId) {
+            targetIndex = i;
+            break;
+        }
+    }
+    if (targetIndex == -1) return;
 
+    ChatData &chat = m_chats[targetIndex];
+
+    // Remove the leaver's key from our local group member list
+    chat.keys.removeAll(fromPeerIdB64u);
+    if (m_db) m_db->saveContact(chat);
+
+    // Find a display name for the leaver
+    QString leaverName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
+    for (const ChatData &c : m_chats) {
+        if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
+            leaverName = c.name;
+            break;
+        }
+    }
+
+    // Show system message like Snapchat
+    const QString systemText = leaverName + " left the group";
+    Message systemMsg{ false, systemText, ts };
+    chat.messages.append(systemMsg);
+    if (m_db) m_db->saveMessage(
+            chat.groupId.isEmpty() ? "name:" + chat.name : chat.groupId, systemMsg);
+
+    if (targetIndex == m_currentChat) {
+        addMessageBubble(systemText, false);
+        rebuildChatList();
+    } else {
+        m_unread[targetIndex] += 1;
+        emit unreadChanged(totalUnread());
+        rebuildChatList();
+    }
+}
 // ── File chunk received ───────────────────────────────────────────────────────
 
 void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
@@ -644,8 +917,20 @@ void ChatView::onEditContact(int index)
     if (index < 0 || index >= m_chats.size()) return;
     QString     name = m_chats[index].name;
     QStringList keys = m_chats[index].keys;
-    const auto result = openContactEditor(m_ui->centralwidget, "Edit Contact",
-                                          name, keys, true, m_chats[index].isBlocked);
+
+    const ContactEditorResult result =
+        openContactEditor(m_ui->centralwidget,
+                          m_chats[index].isGroup ? "Edit Group" : "Edit Contact",
+                          name, keys, true,
+                          m_chats[index].isBlocked,
+                          m_chats[index].isGroup,
+                          &m_chats,
+                          [this](const ChatData &newContact) {
+                              // Save new contact discovered from group member list
+                              m_chats.append(newContact);
+                              if (m_db) m_db->saveContact(newContact);
+                              rebuildChatList();
+                          });
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
         m_chats[index].name = name; m_chats[index].keys = keys;
@@ -658,9 +943,11 @@ void ChatView::onEditContact(int index)
             m_ui->chatAvatarLabel->setText(QString(name[0]).toUpper());
         }
     } else if (result == ContactEditorResult::Removed) {
-        const QString key = chatKey(m_chats[index]);
-        if (m_db) m_db->deleteContact(m_chats[index].peerIdB64u);
-        m_filesByKey.remove(key);
+        // Use the same key logic as saveContact
+        const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
+                                  ? "name:" + m_chats[index].name
+                                  : m_chats[index].peerIdB64u;
+        if (m_db) m_db->deleteContact(dbKey);
         m_chats.remove(index);
         m_unread.remove(index);
         m_currentChat = -1;
@@ -670,6 +957,27 @@ void ChatView::onEditContact(int index)
         m_chats[index].isBlocked = !m_chats[index].isBlocked;
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
+
+    } else if (result == ContactEditorResult::Left) {
+        // Notify all members you're leaving
+        const QString groupId = m_chats[index].groupId;
+        m_controller->sendGroupLeaveNotification(
+            groupId,
+            m_chats[index].name,
+            m_chats[index].keys
+            );
+
+        // Remove group locally
+        const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
+                                  ? "name:" + m_chats[index].name
+                                  : m_chats[index].peerIdB64u;
+        if (m_db) m_db->deleteContact(dbKey);
+        m_chats.remove(index);
+        m_unread.remove(index);
+        m_currentChat = -1;
+        rebuildChatList();
+        if (!m_chats.isEmpty())
+            m_ui->chatList->setCurrentRow(0);
     }
 }
 

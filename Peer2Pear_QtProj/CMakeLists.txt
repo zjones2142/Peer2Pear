@@ -17,6 +17,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Sql)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network Sql)
 
+# Fix Qt's malformed framework flags on macOS
+if(APPLE)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -framework CoreFoundation -framework AppKit -framework Carbon")
+endif()
+
 # --- 2. Find vcpkg Dependencies ---
 # libsodium uses an unofficial wrapper name in vcpkg
 find_package(unofficial-sodium CONFIG REQUIRED)
@@ -25,6 +30,11 @@ find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
 pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0 gobject-2.0 gio-2.0)
+
+if(APPLE)
+    set_property(TARGET PkgConfig::NICE PROPERTY INTERFACE_LINK_OPTIONS "")
+    set_property(TARGET PkgConfig::GLIB PROPERTY INTERFACE_LINK_OPTIONS "")
+endif()
 
 # --- 3. Define Project Sources (Unified List) ---
 set(PROJECT_SOURCES

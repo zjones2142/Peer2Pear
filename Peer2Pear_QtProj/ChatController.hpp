@@ -40,6 +40,9 @@ public:
                                     const QString& groupName,
                                     const QStringList& memberPeerIds,
                                     const QString& text);
+    void sendGroupLeaveNotification(const QString& groupId,
+                                    const QString& groupName,
+                                    const QStringList& memberPeerIds);
 
 signals:
     void status(const QString& s);
@@ -54,8 +57,13 @@ signals:
                               const QString& groupName,
                               const QStringList& memberKeys,
                               const QString& text,
-                              const QDateTime& ts,
-                              const QString& msgId);
+                              const QDateTime& ts);
+    void groupMemberLeft(const QString& fromPeerIdB64u,
+                         const QString& groupId,
+                         const QString& groupName,
+                         const QStringList& memberKeys,
+                         const QDateTime& ts,
+                         const QString& msgId);
 
     // Emitted each time a chunk of an incoming transfer arrives.
     // chunksReceived == chunksTotal signals completion; fileData contains
