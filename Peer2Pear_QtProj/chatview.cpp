@@ -568,11 +568,6 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         for (const Message &m : chat.messages)
             if (m.msgId == msgId) return;
 
-    bool updated = false;
-    for (const QString &k : memberKeys)
-        if (!k.trimmed().isEmpty() && !chat.keys.contains(k)) { chat.keys << k; updated = true; }
-    if (updated && m_db) m_db->saveContact(chat);
-
     const bool needsSep = chat.messages.isEmpty() ||
                           chat.messages.last().timestamp.secsTo(ts) >= kDateSepSecs;
 
