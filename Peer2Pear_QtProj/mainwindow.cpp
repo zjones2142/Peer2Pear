@@ -93,6 +93,8 @@ MainWindow::MainWindow(QWidget *parent)
             m_chatView,    &ChatView::onGroupMemberLeft);
     connect(&m_controller, &ChatController::fileChunkReceived,
             m_chatView,    &ChatView::onFileChunkReceived);
+    connect(&m_controller, &ChatController::presenceChanged,
+            m_chatView,    &ChatView::onPresenceChanged);
 
     // ── Notifier ──────────────────────────────────────────────────────────────
     m_notifier = new ChatNotifier(this);

@@ -44,8 +44,11 @@ public:
                                     const QString& groupName,
                                     const QStringList& memberPeerIds);
 
+    void checkPresence(const QStringList& peerIds);
+
 signals:
     void status(const QString& s);
+    void presenceChanged(const QString& peerIdB64u, bool online);
 
     void messageReceived(const QString& fromPeerIdB64u,
                          const QString& text,

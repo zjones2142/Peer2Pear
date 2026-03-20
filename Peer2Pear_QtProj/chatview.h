@@ -34,7 +34,10 @@ public:
     void setShouldToastFn(std::function<bool()> fn) { m_shouldToastFn = std::move(fn); }
     void setNotifier(ChatNotifier *notifier)         { m_notifier = notifier; }
 
+    void startPresencePolling(int intervalMs = 30000);
+
 public slots:
+    void onPresenceChanged(const QString &peerIdB64u, bool online);
     void onIncomingMessage(const QString &fromPeerIdB64u,
                            const QString &text,
                            const QDateTime &timestamp,
@@ -110,6 +113,7 @@ private:
 
     QStringList m_profileKeys;
     QVector<int> m_unread;
+    QTimer       m_presenceTimer;
 
     // File records keyed by stable chatKey() — never needs index remapping
     QMap<QString, QVector<FileTransferRecord>> m_filesByKey;
