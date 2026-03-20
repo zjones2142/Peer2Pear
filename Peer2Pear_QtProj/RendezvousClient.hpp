@@ -13,10 +13,12 @@ public:
 
     void publish(const QString& host, int port, qint64 expiresMs);
     void lookup(const QString& peerIdB64u);
+    void checkPresence(const QString& peerIdB64u);
 
 signals:
     void status(const QString& s);
     void lookupResult(const QString& host, int port);
+    void presenceResult(const QString& peerIdB64u, bool online);
 
 private:
     CryptoEngine* m_crypto = nullptr;

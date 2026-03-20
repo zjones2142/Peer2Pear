@@ -21,5 +21,6 @@ struct ChatData {
     QVector<Message> messages;
     bool isBlocked  = false;
     bool isGroup    = false;
+    bool isOnline   = false;
     QString groupId;
 };
