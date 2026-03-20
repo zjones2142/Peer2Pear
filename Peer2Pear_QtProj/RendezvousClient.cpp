@@ -52,3 +52,24 @@ void RendezvousClient::lookup(const QString& peerIdB64u) {
         rep->deleteLater();
     });
 }
+
+void RendezvousClient::checkPresence(const QString& peerIdB64u) {
+    QJsonObject j;
+    j["id"] = peerIdB64u;
+
+    QNetworkRequest req(m_base.resolved(QUrl("/rvz/lookup")));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+
+    auto* rep = m_nam.post(req, QJsonDocument(j).toJson(QJsonDocument::Compact));
+    connect(rep, &QNetworkReply::finished, this, [this, peerIdB64u, rep](){
+        bool online = false;
+        if (rep->error() == QNetworkReply::NoError) {
+            const auto doc = QJsonDocument::fromJson(rep->readAll());
+            const auto o = doc.object();
+            const QString host = o["host"].toString();
+            online = !host.isEmpty() && host != "0.0.0.0";
+        }
+        emit presenceResult(peerIdB64u, online);
+        rep->deleteLater();
+    });
+}

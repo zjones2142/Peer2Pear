@@ -65,6 +65,7 @@ ChatController::ChatController(QObject* parent)
     connect(&m_rvz,  &RendezvousClient::status,        this, &ChatController::status);
     connect(&m_mbox, &MailboxClient::envelopeReceived, this, &ChatController::onEnvelope);
     connect(&m_pollTimer, &QTimer::timeout,            this, &ChatController::pollOnce);
+    connect(&m_rvz,  &RendezvousClient::presenceResult, this, &ChatController::presenceChanged);
 
     // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
     connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
@@ -183,6 +184,14 @@ void ChatController::startPolling(int intervalMs)
 void ChatController::stopPolling() { m_pollTimer.stop(); }
 
 void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
+
+void ChatController::checkPresence(const QStringList& peerIds)
+{
+    for (const QString& id : peerIds) {
+        if (!id.trimmed().isEmpty())
+            m_rvz.checkPresence(id.trimmed());
+    }
+}
 
 void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
                                                 const QString& groupName,
