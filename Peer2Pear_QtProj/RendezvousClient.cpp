@@ -66,7 +66,6 @@ void RendezvousClient::checkPresence(const QString& peerIdB64u) {
         if (rep->error() == QNetworkReply::NoError) {
             const auto doc = QJsonDocument::fromJson(rep->readAll());
             const auto o = doc.object();
-            // If the server returns a valid host, the peer has an active registration
             const QString host = o["host"].toString();
             online = !host.isEmpty() && host != "0.0.0.0";
         }
