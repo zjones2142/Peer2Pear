@@ -106,6 +106,7 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
 
     if (m_p2pConnections.contains(peerIdB64u) && m_p2pConnections[peerIdB64u]->isReady()) {
         m_p2pConnections[peerIdB64u]->sendData(ct);
+        sendSignalingMessage(peerIdB64u, payload);
     } else {
         sendSignalingMessage(peerIdB64u, payload);
         initiateP2PConnection(peerIdB64u);
