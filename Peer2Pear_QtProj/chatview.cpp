@@ -445,6 +445,63 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
 
     rebuildChatList();
     m_ui->chatList->setCurrentRow(0);
+
+    // Start presence polling (check every 30 seconds)
+    startPresencePolling(30000);
+}
+
+void ChatView::startPresencePolling(int intervalMs)
+{
+    connect(&m_presenceTimer, &QTimer::timeout, this, [this]() {
+        QStringList peerIds;
+        for (const ChatData &c : m_chats) {
+            if (c.isGroup) continue;
+            for (const QString &k : c.keys)
+                if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
+        }
+        if (!peerIds.isEmpty())
+            m_controller->checkPresence(peerIds);
+    });
+    m_presenceTimer.start(intervalMs);
+    // Do an immediate first check
+    QTimer::singleShot(2000, this, [this]() {
+        QStringList peerIds;
+        for (const ChatData &c : m_chats) {
+            if (c.isGroup) continue;
+            for (const QString &k : c.keys)
+                if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
+        }
+        if (!peerIds.isEmpty())
+            m_controller->checkPresence(peerIds);
+    });
+}
+
+void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
+{
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].isGroup) continue;
+
+        bool match = (m_chats[i].peerIdB64u.trimmed() == peerIdB64u);
+        if (!match) {
+            for (const QString &k : m_chats[i].keys)
+                if (k.trimmed() == peerIdB64u) { match = true; break; }
+        }
+        if (!match) continue;
+
+        if (m_chats[i].isOnline != online) {
+            m_chats[i].isOnline = online;
+
+            // Update the header if this is the currently selected chat
+            if (i == m_currentChat) {
+                const QString statusText = online ? "Online" : "Offline";
+                m_ui->chatSubLabel->setText("● " + statusText);
+                m_ui->chatSubLabel->setStyleSheet(
+                    online ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
+                           : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+            }
+        }
+        return;
+    }
 }
 
 void ChatView::reloadCurrentChat()
@@ -1219,7 +1276,21 @@ void ChatView::loadChat(int index)
 {
     const ChatData &chat = m_chats[index];
     m_ui->chatTitleLabel->setText(chat.name);
-    m_ui->chatSubLabel->setText("● " + chat.subtitle);
+
+    // Show online/offline for DM chats, group subtitle for groups
+    if (!chat.isGroup) {
+        const QString statusText = chat.isOnline ? "Online" : "Offline";
+        m_ui->chatSubLabel->setText("● " + statusText);
+        m_ui->chatSubLabel->setStyleSheet(
+            chat.isOnline
+                ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
+                : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+    } else {
+        m_ui->chatSubLabel->setText("● " + chat.subtitle);
+        m_ui->chatSubLabel->setStyleSheet(
+            "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+    }
+
     m_ui->chatAvatarLabel->setText(chat.name.isEmpty() ? "?" : QString(chat.name[0]).toUpper());
     clearMessages();
 
