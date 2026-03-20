@@ -571,13 +571,23 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     const bool needsSep = chat.messages.isEmpty() ||
                           chat.messages.last().timestamp.secsTo(ts) >= kDateSepSecs;
 
+    // Look up sender name from contacts
+    QString senderName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
+    for (const ChatData &c : m_chats) {
+        if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
+            senderName = c.name;
+            break;
+        }
+    }
+
     Message msg{false, text, ts, msgId};
+    msg.senderName = senderName;
     chat.messages.append(msg);
     if (m_db) m_db->saveMessage(chat.groupId.isEmpty() ? "name:"+chat.name : chat.groupId, msg);
 
     if (idx == m_currentChat) {
         if (needsSep) addDateSeparator(ts);
-        addMessageBubble(text, false);
+        addMessageBubble(text, false, senderName);
         promoteChatToTop(idx);
         rebuildChatList();
     } else {
@@ -1219,7 +1229,12 @@ void ChatView::loadChat(int index)
             addDateSeparator(msg.timestamp);
             lastShown = msg.timestamp;
         }
-        addMessageBubble(msg.text, msg.sent);
+
+        QString senderName;
+        if (chat.isGroup && !msg.sent && !msg.senderName.isEmpty()) {
+            senderName = msg.senderName;
+        }
+        addMessageBubble(msg.text, msg.sent, senderName);
     }
     rebuildFilesTab();
 }
@@ -1268,20 +1283,18 @@ void ChatView::addDateSeparator(const QDateTime &dt)
     layout->insertWidget(layout->count()-1, row);
 }
 
-void ChatView::addMessageBubble(const QString &text, bool sent)
+void ChatView::addMessageBubble(const QString &text, bool sent, const QString &senderName)
 {
     QFont f = QApplication::font(); f.setPixelSize(13);
     QFontMetrics fm(f);
     int vpW   = m_ui->messageScroll->viewport()->width();
     int maxW  = qMax(int(vpW * 0.65), 120);
     int hPad  = 28, vPad = 28, avail = maxW - hPad;
-
     QString disp  = processText(text, fm, avail);
     int     slw   = fm.horizontalAdvance(disp);
     bool    wrap  = (slw > avail) || disp.contains('\n');
     int     bw    = wrap ? maxW : qMin(slw + hPad + 4, maxW);
     int     bh;
-
     if (wrap) {
         int lines = 0;
         for (const QString &p : disp.split('\n')) {
@@ -1298,10 +1311,35 @@ void ChatView::addMessageBubble(const QString &text, bool sent)
         bh = fm.height() + vPad + 1;
     }
 
+    // ── Outer widget holds optional name label + bubble row ───────────────────
+    const bool showName = !sent && !senderName.isEmpty();
+    const int nameHeight = showName ? 16 : 0;
+
     auto *row = new QWidget(m_ui->scrollAreaWidgetContents);
     row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    row->setFixedHeight(bh+4);
-    auto *rl = new QHBoxLayout(row); rl->setContentsMargins(0,2,0,2); rl->setSpacing(0);
+    row->setFixedHeight(bh + nameHeight + 4);
+
+    auto *outerLayout = new QVBoxLayout(row);
+    outerLayout->setContentsMargins(0, 2, 0, 2);
+    outerLayout->setSpacing(2);
+
+    // ── Sender name — group received messages only ────────────────────────────
+    if (showName) {
+        auto *nameRow = new QHBoxLayout;
+        nameRow->setContentsMargins(0, 0, 0, 0);
+        auto *nameLbl = new QLabel(senderName, row);
+        nameLbl->setStyleSheet(
+            "color: #5dd868; font-size: 11px; background: transparent; padding-left: 4px;"
+            );
+        nameRow->addWidget(nameLbl);
+        nameRow->addStretch();
+        outerLayout->addLayout(nameRow);
+    }
+
+    // ── Bubble row ────────────────────────────────────────────────────────────
+    auto *rl = new QHBoxLayout;
+    rl->setContentsMargins(0, 0, 0, 0);
+    rl->setSpacing(0);
 
     auto *bubble = new QLabel(disp, row);
     bubble->setFont(f); bubble->setFixedSize(bw, bh);
@@ -1318,13 +1356,15 @@ void ChatView::addMessageBubble(const QString &text, bool sent)
                               "border-radius:14px;padding:10px 14px;font-size:13px;");
         rl->addWidget(bubble); rl->addStretch();
     }
+    outerLayout->addLayout(rl);
 
     auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
     if (!layout) return;
     layout->insertWidget(layout->count()-1, row);
     QTimer::singleShot(5,[this](){
         m_ui->messageScroll->verticalScrollBar()->setValue(
-            m_ui->messageScroll->verticalScrollBar()->maximum()); });
+            m_ui->messageScroll->verticalScrollBar()->maximum());
+    });
 }
 
 // ── Files tab ─────────────────────────────────────────────────────────────────
