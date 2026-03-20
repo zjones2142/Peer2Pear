@@ -10,6 +10,7 @@ struct Message {
     QString   text;
     QDateTime timestamp;
     QString   msgId;      // dedup ID; empty for legacy messages
+    QString   senderName; // populated for received group messages
 };
 
 struct ChatData {

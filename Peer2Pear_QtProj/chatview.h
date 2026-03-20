@@ -88,7 +88,7 @@ private:
     QLabel *m_emptyLabel = nullptr;
 
     void clearMessages();
-    void addMessageBubble(const QString &text, bool sent);
+    void addMessageBubble(const QString &text, bool sent, const QString &senderName = QString());
     void addDateSeparator(const QDateTime &dt);
 
     // File tab — buildFileCard returns an owned QFrame; rebuildFilesTab places it
