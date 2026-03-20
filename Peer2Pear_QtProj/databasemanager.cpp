@@ -78,6 +78,7 @@ void DatabaseManager::createTables()
 
     // Safe migration for existing DBs
     q.exec("ALTER TABLE messages ADD COLUMN msg_id TEXT DEFAULT '';");
+    q.exec("ALTER TABLE messages ADD COLUMN sender_name TEXT DEFAULT '';");
 
     q.exec(
         "CREATE TABLE IF NOT EXISTS settings ("
@@ -162,14 +163,15 @@ void DatabaseManager::saveMessage(const QString &peerIdB64u, const Message &msg)
     if (peerIdB64u.isEmpty()) return;
     QSqlQuery q(m_db);
     q.prepare(
-        "INSERT INTO messages (peer_id,sent,text,timestamp,msg_id)"
-        " VALUES (:peer_id,:sent,:text,:timestamp,:msg_id);"
+        "INSERT INTO messages (peer_id,sent,text,timestamp,msg_id,sender_name)"
+        " VALUES (:peer_id,:sent,:text,:timestamp,:msg_id,:sender_name);"
         );
     q.bindValue(":peer_id",   peerIdB64u);
     q.bindValue(":sent",      msg.sent ? 1 : 0);
     q.bindValue(":text",      msg.text);
     q.bindValue(":timestamp", msg.timestamp.toUTC().toSecsSinceEpoch());
     q.bindValue(":msg_id",    msg.msgId);
+    q.bindValue(":sender_name", msg.senderName);
     if (!q.exec()) { qWarning() << "saveMessage:" << q.lastError().text(); return; }
     updateLastActive(peerIdB64u);
 }
@@ -180,7 +182,7 @@ QVector<Message> DatabaseManager::loadMessages(const QString &peerIdB64u) const
     if (peerIdB64u.isEmpty()) return result;
     QSqlQuery q(m_db);
     q.prepare(
-        "SELECT sent,text,timestamp,msg_id FROM messages"
+        "SELECT sent,text,timestamp,msg_id,sender_name FROM messages"
         " WHERE peer_id=:peer_id ORDER BY timestamp ASC, id ASC;"
         );
     q.bindValue(":peer_id", peerIdB64u);
@@ -191,6 +193,7 @@ QVector<Message> DatabaseManager::loadMessages(const QString &peerIdB64u) const
         msg.text      = q.value(1).toString();
         msg.timestamp = QDateTime::fromSecsSinceEpoch(q.value(2).toLongLong(), Qt::UTC).toLocalTime();
         msg.msgId     = q.value(3).toString();
+        msg.senderName = q.value(4).toString();
         result.append(msg);
     }
     return result;
