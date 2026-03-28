@@ -62,6 +62,8 @@ set(PROJECT_SOURCES
     RendezvousClient.hpp
     NiceConnection.cpp
     NiceConnection.hpp
+    onboardingdialog.h
+    onboardingdialog.cpp
 )
 
 # --- 4. Create Executable ---
@@ -76,6 +78,8 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         chattypes.h
         NiceConnection.hpp
         NiceConnection.cpp
+        onboardingdialog.h
+        onboardingdialog.cpp
     )
 else()
     if(ANDROID)

@@ -27,6 +27,29 @@
 #include <QTimer>
 #include <QDesktopServices>
 #include <QUrl>
+#include <QPainter>
+#include <QPainterPath>
+#include <QBuffer>
+#include <QColorDialog>
+
+// ── makeCircularPixmap ────────────────────────────────────────────────────────
+static QPixmap makeCircularPixmap(const QPixmap &src, int size)
+{
+    if (size <= 0 || src.isNull()) return QPixmap();
+    QPixmap pm(size, size);
+    pm.fill(Qt::transparent);
+
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+
+    QPainterPath path;
+    path.addEllipse(0, 0, size, size);
+    p.setClipPath(path);
+    const QPixmap scaled = src.scaled(size, size, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+    p.drawPixmap((size - scaled.width()) / 2, (size - scaled.height()) / 2, scaled);
+    p.end();
+    return pm;
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 static constexpr int kDateSepSecs = 60 * 60 * 2; // 2-hour gap → date separator
@@ -390,6 +413,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
     auto *saveBtn   = new QPushButton("Save", &dlg);
     cancelBtn->setObjectName("cancelBtn");
     saveBtn->setObjectName("saveBtn");
+    saveBtn->setDefault(true);
     btnRow->setSpacing(10);
     btnRow->addStretch();
     btnRow->addWidget(cancelBtn);
@@ -490,6 +514,14 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 
         if (m_chats[i].isOnline != online) {
             m_chats[i].isOnline = online;
+
+            // Always send our avatar when they come online so they get the latest
+            if (online && m_db) {
+                const QString myName   = m_db->loadSetting("displayName");
+                const QString myAvatar = m_db->loadSetting("avatarData");
+                if (!myName.isEmpty())
+                    m_controller->sendAvatar(peerIdB64u, myName, myAvatar);
+            }
 
             // Update the header if this is the currently selected chat
             if (i == m_currentChat) {
@@ -792,6 +824,39 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
         rebuildFilesTab();
 }
 
+// ── Avatar received ───────────────────────────────────────────────────────────
+
+void ChatView::onAvatarReceived(const QString &peerIdB64u,
+                                const QString &displayName,
+                                const QString &avatarB64)
+{
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].isGroup) continue;
+        if (m_chats[i].peerIdB64u.trimmed() != peerIdB64u) continue;
+
+        const bool firstTime = m_chats[i].avatarData.isEmpty();
+        m_chats[i].avatarData = avatarB64;
+
+        // Persist to DB
+        if (m_db) m_db->saveContactAvatar(peerIdB64u, avatarB64);
+
+        // Send our avatar back only on first receive to avoid infinite exchange loop
+        if (firstTime && m_db) {
+            const QString myName   = m_db->loadSetting("displayName");
+            const QString myAvatar = m_db->loadSetting("avatarData");
+            if (!myName.isEmpty())
+                m_controller->sendAvatar(peerIdB64u, myName, myAvatar);
+        }
+
+        // Rebuild the list so the avatar label updates immediately
+        rebuildChatList();
+
+        if (firstTime)
+            showToast(m_chats[i].name + "'s profile has been updated");
+        return;
+    }
+}
+
 // ── Attach / send file ────────────────────────────────────────────────────────
 
 void ChatView::onAttachFile()
@@ -956,21 +1021,343 @@ void ChatView::onSearchChanged(const QString &text)
 
 void ChatView::onEditProfile()
 {
-    QString name = m_ui->profileNameLabel->text();
+    // ── Avatar state (shared between main dialog and photo popup) ─────────────
+    bool usingPhoto = false;
+    QPixmap uploadedPhoto;
+    QColor avatarColor("#2e8b3a");
+
+    const QString currentAvatarB64 = m_db ? m_db->loadSetting("avatarData") : QString();
+    if (!currentAvatarB64.isEmpty()) {
+        QPixmap px;
+        px.loadFromData(QByteArray::fromBase64(currentAvatarB64.toUtf8()));
+        if (!px.isNull()) { usingPhoto = true; uploadedPhoto = px; }
+    }
+
+    // ── Initials renderer (used in both dialogs) ──────────────────────────────
+    auto renderInitials = [](const QString &initial, const QColor &bg, int size) -> QPixmap {
+        QPixmap pm(size, size);
+        pm.setDevicePixelRatio(1.0);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setBrush(bg); p.setPen(Qt::NoPen);
+        p.drawEllipse(0, 0, size, size);
+        QFont f = p.font(); f.setBold(true); f.setPixelSize(size / 2); p.setFont(f);
+        p.setPen(Qt::white);
+        p.drawText(QRect(0, 0, size, size), Qt::AlignCenter, initial.toUpper());
+        p.end();
+        return pm;
+    };
+
+    // ── Main profile dialog ───────────────────────────────────────────────────
+    QDialog dlg(m_ui->centralwidget);
+    dlg.setWindowTitle("Edit Profile");
+    dlg.setStyleSheet(kDlgStyle);
+    dlg.setMinimumWidth(420);
+    dlg.setModal(true);
+
+    auto *root = new QVBoxLayout(&dlg);
+    root->setSpacing(14);
+    root->setContentsMargins(24, 24, 24, 24);
+
+    auto *titleLbl = new QLabel("Edit Profile", &dlg);
+    titleLbl->setObjectName("dlgTitle");
+    root->addWidget(titleLbl);
+
+    auto *sep = new QFrame(&dlg);
+    sep->setFrameShape(QFrame::HLine);
+    sep->setStyleSheet("color:#2a2a2a;");
+    root->addWidget(sep);
+
+    // ── Avatar row: preview + Change Photo button ─────────────────────────────
+    auto *avatarRowLayout = new QHBoxLayout;
+    avatarRowLayout->setSpacing(14);
+
+    auto *avatarThumb = new QLabel(&dlg);
+    avatarThumb->setFixedSize(56, 56);
+    avatarThumb->setAlignment(Qt::AlignCenter);
+
+    auto refreshThumb = [&]() {
+        QPixmap px;
+        if (usingPhoto && !uploadedPhoto.isNull())
+            px = makeCircularPixmap(uploadedPhoto, 56);
+        else {
+            const QString nm = m_ui->profileNameLabel->text();
+            const QString ch = nm.isEmpty() ? "?" : QString(nm[0]);
+            px = makeCircularPixmap(renderInitials(ch, avatarColor, 200), 56);
+        }
+        avatarThumb->setPixmap(px);
+    };
+    refreshThumb();
+
+    auto *changePhotoBtn = new QPushButton("Change Photo", &dlg);
+    changePhotoBtn->setAutoDefault(false);
+    changePhotoBtn->setStyleSheet(
+        "QPushButton{background:#111;border:1px solid #333;color:#f0f0f0;"
+        "border-radius:8px;padding:8px 14px;font-size:13px;}"
+        "QPushButton:hover{background:#1a1a1a;border:1px solid #555;}");
+
+    avatarRowLayout->addWidget(avatarThumb);
+    avatarRowLayout->addWidget(changePhotoBtn);
+    avatarRowLayout->addStretch();
+    root->addLayout(avatarRowLayout);
+
+    // ── Name ─────────────────────────────────────────────────────────────────
+    root->addWidget(new QLabel("Display Name", &dlg));
+    auto *nameEdit = new QLineEdit(m_ui->profileNameLabel->text(), &dlg);
+    root->addWidget(nameEdit);
+
+    // ── Keys ─────────────────────────────────────────────────────────────────
+    root->addWidget(new QLabel("Public Keys", &dlg));
+    auto *keyList = new QListWidget(&dlg);
+    keyList->setFixedHeight(130);
+
     QStringList keys = m_profileKeys;
     const QString myKey = m_controller->myIdB64u();
     if (!myKey.isEmpty() && !keys.contains(myKey)) keys << myKey;
+    for (const QString &k : keys) keyList->addItem(k);
+    root->addWidget(keyList);
 
-    if (openContactEditor(m_ui->centralwidget, "Edit Your Profile", name, keys, false)
-        == ContactEditorResult::Saved) {
-        m_ui->profileNameLabel->setText(name.isEmpty() ? "Me" : name);
-        m_ui->profileAvatarLabel->setText(name.isEmpty() ? "Y" : QString(name[0]).toUpper());
-        m_profileKeys = keys;
-        m_controller->setSelfKeys(m_profileKeys);
-        if (m_db) {
-            m_db->saveSetting("displayName", name);
-            m_db->saveSetting("profileKeys", m_profileKeys.join(','));
+    auto *keyRow    = new QHBoxLayout;
+    auto *keyInput  = new QLineEdit(&dlg);
+    keyInput->setPlaceholderText("Paste public key...");
+    auto *addKeyBtn    = new QPushButton("Add Key", &dlg);
+    auto *removeKeyBtn = new QPushButton("Remove",  &dlg);
+    addKeyBtn->setAutoDefault(false);
+    removeKeyBtn->setAutoDefault(false);
+    removeKeyBtn->setObjectName("removeKeyBtn");
+    keyRow->addWidget(keyInput, 1);
+    keyRow->addWidget(addKeyBtn);
+    keyRow->addWidget(removeKeyBtn);
+    root->addLayout(keyRow);
+
+    QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
+        const QString k = keyInput->text().trimmed();
+        if (k.isEmpty()) return;
+        for (int i = 0; i < keyList->count(); ++i) {
+            if (keyList->item(i)->text() == k) {
+                QMessageBox::warning(&dlg, "Duplicate Key", "This key already exists.");
+                return;
+            }
         }
+        keyList->addItem(k);
+        keyInput->clear();
+    });
+    QObject::connect(removeKeyBtn, &QPushButton::clicked,
+                     [&]() { delete keyList->currentItem(); });
+
+    root->addStretch();
+
+    // ── Cancel / Save ─────────────────────────────────────────────────────────
+    auto *btnRow    = new QHBoxLayout;
+    auto *cancelBtn = new QPushButton("Cancel", &dlg);
+    auto *saveBtn   = new QPushButton("Save",   &dlg);
+    cancelBtn->setObjectName("cancelBtn");
+    saveBtn->setObjectName("saveBtn");
+    saveBtn->setDefault(true);
+    btnRow->setSpacing(10);
+    btnRow->addStretch();
+    btnRow->addWidget(cancelBtn);
+    btnRow->addWidget(saveBtn);
+    root->addLayout(btnRow);
+
+    QObject::connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    QObject::connect(saveBtn,   &QPushButton::clicked, &dlg, &QDialog::accept);
+
+    // ── "Change Photo" opens avatar sub-dialog ────────────────────────────────
+    QObject::connect(changePhotoBtn, &QPushButton::clicked, [&]() {
+        QDialog photoDlg(&dlg);
+        photoDlg.setWindowTitle("Change Profile Picture");
+        photoDlg.setStyleSheet(kDlgStyle);
+        photoDlg.setMinimumWidth(340);
+        photoDlg.setModal(true);
+
+        // Local copies so cancel reverts state
+        bool localUsingPhoto   = usingPhoto;
+        QPixmap localUploaded  = uploadedPhoto;
+        QColor  localColor     = avatarColor;
+
+        auto *pRoot = new QVBoxLayout(&photoDlg);
+        pRoot->setSpacing(14);
+        pRoot->setContentsMargins(24, 24, 24, 24);
+
+        auto *pTitle = new QLabel("Change Profile Picture", &photoDlg);
+        pTitle->setObjectName("dlgTitle");
+        pRoot->addWidget(pTitle);
+
+        auto *pSep = new QFrame(&photoDlg);
+        pSep->setFrameShape(QFrame::HLine);
+        pSep->setStyleSheet("color:#2a2a2a;");
+        pRoot->addWidget(pSep);
+
+        // Preview
+        auto *preview = new QLabel(&photoDlg);
+        preview->setFixedSize(100, 100);
+        preview->setAlignment(Qt::AlignCenter);
+        auto *pPrevRow = new QHBoxLayout;
+        pPrevRow->addStretch();
+        pPrevRow->addWidget(preview);
+        pPrevRow->addStretch();
+        pRoot->addLayout(pPrevRow);
+
+        const QString curName = nameEdit->text().trimmed();
+        auto updatePrev = [&]() {
+            QPixmap px;
+            if (localUsingPhoto && !localUploaded.isNull())
+                px = makeCircularPixmap(localUploaded, 100);
+            else {
+                const QString ch = curName.isEmpty() ? "?" : QString(curName[0]);
+                px = makeCircularPixmap(renderInitials(ch, localColor, 200), 100);
+            }
+            preview->setPixmap(px);
+        };
+        updatePrev();
+
+        // Swatches
+        auto *pColorLbl = new QLabel("Background color", &photoDlg);
+        pColorLbl->setStyleSheet("color:#888888;font-size:11px;");
+        pRoot->addWidget(pColorLbl);
+
+        const QList<QColor> presets = {
+            QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
+            QColor("#bf7b3a"), QColor("#bf3a3a"),
+        };
+        auto swatchStyle = [](const QColor &col, bool sel) -> QString {
+            return QString("QPushButton{background:%1;border:%2;border-radius:14px;}"
+                           "QPushButton:hover{border:2px solid #888;border-radius:14px;}")
+                .arg(col.name(), sel ? "2px solid white" : "none");
+        };
+
+        QList<QPushButton*> pSwatches;
+        auto *pSwatchRow = new QHBoxLayout;
+        pSwatchRow->setSpacing(8);
+        pSwatchRow->addStretch();
+
+        for (int i = 0; i < presets.size(); ++i) {
+            auto *sb = new QPushButton(&photoDlg);
+            sb->setFixedSize(28, 28);
+            sb->setAutoDefault(false);
+            sb->setStyleSheet(swatchStyle(presets[i], !localUsingPhoto && presets[i] == localColor));
+            pSwatches.append(sb);
+            connect(sb, &QPushButton::clicked, [&, sb, i]() {
+                localUsingPhoto = false;
+                localColor = presets[i];
+                for (int j = 0; j < pSwatches.size(); ++j)
+                    pSwatches[j]->setStyleSheet(swatchStyle(presets[j], pSwatches[j] == sb));
+                updatePrev();
+            });
+            pSwatchRow->addWidget(sb);
+        }
+
+        auto *pCustom = new QPushButton("+", &photoDlg);
+        pCustom->setFixedSize(28, 28);
+        pCustom->setAutoDefault(false);
+        pCustom->setStyleSheet(
+            "QPushButton{background:#1e1e1e;border:1px solid #555;border-radius:14px;"
+            "color:#f0f0f0;font-size:16px;font-weight:bold;}"
+            "QPushButton:hover{background:#2a2a2a;}");
+        connect(pCustom, &QPushButton::clicked, [&]() {
+            QColor c = QColorDialog::getColor(localColor, &photoDlg, "Choose Color");
+            if (!c.isValid()) return;
+            localUsingPhoto = false;
+            localColor = c;
+            for (int j = 0; j < pSwatches.size(); ++j)
+                pSwatches[j]->setStyleSheet(swatchStyle(presets[j], false));
+            updatePrev();
+        });
+        pSwatchRow->addWidget(pCustom);
+        pSwatchRow->addStretch();
+        pRoot->addLayout(pSwatchRow);
+
+        pRoot->addSpacing(4);
+
+        // Upload Photo
+        auto *pUpload = new QPushButton("Upload Photo", &photoDlg);
+        pUpload->setAutoDefault(false);
+        pUpload->setStyleSheet(
+            "QPushButton{background:#111;border:1px solid #1e1e1e;color:#f0f0f0;"
+            "border-radius:8px;padding:8px;font-size:13px;}"
+            "QPushButton:hover{background:#1a1a1a;border:1px solid #333;}");
+        connect(pUpload, &QPushButton::clicked, [&]() {
+            const QString path = QFileDialog::getOpenFileName(
+                &photoDlg, "Choose Photo", QString(), "Images (*.png *.jpg *.jpeg *.bmp)");
+            if (path.isEmpty()) return;
+            QPixmap px(path);
+            if (px.isNull()) return;
+            localUsingPhoto = true;
+            localUploaded   = px;
+            for (int j = 0; j < pSwatches.size(); ++j)
+                pSwatches[j]->setStyleSheet(swatchStyle(presets[j], false));
+            updatePrev();
+        });
+        pRoot->addWidget(pUpload);
+
+        pRoot->addStretch();
+
+        auto *pBtnRow   = new QHBoxLayout;
+        auto *pCancel   = new QPushButton("Cancel", &photoDlg);
+        auto *pApply    = new QPushButton("Apply",  &photoDlg);
+        pCancel->setObjectName("cancelBtn");
+        pApply->setObjectName("saveBtn");
+        pApply->setDefault(true);
+        pBtnRow->setSpacing(10);
+        pBtnRow->addStretch();
+        pBtnRow->addWidget(pCancel);
+        pBtnRow->addWidget(pApply);
+        pRoot->addLayout(pBtnRow);
+
+        connect(pCancel, &QPushButton::clicked, &photoDlg, &QDialog::reject);
+        connect(pApply,  &QPushButton::clicked, &photoDlg, &QDialog::accept);
+
+        if (photoDlg.exec() != QDialog::Accepted) return;
+
+        // Commit local state back to outer scope
+        usingPhoto    = localUsingPhoto;
+        uploadedPhoto = localUploaded;
+        avatarColor   = localColor;
+        refreshThumb();
+    });
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    // ── Commit ────────────────────────────────────────────────────────────────
+    const QString newName = nameEdit->text().trimmed();
+
+    QPixmap finalPx;
+    if (usingPhoto && !uploadedPhoto.isNull()) {
+        finalPx = makeCircularPixmap(uploadedPhoto, 200);
+    } else {
+        const QString ch = newName.isEmpty() ? "?" : QString(newName[0]);
+        finalPx = renderInitials(ch, avatarColor, 200);
+    }
+
+    QByteArray bytes;
+    QBuffer buf(&bytes);
+    buf.open(QIODevice::WriteOnly);
+    finalPx.save(&buf, "PNG");
+    const QString newAvatarB64 = QString::fromLatin1(bytes.toBase64());
+
+    keys.clear();
+    for (int i = 0; i < keyList->count(); ++i)
+        keys << keyList->item(i)->text();
+
+    const QString displayName = newName.isEmpty() ? "Me" : newName;
+    m_ui->profileNameLabel->setText(displayName);
+    m_ui->profileAvatarLabel->setPixmap(makeCircularPixmap(finalPx, 40));
+    m_ui->profileAvatarLabel->setText("");
+
+    m_profileKeys = keys;
+    m_controller->setSelfKeys(m_profileKeys);
+
+    if (m_db) {
+        m_db->saveSetting("displayName", displayName);
+        m_db->saveSetting("avatarData",  newAvatarB64);
+        m_db->saveSetting("profileKeys", m_profileKeys.join(','));
+    }
+
+    for (const ChatData &chat : m_chats) {
+        if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
+            m_controller->sendAvatar(chat.peerIdB64u, displayName, newAvatarB64);
     }
 }
 
@@ -1000,10 +1387,8 @@ void ChatView::onEditContact(int index)
             m_chats[index].peerIdB64u = keys.first();
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
-        if (m_currentChat == index) {
+        if (m_currentChat == index)
             m_ui->chatTitleLabel->setText(name);
-            m_ui->chatAvatarLabel->setText(QString(name[0]).toUpper());
-        }
     } else if (result == ContactEditorResult::Removed) {
         // Use the same key logic as saveContact
         const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
@@ -1156,6 +1541,15 @@ void ChatView::onAddContact()
     if(!keys.isEmpty()) nc.peerIdB64u=keys.first();
     m_chats.append(nc);
     if(m_db) m_db->saveContact(nc);
+
+    // Send our avatar to the new contact
+    if (!nc.peerIdB64u.isEmpty()) {
+        const QString myName   = m_db ? m_db->loadSetting("displayName") : QString();
+        const QString myAvatar = m_db ? m_db->loadSetting("avatarData")  : QString();
+        if (!myName.isEmpty())
+            m_controller->sendAvatar(nc.peerIdB64u, myName, myAvatar);
+    }
+
     rebuildChatList();
     m_ui->chatList->setCurrentRow(m_chats.size()-1);
 }
@@ -1190,6 +1584,16 @@ void ChatView::initChats()
             m_ui->profileNameLabel->setText(savedName);
             m_ui->profileAvatarLabel->setText(QString(savedName[0]).toUpper());
         }
+
+        const QString avatarB64 = m_db->loadSetting("avatarData");
+        if (!avatarB64.isEmpty()) {
+            QPixmap px;
+            px.loadFromData(QByteArray::fromBase64(avatarB64.toUtf8()));
+            if (!px.isNull()) {
+                m_ui->profileAvatarLabel->setPixmap(makeCircularPixmap(px, 40));
+                m_ui->profileAvatarLabel->setText("");
+            }
+        }
     }
 
     if (m_db) m_chats = m_db->loadAllContacts();
@@ -1219,11 +1623,11 @@ void ChatView::rebuildChatList()
 
     for (int i = 0; i < m_chats.size(); ++i) {
         auto *item = new QListWidgetItem(m_ui->chatList);
-        item->setSizeHint(QSize(0, 52));
+        item->setSizeHint(QSize(0, 64));
         auto *row = new QWidget;
         row->setStyleSheet("background:transparent;");
         auto *hl = new QHBoxLayout(row);
-        hl->setContentsMargins(14,0,8,0); hl->setSpacing(6);
+        hl->setContentsMargins(14,0,14,0); hl->setSpacing(6);
 
         auto *nameLbl = new QLabel(m_chats[i].name, row);
         nameLbl->setStyleSheet("color:#d0d0d0;font-size:14px;background:transparent;");
@@ -1235,6 +1639,21 @@ void ChatView::rebuildChatList()
             dot->setStyleSheet("QLabel{background-color:#5dd868;border-radius:4px;}");
             hl->addWidget(dot);
         }
+
+        // Avatar label — shows received photo or initials circle
+        auto *avatarLbl = new QLabel(row);
+        avatarLbl->setFixedSize(34, 34);
+        avatarLbl->setAlignment(Qt::AlignCenter);
+        if (!m_chats[i].avatarData.isEmpty()) {
+            QPixmap px;
+            px.loadFromData(QByteArray::fromBase64(m_chats[i].avatarData.toUtf8()));
+            if (!px.isNull())
+                avatarLbl->setPixmap(makeCircularPixmap(px, 34));
+        } else {
+            avatarLbl->setStyleSheet(
+                "background-color:#222222;border-radius:17px;border:1px solid #333333;");
+        }
+        hl->addWidget(avatarLbl);
 
         auto *editBtn = new QToolButton(row);
         editBtn->setText("✎"); editBtn->setFixedSize(28,28);
@@ -1291,7 +1710,18 @@ void ChatView::loadChat(int index)
             "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
     }
 
-    m_ui->chatAvatarLabel->setText(chat.name.isEmpty() ? "?" : QString(chat.name[0]).toUpper());
+    if (!chat.avatarData.isEmpty()) {
+        QPixmap px;
+        px.loadFromData(QByteArray::fromBase64(chat.avatarData.toUtf8()));
+        if (!px.isNull()) {
+            m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
+            m_ui->chatAvatarLabel->setText("");
+        }
+    } else {
+        m_ui->chatAvatarLabel->clear();
+        m_ui->chatAvatarLabel->setText(
+            chat.name.isEmpty() ? "?" : QString(chat.name[0]).toUpper());
+    }
     clearMessages();
 
     QDateTime lastShown;
@@ -1696,4 +2126,29 @@ void ChatView::ensureUnreadSize()
 int ChatView::totalUnread() const
 {
     int s = 0; for (int n : m_unread) s += n; return s;
+}
+
+void ChatView::showToast(const QString &message)
+{
+    if (!m_toastLabel) {
+        m_toastLabel = new QLabel(m_ui->centralwidget);
+        m_toastLabel->setAlignment(Qt::AlignCenter);
+        m_toastLabel->setStyleSheet(
+            "background-color:#1a2e1c;"
+            "color:#5dd868;"
+            "font-size:12px;"
+            "padding:8px 16px;"
+            "border-radius:8px;"
+            "border:1px solid #2e5e30;");
+        m_toastLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+    m_toastLabel->setText(message);
+    m_toastLabel->adjustSize();
+    // Position at bottom-center of centralwidget
+    const QSize ws = m_ui->centralwidget->size();
+    m_toastLabel->move((ws.width() - m_toastLabel->width()) / 2,
+                        ws.height() - m_toastLabel->height() - 24);
+    m_toastLabel->raise();
+    m_toastLabel->show();
+    QTimer::singleShot(3000, m_toastLabel, &QLabel::hide);
 }

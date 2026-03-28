@@ -46,6 +46,8 @@ public:
 
     void checkPresence(const QStringList& peerIds);
 
+    void sendAvatar(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
+
 signals:
     void status(const QString& s);
     void presenceChanged(const QString& peerIdB64u, bool online);
@@ -68,6 +70,8 @@ signals:
                          const QStringList& memberKeys,
                          const QDateTime& ts,
                          const QString& msgId);
+
+    void avatarReceived(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
 
     // Emitted each time a chunk of an incoming transfer arrives.
     // chunksReceived == chunksTotal signals completion; fileData contains
