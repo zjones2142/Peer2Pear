@@ -515,8 +515,8 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
         if (m_chats[i].isOnline != online) {
             m_chats[i].isOnline = online;
 
-            // Always send our avatar when they come online so they get the latest
-            if (online && m_db) {
+            // Send our avatar on first contact (initial handshake); updates use explicit broadcast
+            if (online && m_chats[i].avatarData.isEmpty() && m_db) {
                 const QString myName   = m_db->loadSetting("displayName");
                 const QString myAvatar = m_db->loadSetting("avatarData");
                 if (!myName.isEmpty())
