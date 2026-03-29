@@ -62,6 +62,8 @@ public slots:
     void onAvatarReceived(const QString &peerIdB64u,
                           const QString &displayName,
                           const QString &avatarB64);
+    void onGroupRenamed(const QString &groupId, const QString &newName);
+    void onGroupAvatarReceived(const QString &groupId, const QString &avatarB64);
 
     // Fired for every arriving chunk.
     // fileData is non-empty only when chunksReceived == chunksTotal (transfer complete).

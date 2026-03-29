@@ -14,7 +14,8 @@ class OnboardingDialog : public QDialog
 public:
     explicit OnboardingDialog(QWidget *parent = nullptr);
     QString displayName() const;
-    QString avatarData() const; // base64-encoded PNG, may be empty if using initials
+    QString avatarData() const;   // base64-encoded PNG, may be empty if using initials
+    bool isPhotoAvatar() const;   // true only if user uploaded a real photo
 
 private slots:
     void onNextClicked();

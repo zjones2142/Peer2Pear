@@ -503,5 +503,6 @@ void OnboardingDialog::updateAvatarPreview()
 
 // ── Accessors ─────────────────────────────────────────────────────────────────
 
-QString OnboardingDialog::displayName() const { return m_displayName; }
-QString OnboardingDialog::avatarData()  const { return m_avatarData;  }
+QString OnboardingDialog::displayName()  const { return m_displayName; }
+QString OnboardingDialog::avatarData()   const { return m_avatarData;  }
+bool    OnboardingDialog::isPhotoAvatar() const { return m_usingPhoto;  }
