@@ -32,6 +32,23 @@
 #include <QBuffer>
 #include <QColorDialog>
 
+// ── renderInitialsAvatar ──────────────────────────────────────────────────────
+static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, int size)
+{
+    QPixmap pm(size, size);
+    pm.setDevicePixelRatio(1.0);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setBrush(bg); p.setPen(Qt::NoPen);
+    p.drawEllipse(0, 0, size, size);
+    QFont f = p.font(); f.setBold(true); f.setPixelSize(size / 2); p.setFont(f);
+    p.setPen(Qt::white);
+    p.drawText(QRect(0, 0, size, size), Qt::AlignCenter, initial.toUpper());
+    p.end();
+    return pm;
+}
+
 // ── makeCircularPixmap ────────────────────────────────────────────────────────
 static QPixmap makeCircularPixmap(const QPixmap &src, int size)
 {
@@ -1033,21 +1050,6 @@ void ChatView::onEditProfile()
         if (!px.isNull()) { usingPhoto = true; uploadedPhoto = px; }
     }
 
-    // ── Initials renderer (used in both dialogs) ──────────────────────────────
-    auto renderInitials = [](const QString &initial, const QColor &bg, int size) -> QPixmap {
-        QPixmap pm(size, size);
-        pm.setDevicePixelRatio(1.0);
-        pm.fill(Qt::transparent);
-        QPainter p(&pm);
-        p.setRenderHint(QPainter::Antialiasing);
-        p.setBrush(bg); p.setPen(Qt::NoPen);
-        p.drawEllipse(0, 0, size, size);
-        QFont f = p.font(); f.setBold(true); f.setPixelSize(size / 2); p.setFont(f);
-        p.setPen(Qt::white);
-        p.drawText(QRect(0, 0, size, size), Qt::AlignCenter, initial.toUpper());
-        p.end();
-        return pm;
-    };
 
     // ── Main profile dialog ───────────────────────────────────────────────────
     QDialog dlg(m_ui->centralwidget);
@@ -1084,7 +1086,7 @@ void ChatView::onEditProfile()
         else {
             const QString nm = m_ui->profileNameLabel->text();
             const QString ch = nm.isEmpty() ? "?" : QString(nm[0]);
-            px = makeCircularPixmap(renderInitials(ch, avatarColor, 200), 56);
+            px = makeCircularPixmap(renderInitialsAvatar(ch, avatarColor, 200), 56);
         }
         avatarThumb->setPixmap(px);
     };
@@ -1207,7 +1209,7 @@ void ChatView::onEditProfile()
                 px = makeCircularPixmap(localUploaded, 100);
             else {
                 const QString ch = curName.isEmpty() ? "?" : QString(curName[0]);
-                px = makeCircularPixmap(renderInitials(ch, localColor, 200), 100);
+                px = makeCircularPixmap(renderInitialsAvatar(ch, localColor, 200), 100);
             }
             preview->setPixmap(px);
         };
@@ -1328,7 +1330,7 @@ void ChatView::onEditProfile()
         finalPx = makeCircularPixmap(uploadedPhoto, 200);
     } else {
         const QString ch = newName.isEmpty() ? "?" : QString(newName[0]);
-        finalPx = renderInitials(ch, avatarColor, 200);
+        finalPx = renderInitialsAvatar(ch, avatarColor, 200);
     }
 
     QByteArray bytes;
@@ -1640,7 +1642,7 @@ void ChatView::rebuildChatList()
             hl->addWidget(dot);
         }
 
-        // Avatar label — shows received photo or initials circle
+        // Avatar label — shows received photo, group initials, or neutral placeholder
         auto *avatarLbl = new QLabel(row);
         avatarLbl->setFixedSize(34, 34);
         avatarLbl->setAlignment(Qt::AlignCenter);
@@ -1649,6 +1651,9 @@ void ChatView::rebuildChatList()
             px.loadFromData(QByteArray::fromBase64(m_chats[i].avatarData.toUtf8()));
             if (!px.isNull())
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
+        } else if (m_chats[i].isGroup) {
+            const QString ch = m_chats[i].name.isEmpty() ? "#" : QString(m_chats[i].name[0]);
+            avatarLbl->setPixmap(renderInitialsAvatar(ch, QColor("#1a4a6a"), 34));
         } else {
             avatarLbl->setStyleSheet(
                 "background-color:#222222;border-radius:17px;border:1px solid #333333;");
@@ -1717,6 +1722,10 @@ void ChatView::loadChat(int index)
             m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
             m_ui->chatAvatarLabel->setText("");
         }
+    } else if (chat.isGroup) {
+        const QString ch = chat.name.isEmpty() ? "#" : QString(chat.name[0]);
+        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor("#1a4a6a"), 44));
+        m_ui->chatAvatarLabel->setText("");
     } else {
         m_ui->chatAvatarLabel->clear();
         m_ui->chatAvatarLabel->setText(
