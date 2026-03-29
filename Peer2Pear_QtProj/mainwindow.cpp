@@ -53,8 +53,10 @@ MainWindow::MainWindow(QWidget *parent)
             return;
         }
         m_db.saveSetting("displayName", dlg.displayName());
-        if (!dlg.avatarData().isEmpty())
+        if (!dlg.avatarData().isEmpty()) {
             m_db.saveSetting("avatarData", dlg.avatarData());
+            m_db.saveSetting("avatarIsPhoto", dlg.isPhotoAvatar() ? "true" : "false");
+        }
     }
 
     // ── Server + polling ──────────────────────────────────────────────────────
@@ -110,6 +112,10 @@ MainWindow::MainWindow(QWidget *parent)
             m_chatView,    &ChatView::onPresenceChanged);
     connect(&m_controller, &ChatController::avatarReceived,
             m_chatView,    &ChatView::onAvatarReceived);
+    connect(&m_controller, &ChatController::groupRenamed,
+            m_chatView,    &ChatView::onGroupRenamed);
+    connect(&m_controller, &ChatController::groupAvatarReceived,
+            m_chatView,    &ChatView::onGroupAvatarReceived);
 
     // ── Notifier ──────────────────────────────────────────────────────────────
     m_notifier = new ChatNotifier(this);

@@ -48,6 +48,9 @@ public:
 
     void sendAvatar(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
 
+    void sendGroupRename(const QString& groupId, const QString& newName, const QStringList& memberKeys);
+    void sendGroupAvatar(const QString& groupId, const QString& avatarB64, const QStringList& memberKeys);
+
 signals:
     void status(const QString& s);
     void presenceChanged(const QString& peerIdB64u, bool online);
@@ -72,6 +75,8 @@ signals:
                          const QString& msgId);
 
     void avatarReceived(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
+    void groupRenamed(const QString& groupId, const QString& newName);
+    void groupAvatarReceived(const QString& groupId, const QString& avatarB64);
 
     // Emitted each time a chunk of an incoming transfer arrives.
     // chunksReceived == chunksTotal signals completion; fileData contains

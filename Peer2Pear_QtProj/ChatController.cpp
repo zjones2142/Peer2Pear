@@ -505,5 +505,37 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         emit avatarReceived(fromId,
                             o.value("name").toString(),
                             o.value("avatar").toString());
+    } else if (type == "group_rename") {
+        emit groupRenamed(o.value("groupId").toString(),
+                          o.value("newName").toString());
+    } else if (type == "group_avatar") {
+        emit groupAvatarReceived(o.value("groupId").toString(),
+                                 o.value("avatar").toString());
     }
+}
+
+void ChatController::sendGroupRename(const QString& groupId,
+                                     const QString& newName,
+                                     const QStringList& memberKeys)
+{
+    QJsonObject payload;
+    payload["from"]    = myIdB64u();
+    payload["type"]    = "group_rename";
+    payload["groupId"] = groupId;
+    payload["newName"] = newName;
+    for (const QString &key : memberKeys)
+        sendSignalingMessage(key, payload);
+}
+
+void ChatController::sendGroupAvatar(const QString& groupId,
+                                     const QString& avatarB64,
+                                     const QStringList& memberKeys)
+{
+    QJsonObject payload;
+    payload["from"]    = myIdB64u();
+    payload["type"]    = "group_avatar";
+    payload["groupId"] = groupId;
+    payload["avatar"]  = avatarB64;
+    for (const QString &key : memberKeys)
+        sendSignalingMessage(key, payload);
 }

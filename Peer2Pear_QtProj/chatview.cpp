@@ -141,7 +141,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                                              bool isBlocked = false,
                                              bool isGroup = false,
                                              const QVector<ChatData> *allContacts = nullptr,
-                                             std::function<void(const ChatData&)> onNewContact = nullptr)
+                                             std::function<void(const ChatData&)> onNewContact = nullptr,
+                                             QString *avatarInOut = nullptr)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -161,6 +162,94 @@ static ContactEditorResult openContactEditor(QWidget *parent,
     sep->setFrameShape(QFrame::HLine);
     sep->setStyleSheet("color:#2a2a2a;");
     root->addWidget(sep);
+
+    // ── Group avatar row (only when avatarInOut provided) ─────────────────────
+    QString localAvatar = avatarInOut ? *avatarInOut : QString();
+    QPixmap localAvatarRaw; // raw upload — converted to base64 only at Save time
+    // Declared at function scope so lambdas connected inside the if-block below
+    // don't capture dangling references after the block exits.
+    QLabel *avatarThumb = nullptr;
+    std::function<void()> refreshGroupThumb;
+    if (isGroup && avatarInOut) {
+        auto *avatarRow = new QHBoxLayout;
+        avatarRow->setSpacing(14);
+
+        avatarThumb = new QLabel(&dlg);
+        avatarThumb->setFixedSize(56, 56);
+        avatarThumb->setAlignment(Qt::AlignCenter);
+
+        refreshGroupThumb = [&]() {
+            QPixmap px;
+            if (!localAvatarRaw.isNull()) {
+                px = makeCircularPixmap(localAvatarRaw, 56);
+            } else if (!localAvatar.isEmpty()) {
+                QPixmap src;
+                src.loadFromData(QByteArray::fromBase64(localAvatar.toUtf8()));
+                if (!src.isNull()) px = makeCircularPixmap(src, 56);
+            }
+            if (px.isNull()) {
+                const QString ch = nameInOut.isEmpty() ? "#" : QString(nameInOut[0]);
+                px = renderInitialsAvatar(ch, QColor("#2e8b3a"), 56);
+            }
+            avatarThumb->setPixmap(px);
+        };
+        refreshGroupThumb();
+
+        auto *changePhotoBtn = new QPushButton("Change Photo", &dlg);
+        changePhotoBtn->setAutoDefault(false);
+        changePhotoBtn->setStyleSheet(
+            "QPushButton{background:#111;border:1px solid #333;color:#f0f0f0;"
+            "border-radius:8px;padding:8px 14px;font-size:13px;}"
+            "QPushButton:hover{background:#1a1a1a;border:1px solid #555;}");
+
+        // Inline photo options — toggled by changePhotoBtn
+        auto *photoOptionsGroup = new QWidget(&dlg);
+        photoOptionsGroup->setVisible(false);
+        auto *poLayout = new QVBoxLayout(photoOptionsGroup);
+        poLayout->setContentsMargins(0, 4, 0, 4);
+        poLayout->setSpacing(8);
+
+        auto *pUpload = new QPushButton("Upload Photo", photoOptionsGroup);
+        pUpload->setAutoDefault(false);
+        pUpload->setStyleSheet(
+            "QPushButton{background:#111;border:1px solid #1e1e1e;color:#f0f0f0;"
+            "border-radius:8px;padding:8px;font-size:13px;}"
+            "QPushButton:hover{background:#1a1a1a;border:1px solid #333;}");
+        QObject::connect(pUpload, &QPushButton::clicked, [&]() {
+            const QString path = QFileDialog::getOpenFileName(
+                &dlg, "Choose Photo", QString(),
+                "Images (*.png *.jpg *.jpeg *.bmp)");
+            if (path.isEmpty()) return;
+            QPixmap px(path);
+            if (px.isNull()) return;
+            localAvatarRaw = px;
+            refreshGroupThumb();
+        });
+        poLayout->addWidget(pUpload);
+
+        auto *pReset = new QPushButton("Reset to Default", photoOptionsGroup);
+        pReset->setAutoDefault(false);
+        pReset->setObjectName("cancelBtn");
+        QObject::connect(pReset, &QPushButton::clicked, [&]() {
+            localAvatarRaw = QPixmap();
+            localAvatar.clear();
+            refreshGroupThumb();
+        });
+        poLayout->addWidget(pReset);
+
+        QObject::connect(changePhotoBtn, &QPushButton::clicked, [&, photoOptionsGroup, changePhotoBtn]() {
+            const bool v = !photoOptionsGroup->isVisible();
+            photoOptionsGroup->setVisible(v);
+            changePhotoBtn->setText(v ? "Done" : "Change Photo");
+            dlg.adjustSize();
+        });
+
+        avatarRow->addWidget(avatarThumb);
+        avatarRow->addWidget(changePhotoBtn);
+        avatarRow->addStretch();
+        root->addLayout(avatarRow);
+        root->addWidget(photoOptionsGroup);
+    }
 
     root->addWidget(new QLabel("Display Name", &dlg));
     auto *nameEdit = new QLineEdit(nameInOut, &dlg);
@@ -455,6 +544,16 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             for (int i = 0; i < keyList->count(); ++i)
                 keysInOut << keyList->item(i)->text();
         }
+        if (avatarInOut) {
+            if (!localAvatarRaw.isNull()) {
+                QPixmap circ = makeCircularPixmap(localAvatarRaw, 200);
+                QByteArray bytes; QBuffer buf(&bytes);
+                buf.open(QIODevice::WriteOnly);
+                circ.save(&buf, "PNG");
+                localAvatar = QString::fromLatin1(bytes.toBase64());
+            }
+            *avatarInOut = localAvatar;
+        }
     }
     return result;
 }
@@ -532,8 +631,9 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
         if (m_chats[i].isOnline != online) {
             m_chats[i].isOnline = online;
 
-            // Send our avatar on first contact (initial handshake); updates use explicit broadcast
-            if (online && m_chats[i].avatarData.isEmpty() && m_db) {
+            // Send our avatar on first contact only if it's a real photo
+            if (online && m_chats[i].avatarData.isEmpty() && m_db
+                    && m_db->loadSetting("avatarIsPhoto") == "true") {
                 const QString myName   = m_db->loadSetting("displayName");
                 const QString myAvatar = m_db->loadSetting("avatarData");
                 if (!myName.isEmpty())
@@ -874,6 +974,31 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
     }
 }
 
+void ChatView::onGroupRenamed(const QString &groupId, const QString &newName)
+{
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (!m_chats[i].isGroup || m_chats[i].groupId != groupId) continue;
+        m_chats[i].name = newName;
+        if (m_db) m_db->saveContact(m_chats[i]);
+        rebuildChatList();
+        if (m_currentChat == i)
+            m_ui->chatTitleLabel->setText(newName);
+        return;
+    }
+}
+
+void ChatView::onGroupAvatarReceived(const QString &groupId, const QString &avatarB64)
+{
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (!m_chats[i].isGroup || m_chats[i].groupId != groupId) continue;
+        m_chats[i].avatarData = avatarB64;
+        if (m_db) m_db->saveContactAvatar(m_chats[i].peerIdB64u, avatarB64);
+        rebuildChatList();
+        if (m_currentChat == i) loadChat(i);
+        return;
+    }
+}
+
 // ── Attach / send file ────────────────────────────────────────────────────────
 
 void ChatView::onAttachFile()
@@ -1104,6 +1229,89 @@ void ChatView::onEditProfile()
     avatarRowLayout->addStretch();
     root->addLayout(avatarRowLayout);
 
+    // ── Inline photo options (toggled by Change Photo button) ─────────────────
+    auto *photoOptionsWidget = new QWidget(&dlg);
+    photoOptionsWidget->setVisible(false);
+    auto *poLayout = new QVBoxLayout(photoOptionsWidget);
+    poLayout->setContentsMargins(0, 4, 0, 4);
+    poLayout->setSpacing(8);
+
+    const QList<QColor> presets = {
+        QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
+        QColor("#bf7b3a"), QColor("#bf3a3a"),
+    };
+    auto swatchStyle = [](const QColor &col, bool sel) -> QString {
+        return QString("QPushButton{background:%1;border:%2;border-radius:14px;}"
+                       "QPushButton:hover{border:2px solid #888;border-radius:14px;}")
+            .arg(col.name(), sel ? "2px solid white" : "none");
+    };
+
+    auto *pColorLbl = new QLabel("Background color", photoOptionsWidget);
+    pColorLbl->setStyleSheet("color:#888888;font-size:11px;");
+    poLayout->addWidget(pColorLbl);
+
+    QList<QPushButton*> pSwatches;
+    auto *pSwatchRow = new QHBoxLayout;
+    pSwatchRow->setSpacing(8);
+    pSwatchRow->addStretch();
+    for (int i = 0; i < presets.size(); ++i) {
+        auto *sb = new QPushButton(photoOptionsWidget);
+        sb->setFixedSize(28, 28);
+        sb->setAutoDefault(false);
+        sb->setStyleSheet(swatchStyle(presets[i], !usingPhoto && presets[i] == avatarColor));
+        pSwatches.append(sb);
+        QObject::connect(sb, &QPushButton::clicked, [&, sb, i]() {
+            usingPhoto  = false;
+            avatarColor = presets[i];
+            for (int j = 0; j < pSwatches.size(); ++j)
+                pSwatches[j]->setStyleSheet(swatchStyle(presets[j], pSwatches[j] == sb));
+            refreshThumb();
+        });
+        pSwatchRow->addWidget(sb);
+    }
+    auto *pCustom = new QPushButton("+", photoOptionsWidget);
+    pCustom->setFixedSize(28, 28);
+    pCustom->setAutoDefault(false);
+    pCustom->setStyleSheet(
+        "QPushButton{background:#1e1e1e;border:1px solid #555;border-radius:14px;"
+        "color:#f0f0f0;font-size:16px;font-weight:bold;}"
+        "QPushButton:hover{background:#2a2a2a;}");
+    QObject::connect(pCustom, &QPushButton::clicked, [&]() {
+        QColor c = QColorDialog::getColor(avatarColor, nullptr, "Choose Color");
+        if (!c.isValid()) return;
+        usingPhoto  = false;
+        avatarColor = c;
+        for (int j = 0; j < pSwatches.size(); ++j)
+            pSwatches[j]->setStyleSheet(swatchStyle(presets[j], false));
+        refreshThumb();
+    });
+    pSwatchRow->addWidget(pCustom);
+    pSwatchRow->addStretch();
+    poLayout->addLayout(pSwatchRow);
+
+    auto *pUpload = new QPushButton("Upload Photo", photoOptionsWidget);
+    pUpload->setAutoDefault(false);
+    pUpload->setStyleSheet(
+        "QPushButton{background:#111;border:1px solid #1e1e1e;color:#f0f0f0;"
+        "border-radius:8px;padding:8px;font-size:13px;}"
+        "QPushButton:hover{background:#1a1a1a;border:1px solid #333;}");
+    QObject::connect(pUpload, &QPushButton::clicked, [&]() {
+        const QString path = QFileDialog::getOpenFileName(
+            &dlg, "Choose Photo", QString(),
+            "Images (*.png *.jpg *.jpeg *.bmp)");
+        if (path.isEmpty()) return;
+        QPixmap px(path);
+        if (px.isNull()) return;
+        usingPhoto    = true;
+        uploadedPhoto = px;
+        for (int j = 0; j < pSwatches.size(); ++j)
+            pSwatches[j]->setStyleSheet(swatchStyle(presets[j], false));
+        refreshThumb();
+    });
+    poLayout->addWidget(pUpload);
+
+    root->addWidget(photoOptionsWidget);
+
     // ── Name ─────────────────────────────────────────────────────────────────
     root->addWidget(new QLabel("Display Name", &dlg));
     auto *nameEdit = new QLineEdit(m_ui->profileNameLabel->text(), &dlg);
@@ -1166,158 +1374,12 @@ void ChatView::onEditProfile()
     QObject::connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
     QObject::connect(saveBtn,   &QPushButton::clicked, &dlg, &QDialog::accept);
 
-    // ── "Change Photo" opens avatar sub-dialog ────────────────────────────────
-    QObject::connect(changePhotoBtn, &QPushButton::clicked, [&]() {
-        QDialog photoDlg(&dlg);
-        photoDlg.setWindowTitle("Change Profile Picture");
-        photoDlg.setStyleSheet(kDlgStyle);
-        photoDlg.setMinimumWidth(340);
-        photoDlg.setModal(true);
-
-        // Local copies so cancel reverts state
-        bool localUsingPhoto   = usingPhoto;
-        QPixmap localUploaded  = uploadedPhoto;
-        QColor  localColor     = avatarColor;
-
-        auto *pRoot = new QVBoxLayout(&photoDlg);
-        pRoot->setSpacing(14);
-        pRoot->setContentsMargins(24, 24, 24, 24);
-
-        auto *pTitle = new QLabel("Change Profile Picture", &photoDlg);
-        pTitle->setObjectName("dlgTitle");
-        pRoot->addWidget(pTitle);
-
-        auto *pSep = new QFrame(&photoDlg);
-        pSep->setFrameShape(QFrame::HLine);
-        pSep->setStyleSheet("color:#2a2a2a;");
-        pRoot->addWidget(pSep);
-
-        // Preview
-        auto *preview = new QLabel(&photoDlg);
-        preview->setFixedSize(100, 100);
-        preview->setAlignment(Qt::AlignCenter);
-        auto *pPrevRow = new QHBoxLayout;
-        pPrevRow->addStretch();
-        pPrevRow->addWidget(preview);
-        pPrevRow->addStretch();
-        pRoot->addLayout(pPrevRow);
-
-        const QString curName = nameEdit->text().trimmed();
-        auto updatePrev = [&]() {
-            QPixmap px;
-            if (localUsingPhoto && !localUploaded.isNull())
-                px = makeCircularPixmap(localUploaded, 100);
-            else {
-                const QString ch = curName.isEmpty() ? "?" : QString(curName[0]);
-                px = makeCircularPixmap(renderInitialsAvatar(ch, localColor, 200), 100);
-            }
-            preview->setPixmap(px);
-        };
-        updatePrev();
-
-        // Swatches
-        auto *pColorLbl = new QLabel("Background color", &photoDlg);
-        pColorLbl->setStyleSheet("color:#888888;font-size:11px;");
-        pRoot->addWidget(pColorLbl);
-
-        const QList<QColor> presets = {
-            QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-            QColor("#bf7b3a"), QColor("#bf3a3a"),
-        };
-        auto swatchStyle = [](const QColor &col, bool sel) -> QString {
-            return QString("QPushButton{background:%1;border:%2;border-radius:14px;}"
-                           "QPushButton:hover{border:2px solid #888;border-radius:14px;}")
-                .arg(col.name(), sel ? "2px solid white" : "none");
-        };
-
-        QList<QPushButton*> pSwatches;
-        auto *pSwatchRow = new QHBoxLayout;
-        pSwatchRow->setSpacing(8);
-        pSwatchRow->addStretch();
-
-        for (int i = 0; i < presets.size(); ++i) {
-            auto *sb = new QPushButton(&photoDlg);
-            sb->setFixedSize(28, 28);
-            sb->setAutoDefault(false);
-            sb->setStyleSheet(swatchStyle(presets[i], !localUsingPhoto && presets[i] == localColor));
-            pSwatches.append(sb);
-            connect(sb, &QPushButton::clicked, [&, sb, i]() {
-                localUsingPhoto = false;
-                localColor = presets[i];
-                for (int j = 0; j < pSwatches.size(); ++j)
-                    pSwatches[j]->setStyleSheet(swatchStyle(presets[j], pSwatches[j] == sb));
-                updatePrev();
-            });
-            pSwatchRow->addWidget(sb);
-        }
-
-        auto *pCustom = new QPushButton("+", &photoDlg);
-        pCustom->setFixedSize(28, 28);
-        pCustom->setAutoDefault(false);
-        pCustom->setStyleSheet(
-            "QPushButton{background:#1e1e1e;border:1px solid #555;border-radius:14px;"
-            "color:#f0f0f0;font-size:16px;font-weight:bold;}"
-            "QPushButton:hover{background:#2a2a2a;}");
-        connect(pCustom, &QPushButton::clicked, [&]() {
-            QColor c = QColorDialog::getColor(localColor, &photoDlg, "Choose Color");
-            if (!c.isValid()) return;
-            localUsingPhoto = false;
-            localColor = c;
-            for (int j = 0; j < pSwatches.size(); ++j)
-                pSwatches[j]->setStyleSheet(swatchStyle(presets[j], false));
-            updatePrev();
-        });
-        pSwatchRow->addWidget(pCustom);
-        pSwatchRow->addStretch();
-        pRoot->addLayout(pSwatchRow);
-
-        pRoot->addSpacing(4);
-
-        // Upload Photo
-        auto *pUpload = new QPushButton("Upload Photo", &photoDlg);
-        pUpload->setAutoDefault(false);
-        pUpload->setStyleSheet(
-            "QPushButton{background:#111;border:1px solid #1e1e1e;color:#f0f0f0;"
-            "border-radius:8px;padding:8px;font-size:13px;}"
-            "QPushButton:hover{background:#1a1a1a;border:1px solid #333;}");
-        connect(pUpload, &QPushButton::clicked, [&]() {
-            const QString path = QFileDialog::getOpenFileName(
-                &photoDlg, "Choose Photo", QString(), "Images (*.png *.jpg *.jpeg *.bmp)");
-            if (path.isEmpty()) return;
-            QPixmap px(path);
-            if (px.isNull()) return;
-            localUsingPhoto = true;
-            localUploaded   = px;
-            for (int j = 0; j < pSwatches.size(); ++j)
-                pSwatches[j]->setStyleSheet(swatchStyle(presets[j], false));
-            updatePrev();
-        });
-        pRoot->addWidget(pUpload);
-
-        pRoot->addStretch();
-
-        auto *pBtnRow   = new QHBoxLayout;
-        auto *pCancel   = new QPushButton("Cancel", &photoDlg);
-        auto *pApply    = new QPushButton("Apply",  &photoDlg);
-        pCancel->setObjectName("cancelBtn");
-        pApply->setObjectName("saveBtn");
-        pApply->setDefault(true);
-        pBtnRow->setSpacing(10);
-        pBtnRow->addStretch();
-        pBtnRow->addWidget(pCancel);
-        pBtnRow->addWidget(pApply);
-        pRoot->addLayout(pBtnRow);
-
-        connect(pCancel, &QPushButton::clicked, &photoDlg, &QDialog::reject);
-        connect(pApply,  &QPushButton::clicked, &photoDlg, &QDialog::accept);
-
-        if (photoDlg.exec() != QDialog::Accepted) return;
-
-        // Commit local state back to outer scope
-        usingPhoto    = localUsingPhoto;
-        uploadedPhoto = localUploaded;
-        avatarColor   = localColor;
-        refreshThumb();
+    // ── "Change Photo" toggles inline photo options ───────────────────────────
+    QObject::connect(changePhotoBtn, &QPushButton::clicked, [&, photoOptionsWidget]() {
+        const bool nowVisible = !photoOptionsWidget->isVisible();
+        photoOptionsWidget->setVisible(nowVisible);
+        changePhotoBtn->setText(nowVisible ? "Done" : "Change Photo");
+        dlg.adjustSize();
     });
 
     if (dlg.exec() != QDialog::Accepted) return;
@@ -1352,45 +1414,64 @@ void ChatView::onEditProfile()
     m_controller->setSelfKeys(m_profileKeys);
 
     if (m_db) {
-        m_db->saveSetting("displayName", displayName);
-        m_db->saveSetting("avatarData",  newAvatarB64);
-        m_db->saveSetting("profileKeys", m_profileKeys.join(','));
+        m_db->saveSetting("displayName",  displayName);
+        m_db->saveSetting("avatarData",   newAvatarB64);
+        m_db->saveSetting("avatarIsPhoto", usingPhoto ? "true" : "false");
+        m_db->saveSetting("profileKeys",  m_profileKeys.join(','));
     }
 
-    for (const ChatData &chat : m_chats) {
-        if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
-            m_controller->sendAvatar(chat.peerIdB64u, displayName, newAvatarB64);
+    // Only broadcast if it's a real photo — contacts generate their own initials fallback
+    if (usingPhoto) {
+        for (const ChatData &chat : m_chats) {
+            if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
+                m_controller->sendAvatar(chat.peerIdB64u, displayName, newAvatarB64);
+        }
     }
 }
 
 void ChatView::onEditContact(int index)
 {
     if (index < 0 || index >= m_chats.size()) return;
-    QString     name = m_chats[index].name;
-    QStringList keys = m_chats[index].keys;
+    QString     name       = m_chats[index].name;
+    QStringList keys       = m_chats[index].keys;
+    QString     avatar     = m_chats[index].avatarData;
+    const bool  wasGroup   = m_chats[index].isGroup;
+    const QString oldName  = name;
+    const QString oldAvatar = avatar;
 
     const ContactEditorResult result =
         openContactEditor(m_ui->centralwidget,
-                          m_chats[index].isGroup ? "Edit Group" : "Edit Contact",
+                          wasGroup ? "Edit Group" : "Edit Contact",
                           name, keys, true,
                           m_chats[index].isBlocked,
-                          m_chats[index].isGroup,
+                          wasGroup,
                           &m_chats,
                           [this](const ChatData &newContact) {
-                              // Save new contact discovered from group member list
                               m_chats.append(newContact);
                               if (m_db) m_db->saveContact(newContact);
                               rebuildChatList();
-                          });
+                          },
+                          wasGroup ? &avatar : nullptr);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
         m_chats[index].name = name; m_chats[index].keys = keys;
+        if (wasGroup) m_chats[index].avatarData = avatar;
         if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
             m_chats[index].peerIdB64u = keys.first();
         if (m_db) m_db->saveContact(m_chats[index]);
+        if (wasGroup && !avatar.isEmpty())
+            m_db->saveContactAvatar(m_chats[index].peerIdB64u, avatar);
         rebuildChatList();
         if (m_currentChat == index)
             m_ui->chatTitleLabel->setText(name);
+
+        // Broadcast group changes to all members
+        if (wasGroup) {
+            if (name != oldName)
+                m_controller->sendGroupRename(m_chats[index].groupId, name, keys);
+            if (avatar != oldAvatar && !avatar.isEmpty())
+                m_controller->sendGroupAvatar(m_chats[index].groupId, avatar, keys);
+        }
     } else if (result == ContactEditorResult::Removed) {
         // Use the same key logic as saveContact
         const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
@@ -1651,12 +1732,19 @@ void ChatView::rebuildChatList()
             px.loadFromData(QByteArray::fromBase64(m_chats[i].avatarData.toUtf8()));
             if (!px.isNull())
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
-        } else if (m_chats[i].isGroup) {
-            const QString ch = m_chats[i].name.isEmpty() ? "#" : QString(m_chats[i].name[0]);
-            avatarLbl->setPixmap(renderInitialsAvatar(ch, QColor("#1a4a6a"), 34));
         } else {
-            avatarLbl->setStyleSheet(
-                "background-color:#222222;border-radius:17px;border:1px solid #333333;");
+            static const QList<QColor> kPalette = {
+                QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
+                QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+            };
+            const QString &nm = m_chats[i].name;
+            const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
+            int hash = 0;
+            for (QChar c : nm) hash += c.unicode();
+            const QColor bg = m_chats[i].isGroup
+                ? QColor("#2e8b3a")
+                : kPalette[qAbs(hash) % kPalette.size()];
+            avatarLbl->setPixmap(renderInitialsAvatar(ch, bg, 34));
         }
         hl->addWidget(avatarLbl);
 
@@ -1724,12 +1812,19 @@ void ChatView::loadChat(int index)
         }
     } else if (chat.isGroup) {
         const QString ch = chat.name.isEmpty() ? "#" : QString(chat.name[0]);
-        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor("#1a4a6a"), 44));
+        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor("#2e8b3a"), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
-        m_ui->chatAvatarLabel->clear();
-        m_ui->chatAvatarLabel->setText(
-            chat.name.isEmpty() ? "?" : QString(chat.name[0]).toUpper());
+        static const QList<QColor> kPalette = {
+            QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
+            QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+        };
+        const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
+        int hash = 0;
+        for (QChar c : chat.name) hash += c.unicode();
+        const QColor bg = kPalette[qAbs(hash) % kPalette.size()];
+        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));
+        m_ui->chatAvatarLabel->setText("");
     }
     clearMessages();
 
