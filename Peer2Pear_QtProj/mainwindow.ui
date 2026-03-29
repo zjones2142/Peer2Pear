@@ -41,7 +41,7 @@ QWidget#sidebarWidget { background-color: #0f0f0f; border-right: 1px solid #1c1c
 QWidget#profileWidget { background-color: #0f0f0f; border-bottom: 1px solid #1c1c1c; }
 
 /* ── Profile avatar ── */
-QLabel#profileAvatarLabel { background-color: #2e8b3a; color: #ffffff; font-size: 15px; font-weight: bold; border-radius: 20px; min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; }
+QLabel#profileAvatarLabel { background-color: transparent; color: #ffffff; font-size: 15px; font-weight: bold; border-radius: 20px; min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; }
 QLabel#profileNameLabel { color: #f0f0f0; font-size: 13px; font-weight: bold; }
 QLabel#profileHandleLabel { color: #555555; font-size: 11px; }
 
@@ -538,7 +538,7 @@ QToolButton#editProfileBtn:hover, QToolButton#editItemBtn:hover { color: #5dd868
                 <item>
                  <widget class="QLabel" name="chatAvatarLabel">
                   <property name="styleSheet">
-                   <string notr="true">background-color: #1e5c26; color: #5dd868; font-size: 15px; font-weight: bold; border-radius: 20px; min-width: 44px; max-width: 44px; min-height: 44px; max-height: 44px;</string>
+                   <string notr="true">background-color: transparent; color: #5dd868; font-size: 15px; font-weight: bold; border-radius: 20px; min-width: 44px; max-width: 44px; min-height: 44px; max-height: 44px;</string>
                   </property>
                   <property name="text">
                    <string>A</string>

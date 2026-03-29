@@ -22,6 +22,12 @@ if(APPLE)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -framework CoreFoundation -framework AppKit -framework Carbon")
 endif()
 
+if(WIN32)
+    set(app_icon_resource "windows_icon.rc")
+else()
+    set(app_icon_resource "")
+endif()
+
 # --- 2. Find vcpkg Dependencies ---
 # libsodium uses an unofficial wrapper name in vcpkg
 find_package(unofficial-sodium CONFIG REQUIRED)
@@ -62,6 +68,9 @@ set(PROJECT_SOURCES
     RendezvousClient.hpp
     NiceConnection.cpp
     NiceConnection.hpp
+    onboardingdialog.h
+    onboardingdialog.cpp
+    ${app_icon_resource}
 )
 
 # --- 4. Create Executable ---
@@ -76,6 +85,8 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         chattypes.h
         NiceConnection.hpp
         NiceConnection.cpp
+        onboardingdialog.h
+        onboardingdialog.cpp
     )
 else()
     if(ANDROID)
