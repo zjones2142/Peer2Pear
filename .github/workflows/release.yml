@@ -1,0 +1,203 @@
+# =============================================================================
+# Peer2Pear — Build & Release Workflow
+# =============================================================================
+#
+# TRIGGER
+# -------
+# This workflow runs whenever commits are pushed to the "Release" branch.
+# The intended flow is: open a PR from main → Release, get it approved and
+# merged, and this workflow fires automatically.
+#
+# RUNNER SELECTION
+# ----------------
+# The `runs-on` key below is currently set to `windows-latest` (GitHub-hosted).
+# When you are ready to use your own hardware instead, replace that value with
+# the self-hosted runner label(s) you registered, for example:
+#
+#   runs-on: [self-hosted, Windows, X64]
+#
+# BRANCH PROTECTION — REQUIRED MANUAL SETUP
+# ------------------------------------------
+# GitHub branch-protection rules are a repository-settings concern and cannot
+# be fully enforced by a workflow file alone.  Before relying on this workflow
+# you MUST configure the following rules in:
+#
+#   GitHub → Repository Settings → Branches → Add branch ruleset
+#
+# Recommended settings for the "Release" branch:
+#   • Target branches: Release
+#   • Restrict who can push to matching branches
+#       – Allow only: (leave empty — no one pushes directly)
+#   • Require a pull request before merging
+#       – Required approvals: 1 (or more, as you prefer)
+#   • Restrict which branches can open pull requests targeting "Release"
+#       – Only allow PRs whose source branch is "main"
+#         (This is enforced in the merge-guard job below as a best-effort
+#          check; the definitive guard is the ruleset above.)
+#   • Do not allow bypassing the above settings
+#
+# =============================================================================
+
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - Release
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # GUARD: reject any push that did not originate from the main branch.
+  # This is a best-effort check inside the workflow.  The authoritative
+  # restriction is the branch-protection ruleset described above.
+  # ---------------------------------------------------------------------------
+  merge-guard:
+    name: Verify source is main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # Read commit/PR metadata via the GitHub API
+      pull-requests: read   # Look up pull requests associated with the commit
+    steps:
+      - name: Check that the merge came from main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          SHA:      ${{ github.sha }}
+        run: |
+          # Look for a merged PR targeting Release whose head is main
+          RESULT=$(gh api \
+            "repos/${REPO}/commits/${SHA}/pulls" \
+            --jq '[.[] | select(.base.ref=="Release" and .head.ref=="main" and .merged_at!=null)] | length')
+          if [ "$RESULT" -lt 1 ]; then
+            echo "::error::This push to Release did not come from an approved PR from main. Aborting."
+            exit 1
+          fi
+          echo "Merge guard passed — source branch is main."
+
+  # ---------------------------------------------------------------------------
+  # BUILD: compile the project on Windows, deploy Qt runtime, zip the output.
+  # ---------------------------------------------------------------------------
+  build-and-release:
+    name: Build (Windows) and publish release
+    needs: merge-guard
+
+    # -------------------------------------------------------------------------
+    # RUNNER — change this line when you are ready to switch runner types:
+    #
+    #   GitHub-hosted (default):   windows-latest
+    #   Self-hosted Windows:       [self-hosted, Windows, X64]
+    # -------------------------------------------------------------------------
+    runs-on: windows-latest
+
+    permissions:
+      contents: write   # Required to create/update GitHub Releases
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Set up the MSVC developer environment so that CMake/Ninja can find the
+      # compiler.  The vcpkg toolchain and Qt both rely on MSVC on Windows.
+      # -----------------------------------------------------------------------
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # -----------------------------------------------------------------------
+      # Install Qt 6 (desktop, MSVC 2019 64-bit).
+      # Adjust `version` if your project targets a different Qt release.
+      # -----------------------------------------------------------------------
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v3
+        with:
+          version:   '6.7.3'
+          target:    'desktop'
+          arch:      'win64_msvc2019_64'
+          cache:     true
+
+      # -----------------------------------------------------------------------
+      # Clone and bootstrap vcpkg (mirrors what winsetup.bat does locally).
+      # A cached installation is used when the vcpkg commit hash is unchanged.
+      # -----------------------------------------------------------------------
+      - name: Cache vcpkg packages
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: Peer2Pear_QtProj/vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('Peer2Pear_QtProj/vcpkg.json') }}
+
+      - name: Bootstrap vcpkg
+        working-directory: Peer2Pear_QtProj
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      # -----------------------------------------------------------------------
+      # Configure — the vcpkg-default preset from CMakePresets.json is used.
+      # -----------------------------------------------------------------------
+      - name: Configure CMake
+        working-directory: Peer2Pear_QtProj
+        run: cmake --preset vcpkg-default -DCMAKE_BUILD_TYPE=Release
+
+      # -----------------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------------
+      - name: Build
+        working-directory: Peer2Pear_QtProj
+        run: cmake --build build --config Release --parallel
+
+      # -----------------------------------------------------------------------
+      # Bundle all Qt runtime DLLs next to the executable so the ZIP is
+      # self-contained and runnable on a clean Windows machine.
+      # -----------------------------------------------------------------------
+      - name: Deploy Qt runtime (windeployqt)
+        working-directory: Peer2Pear_QtProj
+        run: |
+          windeployqt --release --no-translations `
+            build\Release\Peer2Pear_QtProj.exe
+
+      # -----------------------------------------------------------------------
+      # Zip the deployed build directory.
+      # -----------------------------------------------------------------------
+      - name: Package release ZIP
+        working-directory: Peer2Pear_QtProj
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path   build\Release\* `
+            -DestinationPath ..\Peer2Pear-Release.zip
+
+      # -----------------------------------------------------------------------
+      # Derive a human-readable version tag from the project's CMakeLists.txt,
+      # then create (or update) a GitHub Release and attach the ZIP.
+      # -----------------------------------------------------------------------
+      # Expected CMakeLists.txt format (single line):
+      #   project(Peer2Pear_QtProj VERSION 0.1 LANGUAGES CXX)
+      - name: Read version from CMakeLists.txt
+        id: version
+        shell: pwsh
+        run: |
+          # Read the entire file as one string so multi-line project() blocks
+          # are handled correctly, then match VERSION followed by digits.
+          $content = Get-Content Peer2Pear_QtProj\CMakeLists.txt -Raw
+          $match   = [regex]::Match($content, 'project\s*\([^)]*VERSION\s+([\d]+(?:\.[\d]+)*)')
+          if ($match.Success) {
+            $ver = $match.Groups[1].Value
+          } else {
+            Write-Warning "Could not parse VERSION from CMakeLists.txt — defaulting to 0.0"
+            $ver = "0.0"
+          }
+          $tag = "v$ver-build-${{ github.run_number }}"
+          echo "tag=$tag"   >> $env:GITHUB_OUTPUT
+          echo "label=v$ver (build ${{ github.run_number }})" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:              ${{ steps.version.outputs.tag }}
+          name:                  "Peer2Pear ${{ steps.version.outputs.label }}"
+          generate_release_notes: true
+          files:                 Peer2Pear-Release.zip
