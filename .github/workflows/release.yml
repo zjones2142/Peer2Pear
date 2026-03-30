@@ -1,0 +1,141 @@
+name: Release Build
+
+on:
+  push:
+    branches: [ Release ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read   # actions/checkout
+      actions: write   # GitHub Actions cache (vcpkg binary cache + Qt cache)
+
+    env:
+      # Tell vcpkg to use GitHub Actions' built-in cache as the binary cache
+      # backend.  Packages that haven't changed are restored instead of
+      # recompiled, eliminating the 30-45 min cold-build penalty on every push.
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      # ── 1. Source ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. vcpkg binary cache – expose GHA cache credentials to vcpkg ────────
+      - name: Export GitHub Actions cache environment variables for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL',    process.env.ACTIONS_CACHE_URL    || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # ── 3. Qt (cached between runs) ──────────────────────────────────────────
+      - name: Install Qt 6.5.3 (MSVC x64)
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.5.3'
+          arch: 'win64_msvc2019_64'
+          # Cache the downloaded Qt installer payload so subsequent runs skip
+          # the download entirely.
+          cache: true
+
+      # ── 4. MSVC compiler environment (required for Ninja + cl.exe) ───────────
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ── 5. vcpkg toolchain ───────────────────────────────────────────────────
+      - name: Bootstrap vcpkg
+        working-directory: Peer2Pear_QtProj
+        shell: cmd
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          call .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      # ── 6. Build ─────────────────────────────────────────────────────────────
+      # CMake configure triggers vcpkg manifest install (libsodium, libnice,
+      # glib).  On the first run packages are compiled and stored in the GHA
+      # cache; subsequent runs restore the pre-built binaries.
+      - name: Configure CMake
+        working-directory: Peer2Pear_QtProj
+        run: cmake --preset vcpkg-default -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        working-directory: Peer2Pear_QtProj
+        run: cmake --build build --config Release
+
+      # ── 7. Assemble release staging folder ───────────────────────────────────
+      - name: Create staging directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path staging | Out-Null
+
+      - name: Copy executable
+        shell: pwsh
+        run: Copy-Item "Peer2Pear_QtProj\build\Peer2Pear_QtProj.exe" staging\
+
+      # windeployqt walks the PE import table and copies every Qt DLL, plugin,
+      # and QML module that the executable actually uses.
+      - name: Deploy Qt DLLs with windeployqt
+        shell: pwsh
+        run: windeployqt --release staging\Peer2Pear_QtProj.exe
+
+      # Copy the runtime DLLs produced by vcpkg (libsodium, libnice, glib, …).
+      # vcpkg places them in vcpkg_installed/<triplet>/bin/ inside the CMake
+      # build directory when using the manifest + CMake toolchain integration.
+      - name: Copy vcpkg runtime DLLs
+        shell: pwsh
+        run: |
+          $vcpkgBin = "Peer2Pear_QtProj\build\vcpkg_installed\x64-windows\bin"
+          if (Test-Path $vcpkgBin) {
+            Get-ChildItem $vcpkgBin -Filter "*.dll" |
+              Copy-Item -Destination staging\
+          } else {
+            Write-Warning "vcpkg bin dir not found at: $vcpkgBin"
+          }
+
+      # ── 8. Collect licenses ───────────────────────────────────────────────────
+      # Every vcpkg port ships a 'copyright' file under
+      # share/<package>/copyright.  Qt ships LICENSE* files at the install root.
+      - name: Collect licenses
+        shell: pwsh
+        run: |
+          $licenseDir = "staging\licenses"
+          New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
+
+          # --- vcpkg package licenses ---
+          $shareDir = "Peer2Pear_QtProj\build\vcpkg_installed\x64-windows\share"
+          if (Test-Path $shareDir) {
+            Get-ChildItem $shareDir -Directory | ForEach-Object {
+              $copyright = Join-Path $_.FullName "copyright"
+              if (Test-Path $copyright) {
+                Copy-Item $copyright "$licenseDir\$($_.Name).txt"
+              }
+            }
+          }
+
+          # --- Qt licenses ---
+          # jurplel/install-qt-action places windeployqt.exe in:
+          #   <Qt root>/<version>/<arch>/bin/windeployqt.exe
+          # LICENSE* files live one level up at <Qt root>/<version>/<arch>/.
+          $qdeploy = Get-Command windeployqt.exe -ErrorAction SilentlyContinue
+          if ($qdeploy) {
+            $qtArchDir = Split-Path -Parent (Split-Path -Parent $qdeploy.Source)
+            Get-ChildItem $qtArchDir -Filter "LICENSE*" | ForEach-Object {
+              Copy-Item $_.FullName "$licenseDir\Qt_$($_.Name)"
+            }
+          }
+
+      # ── 9. Package & upload ───────────────────────────────────────────────────
+      - name: Create release zip
+        shell: pwsh
+        run: Compress-Archive -Path "staging\*" -DestinationPath "Peer2Pear-Release.zip"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peer2Pear-Release
+          path: Peer2Pear-Release.zip
+          if-no-files-found: error
