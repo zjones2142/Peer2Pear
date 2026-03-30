@@ -1,16 +1,76 @@
-name: Release Build
+# =============================================================================
+# Peer2Pear — Windows Build & Release Workflow
+# =============================================================================
+#
+# Triggered by pushes to the Release branch (or manually via workflow_dispatch).
+#
+# BRANCH PROTECTION — REQUIRED MANUAL SETUP
+# ------------------------------------------
+# Before relying on this workflow configure the following in:
+#   GitHub → Repository Settings → Branches → Add branch ruleset
+#
+# Recommended settings for the "Release" branch:
+#   • Target branches: Release
+#   • Restrict who can push to matching branches (no direct pushes)
+#   • Require a pull request before merging (source branch: main)
+#   • Required approvals: 1+
+#   • Do not allow bypassing the above settings
+#
+# =============================================================================
+
+name: Build and Release
 
 on:
   push:
-    branches: [ Release ]
+    branches:
+      - Release
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-latest
+  # ---------------------------------------------------------------------------
+  # GUARD: reject any push that did not originate from the main branch.
+  # This is a best-effort check inside the workflow.  The authoritative
+  # restriction is the branch-protection ruleset described above.
+  # ---------------------------------------------------------------------------
+  merge-guard:
+    name: Verify source is main
+    runs-on: ubuntu-latest
     permissions:
-      contents: read   # actions/checkout
-      actions: write   # GitHub Actions cache (vcpkg binary cache + Qt cache)
+      contents: read        # Read commit/PR metadata via the GitHub API
+      pull-requests: read   # Look up pull requests associated with the commit
+    steps:
+      - name: Check that the merge came from main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          SHA:      ${{ github.sha }}
+        run: |
+          # workflow_dispatch pushes are always allowed (manual trigger)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch — skipping merge-guard."
+            exit 0
+          fi
+          # Look for a merged PR targeting Release whose head is main
+          RESULT=$(gh api \
+            "repos/${REPO}/commits/${SHA}/pulls" \
+            --jq '[.[] | select(.base.ref=="Release" and .head.ref=="main" and .merged_at!=null)] | length')
+          if [ "$RESULT" -lt 1 ]; then
+            echo "::error::This push to Release did not come from an approved PR from main. Aborting."
+            exit 1
+          fi
+          echo "Merge guard passed — source branch is main."
+
+  # ---------------------------------------------------------------------------
+  # BUILD: compile the project on Windows, stage the runtime, and publish.
+  # ---------------------------------------------------------------------------
+  build-and-release:
+    name: Build (Windows) and publish release
+    needs: merge-guard
+    runs-on: windows-latest
+
+    permissions:
+      contents: write   # Required to create/update GitHub Releases
+      actions: write    # Required for the vcpkg GHA binary cache
 
     env:
       # Tell vcpkg to use GitHub Actions' built-in cache as the binary cache
@@ -32,14 +92,13 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       # ── 3. Qt (cached between runs) ──────────────────────────────────────────
-      - name: Install Qt 6.5.3 (MSVC x64)
+      - name: Install Qt 6.7.3 (MSVC x64)
         uses: jurplel/install-qt-action@v3
         with:
-          version: '6.5.3'
-          arch: 'win64_msvc2019_64'
-          # Cache the downloaded Qt installer payload so subsequent runs skip
-          # the download entirely.
-          cache: true
+          version: '6.7.3'
+          target:  'desktop'
+          arch:    'win64_msvc2019_64'
+          cache:   true
 
       # ── 4. MSVC compiler environment (required for Ninja + cl.exe) ───────────
       - name: Set up MSVC x64 environment
@@ -48,6 +107,9 @@ jobs:
           arch: x64
 
       # ── 5. vcpkg toolchain ───────────────────────────────────────────────────
+      # Clone and bootstrap vcpkg (mirrors what winsetup.bat does locally).
+      # On subsequent runs vcpkg restores pre-built package binaries from the
+      # GHA cache set up above instead of recompiling them.
       - name: Bootstrap vcpkg
         working-directory: Peer2Pear_QtProj
         shell: cmd
@@ -65,9 +127,11 @@ jobs:
 
       - name: Build
         working-directory: Peer2Pear_QtProj
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --parallel
 
       # ── 7. Assemble release staging folder ───────────────────────────────────
+      # The Ninja single-config generator places the binary directly under the
+      # binaryDir (build/), not in a Release/ subdirectory.
       - name: Create staging directory
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path staging | Out-Null
@@ -80,7 +144,7 @@ jobs:
       # and QML module that the executable actually uses.
       - name: Deploy Qt DLLs with windeployqt
         shell: pwsh
-        run: windeployqt --release staging\Peer2Pear_QtProj.exe
+        run: windeployqt --release --no-translations staging\Peer2Pear_QtProj.exe
 
       # Copy the runtime DLLs produced by vcpkg (libsodium, libnice, glib, …).
       # vcpkg places them in vcpkg_installed/<triplet>/bin/ inside the CMake
@@ -97,8 +161,8 @@ jobs:
           }
 
       # ── 8. Collect licenses ───────────────────────────────────────────────────
-      # Every vcpkg port ships a 'copyright' file under
-      # share/<package>/copyright.  Qt ships LICENSE* files at the install root.
+      # Every vcpkg port ships a 'copyright' file under share/<package>/copyright.
+      # Qt ships LICENSE* files at the arch install root.
       - name: Collect licenses
         shell: pwsh
         run: |
@@ -117,25 +181,45 @@ jobs:
           }
 
           # --- Qt licenses ---
-          # jurplel/install-qt-action places windeployqt.exe in:
-          #   <Qt root>/<version>/<arch>/bin/windeployqt.exe
-          # LICENSE* files live one level up at <Qt root>/<version>/<arch>/.
-          $qdeploy = Get-Command windeployqt.exe -ErrorAction SilentlyContinue
-          if ($qdeploy) {
-            $qtArchDir = Split-Path -Parent (Split-Path -Parent $qdeploy.Source)
-            Get-ChildItem $qtArchDir -Filter "LICENSE*" | ForEach-Object {
+          # Use qmake -query to locate the Qt install prefix reliably,
+          # matching the same approach used in the Linux workflow.
+          $qtPrefix = & qmake -query QT_INSTALL_PREFIX 2>$null
+          if ($qtPrefix) {
+            Get-ChildItem $qtPrefix -Filter "LICENSE*" | ForEach-Object {
               Copy-Item $_.FullName "$licenseDir\Qt_$($_.Name)"
             }
           }
 
-      # ── 9. Package & upload ───────────────────────────────────────────────────
-      - name: Create release zip
+      # ── 9. Package ───────────────────────────────────────────────────────────
+      - name: Create release ZIP
         shell: pwsh
-        run: Compress-Archive -Path "staging\*" -DestinationPath "Peer2Pear-Release.zip"
+        run: Compress-Archive -Path "staging\*" -DestinationPath "Peer2Pear-Windows-Release.zip"
 
-      - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+      # ── 10. Read version & publish GitHub Release ─────────────────────────────
+      # Expected CMakeLists.txt format:
+      #   project(Peer2Pear_QtProj VERSION 0.1 LANGUAGES CXX)
+      # Both the Windows and Linux workflows use the same tag so their artifacts
+      # land in the same GitHub Release.
+      - name: Read version from CMakeLists.txt
+        id: version
+        shell: pwsh
+        run: |
+          $content = Get-Content Peer2Pear_QtProj\CMakeLists.txt -Raw
+          $match   = [regex]::Match($content, 'project\s*\([^)]*VERSION\s+([\d]+(?:\.[\d]+)*)')
+          if ($match.Success) {
+            $ver = $match.Groups[1].Value
+          } else {
+            Write-Warning "Could not parse VERSION from CMakeLists.txt — defaulting to 0.0"
+            $ver = "0.0"
+          }
+          $tag = "v$ver-build-${{ github.run_number }}"
+          echo "tag=$tag"   >> $env:GITHUB_OUTPUT
+          echo "label=v$ver (build ${{ github.run_number }})" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: Peer2Pear-Release
-          path: Peer2Pear-Release.zip
-          if-no-files-found: error
+          tag_name:               ${{ steps.version.outputs.tag }}
+          name:                   "Peer2Pear ${{ steps.version.outputs.label }}"
+          generate_release_notes: true
+          files:                  Peer2Pear-Windows-Release.zip
