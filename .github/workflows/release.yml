@@ -108,7 +108,7 @@ jobs:
         working-directory: Peer2Pear_QtProj
         run: |
           windeployqt --release --no-translations `
-            build\Release\Peer2Pear_QtProj.exe
+            build\Peer2Pear_QtProj.exe
 
       # -----------------------------------------------------------------------
       # Zip the deployed build directory.
@@ -118,7 +118,7 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path   build\Release\* `
+            -Path   build\* `
             -DestinationPath ..\Peer2Pear-Release.zip
 
       # -----------------------------------------------------------------------

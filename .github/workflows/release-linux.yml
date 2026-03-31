@@ -79,10 +79,10 @@ jobs:
             libxext-dev
 
       # ── 4. Qt (cached between runs) ──────────────────────────────────────────
-      - name: Install Qt 6.8.2 (GCC x64)
+      - name: Install Qt 6.7.3 (GCC x64)
         uses: jurplel/install-qt-action@v3
         with:
-          version:    '6.8.2'
+          version:    '6.7.3'
           arch:       'gcc_64'
           cache:      true
           aqtversion: '==3.3.*'
