@@ -219,8 +219,21 @@ jobs:
       # GitHub-hosted runners.
       - name: Download linuxdeploy and Qt plugin
         run: |
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          # Pin to specific, immutable release versions of linuxdeploy and its Qt plugin.
+          # NOTE: Replace the VERSION and SHA256 values below with the exact releases
+          # and checksums you intend to trust. These are example placeholders.
+          LINUXDEPLOY_VERSION="1-alpha-20240110-1"
+          LINUXDEPLOY_QT_PLUGIN_VERSION="1-alpha-20240110-1"
+
+          LINUXDEPLOY_SHA256="REPLACE_WITH_ACTUAL_LINUXDEPLOY_SHA256"
+          LINUXDEPLOY_QT_PLUGIN_SHA256="REPLACE_WITH_ACTUAL_LINUXDEPLOY_QT_PLUGIN_SHA256"
+
+          wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-x86_64.AppImage"
+          wget -q "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/${LINUXDEPLOY_QT_PLUGIN_VERSION}/linuxdeploy-plugin-qt-x86_64.AppImage"
+
+          # Verify integrity of downloaded AppImages before executing them.
+          echo "${LINUXDEPLOY_SHA256}  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          echo "${LINUXDEPLOY_QT_PLUGIN_SHA256}  linuxdeploy-plugin-qt-x86_64.AppImage" | sha256sum -c -
           chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
 
       - name: Bundle Qt libs and create AppImage
