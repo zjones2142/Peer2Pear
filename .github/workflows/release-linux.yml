@@ -24,41 +24,10 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # GUARD: mirrors the Windows workflow — reject pushes not from main.
-  # ---------------------------------------------------------------------------
-  merge-guard:
-    name: Verify source is main
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - name: Check that the merge came from main
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO:     ${{ github.repository }}
-          SHA:      ${{ github.sha }}
-        run: |
-          # workflow_dispatch pushes are always allowed (manual trigger)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual dispatch — skipping merge-guard."
-            exit 0
-          fi
-          RESULT=$(gh api \
-            "repos/${REPO}/commits/${SHA}/pulls" \
-            --jq '[.[] | select(.base.ref=="Release" and .head.ref=="main" and .merged_at!=null)] | length')
-          if [ "$RESULT" -lt 1 ]; then
-            echo "::error::This push to Release did not come from an approved PR from main. Aborting."
-            exit 1
-          fi
-          echo "Merge guard passed — source branch is main."
-
-  # ---------------------------------------------------------------------------
   # BUILD: compile on Linux, bundle as an AppImage, and publish.
   # ---------------------------------------------------------------------------
   build-and-release:
     name: Build (Linux) and publish release
-    needs: merge-guard
     runs-on: ubuntu-latest
 
     permissions:
