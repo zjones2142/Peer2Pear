@@ -23,7 +23,7 @@ if(APPLE)
 endif()
 
 if(WIN32)
-    set(app_icon_resource "windows_icon.rc")
+    set(app_icon_resource "logo.rc")
 else()
     set(app_icon_resource "")
 endif()
