@@ -87,6 +87,23 @@ void DatabaseManager::createTables()
         "  value TEXT"
         ");"
         );
+
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS file_transfers ("
+        "  transfer_id      TEXT PRIMARY KEY,"
+        "  chat_key         TEXT NOT NULL,"
+        "  file_name        TEXT NOT NULL,"
+        "  file_size        INTEGER NOT NULL,"
+        "  peer_id          TEXT,"
+        "  peer_name        TEXT,"
+        "  timestamp        INTEGER NOT NULL,"
+        "  sent             INTEGER NOT NULL,"
+        "  status           INTEGER NOT NULL,"
+        "  chunks_total     INTEGER NOT NULL,"
+        "  chunks_complete  INTEGER NOT NULL,"
+        "  saved_path       TEXT"
+        ");"
+        );
 }
 
 QVector<ChatData> DatabaseManager::loadAllContacts() const
@@ -208,6 +225,61 @@ QVector<Message> DatabaseManager::loadMessages(const QString &peerIdB64u) const
         msg.msgId     = q.value(3).toString();
         msg.senderName = q.value(4).toString();
         result.append(msg);
+    }
+    return result;
+}
+
+void DatabaseManager::saveFileRecord(const QString &chatKey, const FileTransferRecord &rec)
+{
+    if (chatKey.isEmpty() || rec.transferId.isEmpty()) return;
+    QSqlQuery q(m_db);
+    q.prepare(
+        "INSERT OR REPLACE INTO file_transfers"
+        " (transfer_id,chat_key,file_name,file_size,peer_id,peer_name,"
+        "  timestamp,sent,status,chunks_total,chunks_complete,saved_path)"
+        " VALUES (:tid,:ck,:fn,:fs,:pid,:pn,:ts,:sent,:status,:ct,:cc,:sp);"
+        );
+    q.bindValue(":tid",    rec.transferId);
+    q.bindValue(":ck",     chatKey);
+    q.bindValue(":fn",     rec.fileName);
+    q.bindValue(":fs",     rec.fileSize);
+    q.bindValue(":pid",    rec.peerIdB64u);
+    q.bindValue(":pn",     rec.peerName);
+    q.bindValue(":ts",     rec.timestamp.toUTC().toSecsSinceEpoch());
+    q.bindValue(":sent",   rec.sent ? 1 : 0);
+    q.bindValue(":status", static_cast<int>(rec.status));
+    q.bindValue(":ct",     rec.chunksTotal);
+    q.bindValue(":cc",     rec.chunksComplete);
+    q.bindValue(":sp",     rec.savedPath);
+    if (!q.exec()) qWarning() << "saveFileRecord:" << q.lastError().text();
+}
+
+QVector<FileTransferRecord> DatabaseManager::loadFileRecords(const QString &chatKey) const
+{
+    QVector<FileTransferRecord> result;
+    if (chatKey.isEmpty()) return result;
+    QSqlQuery q(m_db);
+    q.prepare(
+        "SELECT transfer_id,file_name,file_size,peer_id,peer_name,"
+        "       timestamp,sent,status,chunks_total,chunks_complete,saved_path"
+        " FROM file_transfers WHERE chat_key=:ck ORDER BY timestamp ASC;"
+        );
+    q.bindValue(":ck", chatKey);
+    if (!q.exec()) { qWarning() << "loadFileRecords:" << q.lastError().text(); return result; }
+    while (q.next()) {
+        FileTransferRecord rec;
+        rec.transferId      = q.value(0).toString();
+        rec.fileName        = q.value(1).toString();
+        rec.fileSize        = q.value(2).toLongLong();
+        rec.peerIdB64u      = q.value(3).toString();
+        rec.peerName        = q.value(4).toString();
+        rec.timestamp       = QDateTime::fromSecsSinceEpoch(q.value(5).toLongLong(), Qt::UTC).toLocalTime();
+        rec.sent            = q.value(6).toInt() == 1;
+        rec.status          = static_cast<FileTransferStatus>(q.value(7).toInt());
+        rec.chunksTotal     = q.value(8).toInt();
+        rec.chunksComplete  = q.value(9).toInt();
+        rec.savedPath       = q.value(10).toString();
+        result.append(rec);
     }
     return result;
 }

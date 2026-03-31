@@ -6,6 +6,7 @@
 #include <QtSql/QSqlDatabase>
 
 #include "chattypes.h"
+#include "filetransfer.h"
 
 class DatabaseManager
 {
@@ -24,6 +25,9 @@ public:
     // saveMessage also updates last_active on the contact row
     void saveMessage(const QString &peerIdB64u, const Message &msg);
     QVector<Message> loadMessages(const QString &peerIdB64u) const;
+
+    void saveFileRecord(const QString &chatKey, const FileTransferRecord &rec);
+    QVector<FileTransferRecord> loadFileRecords(const QString &chatKey) const;
 
     void    saveSetting(const QString &key, const QString &value);
     QString loadSetting(const QString &key, const QString &defaultValue = {}) const;
