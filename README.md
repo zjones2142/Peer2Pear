@@ -58,8 +58,6 @@ cd Peer2Pear_QtProj
 winsetup.bat
 ```
 
-The setup scripts bootstrap vcpkg, install the required libraries, and configure the CMake build.
-
 ## License
 
 This project is provided as-is. See the repository for any licensing information.
