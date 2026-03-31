@@ -12,7 +12,7 @@ A hybrid peer-to-peer file sharing and messaging application built with Qt, feat
 - **Hybrid P2P networking** — attempts direct peer-to-peer connections via ICE/NAT traversal (libnice), falling back to a relay mailbox server when a direct path is not available.
 - **Persistent storage** — chat history and contacts are stored locally in a SQLite database.
 - **Contact management** — add contacts by peer ID, block unwanted contacts.
-- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 6.
+- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 5 or Qt 6.
 
 ## How It Works
 
@@ -27,7 +27,7 @@ When sending a message or file:
 
 | Dependency | Purpose |
 |---|---|
-| [Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
+| [Qt 5/Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
 | [libsodium](https://libsodium.org/) | Cryptographic primitives (Ed25519, X25519, XChaCha20-Poly1305) |
 | [libnice](https://libnice.freedesktop.org/) | ICE agent for P2P NAT traversal |
 | [GLib](https://docs.gtk.org/glib/) | Required by libnice |
@@ -39,7 +39,7 @@ Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io
 ### Prerequisites
 
 - CMake ≥ 3.16
-- Qt 6 (Widgets, Network, Sql modules)
+- Qt 5 / Qt 6 (Widgets, Network, Sql modules)
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
 
