@@ -85,7 +85,7 @@ jobs:
           version:    '6.7.3'
           arch:       'gcc_64'
           cache:      true
-          aqtversion: '==3.3.*'
+          aqtversion: '==3.1.*'
 
       # ── 5. vcpkg toolchain ───────────────────────────────────────────────────
       # Clone and bootstrap vcpkg at a pinned commit for reproducible builds.
