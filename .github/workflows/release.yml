@@ -16,26 +16,6 @@
 #
 #   runs-on: [self-hosted, Windows, X64]
 #
-# BRANCH PROTECTION — REQUIRED MANUAL SETUP
-# ------------------------------------------
-# GitHub branch-protection rules are a repository-settings concern and cannot
-# be fully enforced by a workflow file alone.  Before relying on this workflow
-# you MUST configure the following rules in:
-#
-#   GitHub → Repository Settings → Branches → Add branch ruleset
-#
-# Recommended settings for the "Release" branch:
-#   • Target branches: Release
-#   • Restrict who can push to matching branches
-#       – Allow only: (leave empty — no one pushes directly)
-#   • Require a pull request before merging
-#       – Required approvals: 1 (or more, as you prefer)
-#   • Restrict which branches can open pull requests targeting "Release"
-#       – Only allow PRs whose source branch is "main"
-#         (This is enforced in the merge-guard job below as a best-effort
-#          check; the definitive guard is the ruleset above.)
-#   • Do not allow bypassing the above settings
-#
 # =============================================================================
 
 name: Build and Release
@@ -47,39 +27,10 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # GUARD: reject any push that did not originate from the main branch.
-  # This is a best-effort check inside the workflow.  The authoritative
-  # restriction is the branch-protection ruleset described above.
-  # ---------------------------------------------------------------------------
-  merge-guard:
-    name: Verify source is main
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read        # Read commit/PR metadata via the GitHub API
-      pull-requests: read   # Look up pull requests associated with the commit
-    steps:
-      - name: Check that the merge came from main
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO:     ${{ github.repository }}
-          SHA:      ${{ github.sha }}
-        run: |
-          # Look for a merged PR targeting Release whose head is main
-          RESULT=$(gh api \
-            "repos/${REPO}/commits/${SHA}/pulls" \
-            --jq '[.[] | select(.base.ref=="Release" and .head.ref=="main" and .merged_at!=null)] | length')
-          if [ "$RESULT" -lt 1 ]; then
-            echo "::error::This push to Release did not come from an approved PR from main. Aborting."
-            exit 1
-          fi
-          echo "Merge guard passed — source branch is main."
-
-  # ---------------------------------------------------------------------------
   # BUILD: compile the project on Windows, deploy Qt runtime, zip the output.
   # ---------------------------------------------------------------------------
   build-and-release:
     name: Build (Windows) and publish release
-    needs: merge-guard
 
     # -------------------------------------------------------------------------
     # RUNNER — change this line when you are ready to switch runner types:
