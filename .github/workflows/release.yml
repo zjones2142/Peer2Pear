@@ -1,19 +1,39 @@
 # =============================================================================
-# Peer2Pear — Windows Build & Release Workflow
+# Peer2Pear — Build & Release Workflow
 # =============================================================================
 #
-# Triggered by pushes to the Release branch (or manually via workflow_dispatch).
+# TRIGGER
+# -------
+# This workflow runs whenever commits are pushed to the "Release" branch.
+# The intended flow is: open a PR from main → Release, get it approved and
+# merged, and this workflow fires automatically.
+#
+# RUNNER SELECTION
+# ----------------
+# The `runs-on` key below is currently set to `windows-latest` (GitHub-hosted).
+# When you are ready to use your own hardware instead, replace that value with
+# the self-hosted runner label(s) you registered, for example:
+#
+#   runs-on: [self-hosted, Windows, X64]
 #
 # BRANCH PROTECTION — REQUIRED MANUAL SETUP
 # ------------------------------------------
-# Before relying on this workflow configure the following in:
+# GitHub branch-protection rules are a repository-settings concern and cannot
+# be fully enforced by a workflow file alone.  Before relying on this workflow
+# you MUST configure the following rules in:
+#
 #   GitHub → Repository Settings → Branches → Add branch ruleset
 #
 # Recommended settings for the "Release" branch:
 #   • Target branches: Release
-#   • Restrict who can push to matching branches (no direct pushes)
-#   • Require a pull request before merging (source branch: main)
-#   • Required approvals: 1+
+#   • Restrict who can push to matching branches
+#       – Allow only: (leave empty — no one pushes directly)
+#   • Require a pull request before merging
+#       – Required approvals: 1 (or more, as you prefer)
+#   • Restrict which branches can open pull requests targeting "Release"
+#       – Only allow PRs whose source branch is "main"
+#         (This is enforced in the merge-guard job below as a best-effort
+#          check; the definitive guard is the ruleset above.)
 #   • Do not allow bypassing the above settings
 #
 # =============================================================================
@@ -24,7 +44,6 @@ on:
   push:
     branches:
       - Release
-  workflow_dispatch:
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -45,11 +64,6 @@ jobs:
           REPO:     ${{ github.repository }}
           SHA:      ${{ github.sha }}
         run: |
-          # workflow_dispatch pushes are always allowed (manual trigger)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual dispatch — skipping merge-guard."
-            exit 0
-          fi
           # Look for a merged PR targeting Release whose head is main
           RESULT=$(gh api \
             "repos/${REPO}/commits/${SHA}/pulls" \
@@ -61,149 +75,113 @@ jobs:
           echo "Merge guard passed — source branch is main."
 
   # ---------------------------------------------------------------------------
-  # BUILD: compile the project on Windows, stage the runtime, and publish.
+  # BUILD: compile the project on Windows, deploy Qt runtime, zip the output.
   # ---------------------------------------------------------------------------
   build-and-release:
     name: Build (Windows) and publish release
     needs: merge-guard
+
+    # -------------------------------------------------------------------------
+    # RUNNER — change this line when you are ready to switch runner types:
+    #
+    #   GitHub-hosted (default):   windows-latest
+    #   Self-hosted Windows:       [self-hosted, Windows, X64]
+    # -------------------------------------------------------------------------
     runs-on: windows-latest
 
     permissions:
       contents: write   # Required to create/update GitHub Releases
-      actions: write    # Required for the vcpkg GHA binary cache
-
-    env:
-      # Tell vcpkg to use GitHub Actions' built-in cache as the binary cache
-      # backend.  Packages that haven't changed are restored instead of
-      # recompiled, eliminating the 30-45 min cold-build penalty on every push.
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
     steps:
-      # ── 1. Source ────────────────────────────────────────────────────────────
+      # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. vcpkg binary cache – expose GHA cache credentials to vcpkg ────────
-      - name: Export GitHub Actions cache environment variables for vcpkg
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL',    process.env.ACTIONS_CACHE_URL    || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      # ── 3. Qt (cached between runs) ──────────────────────────────────────────
-      - name: Install Qt 6.7.3 (MSVC x64)
-        uses: jurplel/install-qt-action@v3
-        with:
-          version: '6.7.3'
-          target:  'desktop'
-          arch:    'win64_msvc2019_64'
-          cache:   true
-
-      # ── 4. MSVC compiler environment (required for Ninja + cl.exe) ───────────
-      - name: Set up MSVC x64 environment
+      # -----------------------------------------------------------------------
+      # Set up the MSVC developer environment so that CMake/Ninja can find the
+      # compiler.  The vcpkg toolchain and Qt both rely on MSVC on Windows.
+      # -----------------------------------------------------------------------
+      - name: Set up MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ── 5. vcpkg toolchain ───────────────────────────────────────────────────
+      # -----------------------------------------------------------------------
+      # Install Qt 6 (desktop, MSVC 2019 64-bit).
+      # Adjust `version` if your project targets a different Qt release.
+      # -----------------------------------------------------------------------
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v3
+        with:
+          version:   '6.7.3'
+          target:    'desktop'
+          arch:      'win64_msvc2019_64'
+          cache:     true
+
+      # -----------------------------------------------------------------------
       # Clone and bootstrap vcpkg (mirrors what winsetup.bat does locally).
-      # On subsequent runs vcpkg restores pre-built package binaries from the
-      # GHA cache set up above instead of recompiling them.
+      # A cached installation is used when the vcpkg commit hash is unchanged.
+      # -----------------------------------------------------------------------
+      - name: Cache vcpkg packages
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: Peer2Pear_QtProj/vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('Peer2Pear_QtProj/vcpkg.json') }}
+
       - name: Bootstrap vcpkg
         working-directory: Peer2Pear_QtProj
-        shell: cmd
         run: |
           git clone https://github.com/microsoft/vcpkg.git
-          call .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      # ── 6. Build ─────────────────────────────────────────────────────────────
-      # CMake configure triggers vcpkg manifest install (libsodium, libnice,
-      # glib).  On the first run packages are compiled and stored in the GHA
-      # cache; subsequent runs restore the pre-built binaries.
+      # -----------------------------------------------------------------------
+      # Configure — the vcpkg-default preset from CMakePresets.json is used.
+      # -----------------------------------------------------------------------
       - name: Configure CMake
         working-directory: Peer2Pear_QtProj
         run: cmake --preset vcpkg-default -DCMAKE_BUILD_TYPE=Release
 
+      # -----------------------------------------------------------------------
+      # Build
+      # -----------------------------------------------------------------------
       - name: Build
         working-directory: Peer2Pear_QtProj
         run: cmake --build build --config Release --parallel
 
-      # ── 7. Assemble release staging folder ───────────────────────────────────
-      # The Ninja single-config generator places the binary directly under the
-      # binaryDir (build/), not in a Release/ subdirectory.
-      - name: Create staging directory
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path staging | Out-Null
+      # -----------------------------------------------------------------------
+      # Bundle all Qt runtime DLLs next to the executable so the ZIP is
+      # self-contained and runnable on a clean Windows machine.
+      # -----------------------------------------------------------------------
+      - name: Deploy Qt runtime (windeployqt)
+        working-directory: Peer2Pear_QtProj
+        run: |
+          windeployqt --release --no-translations `
+            build\Release\Peer2Pear_QtProj.exe
 
-      - name: Copy executable
-        shell: pwsh
-        run: Copy-Item "Peer2Pear_QtProj\build\Peer2Pear_QtProj.exe" staging\
-
-      # windeployqt walks the PE import table and copies every Qt DLL, plugin,
-      # and QML module that the executable actually uses.
-      - name: Deploy Qt DLLs with windeployqt
-        shell: pwsh
-        run: windeployqt --release --no-translations staging\Peer2Pear_QtProj.exe
-
-      # Copy the runtime DLLs produced by vcpkg (libsodium, libnice, glib, …).
-      # vcpkg places them in vcpkg_installed/<triplet>/bin/ inside the CMake
-      # build directory when using the manifest + CMake toolchain integration.
-      - name: Copy vcpkg runtime DLLs
+      # -----------------------------------------------------------------------
+      # Zip the deployed build directory.
+      # -----------------------------------------------------------------------
+      - name: Package release ZIP
+        working-directory: Peer2Pear_QtProj
         shell: pwsh
         run: |
-          $vcpkgBin = "Peer2Pear_QtProj\build\vcpkg_installed\x64-windows\bin"
-          if (Test-Path $vcpkgBin) {
-            Get-ChildItem $vcpkgBin -Filter "*.dll" |
-              Copy-Item -Destination staging\
-          } else {
-            Write-Warning "vcpkg bin dir not found at: $vcpkgBin"
-          }
+          Compress-Archive `
+            -Path   build\Release\* `
+            -DestinationPath ..\Peer2Pear-Release.zip
 
-      # ── 8. Collect licenses ───────────────────────────────────────────────────
-      # Every vcpkg port ships a 'copyright' file under share/<package>/copyright.
-      # Qt ships LICENSE* files at the arch install root.
-      - name: Collect licenses
-        shell: pwsh
-        run: |
-          $licenseDir = "staging\licenses"
-          New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
-
-          # --- vcpkg package licenses ---
-          $shareDir = "Peer2Pear_QtProj\build\vcpkg_installed\x64-windows\share"
-          if (Test-Path $shareDir) {
-            Get-ChildItem $shareDir -Directory | ForEach-Object {
-              $copyright = Join-Path $_.FullName "copyright"
-              if (Test-Path $copyright) {
-                Copy-Item $copyright "$licenseDir\$($_.Name).txt"
-              }
-            }
-          }
-
-          # --- Qt licenses ---
-          # Use qmake -query to locate the Qt install prefix reliably,
-          # matching the same approach used in the Linux workflow.
-          $qtPrefix = & qmake -query QT_INSTALL_PREFIX 2>$null
-          if ($qtPrefix) {
-            Get-ChildItem $qtPrefix -Filter "LICENSE*" | ForEach-Object {
-              Copy-Item $_.FullName "$licenseDir\Qt_$($_.Name)"
-            }
-          }
-
-      # ── 9. Package ───────────────────────────────────────────────────────────
-      - name: Create release ZIP
-        shell: pwsh
-        run: Compress-Archive -Path "staging\*" -DestinationPath "Peer2Pear-Windows-Release.zip"
-
-      # ── 10. Read version & publish GitHub Release ─────────────────────────────
-      # Expected CMakeLists.txt format:
+      # -----------------------------------------------------------------------
+      # Derive a human-readable version tag from the project's CMakeLists.txt,
+      # then create (or update) a GitHub Release and attach the ZIP.
+      # -----------------------------------------------------------------------
+      # Expected CMakeLists.txt format (single line):
       #   project(Peer2Pear_QtProj VERSION 0.1 LANGUAGES CXX)
-      # Both the Windows and Linux workflows use the same tag so their artifacts
-      # land in the same GitHub Release.
       - name: Read version from CMakeLists.txt
         id: version
         shell: pwsh
         run: |
+          # Read the entire file as one string so multi-line project() blocks
+          # are handled correctly, then match VERSION followed by digits.
           $content = Get-Content Peer2Pear_QtProj\CMakeLists.txt -Raw
           $match   = [regex]::Match($content, 'project\s*\([^)]*VERSION\s+([\d]+(?:\.[\d]+)*)')
           if ($match.Success) {
@@ -216,10 +194,10 @@ jobs:
           echo "tag=$tag"   >> $env:GITHUB_OUTPUT
           echo "label=v$ver (build ${{ github.run_number }})" >> $env:GITHUB_OUTPUT
 
-      - name: Create or update GitHub Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name:               ${{ steps.version.outputs.tag }}
-          name:                   "Peer2Pear ${{ steps.version.outputs.label }}"
+          tag_name:              ${{ steps.version.outputs.tag }}
+          name:                  "Peer2Pear ${{ steps.version.outputs.label }}"
           generate_release_notes: true
-          files:                  Peer2Pear-Windows-Release.zip
+          files:                 Peer2Pear-Release.zip
