@@ -101,6 +101,14 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       # -----------------------------------------------------------------------
+      # Rename the executable to the user-facing product name.
+      # -----------------------------------------------------------------------
+      - name: Rename executable to Peer2Pear.exe
+        working-directory: Peer2Pear_QtProj
+        shell: pwsh
+        run: Rename-Item -Path build\Peer2Pear_QtProj.exe -NewName Peer2Pear.exe
+
+      # -----------------------------------------------------------------------
       # Bundle all Qt runtime DLLs next to the executable so the ZIP is
       # self-contained and runnable on a clean Windows machine.
       # -----------------------------------------------------------------------
@@ -108,7 +116,7 @@ jobs:
         working-directory: Peer2Pear_QtProj
         run: |
           windeployqt --release --no-translations `
-            build\Release\Peer2Pear_QtProj.exe
+            build\Peer2Pear.exe
 
       # -----------------------------------------------------------------------
       # Zip the deployed build directory.
@@ -118,7 +126,7 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path   build\Release\* `
+            -Path   build\* `
             -DestinationPath ..\Peer2Pear-Release.zip
 
       # -----------------------------------------------------------------------
