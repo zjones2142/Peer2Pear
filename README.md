@@ -43,7 +43,7 @@ Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
 
-#### Run the following before opening in Qt!
+#### Run the following before opening in Qt!  (they clone vcpkg to correct directory)
 ### Linux / macOS
 
 ```bash
