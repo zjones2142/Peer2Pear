@@ -12,7 +12,7 @@ A hybrid peer-to-peer file sharing and messaging application built with Qt, feat
 - **Hybrid P2P networking** — attempts direct peer-to-peer connections via ICE/NAT traversal (libnice), falling back to a relay mailbox server when a direct path is not available.
 - **Persistent storage** — chat history and contacts are stored locally in a SQLite database.
 - **Contact management** — add contacts by peer ID, block unwanted contacts.
-- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 5 or Qt 6.
+- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 6.
 
 ## How It Works
 
