@@ -59,6 +59,12 @@ public slots:
                            const QDateTime& ts,
                            const QString& msgId);
 
+    void onAvatarReceived(const QString &peerIdB64u,
+                          const QString &displayName,
+                          const QString &avatarB64);
+    void onGroupRenamed(const QString &groupId, const QString &newName);
+    void onGroupAvatarReceived(const QString &groupId, const QString &avatarB64);
+
     // Fired for every arriving chunk.
     // fileData is non-empty only when chunksReceived == chunksTotal (transfer complete).
     void onFileChunkReceived(const QString &fromPeerIdB64u,
@@ -120,4 +126,7 @@ private:
 
     int  totalUnread() const;
     void ensureUnreadSize();
+
+    void showToast(const QString &message);
+    QLabel *m_toastLabel = nullptr;
 };

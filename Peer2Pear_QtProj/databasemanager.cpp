@@ -63,6 +63,7 @@ void DatabaseManager::createTables()
     q.exec("ALTER TABLE contacts ADD COLUMN is_blocked  INTEGER DEFAULT 0;");
     q.exec("ALTER TABLE contacts ADD COLUMN is_group    INTEGER DEFAULT 0;");
     q.exec("ALTER TABLE contacts ADD COLUMN group_id    TEXT    DEFAULT '';");
+    q.exec("ALTER TABLE contacts ADD COLUMN avatar      TEXT    DEFAULT '';");
 
     q.exec(
         "CREATE TABLE IF NOT EXISTS messages ("
@@ -93,7 +94,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
     QVector<ChatData> result;
     QSqlQuery q(m_db);
     q.prepare(
-        "SELECT peer_id, name, subtitle, keys, is_blocked, is_group, group_id"
+        "SELECT peer_id, name, subtitle, keys, is_blocked, is_group, group_id, avatar"
         " FROM contacts ORDER BY last_active DESC, rowid ASC;"
         );
     if (!q.exec()) { qWarning() << "loadAllContacts:" << q.lastError().text(); return result; }
@@ -107,6 +108,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
         chat.isBlocked  = q.value(4).toInt() == 1;
         chat.isGroup    = q.value(5).toInt() == 1;
         chat.groupId    = q.value(6).toString();
+        chat.avatarData = q.value(7).toString();
 
         const QString ks = q.value(3).toString();
         if (!ks.isEmpty()) chat.keys = ks.split('|', Qt::SkipEmptyParts);
@@ -124,8 +126,8 @@ void DatabaseManager::saveContact(const ChatData &chat)
 
     QSqlQuery q(m_db);
     q.prepare(
-        "INSERT INTO contacts (peer_id,name,subtitle,keys,is_blocked,is_group,group_id,last_active)"
-        " VALUES (:peer_id,:name,:subtitle,:keys,:is_blocked,:is_group,:group_id,0)"
+        "INSERT INTO contacts (peer_id,name,subtitle,keys,is_blocked,is_group,group_id,last_active,avatar)"
+        " VALUES (:peer_id,:name,:subtitle,:keys,:is_blocked,:is_group,:group_id,0,:avatar)"
         " ON CONFLICT(peer_id) DO UPDATE SET"
         "   name=excluded.name, subtitle=excluded.subtitle, keys=excluded.keys,"
         "   is_blocked=excluded.is_blocked, is_group=excluded.is_group, group_id=excluded.group_id;"
@@ -137,6 +139,7 @@ void DatabaseManager::saveContact(const ChatData &chat)
     q.bindValue(":is_blocked",chat.isBlocked ? 1 : 0);
     q.bindValue(":is_group",  chat.isGroup   ? 1 : 0);
     q.bindValue(":group_id",  chat.groupId);
+    q.bindValue(":avatar",    chat.avatarData);
     if (!q.exec()) qWarning() << "saveContact:" << q.lastError().text();
 }
 
@@ -146,6 +149,16 @@ void DatabaseManager::deleteContact(const QString &peerIdB64u)
     q.prepare("DELETE FROM contacts WHERE peer_id=:peer_id;");
     q.bindValue(":peer_id", peerIdB64u);
     if (!q.exec()) qWarning() << "deleteContact:" << q.lastError().text();
+}
+
+void DatabaseManager::saveContactAvatar(const QString &peerIdB64u, const QString &avatarB64)
+{
+    if (peerIdB64u.isEmpty()) return;
+    QSqlQuery q(m_db);
+    q.prepare("UPDATE contacts SET avatar=:avatar WHERE peer_id=:peer_id;");
+    q.bindValue(":avatar",  avatarB64);
+    q.bindValue(":peer_id", peerIdB64u);
+    if (!q.exec()) qWarning() << "saveContactAvatar:" << q.lastError().text();
 }
 
 void DatabaseManager::updateLastActive(const QString &key)

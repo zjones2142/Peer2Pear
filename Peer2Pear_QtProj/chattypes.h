@@ -23,4 +23,5 @@ struct ChatData {
     bool isGroup    = false;
     bool isOnline   = false;
     QString groupId;
+    QString avatarData; // base64 PNG received from peer, may be empty
 };

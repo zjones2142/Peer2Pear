@@ -27,7 +27,7 @@ When sending a message or file:
 
 | Dependency | Purpose |
 |---|---|
-| [Qt 5 / Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
+| [Qt 5/Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
 | [libsodium](https://libsodium.org/) | Cryptographic primitives (Ed25519, X25519, XChaCha20-Poly1305) |
 | [libnice](https://libnice.freedesktop.org/) | ICE agent for P2P NAT traversal |
 | [GLib](https://docs.gtk.org/glib/) | Required by libnice |
@@ -39,11 +39,11 @@ Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io
 ### Prerequisites
 
 - CMake ≥ 3.16
-- Qt 5 or Qt 6 (Widgets, Network, Sql modules)
+- Qt 5 / Qt 6 (Widgets, Network, Sql modules)
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
 
-#### Run the following before opening in Qt!
+#### Run the following before opening in Qt!  (they clone vcpkg to correct directory)
 ### Linux / macOS
 
 ```bash
@@ -57,8 +57,6 @@ cd Peer2Pear_QtProj
 cd Peer2Pear_QtProj
 winsetup.bat
 ```
-
-The setup scripts bootstrap vcpkg, install the required libraries, and configure the CMake build.
 
 ## License
 
