@@ -5,6 +5,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QFontMetrics>
 #include <QApplication>
@@ -2141,29 +2142,107 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
     vl->setSpacing(0);
 
     // ── Thumbnail / icon area ─────────────────────────────────────────────────
-    auto *thumbWidget = new QWidget(card);
-    thumbWidget->setMinimumHeight(220);
-    thumbWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    thumbWidget->setStyleSheet(
-        "background-color:#242424;"
-        "border-radius:10px 10px 0 0;"
-        );
+    const FilePreviewType previewType = filePreviewType(rec.fileName);
+    const bool hasFile = (rec.status == FileTransferStatus::Complete && !rec.savedPath.isEmpty());
+    const bool isImage = (previewType == FilePreviewType::Image && hasFile);
+    const bool isText  = (previewType == FilePreviewType::Text  && hasFile);
+
+    // For images use QPushButton so the whole thumb area is clickable
+    QWidget    *thumbWidget = nullptr;
+    QPushButton *thumbBtn   = nullptr;
+    if (isImage) {
+        thumbBtn = new QPushButton(card);
+        thumbBtn->setFlat(true);
+        thumbBtn->setFixedHeight(220);
+        thumbBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        thumbBtn->setCursor(Qt::PointingHandCursor);
+        thumbBtn->setStyleSheet(
+            "QPushButton{background-color:#242424;border-radius:10px 10px 0 0;border:none;}"
+            "QPushButton:hover{background-color:#2d2d2d;}");
+        thumbWidget = thumbBtn;
+    } else {
+        thumbWidget = new QWidget(card);
+        thumbWidget->setMinimumHeight(220);
+        thumbWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        thumbWidget->setStyleSheet("background-color:#242424;border-radius:10px 10px 0 0;");
+    }
 
     auto *thumbLayout = new QVBoxLayout(thumbWidget);
     thumbLayout->setContentsMargins(0, 0, 0, 0);
 
-    auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
-    iconLbl->setAlignment(Qt::AlignCenter);
-    iconLbl->setStyleSheet(
-        "background:transparent;"
-        "color:#555555;"
-        "font-size:64px;"
-        "border:none;"
-        );
-    thumbLayout->addStretch();
-    thumbLayout->addWidget(iconLbl);
+    if (isImage) {
+        QPixmap px(rec.savedPath);
+        auto *imgLbl = new QLabel(thumbWidget);
+        imgLbl->setAlignment(Qt::AlignCenter);
+        imgLbl->setStyleSheet("background:transparent;border:none;");
+        if (!px.isNull()) {
+            imgLbl->setPixmap(
+                px.scaled(QSize(400, 200), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        } else {
+            imgLbl->setText(fileIcon(rec.fileName));
+            imgLbl->setStyleSheet("background:transparent;color:#555555;font-size:64px;border:none;");
+        }
+        thumbLayout->addStretch();
+        thumbLayout->addWidget(imgLbl);
+        thumbLayout->addStretch();
 
-    // Progress bar overlaid at the bottom of the thumb area (in-flight only)
+        const QString savedPath = rec.savedPath;
+        const QString imgName   = rec.fileName;
+        QObject::connect(thumbBtn, &QPushButton::clicked, [=] {
+            auto *dlg = new QDialog(m_ui->centralwidget);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->setWindowTitle(imgName);
+            dlg->resize(900, 650);
+            auto *scroll = new QScrollArea(dlg);
+            scroll->setAlignment(Qt::AlignCenter);
+            scroll->setWidgetResizable(false);
+            auto *imgLabel = new QLabel;
+            imgLabel->setAlignment(Qt::AlignCenter);
+            QPixmap fullPx(savedPath);
+            imgLabel->setPixmap(fullPx);
+            imgLabel->resize(fullPx.size());
+            scroll->setWidget(imgLabel);
+            auto *dl = new QVBoxLayout(dlg);
+            dl->setContentsMargins(0, 0, 0, 0);
+            dl->addWidget(scroll);
+            dlg->show();
+        });
+
+    } else if (isText) {
+        auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
+        iconLbl->setAlignment(Qt::AlignCenter);
+        iconLbl->setStyleSheet("background:transparent;color:#555555;font-size:40px;border:none;");
+
+        QString preview;
+        QFile tf(rec.savedPath);
+        if (tf.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            for (int i = 0; i < 3 && !tf.atEnd(); ++i)
+                preview += QString::fromUtf8(tf.readLine());
+            tf.close();
+            preview = preview.trimmed();
+        }
+        auto *previewLbl = new QLabel(preview.isEmpty() ? "(empty)" : preview, thumbWidget);
+        previewLbl->setWordWrap(true);
+        previewLbl->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+        previewLbl->setStyleSheet(
+            "background:transparent;color:#888888;font-size:11px;"
+            "font-family:monospace;border:none;padding:0 12px;");
+
+        thumbLayout->addStretch();
+        thumbLayout->addWidget(iconLbl);
+        thumbLayout->addWidget(previewLbl);
+        thumbLayout->addStretch();
+
+    } else {
+        auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
+        iconLbl->setAlignment(Qt::AlignCenter);
+        iconLbl->setStyleSheet("background:transparent;color:#555555;font-size:64px;border:none;");
+        thumbLayout->addStretch();
+        thumbLayout->addWidget(iconLbl);
+        thumbLayout->addStretch();
+    }
+
+    // Progress bar at bottom of thumb area (in-flight only)
     if (inFlight && rec.chunksTotal > 0) {
         auto *pb = new QProgressBar(thumbWidget);
         pb->setRange(0, rec.chunksTotal);
@@ -2174,8 +2253,6 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
             "QProgressBar{background-color:#333333;border-radius:0;border:none;margin:0;}"
             "QProgressBar::chunk{background-color:#3a9e48;border-radius:0;}");
         thumbLayout->addWidget(pb);
-    } else {
-        thumbLayout->addStretch();
     }
 
     vl->addWidget(thumbWidget);

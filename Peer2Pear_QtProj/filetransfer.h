@@ -50,7 +50,8 @@ inline QString fileIcon(const QString &fileName)
     const QString ext = fileName.section('.', -1).toLower();
     if (ext == "pdf")                                                    return "📄";
     if (ext == "png"  || ext == "jpg" || ext == "jpeg"
-        || ext == "gif" || ext == "webp" || ext == "bmp")               return "🖼";
+        || ext == "gif" || ext == "webp" || ext == "bmp"
+        || ext == "heic")                                               return "🖼";
     if (ext == "mp4"  || ext == "mov" || ext == "avi"
         || ext == "mkv" || ext == "webm")                               return "🎬";
     if (ext == "mp3"  || ext == "wav" || ext == "flac"
@@ -65,4 +66,21 @@ inline QString fileIcon(const QString &fileName)
     if (ext == "xls"  || ext == "xlsx" || ext == "ods")                 return "📊";
     if (ext == "ppt"  || ext == "pptx" || ext == "odp")                 return "📽";
     return "📁";
+}
+
+enum class FilePreviewType { Image, Video, Audio, Text, Generic };
+
+inline FilePreviewType filePreviewType(const QString &fileName)
+{
+    const QString ext = fileName.section('.', -1).toLower();
+    if (ext=="png"||ext=="jpg"||ext=="jpeg"||ext=="gif"||ext=="webp"||ext=="bmp"||ext=="heic")
+        return FilePreviewType::Image;
+    if (ext=="mp4"||ext=="mov"||ext=="avi"||ext=="mkv"||ext=="webm")
+        return FilePreviewType::Video;
+    if (ext=="mp3"||ext=="wav"||ext=="flac"||ext=="ogg"||ext=="aac")
+        return FilePreviewType::Audio;
+    if (ext=="txt"||ext=="md"||ext=="csv"||ext=="cpp"||ext=="h"||ext=="py"
+        ||ext=="js"||ext=="ts"||ext=="java"||ext=="rs"||ext=="go"||ext=="cs")
+        return FilePreviewType::Text;
+    return FilePreviewType::Generic;
 }
