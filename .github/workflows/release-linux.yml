@@ -113,9 +113,10 @@ jobs:
       - name: Install Qt 6.7.3 (GCC x64)
         uses: jurplel/install-qt-action@v3
         with:
-          version: '6.7.3'
-          arch:    'gcc_64'
-          cache:   true
+          version:    '6.7.3'
+          arch:       'gcc_64'
+          cache:      true
+          aqtversion: '==3.3.*'
 
       # ── 5. vcpkg toolchain ───────────────────────────────────────────────────
       # Clone and bootstrap vcpkg at a pinned commit for reproducible builds.
