@@ -919,12 +919,17 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
             rec->status = FileTransferStatus::Failed;
         }
 
-        // System tray notification
-        if (m_notifier) {
-            const QString msg = saved
-                                    ? QString("File ready: %1 (%2)").arg(fileName, formatFileSize(fileSize))
-                                    : QString("File received but could not save: %1").arg(fileName);
-            m_notifier->notify(m_chats[chatIndex].name, msg);
+        if (m_db) m_db->saveFileRecord(key, *rec);
+
+        // In-app toast + system tray notification
+        {
+            const QString senderName = m_chats[chatIndex].name;
+            const QString toastMsg = saved
+                ? QString("📎 %1 from %2").arg(fileName, senderName)
+                : QString("⚠ File from %1 could not be saved: %2").arg(senderName, fileName);
+            showToast(toastMsg);
+            if (m_notifier)
+                m_notifier->notify(senderName, toastMsg);
         }
 
         // Bump unread on the chat if it isn't currently open
@@ -1077,6 +1082,7 @@ void ChatView::onAttachFile()
     rec.chunksComplete = totalChunks;
     rec.savedPath      = path;   // original file — lets Download open it directly
     m_filesByKey[key].append(rec);
+    if (m_db) m_db->saveFileRecord(key, rec);
 
     rebuildFilesTab();
 
@@ -1679,7 +1685,15 @@ void ChatView::initChats()
         }
     }
 
-    if (m_db) m_chats = m_db->loadAllContacts();
+    if (m_db) {
+        m_chats = m_db->loadAllContacts();
+        for (const auto &c : m_chats) {
+            const QString ck = chatKey(c);
+            const auto records = m_db->loadFileRecords(ck);
+            if (!records.isEmpty())
+                m_filesByKey[ck] = records;
+        }
+    }
 
     m_ui->chatList->clear();
     for (const auto &c : m_chats) m_ui->chatList->addItem(c.name);
