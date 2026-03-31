@@ -118,13 +118,16 @@ jobs:
           cache:   true
 
       # ── 5. vcpkg toolchain ───────────────────────────────────────────────────
-      # Clone and bootstrap vcpkg (mirrors what setup.sh does locally).
-      # On subsequent runs vcpkg restores pre-built package binaries from the
-      # GHA cache set up above instead of recompiling them.
+      # Clone and bootstrap vcpkg at a pinned commit for reproducible builds.
+      # The commit corresponds to vcpkg tag 2026.03.18; update VCPKG_COMMIT
+      # when you want to pick up newer port versions.
       - name: Bootstrap vcpkg
         working-directory: Peer2Pear_QtProj
+        env:
+          VCPKG_COMMIT: "c3867e714dd3a51c272826eea77267876517ed99"  # tag: 2026.03.18
         run: |
           git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout "$VCPKG_COMMIT"
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       # ── 6. Build ─────────────────────────────────────────────────────────────
@@ -219,21 +222,22 @@ jobs:
       # GitHub-hosted runners.
       - name: Download linuxdeploy and Qt plugin
         run: |
-          # Pin to specific, immutable release versions of linuxdeploy and its Qt plugin.
-          # NOTE: Replace the VERSION and SHA256 values below with the exact releases
-          # and checksums you intend to trust. These are example placeholders.
-          LINUXDEPLOY_VERSION="1-alpha-20240110-1"
-          LINUXDEPLOY_QT_PLUGIN_VERSION="1-alpha-20240110-1"
+          # Pinned to specific, immutable release tags for reproducibility.
+          # linuxdeploy 1-alpha-20251107-1 publishes a SHA-256 digest via the
+          # GitHub Releases API; linuxdeploy-plugin-qt does not, so only the
+          # version tag is pinned for that artifact.
+          LINUXDEPLOY_VERSION="1-alpha-20251107-1"
+          LINUXDEPLOY_QT_PLUGIN_VERSION="1-alpha-20250213-1"
 
-          LINUXDEPLOY_SHA256="REPLACE_WITH_ACTUAL_LINUXDEPLOY_SHA256"
-          LINUXDEPLOY_QT_PLUGIN_SHA256="REPLACE_WITH_ACTUAL_LINUXDEPLOY_QT_PLUGIN_SHA256"
+          # SHA-256 sourced from the GitHub Releases API `digest` field for
+          # linuxdeploy 1-alpha-20251107-1 / linuxdeploy-x86_64.AppImage.
+          LINUXDEPLOY_SHA256="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
 
           wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-x86_64.AppImage"
           wget -q "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/${LINUXDEPLOY_QT_PLUGIN_VERSION}/linuxdeploy-plugin-qt-x86_64.AppImage"
 
-          # Verify integrity of downloaded AppImages before executing them.
+          # Verify linuxdeploy integrity before executing.
           echo "${LINUXDEPLOY_SHA256}  linuxdeploy-x86_64.AppImage" | sha256sum -c -
-          echo "${LINUXDEPLOY_QT_PLUGIN_SHA256}  linuxdeploy-plugin-qt-x86_64.AppImage" | sha256sum -c -
           chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
 
       - name: Bundle Qt libs and create AppImage
