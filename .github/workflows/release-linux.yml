@@ -1,0 +1,277 @@
+# =============================================================================
+# Peer2Pear — Linux Build & Release Workflow
+# =============================================================================
+#
+# Mirrors the Windows workflow structure. Produces a self-contained
+# Peer2Pear-Linux.AppImage and attaches it to the same GitHub Release as the
+# Windows ZIP (both workflows share the same version tag).
+#
+# AppImages are the standard "run anywhere" distribution format for Linux
+# desktop applications — the user only needs to `chmod +x` and run the file.
+# Licenses for all bundled components are included inside the AppImage under
+# usr/share/licenses/ and can be inspected with:
+#   ./Peer2Pear-Linux.AppImage --appimage-extract
+#
+# =============================================================================
+
+name: Build and Release (Linux)
+
+on:
+  push:
+    branches:
+      - Release
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # GUARD: mirrors the Windows workflow — reject pushes not from main.
+  # ---------------------------------------------------------------------------
+  merge-guard:
+    name: Verify source is main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check that the merge came from main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          SHA:      ${{ github.sha }}
+        run: |
+          # workflow_dispatch pushes are always allowed (manual trigger)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch — skipping merge-guard."
+            exit 0
+          fi
+          RESULT=$(gh api \
+            "repos/${REPO}/commits/${SHA}/pulls" \
+            --jq '[.[] | select(.base.ref=="Release" and .head.ref=="main" and .merged_at!=null)] | length')
+          if [ "$RESULT" -lt 1 ]; then
+            echo "::error::This push to Release did not come from an approved PR from main. Aborting."
+            exit 1
+          fi
+          echo "Merge guard passed — source branch is main."
+
+  # ---------------------------------------------------------------------------
+  # BUILD: compile on Linux, bundle as an AppImage, and publish.
+  # ---------------------------------------------------------------------------
+  build-and-release:
+    name: Build (Linux) and publish release
+    needs: merge-guard
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # Required to create/update GitHub Releases
+      actions: write    # Required for the vcpkg GHA binary cache
+
+    env:
+      # Tell vcpkg to use GitHub Actions' built-in cache as the binary cache
+      # backend.  Packages that haven't changed are restored instead of
+      # recompiled, eliminating the 30-45 min cold-build penalty on every push.
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      # ── 1. Source ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. vcpkg binary cache – expose GHA cache credentials to vcpkg ────────
+      - name: Export GitHub Actions cache environment variables for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL',    process.env.ACTIONS_CACHE_URL    || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # ── 3. System build prerequisites ────────────────────────────────────────
+      # Required for vcpkg to compile libnice (meson-based) and glib (meson-based),
+      # and for Qt to link correctly on a headless CI runner.
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ninja-build \
+            pkg-config \
+            meson \
+            gettext \
+            flex \
+            bison \
+            autoconf \
+            automake \
+            libtool \
+            libffi-dev \
+            libmount-dev \
+            libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libfontconfig1-dev \
+            libx11-dev \
+            libxext-dev
+
+      # ── 4. Qt (cached between runs) ──────────────────────────────────────────
+      - name: Install Qt 6.7.3 (GCC x64)
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.7.3'
+          arch:    'gcc_64'
+          cache:   true
+
+      # ── 5. vcpkg toolchain ───────────────────────────────────────────────────
+      # Clone and bootstrap vcpkg at a pinned commit for reproducible builds.
+      # The commit corresponds to vcpkg tag 2026.03.18; update VCPKG_COMMIT
+      # when you want to pick up newer port versions.
+      - name: Bootstrap vcpkg
+        working-directory: Peer2Pear_QtProj
+        env:
+          VCPKG_COMMIT: "c3867e714dd3a51c272826eea77267876517ed99"  # tag: 2026.03.18
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout "$VCPKG_COMMIT"
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      # ── 6. Build ─────────────────────────────────────────────────────────────
+      # CMake configure triggers vcpkg manifest install (libsodium, libnice,
+      # glib).  On the first run packages are compiled and stored in the GHA
+      # cache; subsequent runs restore the pre-built binaries.
+      - name: Configure CMake
+        working-directory: Peer2Pear_QtProj
+        run: cmake --preset vcpkg-default -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        working-directory: Peer2Pear_QtProj
+        run: cmake --build build --config Release --parallel
+
+      # ── 7. Assemble AppDir ────────────────────────────────────────────────────
+      # linuxdeploy (the Linux equivalent of windeployqt) expects an
+      # FHS-style AppDir:
+      #   AppDir/usr/bin/<executable>
+      #   AppDir/usr/share/applications/<app>.desktop
+      #   AppDir/usr/share/icons/hicolor/256x256/apps/<app>.png
+      - name: Create AppDir skeleton
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/lib
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          mkdir -p AppDir/usr/share/licenses
+
+      - name: Copy executable into AppDir
+        run: cp Peer2Pear_QtProj/build/Peer2Pear_QtProj AppDir/usr/bin/
+
+      - name: Write .desktop entry
+        run: |
+          cat > AppDir/usr/share/applications/Peer2Pear.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Peer2Pear
+          Exec=Peer2Pear_QtProj
+          Icon=Peer2Pear
+          Type=Application
+          Categories=Network;Chat;
+          EOF
+
+      - name: Copy application icon
+        run: cp Peer2Pear_QtProj/logo.png AppDir/usr/share/icons/hicolor/256x256/apps/Peer2Pear.png
+
+      # ── 8. Copy vcpkg shared libraries (if any) ───────────────────────────────
+      # The x64-linux vcpkg triplet defaults to static linkage for most ports,
+      # so vcpkg deps are already baked into the binary.  We still scan the lib
+      # directory in case any port produced a shared object.
+      - name: Copy vcpkg shared libraries into AppDir
+        run: |
+          vcpkg_lib="Peer2Pear_QtProj/build/vcpkg_installed/x64-linux/lib"
+          if [ -d "$vcpkg_lib" ]; then
+            find "$vcpkg_lib" -maxdepth 1 -name "*.so*" \
+              -exec cp -P {} AppDir/usr/lib/ \;
+          fi
+
+      # ── 9. Collect licenses ───────────────────────────────────────────────────
+      # Licenses are placed inside the AppDir so they ship inside the AppImage
+      # (readable after `./Peer2Pear-Linux.AppImage --appimage-extract`).
+      - name: Collect licenses into AppDir
+        run: |
+          # vcpkg package licenses (share/<pkg>/copyright)
+          share_dir="Peer2Pear_QtProj/build/vcpkg_installed/x64-linux/share"
+          if [ -d "$share_dir" ]; then
+            for pkg_dir in "$share_dir"/*/; do
+              copyright="${pkg_dir}copyright"
+              if [ -f "$copyright" ]; then
+                pkg_name=$(basename "$pkg_dir")
+                cp "$copyright" "AppDir/usr/share/licenses/${pkg_name}.txt"
+              fi
+            done
+          fi
+
+          # Qt licenses — qmake reports the install prefix reliably and is
+          # guaranteed to be in PATH after jurplel/install-qt-action runs.
+          # Uses the same qmake -query approach as the Windows workflow.
+          qt_prefix=$(qmake -query QT_INSTALL_PREFIX)
+          if [ -d "$qt_prefix" ]; then
+            find "$qt_prefix" -maxdepth 1 -name "LICENSE*" \
+              -exec bash -c \
+                'cp "$1" "AppDir/usr/share/licenses/Qt_$(basename "$1")"' \
+                _ {} \;
+          fi
+
+      # ── 10. Bundle Qt shared libraries and create AppImage ────────────────────
+      # linuxdeploy + linuxdeploy-plugin-qt mirror what windeployqt does on
+      # Windows: they scan the binary's imports and copy every Qt library,
+      # plugin, and QML module it actually needs, then seal everything into a
+      # self-contained AppImage.
+      # APPIMAGE_EXTRACT_AND_RUN bypasses FUSE, which is not available on
+      # GitHub-hosted runners.
+      - name: Download linuxdeploy and Qt plugin
+        run: |
+          # Pinned to specific, immutable release tags for reproducibility.
+          # linuxdeploy 1-alpha-20251107-1 publishes a SHA-256 digest via the
+          # GitHub Releases API; linuxdeploy-plugin-qt does not, so only the
+          # version tag is pinned for that artifact.
+          LINUXDEPLOY_VERSION="1-alpha-20251107-1"
+          LINUXDEPLOY_QT_PLUGIN_VERSION="1-alpha-20250213-1"
+
+          # SHA-256 sourced from the GitHub Releases API `digest` field for
+          # linuxdeploy 1-alpha-20251107-1 / linuxdeploy-x86_64.AppImage.
+          LINUXDEPLOY_SHA256="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
+
+          wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-x86_64.AppImage"
+          wget -q "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/${LINUXDEPLOY_QT_PLUGIN_VERSION}/linuxdeploy-plugin-qt-x86_64.AppImage"
+
+          # Verify linuxdeploy integrity before executing.
+          echo "${LINUXDEPLOY_SHA256}  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
+
+      - name: Bundle Qt libs and create AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --plugin qt \
+            --output appimage
+
+      # linuxdeploy names the output after the .desktop Name field:
+      # "Peer2Pear" → Peer2Pear-x86_64.AppImage
+      - name: Rename AppImage to release name
+        run: mv Peer2Pear-x86_64.AppImage Peer2Pear-Linux.AppImage
+
+      # ── 11. Read version & publish GitHub Release ─────────────────────────────
+      # Reads the VERSION field from CMakeLists.txt using the same regex as the
+      # Windows workflow (platform-native tools: grep -oP vs PowerShell regex,
+      # but semantically identical patterns).  Both workflows use the same tag
+      # so their artifacts land in the same GitHub Release.
+      - name: Read version from CMakeLists.txt
+        id: version
+        run: |
+          ver=$(grep -oP 'project\s*\([^)]*VERSION\s+\K[\d]+(?:\.[\d]+)*' \
+                  Peer2Pear_QtProj/CMakeLists.txt | head -1)
+          ver=${ver:-"0.0"}
+          echo "tag=v${ver}-build-${{ github.run_number }}"     >> "$GITHUB_OUTPUT"
+          echo "label=v${ver} (build ${{ github.run_number }})" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:               ${{ steps.version.outputs.tag }}
+          name:                   "Peer2Pear ${{ steps.version.outputs.label }}"
+          generate_release_notes: true
+          files:                  Peer2Pear-Linux.AppImage
