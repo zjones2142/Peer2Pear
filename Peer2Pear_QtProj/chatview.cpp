@@ -932,6 +932,10 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
                 m_notifier->notify(senderName, toastMsg);
         }
 
+        // Clickable file bubble in chat
+        if (chatIndex == m_currentChat)
+            addFileBubble(fileName, fileSize, false);
+
         // Bump unread on the chat if it isn't currently open
         if (chatIndex != m_currentChat) {
             m_unread[chatIndex] += 1;
@@ -1087,8 +1091,7 @@ void ChatView::onAttachFile()
     rebuildFilesTab();
 
     // Delivery notice bubble in chat
-    addMessageBubble(
-        QString("📎  %1  (%2)").arg(fileName, formatFileSize(data.size())), true);
+    addFileBubble(fileName, data.size(), true);
 }
 
 // ── Private slots ─────────────────────────────────────────────────────────────
@@ -1981,6 +1984,61 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
     if (!layout) return;
     layout->insertWidget(layout->count()-1, row);
     QTimer::singleShot(5,[this](){
+        m_ui->messageScroll->verticalScrollBar()->setValue(
+            m_ui->messageScroll->verticalScrollBar()->maximum());
+    });
+}
+
+// ── Clickable file bubble ─────────────────────────────────────────────────────
+
+void ChatView::addFileBubble(const QString &fileName, qint64 fileSize, bool sent)
+{
+    auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
+    if (!layout) return;
+
+    auto *row = new QWidget(m_ui->scrollAreaWidgetContents);
+    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    auto *rl = new QHBoxLayout(row);
+    rl->setContentsMargins(0, 2, 0, 2);
+    rl->setSpacing(0);
+
+    const QString label = QString("📎  %1  ·  %2\nTap to view files")
+                              .arg(fileName, formatFileSize(fileSize));
+
+    auto *btn = new QPushButton(label, row);
+    btn->setFont([]{ QFont f = QApplication::font(); f.setPixelSize(13); return f; }());
+    btn->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    btn->setMinimumHeight(52);
+    btn->setMaximumWidth(int(m_ui->messageScroll->viewport()->width() * 0.65));
+    btn->setCursor(Qt::PointingHandCursor);
+    btn->setFlat(true);
+
+    const QString bgColor = sent ? "#2e8b3a" : "#222222";
+    btn->setStyleSheet(
+        QString("QPushButton { background-color:%1; color:#ffffff;"
+                " border-radius:14px; padding:10px 14px; font-size:13px;"
+                " text-align:left; }"
+                "QPushButton:hover { background-color:%2; }"
+                "QPushButton:pressed { background-color:%3; }")
+            .arg(bgColor,
+                 sent ? "#36a344" : "#2a2a2a",
+                 sent ? "#256e30" : "#1a1a1a"));
+
+    QObject::connect(btn, &QPushButton::clicked, this, [this]{
+        m_ui->mainTabs->setCurrentIndex(1);
+    });
+
+    if (sent) {
+        rl->addStretch();
+        rl->addWidget(btn);
+    } else {
+        rl->addWidget(btn);
+        rl->addStretch();
+    }
+
+    layout->insertWidget(layout->count() - 1, row);
+    QTimer::singleShot(5, [this]{
         m_ui->messageScroll->verticalScrollBar()->setValue(
             m_ui->messageScroll->verticalScrollBar()->maximum());
     });
