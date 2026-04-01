@@ -39,6 +39,9 @@ MainWindow::MainWindow(QWidget *parent)
         }
         try {
             m_controller.setPassphrase(pass);
+            // Derive a DB encryption key from identity for at-rest protection
+            m_db.setEncryptionKey(ChatController::blake2b256(
+                m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey")));
             break;
         } catch (const std::exception &e) {
             QMessageBox::warning(this, "Identity Unlock Failed", e.what());
@@ -60,7 +63,9 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // ── Server + polling ──────────────────────────────────────────────────────
-    m_controller.setServerBaseUrl(QUrl("http://3.141.14.234"));
+    // TODO: switch default to https:// once TLS is configured on the server
+    const QString serverUrl = m_db.loadSetting("serverUrl", "http://3.141.14.234");
+    m_controller.setServerBaseUrl(QUrl(serverUrl));
     m_controller.startPolling(2000);
 
     // ── Profile handle: first 8 chars of public key ───────────────────────────

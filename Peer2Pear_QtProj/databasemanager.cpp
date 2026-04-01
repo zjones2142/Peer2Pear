@@ -5,6 +5,7 @@
 #include <QtSql/QSqlQuery>
 #include <QtSql/QSqlError>
 #include <QDebug>
+#include <sodium.h>
 
 static QString contactKey(const QString &peerIdB64u, const QString &name)
 {
@@ -42,6 +43,73 @@ bool DatabaseManager::open()
 void DatabaseManager::close()
 {
     if (m_db.isOpen()) m_db.close();
+}
+
+void DatabaseManager::setEncryptionKey(const QByteArray &key32)
+{
+    if (key32.size() == crypto_aead_xchacha20poly1305_ietf_KEYBYTES)
+        m_encKey = key32;
+}
+
+// ── Per-field encryption helpers ─────────────────────────────────────────────
+// Encrypted values are stored as "ENC:" + base64(nonce + ciphertext).
+// Unencrypted legacy values lack the prefix and are returned as-is.
+
+static const QByteArray kEncPrefix = "ENC:";
+
+QString DatabaseManager::encryptField(const QString &plaintext) const
+{
+    if (m_encKey.isEmpty()) return plaintext;
+
+    const QByteArray pt = plaintext.toUtf8();
+    const int nonceLen = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;   // 24
+    const int tagLen   = crypto_aead_xchacha20poly1305_ietf_ABYTES;      // 16
+
+    QByteArray out(nonceLen + pt.size() + tagLen, 0);
+    randombytes_buf(reinterpret_cast<unsigned char*>(out.data()), nonceLen);
+
+    unsigned long long ctLen = 0;
+    crypto_aead_xchacha20poly1305_ietf_encrypt(
+        reinterpret_cast<unsigned char*>(out.data()) + nonceLen, &ctLen,
+        reinterpret_cast<const unsigned char*>(pt.constData()), pt.size(),
+        nullptr, 0,   // no additional data
+        nullptr,       // nsec unused
+        reinterpret_cast<const unsigned char*>(out.constData()),  // nonce
+        reinterpret_cast<const unsigned char*>(m_encKey.constData()));
+
+    out.resize(nonceLen + int(ctLen));
+    return QString::fromLatin1(kEncPrefix + out.toBase64());
+}
+
+QString DatabaseManager::decryptField(const QString &stored) const
+{
+    // Unencrypted legacy value — return as-is
+    if (!stored.startsWith(QString::fromLatin1(kEncPrefix)))
+        return stored;
+
+    if (m_encKey.isEmpty()) return stored;  // can't decrypt without key
+
+    const QByteArray blob = QByteArray::fromBase64(
+        stored.mid(kEncPrefix.size()).toLatin1());
+
+    const int nonceLen = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    if (blob.size() < nonceLen + crypto_aead_xchacha20poly1305_ietf_ABYTES)
+        return stored;
+
+    QByteArray pt(blob.size() - nonceLen - crypto_aead_xchacha20poly1305_ietf_ABYTES, 0);
+    unsigned long long ptLen = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            reinterpret_cast<unsigned char*>(pt.data()), &ptLen,
+            nullptr,   // nsec unused
+            reinterpret_cast<const unsigned char*>(blob.constData()) + nonceLen,
+            blob.size() - nonceLen,
+            nullptr, 0,   // no additional data
+            reinterpret_cast<const unsigned char*>(blob.constData()),  // nonce
+            reinterpret_cast<const unsigned char*>(m_encKey.constData())) != 0)
+        return stored;  // decryption failed — return raw
+
+    pt.resize(int(ptLen));
+    return QString::fromUtf8(pt);
 }
 
 void DatabaseManager::createTables()
@@ -111,7 +179,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
     QVector<ChatData> result;
     QSqlQuery q(m_db);
     q.prepare(
-        "SELECT peer_id, name, subtitle, keys, is_blocked, is_group, group_id, avatar"
+        "SELECT peer_id, name, subtitle, keys, is_blocked, is_group, group_id, avatar, last_active"
         " FROM contacts ORDER BY last_active DESC, rowid ASC;"
         );
     if (!q.exec()) { qWarning() << "loadAllContacts:" << q.lastError().text(); return result; }
@@ -126,6 +194,9 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
         chat.isGroup    = q.value(5).toInt() == 1;
         chat.groupId    = q.value(6).toString();
         chat.avatarData = q.value(7).toString();
+        const qint64 laSecs = q.value(8).toLongLong();
+        if (laSecs > 0)
+            chat.lastActive = QDateTime::fromSecsSinceEpoch(laSecs, Qt::UTC);
 
         const QString ks = q.value(3).toString();
         if (!ks.isEmpty()) chat.keys = ks.split('|', Qt::SkipEmptyParts);
@@ -198,7 +269,7 @@ void DatabaseManager::saveMessage(const QString &peerIdB64u, const Message &msg)
         );
     q.bindValue(":peer_id",   peerIdB64u);
     q.bindValue(":sent",      msg.sent ? 1 : 0);
-    q.bindValue(":text",      msg.text);
+    q.bindValue(":text",      encryptField(msg.text));
     q.bindValue(":timestamp", msg.timestamp.toUTC().toSecsSinceEpoch());
     q.bindValue(":msg_id",    msg.msgId);
     q.bindValue(":sender_name", msg.senderName);
@@ -220,7 +291,7 @@ QVector<Message> DatabaseManager::loadMessages(const QString &peerIdB64u) const
     while (q.next()) {
         Message msg;
         msg.sent      = q.value(0).toInt() == 1;
-        msg.text      = q.value(1).toString();
+        msg.text      = decryptField(q.value(1).toString());
         msg.timestamp = QDateTime::fromSecsSinceEpoch(q.value(2).toLongLong(), Qt::UTC).toLocalTime();
         msg.msgId     = q.value(3).toString();
         msg.senderName = q.value(4).toString();

@@ -69,6 +69,24 @@ static QPixmap makeCircularPixmap(const QPixmap &src, int size)
     return pm;
 }
 
+// ── Last-seen formatter ──────────────────────────────────────────────────────
+static QString formatLastSeen(const QDateTime &utc)
+{
+    if (!utc.isValid()) return "Offline";
+    const QDateTime local = utc.toLocalTime();
+    const QDateTime now   = QDateTime::currentDateTime();
+    const qint64 secsAgo  = local.secsTo(now);
+
+    if (secsAgo <        60) return "Last seen just now";
+    if (secsAgo <      3600) return QString("Last seen %1m ago").arg(secsAgo / 60);
+    if (secsAgo <     86400) return QString("Last seen %1h ago").arg(secsAgo / 3600);
+    if (local.date() == now.date().addDays(-1))
+        return "Last seen yesterday " + local.toString("h:mm AP");
+    if (secsAgo < 7 * 86400)
+        return "Last seen " + local.toString("ddd h:mm AP");
+    return "Last seen " + local.toString("MMM d");
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 static constexpr int kDateSepSecs = 60 * 60 * 2; // 2-hour gap → date separator
 
@@ -631,7 +649,9 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 
             // Update the header if this is the currently selected chat
             if (i == m_currentChat) {
-                const QString statusText = online ? "Online" : "Offline";
+                const QString statusText = online
+                                               ? "Online"
+                                               : formatLastSeen(m_chats[i].lastActive);
                 m_ui->chatSubLabel->setText("● " + statusText);
                 m_ui->chatSubLabel->setStyleSheet(
                     online ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
@@ -683,6 +703,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
 
         Message msg{false, text, timestamp, msgId};
         m_chats[i].messages.append(msg);
+        m_chats[i].lastActive = QDateTime::currentDateTimeUtc();
         if (m_db) { m_db->saveContact(m_chats[i]); m_db->saveMessage(m_chats[i].peerIdB64u, msg); }
 
         if (i == m_currentChat) {
@@ -778,6 +799,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     Message msg{false, text, ts, msgId};
     msg.senderName = senderName;
     chat.messages.append(msg);
+    chat.lastActive = QDateTime::currentDateTimeUtc();
     if (m_db) m_db->saveMessage(chat.groupId.isEmpty() ? "name:"+chat.name : chat.groupId, msg);
 
     if (idx == m_currentChat) {
@@ -878,6 +900,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
         chatIndex = findOrCreateChatForPeer(from);
     }
     if (chatIndex < 0) return;
+    if (m_chats[chatIndex].isBlocked) return;   // drop files from blocked contacts
     const QString key = chatKey(m_chats[chatIndex]);
 
     // Find an existing in-progress record for this transferId, or create one
@@ -910,13 +933,18 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
 
     if (complete) {
         rec->status = FileTransferStatus::Complete;
+        m_chats[chatIndex].lastActive = QDateTime::currentDateTimeUtc();
 
         // Auto-save to Downloads/Peer2Pear/<transferId>/filename
+        // Sanitise filename: strip path separators to prevent directory traversal
+        const QString safeName = QFileInfo(fileName).fileName().isEmpty()
+                                     ? "file"
+                                     : QFileInfo(fileName).fileName();
         const QString saveDir = QStandardPaths::writableLocation(
                                     QStandardPaths::DownloadLocation)
                                 + "/Peer2Pear/" + transferId;
         QDir().mkpath(saveDir);
-        const QString savePath = saveDir + "/" + fileName;
+        const QString savePath = saveDir + "/" + safeName;
         QFile f(savePath);
         bool saved = false;
         if (f.open(QIODevice::WriteOnly)) {
@@ -1833,9 +1861,11 @@ void ChatView::loadChat(int index)
     const ChatData &chat = m_chats[index];
     m_ui->chatTitleLabel->setText(chat.name);
 
-    // Show online/offline for DM chats, group subtitle for groups
+    // Show online / last-seen for DM chats, group subtitle for groups
     if (!chat.isGroup) {
-        const QString statusText = chat.isOnline ? "Online" : "Offline";
+        const QString statusText = chat.isOnline
+                                       ? "Online"
+                                       : formatLastSeen(chat.lastActive);
         m_ui->chatSubLabel->setText("● " + statusText);
         m_ui->chatSubLabel->setStyleSheet(
             chat.isOnline

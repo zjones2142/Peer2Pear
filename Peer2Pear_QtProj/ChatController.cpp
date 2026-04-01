@@ -106,9 +106,10 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
     const QByteArray ct      = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
 
     if (m_p2pConnections.contains(peerIdB64u) && m_p2pConnections[peerIdB64u]->isReady()) {
+        // P2P ready — send directly, skip the mailbox relay
         m_p2pConnections[peerIdB64u]->sendData(ct);
-        sendSignalingMessage(peerIdB64u, payload);
     } else {
+        // No P2P — relay via mailbox and start ICE negotiation
         sendSignalingMessage(peerIdB64u, payload);
         initiateP2PConnection(peerIdB64u);
     }
@@ -138,23 +139,26 @@ QByteArray ChatController::blake2b256(const QByteArray& data)
     return hash;
 }
 
-// ── P2P-first chunk sender ──────────────────────────────────────────────────
+// ── Reliable chunk sender (mailbox-primary, P2P-assist) ─────────────────────
+//
+// File chunks ALWAYS go through the mailbox for guaranteed delivery.
+// UDP (the transport beneath ICE/libnice) cannot reliably carry 240 KB+
+// datagrams — IP fragmentation drops are silent and unrecoverable.
+//
+// When a P2P connection is also ready we *additionally* send via P2P as
+// a latency optimisation.  The receiver's per-chunk dedup
+// ("transferId:chunkIndex") ensures only one copy is processed.
 
 void ChatController::sendFileChunkEnvelope(const QString& peerIdB64u,
-                                           const QByteArray& key32,
+                                           const QByteArray& /* key32 */,
                                            const QByteArray& env)
 {
-    // Try P2P first — if the connection exists and is ready, send directly
-    if (m_p2pConnections.contains(peerIdB64u) &&
-        m_p2pConnections[peerIdB64u]->isReady()) {
-        // Over P2P we send the raw envelope bytes (same wire format)
-        m_p2pConnections[peerIdB64u]->sendData(env);
-    } else {
-        // Fall back to mailbox relay (7-day TTL)
-        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
-        // Attempt to establish P2P for subsequent chunks
+    // Always enqueue to mailbox — reliable delivery over HTTP
+    m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+
+    // Initiate P2P for future text messages (but don't rely on it for files)
+    if (!m_p2pConnections.contains(peerIdB64u))
         initiateP2PConnection(peerIdB64u);
-    }
 }
 
 QString ChatController::sendFile(const QString& peerIdB64u,
@@ -294,7 +298,11 @@ void ChatController::startPolling(int intervalMs)
     }
 }
 
-void ChatController::stopPolling() { m_pollTimer.stop(); }
+void ChatController::stopPolling()
+{
+    m_pollTimer.stop();
+    m_rvzRefreshTimer.stop();   // stop advertising presence to rendezvous
+}
 
 void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
 
@@ -404,6 +412,27 @@ void ChatController::pollOnce()
     for (const QString &key : m_selfKeys) {
         if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u()) m_mbox.fetchAll(key.trimmed());
     }
+
+    // Purge stale incomplete transfers to bound memory usage
+    purgeStaleTransfers();
+}
+
+void ChatController::purgeStaleTransfers()
+{
+    static constexpr qint64 kMaxTransferAgeSecs = 30 * 60;  // 30 minutes
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    auto it = m_incomingTransfers.begin();
+    while (it != m_incomingTransfers.end()) {
+        if (it->createdSecs > 0 && (now - it->createdSecs) > kMaxTransferAgeSecs) {
+            emit status(QString("Purged stale transfer '%1' (%2/%3 chunks) after 30 min.")
+                            .arg(it->fileName)
+                            .arg(it->chunks.size())
+                            .arg(it->totalChunks));
+            it = m_incomingTransfers.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void ChatController::sendSignalingMessage(const QString& peerIdB64u,
@@ -500,6 +529,22 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         const int totalChunks    = meta.value("totalChunks").toInt(0);
         if (transferId.isEmpty() || chunkIndex < 0 || totalChunks <= 0) return;
 
+        // ── Receive-side limits ──────────────────────────────────────────────
+        const qint64 claimedSize = meta.value("fileSize").toVariant().toLongLong();
+        // Reject files that exceed the same 25 MB limit we enforce on send
+        if (claimedSize > kMaxFileBytes || totalChunks > (kMaxFileBytes / kChunkBytes + 1)) {
+            emit status(QString("Rejected incoming file: claimed size %1 exceeds limit.")
+                            .arg(claimedSize));
+            return;
+        }
+        // Cap concurrent in-progress transfers to prevent memory exhaustion
+        static constexpr int kMaxConcurrentTransfers = 50;
+        if (!m_incomingTransfers.contains(transferId)
+            && m_incomingTransfers.size() >= kMaxConcurrentTransfers) {
+            emit status("Too many concurrent incoming transfers — dropping chunk.");
+            return;
+        }
+
         // Per-chunk dedup: "<transferId>:<chunkIndex>"
         if (!markSeen(transferId + ":" + QString::number(chunkIndex))) return;
 
@@ -510,13 +555,17 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         IncomingTransfer &xfer = m_incomingTransfers[transferId];
         if (xfer.totalChunks == 0) {
             xfer.fromId      = fromId;
-            xfer.fileName    = meta.value("fileName").toString("file");
+            // Strip path separators to prevent directory traversal attacks
+            QString rawName  = meta.value("fileName").toString("file");
+            rawName = rawName.section('/', -1).section('\\', -1);
+            xfer.fileName    = rawName.isEmpty() ? "file" : rawName;
             xfer.fileSize    = meta.value("fileSize").toVariant().toLongLong();
             xfer.totalChunks = totalChunks;
             xfer.ts          = tsFromSecs(meta.value("ts").toVariant().toLongLong());
             xfer.fileHash    = CryptoEngine::fromBase64Url(meta.value("fileHash").toString());
             xfer.groupId     = meta.value("groupId").toString();
             xfer.groupName   = meta.value("groupName").toString();
+            xfer.createdSecs = QDateTime::currentSecsSinceEpoch();
         }
         xfer.chunks[chunkIndex] = chunkData;
 
