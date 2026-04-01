@@ -5,6 +5,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QFontMetrics>
 #include <QApplication>
@@ -292,31 +293,19 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             const QString name = item->text();
 
             if (name == "Unknown Contact") {
-                // Offer to add this unknown key as a contact
-                QMessageBox box(&dlg);
-                box.setWindowTitle("Unknown Contact");
-                box.setText("This member is not in your contacts.\nWould you like to add them?");
-                box.setStyleSheet(kDlgStyle);
-                QPushButton *addBtn = box.addButton("Add Contact", QMessageBox::AcceptRole);
-                box.addButton("Cancel", QMessageBox::RejectRole);
-                box.exec();
-                if (box.clickedButton() == addBtn) {
-                    // Pre-populate with their key already filled in
-                    QString newName;
-                    QStringList newKeys = { key };
-                    if (openContactEditor(parent, "Add Contact", newName, newKeys, false)
-                            == ContactEditorResult::Saved && !newName.isEmpty()) {
-                        // Update display name in member list
-                        item->setText(newName);
-                        // Save via callback
-                        if (onNewContact) {
-                            ChatData newContact;
-                            newContact.name       = newName;
-                            newContact.subtitle   = "Secure chat";
-                            newContact.keys       = newKeys;
-                            newContact.peerIdB64u = newKeys.isEmpty() ? QString() : newKeys.first();
-                            onNewContact(newContact);
-                        }
+                // Open contact editor directly — avoids triple-nested exec() on macOS
+                QString newName;
+                QStringList newKeys = { key };
+                if (openContactEditor(nullptr, "Add Contact", newName, newKeys, false)
+                        == ContactEditorResult::Saved && !newName.isEmpty()) {
+                    item->setText(newName);
+                    if (onNewContact) {
+                        ChatData newContact;
+                        newContact.name       = newName;
+                        newContact.subtitle   = "Secure chat";
+                        newContact.keys       = newKeys;
+                        newContact.peerIdB64u = newKeys.isEmpty() ? QString() : newKeys.first();
+                        onNewContact(newContact);
                     }
                 }
             } else {
@@ -326,7 +315,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                         if (!c.isGroup && c.keys.contains(key)) {
                             QString contactName = c.name;
                             QStringList contactKeys = c.keys;
-                            openContactEditor(parent, "Edit Contact", contactName, contactKeys,
+                            openContactEditor(nullptr, "Edit Contact", contactName, contactKeys,
                                               false); // no destructive actions from inside group editor
                             // Update display name in case they were renamed
                             item->setText(contactName);
@@ -861,12 +850,33 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
                                    int            chunksReceived,
                                    int            chunksTotal,
                                    const QByteArray &fileData,
-                                   const QDateTime  &timestamp)
+                                   const QDateTime  &timestamp,
+                                   const QString &groupId,
+                                   const QString &groupName)
 {
     const QString from = fromPeerIdB64u.trimmed();
 
-    // Locate the chat this file belongs to (or create one)
-    const int chatIndex = findOrCreateChatForPeer(from);
+    // Locate the chat this file belongs to — group chat or 1:1
+    int chatIndex = -1;
+    if (!groupId.isEmpty()) {
+        // Find existing group chat by groupId, or create one
+        for (int i = 0; i < m_chats.size(); ++i)
+            if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { chatIndex = i; break; }
+
+        if (chatIndex == -1) {
+            ChatData ng; ng.isGroup = true; ng.groupId = groupId;
+            ng.peerIdB64u = groupId;
+            ng.name = groupName.isEmpty() ? "Group Chat" : groupName;
+            ng.subtitle = "Group chat"; ng.keys.append(from);
+            m_chats.append(ng);
+            if (m_db) m_db->saveContact(ng);
+            chatIndex = m_chats.size() - 1;
+            ensureUnreadSize();
+            rebuildChatList();
+        }
+    } else {
+        chatIndex = findOrCreateChatForPeer(from);
+    }
     if (chatIndex < 0) return;
     const QString key = chatKey(m_chats[chatIndex]);
 
@@ -919,13 +929,22 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
             rec->status = FileTransferStatus::Failed;
         }
 
-        // System tray notification
-        if (m_notifier) {
-            const QString msg = saved
-                                    ? QString("File ready: %1 (%2)").arg(fileName, formatFileSize(fileSize))
-                                    : QString("File received but could not save: %1").arg(fileName);
-            m_notifier->notify(m_chats[chatIndex].name, msg);
+        if (m_db) m_db->saveFileRecord(key, *rec);
+
+        // In-app toast + system tray notification
+        {
+            const QString senderName = m_chats[chatIndex].name;
+            const QString toastMsg = saved
+                ? QString("📎 %1 from %2").arg(fileName, senderName)
+                : QString("⚠ File from %1 could not be saved: %2").arg(senderName, fileName);
+            showToast(toastMsg);
+            if (m_notifier)
+                m_notifier->notify(senderName, toastMsg);
         }
+
+        // Clickable file bubble in chat
+        if (chatIndex == m_currentChat)
+            addFileBubble(fileName, fileSize, false);
 
         // Bump unread on the chat if it isn't currently open
         if (chatIndex != m_currentChat) {
@@ -951,7 +970,11 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         if (m_chats[i].isGroup) continue;
         if (m_chats[i].peerIdB64u.trimmed() != peerIdB64u) continue;
 
-        const bool firstTime = m_chats[i].avatarData.isEmpty();
+        // First genuine contact = had no avatar and now receiving one
+        const bool firstTime = m_chats[i].avatarData.isEmpty() && !avatarB64.isEmpty();
+
+        // Empty avatarB64 means the sender reset to default — clear so the UI
+        // falls back to initials derived from our locally saved name for them
         m_chats[i].avatarData = avatarB64;
 
         // Persist to DB
@@ -961,8 +984,11 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         if (firstTime && m_db) {
             const QString myName   = m_db->loadSetting("displayName");
             const QString myAvatar = m_db->loadSetting("avatarData");
-            if (!myName.isEmpty())
-                m_controller->sendAvatar(peerIdB64u, myName, myAvatar);
+            if (!myName.isEmpty()) {
+                const QString myAvatarIsPhoto = m_db->loadSetting("avatarIsPhoto");
+                const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
+                m_controller->sendAvatar(peerIdB64u, myName, broadcastAvatar);
+            }
         }
 
         // Rebuild the list so the avatar label updates immediately
@@ -991,8 +1017,17 @@ void ChatView::onGroupAvatarReceived(const QString &groupId, const QString &avat
 {
     for (int i = 0; i < m_chats.size(); ++i) {
         if (!m_chats[i].isGroup || m_chats[i].groupId != groupId) continue;
+
+        // Only relay and persist if this is actually new to us
+        if (m_chats[i].avatarData == avatarB64) return;
+
         m_chats[i].avatarData = avatarB64;
         if (m_db) m_db->saveContactAvatar(m_chats[i].peerIdB64u, avatarB64);
+
+        // Relay to all group members so stragglers receive it too
+        if (m_controller && !m_chats[i].keys.isEmpty())
+            m_controller->sendGroupAvatar(groupId, avatarB64, m_chats[i].keys);
+
         rebuildChatList();
         if (m_currentChat == i) loadChat(i);
         return;
@@ -1012,12 +1047,6 @@ void ChatView::onAttachFile()
                              "This contact has no public keys — cannot send a file securely.");
         return;
     }
-    if (chat.isGroup) {
-        QMessageBox::information(m_ui->centralwidget, "Not Supported",
-                                 "File sharing to group chats is not yet supported.\n"
-                                 "Send files to individual contacts.");
-        return;
-    }
 
     const QString path = QFileDialog::getOpenFileName(
         m_ui->centralwidget, "Send File",
@@ -1033,29 +1062,34 @@ void ChatView::onAttachFile()
     const QByteArray data = f.readAll();
     f.close();
 
-    constexpr qint64 kMax = 8LL * 1024 * 1024;
+    constexpr qint64 kMax = ChatController::maxFileBytes();   // 25 MB
     if (data.size() > kMax) {
         QMessageBox::warning(m_ui->centralwidget, "File Too Large",
-                             "Maximum file size is 8 MB.\nThis file is " + formatFileSize(data.size()) + ".");
+                             "Maximum file size is 25 MB.\nThis file is " + formatFileSize(data.size()) + ".");
         return;
     }
 
     const QString fileName = QFileInfo(path).fileName();
 
-    // ── Send to all keys for this contact ─────────────────────────────────────
-    // Use the first key's transferId for the local record (all keys get the same
-    // file but with their own encrypted copies; only one record shown per send).
+    // ── Send to all keys for this contact / group ──────────────────────────────
     QString localTransferId;
     int totalChunks = 0;
+    constexpr qint64 kChunk = 240LL * 1024;
 
-    for (const QString &key : chat.keys) {
-        if (key.trimmed().isEmpty()) continue;
-        const QString tid = m_controller->sendFile(key.trimmed(), fileName, data);
-        if (!tid.isEmpty() && localTransferId.isEmpty()) {
-            localTransferId = tid;
-            // Compute chunk count the same way ChatController does
-            constexpr qint64 kChunk = 240LL * 1024;
+    if (chat.isGroup) {
+        localTransferId = m_controller->sendGroupFile(
+            chat.groupId, chat.name, chat.keys, fileName, data);
+        if (!localTransferId.isEmpty())
             totalChunks = int((data.size() + kChunk - 1) / kChunk);
+    } else {
+        // 1:1: send to every key belonging to this contact
+        for (const QString &key : chat.keys) {
+            if (key.trimmed().isEmpty()) continue;
+            const QString tid = m_controller->sendFile(key.trimmed(), fileName, data);
+            if (!tid.isEmpty() && localTransferId.isEmpty()) {
+                localTransferId = tid;
+                totalChunks = int((data.size() + kChunk - 1) / kChunk);
+            }
         }
     }
 
@@ -1077,12 +1111,12 @@ void ChatView::onAttachFile()
     rec.chunksComplete = totalChunks;
     rec.savedPath      = path;   // original file — lets Download open it directly
     m_filesByKey[key].append(rec);
+    if (m_db) m_db->saveFileRecord(key, rec);
 
     rebuildFilesTab();
 
     // Delivery notice bubble in chat
-    addMessageBubble(
-        QString("📎  %1  (%2)").arg(fileName, formatFileSize(data.size())), true);
+    addFileBubble(fileName, data.size(), true);
 }
 
 // ── Private slots ─────────────────────────────────────────────────────────────
@@ -1420,11 +1454,13 @@ void ChatView::onEditProfile()
         m_db->saveSetting("profileKeys",  m_profileKeys.join(','));
     }
 
-    // Only broadcast if it's a real photo — contacts generate their own initials fallback
-    if (usingPhoto) {
+    // Broadcast to all contacts. Send empty avatar when using default so the
+    // receiver falls back to initials derived from their own saved name for us.
+    {
+        const QString broadcastAvatar = usingPhoto ? newAvatarB64 : QString();
         for (const ChatData &chat : m_chats) {
             if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
-                m_controller->sendAvatar(chat.peerIdB64u, displayName, newAvatarB64);
+                m_controller->sendAvatar(chat.peerIdB64u, displayName, broadcastAvatar);
         }
     }
 }
@@ -1469,7 +1505,7 @@ void ChatView::onEditContact(int index)
         if (wasGroup) {
             if (name != oldName)
                 m_controller->sendGroupRename(m_chats[index].groupId, name, keys);
-            if (avatar != oldAvatar && !avatar.isEmpty())
+            if (avatar != oldAvatar)
                 m_controller->sendGroupAvatar(m_chats[index].groupId, avatar, keys);
         }
     } else if (result == ContactEditorResult::Removed) {
@@ -1679,7 +1715,15 @@ void ChatView::initChats()
         }
     }
 
-    if (m_db) m_chats = m_db->loadAllContacts();
+    if (m_db) {
+        m_chats = m_db->loadAllContacts();
+        for (const auto &c : m_chats) {
+            const QString ck = chatKey(c);
+            const auto records = m_db->loadFileRecords(ck);
+            if (!records.isEmpty())
+                m_filesByKey[ck] = records;
+        }
+    }
 
     m_ui->chatList->clear();
     for (const auto &c : m_chats) m_ui->chatList->addItem(c.name);
@@ -1972,6 +2016,61 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
     });
 }
 
+// ── Clickable file bubble ─────────────────────────────────────────────────────
+
+void ChatView::addFileBubble(const QString &fileName, qint64 fileSize, bool sent)
+{
+    auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
+    if (!layout) return;
+
+    auto *row = new QWidget(m_ui->scrollAreaWidgetContents);
+    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    auto *rl = new QHBoxLayout(row);
+    rl->setContentsMargins(0, 2, 0, 2);
+    rl->setSpacing(0);
+
+    const QString label = QString("📎  %1  ·  %2\nTap to view files")
+                              .arg(fileName, formatFileSize(fileSize));
+
+    auto *btn = new QPushButton(label, row);
+    btn->setFont([]{ QFont f = QApplication::font(); f.setPixelSize(13); return f; }());
+    btn->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    btn->setMinimumHeight(52);
+    btn->setMaximumWidth(int(m_ui->messageScroll->viewport()->width() * 0.65));
+    btn->setCursor(Qt::PointingHandCursor);
+    btn->setFlat(true);
+
+    const QString bgColor = sent ? "#2e8b3a" : "#222222";
+    btn->setStyleSheet(
+        QString("QPushButton { background-color:%1; color:#ffffff;"
+                " border-radius:14px; padding:10px 14px; font-size:13px;"
+                " text-align:left; }"
+                "QPushButton:hover { background-color:%2; }"
+                "QPushButton:pressed { background-color:%3; }")
+            .arg(bgColor,
+                 sent ? "#36a344" : "#2a2a2a",
+                 sent ? "#256e30" : "#1a1a1a"));
+
+    QObject::connect(btn, &QPushButton::clicked, this, [this]{
+        m_ui->mainTabs->setCurrentIndex(1);
+    });
+
+    if (sent) {
+        rl->addStretch();
+        rl->addWidget(btn);
+    } else {
+        rl->addWidget(btn);
+        rl->addStretch();
+    }
+
+    layout->insertWidget(layout->count() - 1, row);
+    QTimer::singleShot(5, [this]{
+        m_ui->messageScroll->verticalScrollBar()->setValue(
+            m_ui->messageScroll->verticalScrollBar()->maximum());
+    });
+}
+
 // ── Files tab ─────────────────────────────────────────────────────────────────
 //
 // Layout strategy: we fully replace the contents of filesScrollContents' layout
@@ -2069,29 +2168,107 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
     vl->setSpacing(0);
 
     // ── Thumbnail / icon area ─────────────────────────────────────────────────
-    auto *thumbWidget = new QWidget(card);
-    thumbWidget->setMinimumHeight(220);
-    thumbWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    thumbWidget->setStyleSheet(
-        "background-color:#242424;"
-        "border-radius:10px 10px 0 0;"
-        );
+    const FilePreviewType previewType = filePreviewType(rec.fileName);
+    const bool hasFile = (rec.status == FileTransferStatus::Complete && !rec.savedPath.isEmpty());
+    const bool isImage = (previewType == FilePreviewType::Image && hasFile);
+    const bool isText  = (previewType == FilePreviewType::Text  && hasFile);
+
+    // For images use QPushButton so the whole thumb area is clickable
+    QWidget    *thumbWidget = nullptr;
+    QPushButton *thumbBtn   = nullptr;
+    if (isImage) {
+        thumbBtn = new QPushButton(card);
+        thumbBtn->setFlat(true);
+        thumbBtn->setFixedHeight(220);
+        thumbBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        thumbBtn->setCursor(Qt::PointingHandCursor);
+        thumbBtn->setStyleSheet(
+            "QPushButton{background-color:#242424;border-radius:10px 10px 0 0;border:none;}"
+            "QPushButton:hover{background-color:#2d2d2d;}");
+        thumbWidget = thumbBtn;
+    } else {
+        thumbWidget = new QWidget(card);
+        thumbWidget->setMinimumHeight(220);
+        thumbWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        thumbWidget->setStyleSheet("background-color:#242424;border-radius:10px 10px 0 0;");
+    }
 
     auto *thumbLayout = new QVBoxLayout(thumbWidget);
     thumbLayout->setContentsMargins(0, 0, 0, 0);
 
-    auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
-    iconLbl->setAlignment(Qt::AlignCenter);
-    iconLbl->setStyleSheet(
-        "background:transparent;"
-        "color:#555555;"
-        "font-size:64px;"
-        "border:none;"
-        );
-    thumbLayout->addStretch();
-    thumbLayout->addWidget(iconLbl);
+    if (isImage) {
+        QPixmap px(rec.savedPath);
+        auto *imgLbl = new QLabel(thumbWidget);
+        imgLbl->setAlignment(Qt::AlignCenter);
+        imgLbl->setStyleSheet("background:transparent;border:none;");
+        if (!px.isNull()) {
+            imgLbl->setPixmap(
+                px.scaled(QSize(400, 200), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        } else {
+            imgLbl->setText(fileIcon(rec.fileName));
+            imgLbl->setStyleSheet("background:transparent;color:#555555;font-size:64px;border:none;");
+        }
+        thumbLayout->addStretch();
+        thumbLayout->addWidget(imgLbl);
+        thumbLayout->addStretch();
 
-    // Progress bar overlaid at the bottom of the thumb area (in-flight only)
+        const QString savedPath = rec.savedPath;
+        const QString imgName   = rec.fileName;
+        QObject::connect(thumbBtn, &QPushButton::clicked, [=] {
+            auto *dlg = new QDialog(m_ui->centralwidget);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->setWindowTitle(imgName);
+            dlg->resize(900, 650);
+            auto *scroll = new QScrollArea(dlg);
+            scroll->setAlignment(Qt::AlignCenter);
+            scroll->setWidgetResizable(false);
+            auto *imgLabel = new QLabel;
+            imgLabel->setAlignment(Qt::AlignCenter);
+            QPixmap fullPx(savedPath);
+            imgLabel->setPixmap(fullPx);
+            imgLabel->resize(fullPx.size());
+            scroll->setWidget(imgLabel);
+            auto *dl = new QVBoxLayout(dlg);
+            dl->setContentsMargins(0, 0, 0, 0);
+            dl->addWidget(scroll);
+            dlg->show();
+        });
+
+    } else if (isText) {
+        auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
+        iconLbl->setAlignment(Qt::AlignCenter);
+        iconLbl->setStyleSheet("background:transparent;color:#555555;font-size:40px;border:none;");
+
+        QString preview;
+        QFile tf(rec.savedPath);
+        if (tf.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            for (int i = 0; i < 3 && !tf.atEnd(); ++i)
+                preview += QString::fromUtf8(tf.readLine());
+            tf.close();
+            preview = preview.trimmed();
+        }
+        auto *previewLbl = new QLabel(preview.isEmpty() ? "(empty)" : preview, thumbWidget);
+        previewLbl->setWordWrap(true);
+        previewLbl->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+        previewLbl->setStyleSheet(
+            "background:transparent;color:#888888;font-size:11px;"
+            "font-family:monospace;border:none;padding:0 12px;");
+
+        thumbLayout->addStretch();
+        thumbLayout->addWidget(iconLbl);
+        thumbLayout->addWidget(previewLbl);
+        thumbLayout->addStretch();
+
+    } else {
+        auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
+        iconLbl->setAlignment(Qt::AlignCenter);
+        iconLbl->setStyleSheet("background:transparent;color:#555555;font-size:64px;border:none;");
+        thumbLayout->addStretch();
+        thumbLayout->addWidget(iconLbl);
+        thumbLayout->addStretch();
+    }
+
+    // Progress bar at bottom of thumb area (in-flight only)
     if (inFlight && rec.chunksTotal > 0) {
         auto *pb = new QProgressBar(thumbWidget);
         pb->setRange(0, rec.chunksTotal);
@@ -2102,8 +2279,6 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
             "QProgressBar{background-color:#333333;border-radius:0;border:none;margin:0;}"
             "QProgressBar::chunk{background-color:#3a9e48;border-radius:0;}");
         thumbLayout->addWidget(pb);
-    } else {
-        thumbLayout->addStretch();
     }
 
     vl->addWidget(thumbWidget);

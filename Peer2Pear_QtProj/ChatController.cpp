@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QTimeZone>
 #include <QUuid>
+#include <sodium.h>
 
 // ── Chunk size ────────────────────────────────────────────────────────────────
 // The server enforces MAX_ENVELOPE_BYTES = 256 KB (262 144 bytes).
@@ -19,9 +20,9 @@
 //
 // Max plaintext chunk = 262 144 - 385 = ~261 759 bytes.
 // We use 240 KB = 245 760 bytes for a comfortable margin.
-// An 8 MB file therefore travels in at most ceil(8192 / 240) = 35 chunks.
+// A 25 MB file therefore travels in at most ceil(25600 / 240) = 107 chunks.
 static constexpr qint64 kChunkBytes   = 240LL * 1024;   // 245 760 bytes
-static constexpr qint64 kMaxFileBytes =   8LL * 1024 * 1024;
+static constexpr qint64 kMaxFileBytes =  25LL * 1024 * 1024;
 
 // Envelope header prefixes
 static const QByteArray kMsgPrefix  = "FROM:";
@@ -125,6 +126,37 @@ void ChatController::sendAvatar(const QString& peerIdB64u,
     sendSignalingMessage(peerIdB64u, payload);
 }
 
+// ── BLAKE2b-256 hash ─────────────────────────────────────────────────────────
+
+QByteArray ChatController::blake2b256(const QByteArray& data)
+{
+    QByteArray hash(32, 0);
+    crypto_generichash(reinterpret_cast<unsigned char*>(hash.data()), 32,
+                       reinterpret_cast<const unsigned char*>(data.constData()),
+                       static_cast<unsigned long long>(data.size()),
+                       nullptr, 0);
+    return hash;
+}
+
+// ── P2P-first chunk sender ──────────────────────────────────────────────────
+
+void ChatController::sendFileChunkEnvelope(const QString& peerIdB64u,
+                                           const QByteArray& key32,
+                                           const QByteArray& env)
+{
+    // Try P2P first — if the connection exists and is ready, send directly
+    if (m_p2pConnections.contains(peerIdB64u) &&
+        m_p2pConnections[peerIdB64u]->isReady()) {
+        // Over P2P we send the raw envelope bytes (same wire format)
+        m_p2pConnections[peerIdB64u]->sendData(env);
+    } else {
+        // Fall back to mailbox relay (7-day TTL)
+        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        // Attempt to establish P2P for subsequent chunks
+        initiateP2PConnection(peerIdB64u);
+    }
+}
+
 QString ChatController::sendFile(const QString& peerIdB64u,
                                  const QString& fileName,
                                  const QByteArray& fileData)
@@ -147,6 +179,10 @@ QString ChatController::sendFile(const QString& peerIdB64u,
     const qint64  fileSize   = fileData.size();
     const int totalChunks    = int((fileSize + kChunkBytes - 1) / kChunkBytes);
 
+    // Compute BLAKE2b-256 integrity hash over the entire plaintext file
+    const QByteArray fileHash = blake2b256(fileData);
+    const QString fileHashB64u = CryptoEngine::toBase64Url(fileHash);
+
     for (int i = 0; i < totalChunks; ++i) {
         const qint64     offset   = qint64(i) * kChunkBytes;
         const QByteArray chunk    = fileData.mid(int(offset), int(kChunkBytes));
@@ -160,6 +196,7 @@ QString ChatController::sendFile(const QString& peerIdB64u,
         meta["fileName"]    = fileName;
         meta["fileSize"]    = fileSize;
         meta["ts"]          = ts;
+        meta["fileHash"]    = fileHashB64u;
 
         const QByteArray metaJson = QJsonDocument(meta).toJson(QJsonDocument::Compact);
         const QByteArray encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
@@ -171,11 +208,75 @@ QString ChatController::sendFile(const QString& peerIdB64u,
                                + encMeta
                                + encChunk;
 
-        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        sendFileChunkEnvelope(peerIdB64u, key32, env);
     }
 
     emit status(QString("'%1' queued in %2 chunk(s) → %3")
                     .arg(fileName).arg(totalChunks).arg(peerIdB64u));
+    return transferId;
+}
+
+QString ChatController::sendGroupFile(const QString& groupId,
+                                      const QString& groupName,
+                                      const QStringList& memberPeerIds,
+                                      const QString& fileName,
+                                      const QByteArray& fileData)
+{
+    if (fileData.size() > kMaxFileBytes) {
+        emit status(QString("File too large (max %1 MB).")
+                        .arg(kMaxFileBytes / (1024 * 1024)));
+        return {};
+    }
+
+    const QString myId       = myIdB64u();
+    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const qint64  ts         = QDateTime::currentSecsSinceEpoch();
+    const qint64  fileSize   = fileData.size();
+    const int totalChunks    = int((fileSize + kChunkBytes - 1) / kChunkBytes);
+
+    // Compute BLAKE2b-256 integrity hash over the entire plaintext file
+    const QByteArray fileHash = blake2b256(fileData);
+    const QString fileHashB64u = CryptoEngine::toBase64Url(fileHash);
+
+    for (const QString& peerId : memberPeerIds) {
+        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
+
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
+        for (int i = 0; i < totalChunks; ++i) {
+            const qint64     offset   = qint64(i) * kChunkBytes;
+            const QByteArray chunk    = fileData.mid(int(offset), int(kChunkBytes));
+
+            QJsonObject meta;
+            meta["from"]        = myId;
+            meta["type"]        = "file_chunk";
+            meta["transferId"]  = transferId;
+            meta["chunkIndex"]  = i;
+            meta["totalChunks"] = totalChunks;
+            meta["fileName"]    = fileName;
+            meta["fileSize"]    = fileSize;
+            meta["ts"]          = ts;
+            meta["fileHash"]    = fileHashB64u;
+            meta["groupId"]     = groupId;
+            meta["groupName"]   = groupName;
+
+            const QByteArray metaJson = QJsonDocument(meta).toJson(QJsonDocument::Compact);
+            const QByteArray encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
+            const QByteArray encChunk = m_crypto.aeadEncrypt(key32, chunk);
+
+            const QByteArray env = kFilePrefix + myId.toUtf8() + "\n"
+                                   + pack32(quint32(encMeta.size()))
+                                   + encMeta
+                                   + encChunk;
+
+            sendFileChunkEnvelope(peerId, key32, env);
+        }
+    }
+
+    emit status(QString("'%1' queued in %2 chunk(s) → group %3")
+                    .arg(fileName).arg(totalChunks).arg(groupName));
     return transferId;
 }
 
@@ -339,10 +440,20 @@ void ChatController::initiateP2PConnection(const QString& peerIdB64u)
     conn->initIce(true);
 }
 
-void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& ct)
+void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data)
 {
+    // ── File chunk received over P2P ─────────────────────────────────────────
+    // P2P file chunks arrive in the same wire format as mailbox envelopes:
+    // FROMFC:<senderId>\n<4-byte metaLen><encMeta><encChunk>
+    if (data.startsWith(kFilePrefix)) {
+        // Re-use onEnvelope which already handles the full wire format
+        onEnvelope(data, QString());
+        return;
+    }
+
+    // ── Encrypted JSON message (text, etc.) ──────────────────────────────────
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), ct);
+    const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
     if (pt.isEmpty()) return;
 
     const auto o = QJsonDocument::fromJson(pt).object();
@@ -403,6 +514,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             xfer.fileSize    = meta.value("fileSize").toVariant().toLongLong();
             xfer.totalChunks = totalChunks;
             xfer.ts          = tsFromSecs(meta.value("ts").toVariant().toLongLong());
+            xfer.fileHash    = CryptoEngine::fromBase64Url(meta.value("fileHash").toString());
+            xfer.groupId     = meta.value("groupId").toString();
+            xfer.groupName   = meta.value("groupName").toString();
         }
         xfer.chunks[chunkIndex] = chunkData;
 
@@ -412,7 +526,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             // Progress update only — no file data yet
             emit fileChunkReceived(fromId, transferId, xfer.fileName,
                                    xfer.fileSize, received, totalChunks,
-                                   QByteArray{}, xfer.ts);
+                                   QByteArray{}, xfer.ts,
+                                   xfer.groupId, xfer.groupName);
         } else {
             // Reassemble in chunk order and free reassembly memory immediately
             QByteArray assembled;
@@ -423,9 +538,25 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             const IncomingTransfer completed = xfer;
             m_incomingTransfers.remove(transferId);
 
+            // Verify BLAKE2b-256 integrity hash if the sender included one
+            if (!completed.fileHash.isEmpty()) {
+                const QByteArray actualHash = blake2b256(assembled);
+                if (actualHash != completed.fileHash) {
+                    emit status(QString("⚠ File '%1' integrity check FAILED — data corrupted.")
+                                    .arg(completed.fileName));
+                    // Still emit so the UI can show the failure
+                    emit fileChunkReceived(fromId, transferId, completed.fileName,
+                                           completed.fileSize, totalChunks, totalChunks,
+                                           QByteArray{}, completed.ts,
+                                           completed.groupId, completed.groupName);
+                    return;
+                }
+            }
+
             emit fileChunkReceived(fromId, transferId, completed.fileName,
                                    completed.fileSize, totalChunks, totalChunks,
-                                   assembled, completed.ts);
+                                   assembled, completed.ts,
+                                   completed.groupId, completed.groupName);
         }
         return;
     }

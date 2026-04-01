@@ -74,7 +74,9 @@ public slots:
                              int            chunksReceived,
                              int            chunksTotal,
                              const QByteArray &fileData,
-                             const QDateTime  &timestamp);
+                             const QDateTime  &timestamp,
+                             const QString &groupId = {},
+                             const QString &groupName = {});
 
 signals:
     void unreadChanged(int totalUnread);
@@ -98,6 +100,7 @@ private:
 
     void clearMessages();
     void addMessageBubble(const QString &text, bool sent, const QString &senderName = QString());
+    void addFileBubble(const QString &fileName, qint64 fileSize, bool sent);
     void addDateSeparator(const QDateTime &dt);
 
     // File tab — buildFileCard returns an owned QFrame; rebuildFilesTab places it
