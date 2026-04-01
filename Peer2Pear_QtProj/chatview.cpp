@@ -293,31 +293,19 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             const QString name = item->text();
 
             if (name == "Unknown Contact") {
-                // Offer to add this unknown key as a contact
-                QMessageBox box(&dlg);
-                box.setWindowTitle("Unknown Contact");
-                box.setText("This member is not in your contacts.\nWould you like to add them?");
-                box.setStyleSheet(kDlgStyle);
-                QPushButton *addBtn = box.addButton("Add Contact", QMessageBox::AcceptRole);
-                box.addButton("Cancel", QMessageBox::RejectRole);
-                box.exec();
-                if (box.clickedButton() == addBtn) {
-                    // Pre-populate with their key already filled in
-                    QString newName;
-                    QStringList newKeys = { key };
-                    if (openContactEditor(parent, "Add Contact", newName, newKeys, false)
-                            == ContactEditorResult::Saved && !newName.isEmpty()) {
-                        // Update display name in member list
-                        item->setText(newName);
-                        // Save via callback
-                        if (onNewContact) {
-                            ChatData newContact;
-                            newContact.name       = newName;
-                            newContact.subtitle   = "Secure chat";
-                            newContact.keys       = newKeys;
-                            newContact.peerIdB64u = newKeys.isEmpty() ? QString() : newKeys.first();
-                            onNewContact(newContact);
-                        }
+                // Open contact editor directly — avoids triple-nested exec() on macOS
+                QString newName;
+                QStringList newKeys = { key };
+                if (openContactEditor(nullptr, "Add Contact", newName, newKeys, false)
+                        == ContactEditorResult::Saved && !newName.isEmpty()) {
+                    item->setText(newName);
+                    if (onNewContact) {
+                        ChatData newContact;
+                        newContact.name       = newName;
+                        newContact.subtitle   = "Secure chat";
+                        newContact.keys       = newKeys;
+                        newContact.peerIdB64u = newKeys.isEmpty() ? QString() : newKeys.first();
+                        onNewContact(newContact);
                     }
                 }
             } else {
@@ -327,7 +315,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                         if (!c.isGroup && c.keys.contains(key)) {
                             QString contactName = c.name;
                             QStringList contactKeys = c.keys;
-                            openContactEditor(parent, "Edit Contact", contactName, contactKeys,
+                            openContactEditor(nullptr, "Edit Contact", contactName, contactKeys,
                                               false); // no destructive actions from inside group editor
                             // Update display name in case they were renamed
                             item->setText(contactName);
