@@ -862,12 +862,33 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
                                    int            chunksReceived,
                                    int            chunksTotal,
                                    const QByteArray &fileData,
-                                   const QDateTime  &timestamp)
+                                   const QDateTime  &timestamp,
+                                   const QString &groupId,
+                                   const QString &groupName)
 {
     const QString from = fromPeerIdB64u.trimmed();
 
-    // Locate the chat this file belongs to (or create one)
-    const int chatIndex = findOrCreateChatForPeer(from);
+    // Locate the chat this file belongs to — group chat or 1:1
+    int chatIndex = -1;
+    if (!groupId.isEmpty()) {
+        // Find existing group chat by groupId, or create one
+        for (int i = 0; i < m_chats.size(); ++i)
+            if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { chatIndex = i; break; }
+
+        if (chatIndex == -1) {
+            ChatData ng; ng.isGroup = true; ng.groupId = groupId;
+            ng.peerIdB64u = groupId;
+            ng.name = groupName.isEmpty() ? "Group Chat" : groupName;
+            ng.subtitle = "Group chat"; ng.keys.append(from);
+            m_chats.append(ng);
+            if (m_db) m_db->saveContact(ng);
+            chatIndex = m_chats.size() - 1;
+            ensureUnreadSize();
+            rebuildChatList();
+        }
+    } else {
+        chatIndex = findOrCreateChatForPeer(from);
+    }
     if (chatIndex < 0) return;
     const QString key = chatKey(m_chats[chatIndex]);
 
@@ -1038,12 +1059,6 @@ void ChatView::onAttachFile()
                              "This contact has no public keys — cannot send a file securely.");
         return;
     }
-    if (chat.isGroup) {
-        QMessageBox::information(m_ui->centralwidget, "Not Supported",
-                                 "File sharing to group chats is not yet supported.\n"
-                                 "Send files to individual contacts.");
-        return;
-    }
 
     const QString path = QFileDialog::getOpenFileName(
         m_ui->centralwidget, "Send File",
@@ -1059,29 +1074,34 @@ void ChatView::onAttachFile()
     const QByteArray data = f.readAll();
     f.close();
 
-    constexpr qint64 kMax = 8LL * 1024 * 1024;
+    constexpr qint64 kMax = ChatController::maxFileBytes();   // 25 MB
     if (data.size() > kMax) {
         QMessageBox::warning(m_ui->centralwidget, "File Too Large",
-                             "Maximum file size is 8 MB.\nThis file is " + formatFileSize(data.size()) + ".");
+                             "Maximum file size is 25 MB.\nThis file is " + formatFileSize(data.size()) + ".");
         return;
     }
 
     const QString fileName = QFileInfo(path).fileName();
 
-    // ── Send to all keys for this contact ─────────────────────────────────────
-    // Use the first key's transferId for the local record (all keys get the same
-    // file but with their own encrypted copies; only one record shown per send).
+    // ── Send to all keys for this contact / group ──────────────────────────────
     QString localTransferId;
     int totalChunks = 0;
+    constexpr qint64 kChunk = 240LL * 1024;
 
-    for (const QString &key : chat.keys) {
-        if (key.trimmed().isEmpty()) continue;
-        const QString tid = m_controller->sendFile(key.trimmed(), fileName, data);
-        if (!tid.isEmpty() && localTransferId.isEmpty()) {
-            localTransferId = tid;
-            // Compute chunk count the same way ChatController does
-            constexpr qint64 kChunk = 240LL * 1024;
+    if (chat.isGroup) {
+        localTransferId = m_controller->sendGroupFile(
+            chat.groupId, chat.name, chat.keys, fileName, data);
+        if (!localTransferId.isEmpty())
             totalChunks = int((data.size() + kChunk - 1) / kChunk);
+    } else {
+        // 1:1: send to every key belonging to this contact
+        for (const QString &key : chat.keys) {
+            if (key.trimmed().isEmpty()) continue;
+            const QString tid = m_controller->sendFile(key.trimmed(), fileName, data);
+            if (!tid.isEmpty() && localTransferId.isEmpty()) {
+                localTransferId = tid;
+                totalChunks = int((data.size() + kChunk - 1) / kChunk);
+            }
         }
     }
 

@@ -74,7 +74,9 @@ public slots:
                              int            chunksReceived,
                              int            chunksTotal,
                              const QByteArray &fileData,
-                             const QDateTime  &timestamp);
+                             const QDateTime  &timestamp,
+                             const QString &groupId = {},
+                             const QString &groupName = {});
 
 signals:
     void unreadChanged(int totalUnread);
