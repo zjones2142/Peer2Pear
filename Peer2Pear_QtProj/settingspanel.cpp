@@ -1,4 +1,5 @@
 #include "settingspanel.h"
+#include "databasemanager.h"
 
 #include <QLabel>
 #include <QVBoxLayout>
@@ -6,6 +7,9 @@
 #include <QScrollArea>
 #include <QFrame>
 #include <QPushButton>
+#include <QClipboard>
+#include <QApplication>
+#include <QTimer>
 
 // ── SettingsPanel ─────────────────────────────────────────────────────────────
 
@@ -74,18 +78,7 @@ void SettingsPanel::buildUI()
     bodyLayout->setSpacing(24);
 
     // ── Profile section ───────────────────────────────────────────────────────
-    bodyLayout->addWidget(makeSection("PROFILE", {
-                                                  { "Display Name", "You"      },
-                                                  { "Handle",       "@handle"  },
-                                                  { "Status",       "Online"   },
-                                                  }));
-
-    // ── Privacy & Security section ────────────────────────────────────────────
-    bodyLayout->addWidget(makeSection("PRIVACY & SECURITY", {
-                                                             { "End-to-End Encryption", "Enabled"   },
-                                                             { "Read Receipts",         "On"        },
-                                                             { "Last Seen",             "Everyone"  },
-                                                             }));
+    bodyLayout->addWidget(makeProfileSection());
 
     // ── Notifications section (interactive) ───────────────────────────────────
     bodyLayout->addWidget(makeNotificationsSection());
@@ -106,7 +99,171 @@ void SettingsPanel::buildUI()
     outerLayout->addWidget(scroll);
 }
 
-// Builds a static read-only section card
+// Builds the Profile section card with display name and public key + copy button
+QWidget *SettingsPanel::makeProfileSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+    QLabel *heading = new QLabel("PROFILE");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+    // ── Display Name row ──────────────────────────────────────────────────────
+    QWidget *nameRow = new QWidget();
+    nameRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *nl = new QHBoxLayout(nameRow);
+    nl->setContentsMargins(16, 10, 16, 10);
+    nl->setSpacing(8);
+    QLabel *nameKey = new QLabel("Display Name");
+    nameKey->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+    m_displayNameLabel = new QLabel("—");
+    m_displayNameLabel->setStyleSheet(
+        "color: #555555; font-size: 13px; background: transparent; border: none;"
+        );
+    m_displayNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    nl->addWidget(nameKey);
+    nl->addStretch();
+    nl->addWidget(m_displayNameLabel);
+    cardLayout->addWidget(nameRow);
+    // Divider
+    QFrame *div = new QFrame();
+    div->setFrameShape(QFrame::HLine);
+    div->setStyleSheet(
+        "color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;"
+        );
+    cardLayout->addWidget(div);
+    // ── Public Key row ────────────────────────────────────────────────────────
+    QWidget *keyRow = new QWidget();
+    keyRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *kl = new QHBoxLayout(keyRow);
+    kl->setContentsMargins(16, 10, 16, 10);
+    kl->setSpacing(8);
+    QLabel *keyLabel = new QLabel("Public Key");
+    keyLabel->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+    m_publicKeyLabel = new QLabel("—");
+    m_publicKeyLabel->setStyleSheet(
+        "color: #555555; font-size: 12px; font-family: monospace; background: transparent; border: none;"
+        );
+    m_publicKeyLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    QPushButton *copyBtn = new QPushButton("Copy");
+    copyBtn->setFixedSize(52, 24);
+    copyBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #1a1a2e;"
+        "  color: #5588dd;"
+        "  border: 1px solid #2e2e5e;"
+        "  border-radius: 5px;"
+        "  font-size: 11px;"
+        "}"
+        "QPushButton:hover { background-color: #22223a; }"
+        );
+    connect(copyBtn, &QPushButton::clicked, this, [this, copyBtn]() {
+        QApplication::clipboard()->setText(m_fullPublicKey);
+        copyBtn->setText("Copied!");
+        QTimer::singleShot(1500, copyBtn, [copyBtn]() { copyBtn->setText("Copy"); });
+    });
+    kl->addWidget(keyLabel);
+    kl->addStretch();
+    kl->addWidget(m_publicKeyLabel);
+    kl->addSpacing(8);
+    kl->addWidget(copyBtn);
+    cardLayout->addWidget(keyRow);
+    return card;
+}
+// Updates profile labels after the panel has been constructed
+void SettingsPanel::setProfileInfo(const QString &displayName, const QString &publicKey)
+{
+    m_fullPublicKey = publicKey;
+    if (m_displayNameLabel)
+        m_displayNameLabel->setText(displayName.isEmpty() ? "—" : displayName);
+    if (m_publicKeyLabel) {
+        if (publicKey.isEmpty()) {
+            m_publicKeyLabel->setText("—");
+        } else {
+            const QString truncated = publicKey.left(16) + (publicKey.length() > 16 ? "…" : "");
+            m_publicKeyLabel->setText(truncated);
+        }
+    }
+}
+
+void SettingsPanel::setDatabase(DatabaseManager *db)
+{
+    m_db = db;
+    if (!m_db) return;
+    // Load persisted notification state
+    const QString saved = m_db->loadSetting("notificationsEnabled", "true");
+    m_notificationsEnabled = (saved == "true");
+    applyNotificationState();
+}
+
+void SettingsPanel::applyNotificationState()
+{
+    if (m_notificationsEnabled) {
+        if (m_notifStatusLabel) {
+            m_notifStatusLabel->setText("Enabled");
+            m_notifStatusLabel->setStyleSheet(
+                "color: #4caf50; font-size: 13px; background: transparent; border: none;"
+                );
+        }
+        if (m_notifToggleBtn) {
+            m_notifToggleBtn->setText("Disable");
+            m_notifToggleBtn->setStyleSheet(
+                "QPushButton {"
+                "  background-color: #2e1a1a;"
+                "  color: #cc5555;"
+                "  border: 1px solid #5e2e2e;"
+                "  border-radius: 6px;"
+                "  font-size: 12px;"
+                "}"
+                "QPushButton:hover { background-color: #3a2020; }"
+                );
+        }
+        // Sub-labels reflect effective state: suppressed when DND is active
+        const bool effective = !m_dndEnabled;
+        if (m_messageAlertsLabel) m_messageAlertsLabel->setText(effective ? "On" : "Off");
+        if (m_soundLabel)         m_soundLabel->setText(effective ? "On" : "Off");
+    } else {
+        if (m_notifStatusLabel) {
+            m_notifStatusLabel->setText("Disabled");
+            m_notifStatusLabel->setStyleSheet(
+                "color: #555555; font-size: 13px; background: transparent; border: none;"
+                );
+        }
+        if (m_notifToggleBtn) {
+            m_notifToggleBtn->setText("Enable");
+            m_notifToggleBtn->setStyleSheet(
+                "QPushButton {"
+                "  background-color: #1a2e1c;"
+                "  color: #5dd868;"
+                "  border: 1px solid #2e5e30;"
+                "  border-radius: 6px;"
+                "  font-size: 12px;"
+                "}"
+                "QPushButton:hover { background-color: #223a24; }"
+                );
+        }
+        if (m_messageAlertsLabel) m_messageAlertsLabel->setText("Off");
+        if (m_soundLabel)         m_soundLabel->setText("Off");
+    }
+}
+
 QWidget *SettingsPanel::makeSection(const QString &sectionTitle,
                                     const QList<QPair<QString, QString>> &rows)
 {
@@ -238,59 +395,100 @@ QWidget *SettingsPanel::makeNotificationsSection()
     cardLayout->addWidget(toggleRow);
 
     // Divider
-    QFrame *div1 = new QFrame();
-    div1->setFrameShape(QFrame::HLine);
-    div1->setStyleSheet(
-        "color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;"
-        );
-    cardLayout->addWidget(div1);
-
-    // ── Message Alerts row ────────────────────────────────────────────────────
-    auto makeStaticRow = [&](const QString &label, const QString &value) {
-        QWidget *row = new QWidget();
-        row->setStyleSheet("background: transparent; border: none;");
-
-        QHBoxLayout *rl = new QHBoxLayout(row);
-        rl->setContentsMargins(16, 10, 16, 10);
-        rl->setSpacing(8);
-
-        QLabel *key = new QLabel(label);
-        key->setStyleSheet(
-            "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+    auto addDivider = [&]() {
+        QFrame *div = new QFrame();
+        div->setFrameShape(QFrame::HLine);
+        div->setStyleSheet(
+            "color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;"
             );
-
-        QLabel *val = new QLabel(value);
-        val->setStyleSheet(
-            "color: #555555; font-size: 13px; background: transparent; border: none;"
-            );
-        val->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-
-        rl->addWidget(key);
-        rl->addStretch();
-        rl->addWidget(val);
-
-        return row;
+        cardLayout->addWidget(div);
     };
 
-    cardLayout->addWidget(makeStaticRow("Message Alerts", "On"));
+    // ── Message Alerts row ────────────────────────────────────────────────────
+    addDivider();
 
-    QFrame *div2 = new QFrame();
-    div2->setFrameShape(QFrame::HLine);
-    div2->setStyleSheet(
-        "color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;"
+    QWidget *alertsRow = new QWidget();
+    alertsRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *al = new QHBoxLayout(alertsRow);
+    al->setContentsMargins(16, 10, 16, 10);
+    al->setSpacing(8);
+    QLabel *alertsKey = new QLabel("Message Alerts");
+    alertsKey->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
         );
-    cardLayout->addWidget(div2);
-
-    cardLayout->addWidget(makeStaticRow("Sound", "On"));
-
-    QFrame *div3 = new QFrame();
-    div3->setFrameShape(QFrame::HLine);
-    div3->setStyleSheet(
-        "color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;"
+    m_messageAlertsLabel = new QLabel("On");
+    m_messageAlertsLabel->setStyleSheet(
+        "color: #555555; font-size: 13px; background: transparent; border: none;"
         );
-    cardLayout->addWidget(div3);
+    m_messageAlertsLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    al->addWidget(alertsKey);
+    al->addStretch();
+    al->addWidget(m_messageAlertsLabel);
+    cardLayout->addWidget(alertsRow);
 
-    cardLayout->addWidget(makeStaticRow("Do Not Disturb", "Off"));
+    // ── Sound row ─────────────────────────────────────────────────────────────
+    addDivider();
+
+    QWidget *soundRow = new QWidget();
+    soundRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *sl = new QHBoxLayout(soundRow);
+    sl->setContentsMargins(16, 10, 16, 10);
+    sl->setSpacing(8);
+    QLabel *soundKey = new QLabel("Sound");
+    soundKey->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+    m_soundLabel = new QLabel("On");
+    m_soundLabel->setStyleSheet(
+        "color: #555555; font-size: 13px; background: transparent; border: none;"
+        );
+    m_soundLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    sl->addWidget(soundKey);
+    sl->addStretch();
+    sl->addWidget(m_soundLabel);
+    cardLayout->addWidget(soundRow);
+
+    // ── Do Not Disturb row ────────────────────────────────────────────────────
+    addDivider();
+
+    QWidget *dndRow = new QWidget();
+    dndRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *dl = new QHBoxLayout(dndRow);
+    dl->setContentsMargins(16, 10, 16, 10);
+    dl->setSpacing(8);
+
+    QLabel *dndKey = new QLabel("Do Not Disturb");
+    dndKey->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+    m_dndStatusLabel = new QLabel("Off");
+    m_dndStatusLabel->setStyleSheet(
+        "color: #555555; font-size: 13px; background: transparent; border: none;"
+        );
+    m_dndStatusLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    m_dndToggleBtn = new QPushButton("Enable");
+    m_dndToggleBtn->setFixedSize(76, 28);
+    m_dndToggleBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #1a2e1a;"
+        "  color: #55cc55;"
+        "  border: 1px solid #2e5e2e;"
+        "  border-radius: 6px;"
+        "  font-size: 12px;"
+        "}"
+        "QPushButton:hover { background-color: #203a20; }"
+        );
+
+    connect(m_dndToggleBtn, &QPushButton::clicked,
+            this, &SettingsPanel::onToggleDnd);
+
+    dl->addWidget(dndKey);
+    dl->addStretch();
+    dl->addWidget(m_dndStatusLabel);
+    dl->addSpacing(8);
+    dl->addWidget(m_dndToggleBtn);
+    cardLayout->addWidget(dndRow);
 
     return card;
 }
@@ -399,14 +597,28 @@ QWidget *SettingsPanel::makeDataSection()
 void SettingsPanel::onToggleNotifications()
 {
     m_notificationsEnabled = !m_notificationsEnabled;
+    applyNotificationState();
 
-    if (m_notificationsEnabled) {
-        m_notifStatusLabel->setText("Enabled");
-        m_notifStatusLabel->setStyleSheet(
-            "color: #4caf50; font-size: 13px; background: transparent; border: none;"
+    // Persist to DB
+    if (m_db)
+        m_db->saveSetting("notificationsEnabled",
+                          m_notificationsEnabled ? "true" : "false");
+
+    // DND overrides: if DND is on, keep notifications suppressed regardless
+    emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
+}
+
+void SettingsPanel::onToggleDnd()
+{
+    m_dndEnabled = !m_dndEnabled;
+
+    if (m_dndEnabled) {
+        m_dndStatusLabel->setText("On");
+        m_dndStatusLabel->setStyleSheet(
+            "color: #cc5555; font-size: 13px; background: transparent; border: none;"
             );
-        m_notifToggleBtn->setText("Disable");
-        m_notifToggleBtn->setStyleSheet(
+        m_dndToggleBtn->setText("Disable");
+        m_dndToggleBtn->setStyleSheet(
             "QPushButton {"
             "  background-color: #2e1a1a;"
             "  color: #cc5555;"
@@ -417,22 +629,26 @@ void SettingsPanel::onToggleNotifications()
             "QPushButton:hover { background-color: #3a2020; }"
             );
     } else {
-        m_notifStatusLabel->setText("Disabled");
-        m_notifStatusLabel->setStyleSheet(
+        m_dndStatusLabel->setText("Off");
+        m_dndStatusLabel->setStyleSheet(
             "color: #555555; font-size: 13px; background: transparent; border: none;"
             );
-        m_notifToggleBtn->setText("Enable");
-        m_notifToggleBtn->setStyleSheet(
+        m_dndToggleBtn->setText("Enable");
+        m_dndToggleBtn->setStyleSheet(
             "QPushButton {"
-            "  background-color: #1a2e1c;"
-            "  color: #5dd868;"
-            "  border: 1px solid #2e5e30;"
+            "  background-color: #1a2e1a;"
+            "  color: #55cc55;"
+            "  border: 1px solid #2e5e2e;"
             "  border-radius: 6px;"
             "  font-size: 12px;"
             "}"
-            "QPushButton:hover { background-color: #223a24; }"
+            "QPushButton:hover { background-color: #203a20; }"
             );
     }
 
-    emit notificationsToggled(m_notificationsEnabled);
+    // Sync Notifications UI (Message Alerts/Sound) to reflect effective state
+    applyNotificationState();
+
+    // DND suppresses notifications; restores them when turned off if global toggle is on
+    emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
 }
