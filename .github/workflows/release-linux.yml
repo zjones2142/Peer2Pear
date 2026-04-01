@@ -149,7 +149,7 @@ jobs:
       # directory in case any port produced a shared object.
       - name: Copy vcpkg shared libraries into AppDir
         run: |
-          vcpkg_lib="Peer2Pear_QtProj/build/vcpkg_installed/x64-linux/lib"
+          vcpkg_lib="Peer2Pear_QtProj/vcpkg_installed/x64-linux/lib"
           if [ -d "$vcpkg_lib" ]; then
             find "$vcpkg_lib" -maxdepth 1 -name "*.so*" \
               -exec cp -P {} AppDir/usr/lib/ \;
@@ -161,13 +161,13 @@ jobs:
       - name: Collect licenses into AppDir
         run: |
           # vcpkg package licenses (share/<pkg>/copyright)
-          share_dir="Peer2Pear_QtProj/build/vcpkg_installed/x64-linux/share"
+          share_dir="Peer2Pear_QtProj/vcpkg_installed/x64-linux/share"
           if [ -d "$share_dir" ]; then
             for pkg_dir in "$share_dir"/*/; do
               copyright="${pkg_dir}copyright"
               if [ -f "$copyright" ]; then
                 pkg_name=$(basename "$pkg_dir")
-                cp "$copyright" "AppDir/usr/share/licenses/${pkg_name}.txt"
+                cp "$copyright" "AppDir/usr/share/licenses/LICENSE_${pkg_name}.txt"
               fi
             done
           fi
