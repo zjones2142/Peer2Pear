@@ -179,6 +179,7 @@ void MainWindow::onExportContacts()
 
     QJsonArray arr;
     for (const auto &c : contacts) {
+        if (c.isBlocked) continue; // never export blocked contacts
         QJsonObject obj;
         obj["name"] = c.name;
         obj["keys"] = QJsonArray::fromStringList(c.keys);
@@ -199,7 +200,7 @@ void MainWindow::onExportContacts()
     file.close();
 
     QMessageBox::information(this, "Export Complete",
-                             QString("Exported %1 contact(s).").arg(contacts.size()));
+                             QString("Exported %1 contact(s).").arg(arr.size()));
 }
 
 void MainWindow::onImportContacts()
