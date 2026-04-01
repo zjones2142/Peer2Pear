@@ -11,6 +11,10 @@
 #include <QLineEdit>
 #include <QToolButton>
 #include <QDebug>
+#include <QFileDialog>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -133,6 +137,10 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onSettingsBackClicked);
     connect(m_settingsPanel, &SettingsPanel::notificationsToggled,
             m_notifier,      &ChatNotifier::setEnabled);
+    connect(m_settingsPanel, &SettingsPanel::exportContactsClicked,
+            this, &MainWindow::onExportContacts);
+    connect(m_settingsPanel, &SettingsPanel::importContactsClicked,
+            this, &MainWindow::onImportContacts);
 
     // ── Resize debounce ───────────────────────────────────────────────────────
     m_resizeDebounce.setSingleShot(true);
@@ -152,3 +160,102 @@ void MainWindow::resizeEvent(QResizeEvent *event)
 
 void MainWindow::onSettingsClicked()    { m_mainStack->setCurrentIndex(1); }
 void MainWindow::onSettingsBackClicked(){ m_mainStack->setCurrentIndex(0); }
+
+void MainWindow::onExportContacts()
+{
+    const QString path = QFileDialog::getSaveFileName(
+        this, "Export Contacts", "peer2pear_contacts.json",
+        "JSON Files (*.json)");
+    if (path.isEmpty()) return;
+
+    const QVector<ChatData> contacts = m_db.loadAllContacts();
+
+    QJsonArray arr;
+    for (const auto &c : contacts) {
+        QJsonObject obj;
+        obj["name"]      = c.name;
+        obj["peerIdB64u"]= c.peerIdB64u;
+        obj["subtitle"]  = c.subtitle;
+        obj["keys"]      = QJsonArray::fromStringList(c.keys);
+        obj["isBlocked"] = c.isBlocked;
+        obj["isGroup"]   = c.isGroup;
+        obj["groupId"]   = c.groupId;
+        arr.append(obj);
+    }
+
+    QJsonObject root;
+    root["version"]  = 1;
+    root["contacts"] = arr;
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        QMessageBox::warning(this, "Export Failed",
+                             "Could not write to:\n" + path);
+        return;
+    }
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    file.close();
+
+    QMessageBox::information(this, "Export Complete",
+                             QString("Exported %1 contact(s).").arg(contacts.size()));
+}
+
+void MainWindow::onImportContacts()
+{
+    const QString path = QFileDialog::getOpenFileName(
+        this, "Import Contacts", QString(),
+        "JSON Files (*.json)");
+    if (path.isEmpty()) return;
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, "Import Failed",
+                             "Could not read:\n" + path);
+        return;
+    }
+
+    QJsonParseError err;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+    file.close();
+
+    if (doc.isNull()) {
+        QMessageBox::warning(this, "Import Failed",
+                             "Invalid JSON:\n" + err.errorString());
+        return;
+    }
+
+    const QJsonObject root = doc.object();
+    const QJsonArray  arr  = root["contacts"].toArray();
+    if (arr.isEmpty()) {
+        QMessageBox::information(this, "Import", "No contacts found in file.");
+        return;
+    }
+
+    int imported = 0;
+    for (const QJsonValue &v : arr) {
+        const QJsonObject obj = v.toObject();
+        const QString peerId = obj["peerIdB64u"].toString();
+        if (peerId.isEmpty()) continue;
+
+        ChatData chat;
+        chat.name       = obj["name"].toString();
+        chat.peerIdB64u = peerId;
+        chat.subtitle   = obj["subtitle"].toString("Secure chat");
+        chat.isBlocked  = obj["isBlocked"].toBool();
+        chat.isGroup    = obj["isGroup"].toBool();
+        chat.groupId    = obj["groupId"].toString();
+
+        const QJsonArray keysArr = obj["keys"].toArray();
+        for (const QJsonValue &k : keysArr)
+            chat.keys.append(k.toString());
+
+        m_db.saveContact(chat);
+        ++imported;
+    }
+
+    // Reload the chat list so newly imported contacts appear
+    if (m_chatView) m_chatView->initChats();
+
+    QMessageBox::information(this, "Import Complete",
+                             QString("Imported %1 contact(s).").arg(imported));
+}

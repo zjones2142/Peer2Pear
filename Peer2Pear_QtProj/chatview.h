@@ -91,8 +91,10 @@ private slots:
     void onEditContact(int index);
     void onAddContact();
 
-private:
+public:
     void initChats();
+
+private:
     void rebuildChatList();
     void loadChat(int index);
     void promoteChatToTop(int index);
