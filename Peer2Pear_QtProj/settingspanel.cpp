@@ -194,8 +194,12 @@ void SettingsPanel::setProfileInfo(const QString &displayName, const QString &pu
     if (m_displayNameLabel)
         m_displayNameLabel->setText(displayName.isEmpty() ? "—" : displayName);
     if (m_publicKeyLabel) {
-        const QString truncated = publicKey.left(16) + (publicKey.length() > 16 ? "…" : "");
-        m_publicKeyLabel->setText(truncated);
+        if (publicKey.isEmpty()) {
+            m_publicKeyLabel->setText("—");
+        } else {
+            const QString truncated = publicKey.left(16) + (publicKey.length() > 16 ? "…" : "");
+            m_publicKeyLabel->setText(truncated);
+        }
     }
 }
 
