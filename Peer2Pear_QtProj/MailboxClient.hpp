@@ -3,6 +3,8 @@
 #include <QNetworkAccessManager>
 #include <QUrl>
 #include <QMap>
+#include <QVector>
+#include <QTimer>
 
 class CryptoEngine;
 
@@ -40,4 +42,21 @@ private:
     // One in-flight fetch per identity — prevents request stacking on a
     // deep queue.  fetch() is re-issued only after the previous one completes.
     QMap<QString, bool>   m_fetchInFlight;
+
+    // ── Retry queue for failed enqueues ──────────────────────────────────────
+    static constexpr int kMaxRetries = 5;
+
+    struct PendingEnvelope {
+        QString    toIdB64u;
+        QByteArray envelopeBytes;
+        qint64     ttlMs;
+        int        retryCount = 0;
+    };
+
+    QVector<PendingEnvelope> m_retryQueue;
+    QTimer                   m_retryTimer;
+    bool                     m_retryInFlight = false;
+
+    void scheduleRetry();
+    void processRetryQueue();
 };

@@ -24,4 +24,5 @@ struct ChatData {
     bool isOnline   = false;
     QString groupId;
     QString avatarData; // base64 PNG received from peer, may be empty
+    QDateTime lastActive; // UTC timestamp of last received message/file
 };

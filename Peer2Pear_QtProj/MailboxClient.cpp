@@ -10,7 +10,11 @@
 #include <QTimer>
 
 MailboxClient::MailboxClient(CryptoEngine* crypto, QObject* parent)
-    : QObject(parent), m_crypto(crypto) {}
+    : QObject(parent), m_crypto(crypto)
+{
+    m_retryTimer.setSingleShot(true);
+    connect(&m_retryTimer, &QTimer::timeout, this, &MailboxClient::processRetryQueue);
+}
 
 void MailboxClient::setBaseUrl(const QUrl& u) { m_base = u; }
 
@@ -26,10 +30,97 @@ void MailboxClient::enqueue(const QString& toIdB64u,
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
 
     auto* rep = m_nam.post(req, envelopeBytes);
-    connect(rep, &QNetworkReply::finished, this, [this, rep]() {
-        if (rep->error() != QNetworkReply::NoError)
-            emit status(QString("mbox enqueue error: %1").arg(rep->errorString()));
-        // No need to log success noise for every chunk
+    connect(rep, &QNetworkReply::finished, this,
+            [this, rep, toIdB64u, envelopeBytes, ttlMs]()
+    {
+        const int http = rep->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+        if (rep->error() == QNetworkReply::NoError) {
+            rep->deleteLater();
+            return;   // success — nothing to do
+        }
+
+        // ── Permanent failures — don't retry ────────────────────────────────
+        if (http == 413) {
+            emit status("Envelope too large for server — chunk rejected.");
+            rep->deleteLater();
+            return;
+        }
+        if (http == 429) {
+            emit status(QString("Recipient mailbox full — some chunks may be delayed."));
+            // Still retry — recipient may fetch and free space
+        }
+
+        // ── Transient failure — queue for retry ─────────────────────────────
+        m_retryQueue.append({ toIdB64u, envelopeBytes, ttlMs, 0 });
+        if (!m_retryTimer.isActive())
+            scheduleRetry();
+
+        if (http != 429)   // 429 already logged above
+            emit status(QString("mbox enqueue error: %1 — will retry").arg(rep->errorString()));
+
+        rep->deleteLater();
+    });
+}
+
+// ── Retry queue with exponential backoff ─────────────────────────────────────
+
+void MailboxClient::scheduleRetry()
+{
+    if (m_retryQueue.isEmpty()) return;
+    // Backoff: 2^retry seconds, capped at 60 s
+    const int attempt = m_retryQueue.first().retryCount;
+    const int delaySec = qMin(1 << attempt, 60);
+    m_retryTimer.start(delaySec * 1000);
+}
+
+void MailboxClient::processRetryQueue()
+{
+    if (m_retryQueue.isEmpty() || m_retryInFlight) return;
+    m_retryInFlight = true;
+
+    PendingEnvelope pe = m_retryQueue.takeFirst();
+
+    QNetworkRequest req(m_base.resolved(QUrl("/mbox/enqueue")));
+    req.setRawHeader("X-To",    pe.toIdB64u.toUtf8());
+    req.setRawHeader("X-TtlMs", QByteArray::number(pe.ttlMs));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+
+    auto* rep = m_nam.post(req, pe.envelopeBytes);
+    connect(rep, &QNetworkReply::finished, this, [this, rep, pe]()
+    {
+        m_retryInFlight = false;
+        const int http = rep->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+        if (rep->error() == QNetworkReply::NoError) {
+            // Success — continue draining the queue
+            rep->deleteLater();
+            if (!m_retryQueue.isEmpty()) scheduleRetry();
+            return;
+        }
+
+        // Permanent: 413 — give up
+        if (http == 413) {
+            emit status("Retry failed: envelope too large (413). Giving up.");
+            rep->deleteLater();
+            if (!m_retryQueue.isEmpty()) scheduleRetry();
+            return;
+        }
+
+        // Still failing — re-queue if under max retries
+        PendingEnvelope next = pe;
+        next.retryCount++;
+        if (next.retryCount < kMaxRetries) {
+            m_retryQueue.prepend(next);
+            scheduleRetry();
+        } else {
+            emit status(QString("Gave up delivering chunk to %1 after %2 retries.")
+                            .arg(pe.toIdB64u.left(8) + "…")
+                            .arg(kMaxRetries));
+        }
+
         rep->deleteLater();
     });
 }
