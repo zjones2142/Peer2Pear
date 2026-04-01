@@ -1,4 +1,5 @@
 #include "settingspanel.h"
+#include "databasemanager.h"
 
 #include <QLabel>
 #include <QVBoxLayout>
@@ -195,6 +196,65 @@ void SettingsPanel::setProfileInfo(const QString &displayName, const QString &pu
     if (m_publicKeyLabel) {
         const QString truncated = publicKey.left(16) + (publicKey.length() > 16 ? "…" : "");
         m_publicKeyLabel->setText(truncated);
+    }
+}
+
+void SettingsPanel::setDatabase(DatabaseManager *db)
+{
+    m_db = db;
+    if (!m_db) return;
+    // Load persisted notification state
+    const QString saved = m_db->loadSetting("notificationsEnabled", "true");
+    m_notificationsEnabled = (saved == "true");
+    applyNotificationState();
+}
+
+void SettingsPanel::applyNotificationState()
+{
+    if (m_notificationsEnabled) {
+        if (m_notifStatusLabel) {
+            m_notifStatusLabel->setText("Enabled");
+            m_notifStatusLabel->setStyleSheet(
+                "color: #4caf50; font-size: 13px; background: transparent; border: none;"
+                );
+        }
+        if (m_notifToggleBtn) {
+            m_notifToggleBtn->setText("Disable");
+            m_notifToggleBtn->setStyleSheet(
+                "QPushButton {"
+                "  background-color: #2e1a1a;"
+                "  color: #cc5555;"
+                "  border: 1px solid #5e2e2e;"
+                "  border-radius: 6px;"
+                "  font-size: 12px;"
+                "}"
+                "QPushButton:hover { background-color: #3a2020; }"
+                );
+        }
+        if (m_messageAlertsLabel) m_messageAlertsLabel->setText("On");
+        if (m_soundLabel)         m_soundLabel->setText("On");
+    } else {
+        if (m_notifStatusLabel) {
+            m_notifStatusLabel->setText("Disabled");
+            m_notifStatusLabel->setStyleSheet(
+                "color: #555555; font-size: 13px; background: transparent; border: none;"
+                );
+        }
+        if (m_notifToggleBtn) {
+            m_notifToggleBtn->setText("Enable");
+            m_notifToggleBtn->setStyleSheet(
+                "QPushButton {"
+                "  background-color: #1a2e1c;"
+                "  color: #5dd868;"
+                "  border: 1px solid #2e5e30;"
+                "  border-radius: 6px;"
+                "  font-size: 12px;"
+                "}"
+                "QPushButton:hover { background-color: #223a24; }"
+                );
+        }
+        if (m_messageAlertsLabel) m_messageAlertsLabel->setText("Off");
+        if (m_soundLabel)         m_soundLabel->setText("Off");
     }
 }
 
@@ -491,15 +551,6 @@ QWidget *SettingsPanel::makeDataSection()
         "color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;"
         );
     cardLayout->addWidget(div);
-    // Store pointer so we can update it when notifications are toggled
-    {
-        QWidget *lastRow = qobject_cast<QWidget*>(cardLayout->itemAt(cardLayout->count()-1)->widget());
-        if (lastRow) {
-            QHBoxLayout *rl = qobject_cast<QHBoxLayout*>(lastRow->layout());
-            if (rl && rl->count() >= 3)
-                m_messageAlertsLabel = qobject_cast<QLabel*>(rl->itemAt(2)->widget());
-        }
-    }
 
     // ── Import row ────────────────────────────────────────────────────────────
     QWidget *importRow = new QWidget();
@@ -540,44 +591,12 @@ QWidget *SettingsPanel::makeDataSection()
 void SettingsPanel::onToggleNotifications()
 {
     m_notificationsEnabled = !m_notificationsEnabled;
+    applyNotificationState();
 
-    if (m_notificationsEnabled) {
-        m_notifStatusLabel->setText("Enabled");
-        m_notifStatusLabel->setStyleSheet(
-            "color: #4caf50; font-size: 13px; background: transparent; border: none;"
-            );
-        m_notifToggleBtn->setText("Disable");
-        m_notifToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #2e1a1a;"
-            "  color: #cc5555;"
-            "  border: 1px solid #5e2e2e;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #3a2020; }"
-            );
-        if (m_messageAlertsLabel) m_messageAlertsLabel->setText("On");
-        if (m_soundLabel)         m_soundLabel->setText("On");
-    } else {
-        m_notifStatusLabel->setText("Disabled");
-        m_notifStatusLabel->setStyleSheet(
-            "color: #555555; font-size: 13px; background: transparent; border: none;"
-            );
-        m_notifToggleBtn->setText("Enable");
-        m_notifToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #1a2e1c;"
-            "  color: #5dd868;"
-            "  border: 1px solid #2e5e30;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #223a24; }"
-            );
-        if (m_messageAlertsLabel) m_messageAlertsLabel->setText("Off");
-        if (m_soundLabel)         m_soundLabel->setText("Off");
-    }
+    // Persist to DB
+    if (m_db)
+        m_db->saveSetting("notificationsEnabled",
+                          m_notificationsEnabled ? "true" : "false");
 
     // DND overrides: if DND is on, keep notifications suppressed regardless
     emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);

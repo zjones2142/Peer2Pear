@@ -97,6 +97,7 @@ MainWindow::MainWindow(QWidget *parent)
     m_settingsPanel = new SettingsPanel(ui->rootWidget);
     m_settingsPanel->setProfileInfo(m_db.loadSetting("displayName"),
                                     m_controller.myIdB64u());
+    m_settingsPanel->setDatabase(&m_db);
     m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
 
     rootLayout->addWidget(m_mainStack);
@@ -143,6 +144,9 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onExportContacts);
     connect(m_settingsPanel, &SettingsPanel::importContactsClicked,
             this, &MainWindow::onImportContacts);
+
+    // Apply persisted notification state to the notifier
+    m_notifier->setEnabled(m_settingsPanel->notificationsEnabled());
 
     // ── Resize debounce ───────────────────────────────────────────────────────
     m_resizeDebounce.setSingleShot(true);

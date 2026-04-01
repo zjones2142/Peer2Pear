@@ -8,6 +8,8 @@
 #include <QHBoxLayout>
 #include <QFrame>
 
+class DatabaseManager;
+
 class SettingsPanel : public QWidget
 {
     Q_OBJECT
@@ -21,6 +23,9 @@ public:
     // Call after construction to populate profile fields
     void setProfileInfo(const QString &displayName, const QString &publicKey);
 
+    // Attach a DatabaseManager for persisting settings, then load saved state
+    void setDatabase(DatabaseManager *db);
+
 signals:
     void backClicked();
     void notificationsToggled(bool enabled);
@@ -33,6 +38,7 @@ private slots:
 
 private:
     void buildUI();
+    void applyNotificationState();   // sync UI labels to m_notificationsEnabled
     QWidget *makeProfileSection();
     QWidget *makeSection(const QString &sectionTitle,
                          const QList<QPair<QString, QString>> &rows);
@@ -43,6 +49,9 @@ private:
     QLabel      *m_displayNameLabel     = nullptr;
     QLabel      *m_publicKeyLabel       = nullptr;
     QString      m_fullPublicKey;
+
+    // Database (not owned)
+    DatabaseManager *m_db               = nullptr;
 
     // Notifications
     bool         m_notificationsEnabled = true;
