@@ -95,6 +95,8 @@ MainWindow::MainWindow(QWidget *parent)
     m_mainStack->addWidget(ui->contentWidget);  // index 0 – chat
 
     m_settingsPanel = new SettingsPanel(ui->rootWidget);
+    m_settingsPanel->setProfileInfo(m_db.loadSetting("displayName"),
+                                    m_controller.myIdB64u());
     m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
 
     rootLayout->addWidget(m_mainStack);
