@@ -27,6 +27,8 @@ protected:
 private slots:
     void onSettingsClicked();
     void onSettingsBackClicked();
+    void onExportContacts();
+    void onImportContacts();
 
 private:
     Ui::MainWindow  *ui;

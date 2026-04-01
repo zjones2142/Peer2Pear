@@ -21,6 +21,8 @@ public:
 signals:
     void backClicked();
     void notificationsToggled(bool enabled);
+    void exportContactsClicked();
+    void importContactsClicked();
 
 private slots:
     void onToggleNotifications();
@@ -30,6 +32,7 @@ private:
     QWidget *makeSection(const QString &sectionTitle,
                          const QList<QPair<QString, QString>> &rows);
     QWidget *makeNotificationsSection();
+    QWidget *makeDataSection();
 
     bool         m_notificationsEnabled = true;
     QPushButton *m_notifToggleBtn       = nullptr;
