@@ -50,6 +50,21 @@ static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, in
     return pm;
 }
 
+// ── Avatar palette ────────────────────────────────────────────────────────────
+// One palette shared by all avatar-rendering sites in this file.
+static const QList<QColor> kAvatarPalette = {
+    QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
+    QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+};
+
+// Returns a stable palette color derived from the contact name.
+// Uses Qt's qHash for a well-distributed, overflow-safe result.
+static QColor avatarColorForName(const QString &name)
+{
+    const uint hash = qHash(name);
+    return kAvatarPalette[hash % static_cast<uint>(kAvatarPalette.size())];
+}
+
 // ── makeCircularPixmap ────────────────────────────────────────────────────────
 static QPixmap makeCircularPixmap(const QPixmap &src, int size)
 {
@@ -67,6 +82,24 @@ static QPixmap makeCircularPixmap(const QPixmap &src, int size)
     p.drawPixmap((size - scaled.width()) / 2, (size - scaled.height()) / 2, scaled);
     p.end();
     return pm;
+}
+
+// ── Last-seen formatter ──────────────────────────────────────────────────────
+static QString formatLastSeen(const QDateTime &utc)
+{
+    if (!utc.isValid()) return "Offline";
+    const QDateTime local = utc.toLocalTime();
+    const QDateTime now   = QDateTime::currentDateTime();
+    const qint64 secsAgo  = local.secsTo(now);
+
+    if (secsAgo <        60) return "Last seen just now";
+    if (secsAgo <      3600) return QString("Last seen %1m ago").arg(secsAgo / 60);
+    if (secsAgo <     86400) return QString("Last seen %1h ago").arg(secsAgo / 3600);
+    if (local.date() == now.date().addDays(-1))
+        return "Last seen yesterday " + local.toString("h:mm AP");
+    if (secsAgo < 7 * 86400)
+        return "Last seen " + local.toString("ddd h:mm AP");
+    return "Last seen " + local.toString("MMM d");
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -631,7 +664,9 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 
             // Update the header if this is the currently selected chat
             if (i == m_currentChat) {
-                const QString statusText = online ? "Online" : "Offline";
+                const QString statusText = online
+                                               ? "Online"
+                                               : formatLastSeen(m_chats[i].lastActive);
                 m_ui->chatSubLabel->setText("● " + statusText);
                 m_ui->chatSubLabel->setStyleSheet(
                     online ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
@@ -683,6 +718,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
 
         Message msg{false, text, timestamp, msgId};
         m_chats[i].messages.append(msg);
+        m_chats[i].lastActive = QDateTime::currentDateTimeUtc();
         if (m_db) { m_db->saveContact(m_chats[i]); m_db->saveMessage(m_chats[i].peerIdB64u, msg); }
 
         if (i == m_currentChat) {
@@ -778,6 +814,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     Message msg{false, text, ts, msgId};
     msg.senderName = senderName;
     chat.messages.append(msg);
+    chat.lastActive = QDateTime::currentDateTimeUtc();
     if (m_db) m_db->saveMessage(chat.groupId.isEmpty() ? "name:"+chat.name : chat.groupId, msg);
 
     if (idx == m_currentChat) {
@@ -878,6 +915,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
         chatIndex = findOrCreateChatForPeer(from);
     }
     if (chatIndex < 0) return;
+    if (m_chats[chatIndex].isBlocked) return;   // drop files from blocked contacts
     const QString key = chatKey(m_chats[chatIndex]);
 
     // Find an existing in-progress record for this transferId, or create one
@@ -910,13 +948,18 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
 
     if (complete) {
         rec->status = FileTransferStatus::Complete;
+        m_chats[chatIndex].lastActive = QDateTime::currentDateTimeUtc();
 
         // Auto-save to Downloads/Peer2Pear/<transferId>/filename
+        // Sanitise filename: strip path separators to prevent directory traversal
+        const QString safeName = QFileInfo(fileName).fileName().isEmpty()
+                                     ? "file"
+                                     : QFileInfo(fileName).fileName();
         const QString saveDir = QStandardPaths::writableLocation(
                                     QStandardPaths::DownloadLocation)
                                 + "/Peer2Pear/" + transferId;
         QDir().mkpath(saveDir);
-        const QString savePath = saveDir + "/" + fileName;
+        const QString savePath = saveDir + "/" + safeName;
         QFile f(savePath);
         bool saved = false;
         if (f.open(QIODevice::WriteOnly)) {
@@ -1777,17 +1820,11 @@ void ChatView::rebuildChatList()
             if (!px.isNull())
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
         } else {
-            static const QList<QColor> kPalette = {
-                QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-                QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
-            };
             const QString &nm = m_chats[i].name;
             const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
-            int hash = 0;
-            for (QChar c : nm) hash += c.unicode();
             const QColor bg = m_chats[i].isGroup
                 ? QColor("#2e8b3a")
-                : kPalette[qAbs(hash) % kPalette.size()];
+                : avatarColorForName(nm);
             avatarLbl->setPixmap(renderInitialsAvatar(ch, bg, 34));
         }
         hl->addWidget(avatarLbl);
@@ -1833,9 +1870,11 @@ void ChatView::loadChat(int index)
     const ChatData &chat = m_chats[index];
     m_ui->chatTitleLabel->setText(chat.name);
 
-    // Show online/offline for DM chats, group subtitle for groups
+    // Show online / last-seen for DM chats, group subtitle for groups
     if (!chat.isGroup) {
-        const QString statusText = chat.isOnline ? "Online" : "Offline";
+        const QString statusText = chat.isOnline
+                                       ? "Online"
+                                       : formatLastSeen(chat.lastActive);
         m_ui->chatSubLabel->setText("● " + statusText);
         m_ui->chatSubLabel->setStyleSheet(
             chat.isOnline
@@ -1859,14 +1898,8 @@ void ChatView::loadChat(int index)
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor("#2e8b3a"), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
-        static const QList<QColor> kPalette = {
-            QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-            QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
-        };
         const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
-        int hash = 0;
-        for (QChar c : chat.name) hash += c.unicode();
-        const QColor bg = kPalette[qAbs(hash) % kPalette.size()];
+        const QColor bg = avatarColorForName(chat.name);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));
         m_ui->chatAvatarLabel->setText("");
     }

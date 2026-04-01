@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QByteArray>
 #include <QVector>
 #include <QDateTime>
 #include <QtSql/QSqlDatabase>
@@ -16,6 +17,10 @@ public:
 
     bool open();
     void close();
+
+    // Set a 32-byte symmetric key for encrypting sensitive fields at rest.
+    // Must be called after open() and before any save/load.
+    void setEncryptionKey(const QByteArray &key32);
 
     QVector<ChatData> loadAllContacts() const;
     void saveContact(const ChatData &chat);
@@ -36,5 +41,10 @@ private:
     void createTables();
     void updateLastActive(const QString &key);
 
+    // Per-field encryption helpers (XChaCha20-Poly1305)
+    QString encryptField(const QString &plaintext) const;
+    QString decryptField(const QString &stored) const;
+
     QSqlDatabase m_db;
+    QByteArray   m_encKey;   // 32-byte key; empty = no encryption
 };

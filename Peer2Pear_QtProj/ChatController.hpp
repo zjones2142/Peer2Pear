@@ -131,9 +131,11 @@ private:
         QByteArray fileHash;  // BLAKE2b-256 of original plaintext (for integrity)
         QString   groupId;    // non-empty if this is a group file transfer
         QString   groupName;
+        qint64    createdSecs = 0; // monotonic creation time for stale-transfer purge
         QMap<int, QByteArray> chunks; // chunkIndex → decrypted chunk data
     };
     QMap<QString, IncomingTransfer> m_incomingTransfers; // transferId → state
+    void purgeStaleTransfers();
 
     // ── Deduplication ─────────────────────────────────────────────────────────
     // Bounded set (capped at 2 000 entries); used for msgId and transferId.
