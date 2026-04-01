@@ -42,11 +42,30 @@ jobs:
 
     permissions:
       contents: write   # Required to create/update GitHub Releases
+      actions: write    # Required for the vcpkg GHA binary cache
+
+    env:
+      # Tell vcpkg to use GitHub Actions' built-in cache as the binary cache
+      # backend.  Packages that haven't changed are restored instead of
+      # recompiled, eliminating the long cold-build penalty on every push.
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
     steps:
       # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Expose GitHub Actions cache credentials to vcpkg so that
+      # VCPKG_BINARY_SOURCES=x-gha can read and write pre-built package
+      # binaries.  This is the same approach used by the Linux workflow.
+      # -----------------------------------------------------------------------
+      - name: Export GitHub Actions cache environment variables for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL',     process.env.ACTIONS_CACHE_URL     || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       # -----------------------------------------------------------------------
       # Set up the MSVC developer environment so that CMake/Ninja can find the
@@ -70,20 +89,19 @@ jobs:
           cache:     true
 
       # -----------------------------------------------------------------------
-      # Clone and bootstrap vcpkg (mirrors what winsetup.bat does locally).
-      # A cached installation is used when the vcpkg commit hash is unchanged.
+      # Clone and bootstrap vcpkg at a pinned commit for reproducible builds.
+      # The commit corresponds to vcpkg tag 2026.03.18; update VCPKG_COMMIT
+      # when you want to pick up newer port versions.
+      # VCPKG_BINARY_SOURCES (set above) caches pre-built package binaries in
+      # the GitHub Actions cache so subsequent runs skip recompilation entirely.
       # -----------------------------------------------------------------------
-      - name: Cache vcpkg packages
-        id: vcpkg-cache
-        uses: actions/cache@v4
-        with:
-          path: Peer2Pear_QtProj/vcpkg_installed
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('Peer2Pear_QtProj/vcpkg.json') }}
-
       - name: Bootstrap vcpkg
         working-directory: Peer2Pear_QtProj
+        env:
+          VCPKG_COMMIT: "c3867e714dd3a51c272826eea77267876517ed99"  # tag: 2026.03.18
         run: |
           git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout "$env:VCPKG_COMMIT"
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
       # -----------------------------------------------------------------------
@@ -157,12 +175,16 @@ jobs:
       # -----------------------------------------------------------------------
       # Create a licenses\ sub-folder inside the staging directory and copy
       # each vcpkg package copyright file there, renamed LICENSE_{pkg}.txt.
+      # Qt license files (always present after jurplel/install-qt-action) are
+      # also copied so the folder is never empty and always appears in the ZIP.
       # -----------------------------------------------------------------------
-      - name: Collect vcpkg licenses into staging
+      - name: Collect licenses into staging
         working-directory: Peer2Pear_QtProj
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path staging\licenses | Out-Null
+
+          # vcpkg package licenses (share\<pkg>\copyright)
           $shareDir = "vcpkg_installed\x64-windows\share"
           if (Test-Path $shareDir) {
             foreach ($pkgDir in Get-ChildItem -Directory $shareDir) {
@@ -171,6 +193,15 @@ jobs:
                 Copy-Item $copyright "staging\licenses\LICENSE_$($pkgDir.Name).txt"
               }
             }
+          }
+
+          # Qt licenses — qmake is in PATH after jurplel/install-qt-action.
+          $qtPrefix = (& qmake -query QT_INSTALL_PREFIX)
+          if ($qtPrefix -and (Test-Path $qtPrefix)) {
+            Get-ChildItem -Path $qtPrefix -Filter "LICENSE*" -File |
+              ForEach-Object {
+                Copy-Item $_.FullName "staging\licenses\Qt_$($_.Name)"
+              }
           }
 
       # -----------------------------------------------------------------------
