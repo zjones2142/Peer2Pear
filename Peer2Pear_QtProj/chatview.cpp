@@ -50,6 +50,21 @@ static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, in
     return pm;
 }
 
+// ── Avatar palette ────────────────────────────────────────────────────────────
+// One palette shared by all avatar-rendering sites in this file.
+static const QList<QColor> kAvatarPalette = {
+    QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
+    QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+};
+
+// Returns a stable palette color derived from the contact name.
+// Uses Qt's qHash for a well-distributed, overflow-safe result.
+static QColor avatarColorForName(const QString &name)
+{
+    const uint hash = qHash(name);
+    return kAvatarPalette[hash % static_cast<uint>(kAvatarPalette.size())];
+}
+
 // ── makeCircularPixmap ────────────────────────────────────────────────────────
 static QPixmap makeCircularPixmap(const QPixmap &src, int size)
 {
@@ -1805,17 +1820,11 @@ void ChatView::rebuildChatList()
             if (!px.isNull())
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
         } else {
-            static const QList<QColor> kPalette = {
-                QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-                QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
-            };
             const QString &nm = m_chats[i].name;
             const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
-            int hash = 0;
-            for (QChar c : nm) hash += c.unicode();
             const QColor bg = m_chats[i].isGroup
                 ? QColor("#2e8b3a")
-                : kPalette[qAbs(hash) % kPalette.size()];
+                : avatarColorForName(nm);
             avatarLbl->setPixmap(renderInitialsAvatar(ch, bg, 34));
         }
         hl->addWidget(avatarLbl);
@@ -1889,14 +1898,8 @@ void ChatView::loadChat(int index)
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor("#2e8b3a"), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
-        static const QList<QColor> kPalette = {
-            QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-            QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
-        };
         const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
-        int hash = 0;
-        for (QChar c : chat.name) hash += c.unicode();
-        const QColor bg = kPalette[qAbs(hash) % kPalette.size()];
+        const QColor bg = avatarColorForName(chat.name);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));
         m_ui->chatAvatarLabel->setText("");
     }
