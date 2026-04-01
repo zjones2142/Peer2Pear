@@ -618,13 +618,13 @@ void SettingsPanel::onToggleDnd()
         m_dndToggleBtn->setText("Disable");
         m_dndToggleBtn->setStyleSheet(
             "QPushButton {"
-            "  background-color: #1a2e1c;"
-            "  color: #5dd868;"
-            "  border: 1px solid #2e5e30;"
+            "  background-color: #2e1a1a;"
+            "  color: #cc5555;"
+            "  border: 1px solid #5e2e2e;"
             "  border-radius: 6px;"
             "  font-size: 12px;"
             "}"
-            "QPushButton:hover { background-color: #223a24; }"
+            "QPushButton:hover { background-color: #3a2020; }"
             );
     } else {
         m_dndStatusLabel->setText("Off");
@@ -634,13 +634,13 @@ void SettingsPanel::onToggleDnd()
         m_dndToggleBtn->setText("Enable");
         m_dndToggleBtn->setStyleSheet(
             "QPushButton {"
-            "  background-color: #2e1a1a;"
-            "  color: #cc5555;"
-            "  border: 1px solid #5e2e2e;"
+            "  background-color: #1a2e1a;"
+            "  color: #55cc55;"
+            "  border: 1px solid #2e5e2e;"
             "  border-radius: 6px;"
             "  font-size: 12px;"
             "}"
-            "QPushButton:hover { background-color: #3a2020; }"
+            "QPushButton:hover { background-color: #203a20; }"
             );
     }
 
