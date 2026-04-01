@@ -961,7 +961,11 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         if (m_chats[i].isGroup) continue;
         if (m_chats[i].peerIdB64u.trimmed() != peerIdB64u) continue;
 
-        const bool firstTime = m_chats[i].avatarData.isEmpty();
+        // First genuine contact = had no avatar and now receiving one
+        const bool firstTime = m_chats[i].avatarData.isEmpty() && !avatarB64.isEmpty();
+
+        // Empty avatarB64 means the sender reset to default — clear so the UI
+        // falls back to initials derived from our locally saved name for them
         m_chats[i].avatarData = avatarB64;
 
         // Persist to DB
@@ -971,8 +975,11 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         if (firstTime && m_db) {
             const QString myName   = m_db->loadSetting("displayName");
             const QString myAvatar = m_db->loadSetting("avatarData");
-            if (!myName.isEmpty())
-                m_controller->sendAvatar(peerIdB64u, myName, myAvatar);
+            if (!myName.isEmpty()) {
+                const QString myAvatarIsPhoto = m_db->loadSetting("avatarIsPhoto");
+                const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
+                m_controller->sendAvatar(peerIdB64u, myName, broadcastAvatar);
+            }
         }
 
         // Rebuild the list so the avatar label updates immediately
@@ -1001,8 +1008,17 @@ void ChatView::onGroupAvatarReceived(const QString &groupId, const QString &avat
 {
     for (int i = 0; i < m_chats.size(); ++i) {
         if (!m_chats[i].isGroup || m_chats[i].groupId != groupId) continue;
+
+        // Only relay and persist if this is actually new to us
+        if (m_chats[i].avatarData == avatarB64) return;
+
         m_chats[i].avatarData = avatarB64;
         if (m_db) m_db->saveContactAvatar(m_chats[i].peerIdB64u, avatarB64);
+
+        // Relay to all group members so stragglers receive it too
+        if (m_controller && !m_chats[i].keys.isEmpty())
+            m_controller->sendGroupAvatar(groupId, avatarB64, m_chats[i].keys);
+
         rebuildChatList();
         if (m_currentChat == i) loadChat(i);
         return;
@@ -1430,11 +1446,13 @@ void ChatView::onEditProfile()
         m_db->saveSetting("profileKeys",  m_profileKeys.join(','));
     }
 
-    // Only broadcast if it's a real photo — contacts generate their own initials fallback
-    if (usingPhoto) {
+    // Broadcast to all contacts. Send empty avatar when using default so the
+    // receiver falls back to initials derived from their own saved name for us.
+    {
+        const QString broadcastAvatar = usingPhoto ? newAvatarB64 : QString();
         for (const ChatData &chat : m_chats) {
             if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
-                m_controller->sendAvatar(chat.peerIdB64u, displayName, newAvatarB64);
+                m_controller->sendAvatar(chat.peerIdB64u, displayName, broadcastAvatar);
         }
     }
 }
@@ -1479,7 +1497,7 @@ void ChatView::onEditContact(int index)
         if (wasGroup) {
             if (name != oldName)
                 m_controller->sendGroupRename(m_chats[index].groupId, name, keys);
-            if (avatar != oldAvatar && !avatar.isEmpty())
+            if (avatar != oldAvatar)
                 m_controller->sendGroupAvatar(m_chats[index].groupId, avatar, keys);
         }
     } else if (result == ContactEditorResult::Removed) {
