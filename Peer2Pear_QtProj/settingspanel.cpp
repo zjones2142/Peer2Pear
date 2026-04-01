@@ -235,8 +235,10 @@ void SettingsPanel::applyNotificationState()
                 "QPushButton:hover { background-color: #3a2020; }"
                 );
         }
-        if (m_messageAlertsLabel) m_messageAlertsLabel->setText("On");
-        if (m_soundLabel)         m_soundLabel->setText("On");
+        // Sub-labels reflect effective state: suppressed when DND is active
+        const bool effective = !m_dndEnabled;
+        if (m_messageAlertsLabel) m_messageAlertsLabel->setText(effective ? "On" : "Off");
+        if (m_soundLabel)         m_soundLabel->setText(effective ? "On" : "Off");
     } else {
         if (m_notifStatusLabel) {
             m_notifStatusLabel->setText("Disabled");
@@ -643,6 +645,9 @@ void SettingsPanel::onToggleDnd()
             "QPushButton:hover { background-color: #203a20; }"
             );
     }
+
+    // Sync Notifications UI (Message Alerts/Sound) to reflect effective state
+    applyNotificationState();
 
     // DND suppresses notifications; restores them when turned off if global toggle is on
     emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
