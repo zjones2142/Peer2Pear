@@ -109,24 +109,79 @@ jobs:
         run: Rename-Item -Path build\Peer2Pear_QtProj.exe -NewName Peer2Pear.exe
 
       # -----------------------------------------------------------------------
+      # Create a clean staging directory that will hold only the files needed
+      # at runtime: the exe, Qt runtime DLLs/plugins, vcpkg dependency DLLs,
+      # and a licenses folder.  This keeps CMake build artifacts, object files,
+      # and any other build-tree noise out of the final ZIP.
+      # -----------------------------------------------------------------------
+      - name: Create staging directory
+        working-directory: Peer2Pear_QtProj
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path staging | Out-Null
+
+      # -----------------------------------------------------------------------
+      # Copy the renamed executable into the staging directory.
+      # -----------------------------------------------------------------------
+      - name: Copy executable to staging
+        working-directory: Peer2Pear_QtProj
+        shell: pwsh
+        run: Copy-Item build\Peer2Pear.exe staging\
+
+      # -----------------------------------------------------------------------
       # Bundle all Qt runtime DLLs next to the executable so the ZIP is
       # self-contained and runnable on a clean Windows machine.
+      # windeployqt is pointed at the staged exe so its output lands directly
+      # in the staging directory instead of the build tree.
       # -----------------------------------------------------------------------
       - name: Deploy Qt runtime (windeployqt)
         working-directory: Peer2Pear_QtProj
         run: |
           windeployqt --release --no-translations `
-            build\Peer2Pear.exe
+            staging\Peer2Pear.exe
 
       # -----------------------------------------------------------------------
-      # Zip the deployed build directory.
+      # Copy vcpkg dependency DLLs (auto-placed in build\ by CMake's
+      # VCPKG_APPLOCAL_DEPS mechanism) into staging.  Because windeployqt was
+      # run against staging\Peer2Pear.exe in the previous step, Qt DLLs were
+      # deployed to staging\ — NOT to build\.  Therefore build\*.dll contains
+      # only the vcpkg runtime DLLs the linker actually required; copying them
+      # to staging ships the minimal set with no Qt duplicates.
+      # -----------------------------------------------------------------------
+      - name: Copy vcpkg dependency DLLs to staging
+        working-directory: Peer2Pear_QtProj
+        shell: pwsh
+        run: |
+          $dlls = Get-ChildItem -Path build -Filter *.dll -File
+          if ($dlls) { $dlls | Copy-Item -Destination staging\ }
+
+      # -----------------------------------------------------------------------
+      # Create a licenses\ sub-folder inside the staging directory and copy
+      # each vcpkg package copyright file there, renamed LICENSE_{pkg}.txt.
+      # -----------------------------------------------------------------------
+      - name: Collect vcpkg licenses into staging
+        working-directory: Peer2Pear_QtProj
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging\licenses | Out-Null
+          $shareDir = "vcpkg_installed\x64-windows\share"
+          if (Test-Path $shareDir) {
+            foreach ($pkgDir in Get-ChildItem -Directory $shareDir) {
+              $copyright = Join-Path $pkgDir.FullName "copyright"
+              if (Test-Path $copyright) {
+                Copy-Item $copyright "staging\licenses\LICENSE_$($pkgDir.Name).txt"
+              }
+            }
+          }
+
+      # -----------------------------------------------------------------------
+      # Zip the clean staging directory (exe + Qt DLLs + vcpkg DLLs + licenses).
       # -----------------------------------------------------------------------
       - name: Package release ZIP
         working-directory: Peer2Pear_QtProj
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path   build\* `
+            -Path   staging\* `
             -DestinationPath ..\Peer2Pear-Release.zip
 
       # -----------------------------------------------------------------------
