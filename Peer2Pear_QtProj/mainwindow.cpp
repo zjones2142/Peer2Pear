@@ -4,6 +4,7 @@
 
 #include <QPixmap>
 #include <QHBoxLayout>
+#include <QSet>
 #include <QStackedWidget>
 #include <QTimer>
 #include <QInputDialog>
@@ -178,14 +179,10 @@ void MainWindow::onExportContacts()
 
     QJsonArray arr;
     for (const auto &c : contacts) {
+        if (c.isBlocked) continue; // never export blocked contacts
         QJsonObject obj;
-        obj["name"]      = c.name;
-        obj["peerIdB64u"]= c.peerIdB64u;
-        obj["subtitle"]  = c.subtitle;
-        obj["keys"]      = QJsonArray::fromStringList(c.keys);
-        obj["isBlocked"] = c.isBlocked;
-        obj["isGroup"]   = c.isGroup;
-        obj["groupId"]   = c.groupId;
+        obj["name"] = c.name;
+        obj["keys"] = QJsonArray::fromStringList(c.keys);
         arr.append(obj);
     }
 
@@ -203,7 +200,7 @@ void MainWindow::onExportContacts()
     file.close();
 
     QMessageBox::information(this, "Export Complete",
-                             QString("Exported %1 contact(s).").arg(contacts.size()));
+                             QString("Exported %1 contact(s).").arg(arr.size()));
 }
 
 void MainWindow::onImportContacts()
@@ -237,25 +234,48 @@ void MainWindow::onImportContacts()
         return;
     }
 
+    // Build a set of existing contact identifiers so we never overwrite them.
+    // Contacts with a real peer ID use that; name-only contacts use "name:<name>".
+    const QVector<ChatData> existing = m_db.loadAllContacts();
+    QSet<QString> existingIds;
+    for (const auto &e : existing) {
+        if (!e.peerIdB64u.isEmpty())
+            existingIds.insert(e.peerIdB64u);
+        else if (!e.name.isEmpty())
+            existingIds.insert(QLatin1String("name:") + e.name);
+    }
+
     int imported = 0;
     for (const QJsonValue &v : arr) {
         const QJsonObject obj = v.toObject();
-        const QString peerId = obj["peerIdB64u"].toString();
-        if (peerId.isEmpty()) continue;
 
         ChatData chat;
-        chat.name       = obj["name"].toString();
-        chat.peerIdB64u = peerId;
-        chat.subtitle   = obj["subtitle"].toString("Secure chat");
-        chat.isBlocked  = obj["isBlocked"].toBool();
-        chat.isGroup    = obj["isGroup"].toBool();
-        chat.groupId    = obj["groupId"].toString();
-
+        chat.name = obj["name"].toString().trimmed();
         const QJsonArray keysArr = obj["keys"].toArray();
         for (const QJsonValue &k : keysArr)
             chat.keys.append(k.toString());
 
+        // Derive peerIdB64u from the first key when available.
+        // In this app the first public key doubles as the peer identifier.
+        if (!chat.keys.isEmpty())
+            chat.peerIdB64u = chat.keys.first();
+
+        // Skip entries with no name and no keys
+        if (chat.name.isEmpty() && chat.keys.isEmpty())
+            continue;
+
+        // Determine the effective storage key (mirrors DatabaseManager::contactKey)
+        const QString effectiveKey = chat.peerIdB64u.isEmpty()
+            ? QLatin1String("name:") + chat.name
+            : chat.peerIdB64u;
+
+        // Skip if the contact already exists — never overwrite
+        if (existingIds.contains(effectiveKey))
+            continue;
+
+        chat.subtitle = "Secure chat";
         m_db.saveContact(chat);
+        existingIds.insert(effectiveKey); // prevent duplicates within the file
         ++imported;
     }
 
