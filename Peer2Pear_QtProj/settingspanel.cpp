@@ -469,13 +469,13 @@ QWidget *SettingsPanel::makeNotificationsSection()
     m_dndToggleBtn->setFixedSize(76, 28);
     m_dndToggleBtn->setStyleSheet(
         "QPushButton {"
-        "  background-color: #2e1a1a;"
-        "  color: #cc5555;"
-        "  border: 1px solid #5e2e2e;"
+        "  background-color: #1a2e1a;"
+        "  color: #55cc55;"
+        "  border: 1px solid #2e5e2e;"
         "  border-radius: 6px;"
         "  font-size: 12px;"
         "}"
-        "QPushButton:hover { background-color: #3a2020; }"
+        "QPushButton:hover { background-color: #203a20; }"
         );
 
     connect(m_dndToggleBtn, &QPushButton::clicked,
