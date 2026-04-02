@@ -20,7 +20,9 @@ public:
 
     // Set a 32-byte symmetric key for encrypting sensitive fields at rest.
     // Must be called after open() and before any save/load.
-    void setEncryptionKey(const QByteArray &key32);
+    // Optionally provide a legacy key for migrating data encrypted with the old key.
+    void setEncryptionKey(const QByteArray &key32,
+                          const QByteArray &legacyKey32 = {});
 
     QVector<ChatData> loadAllContacts() const;
     void saveContact(const ChatData &chat);
@@ -49,5 +51,6 @@ private:
     QString decryptField(const QString &stored) const;
 
     QSqlDatabase m_db;
-    QByteArray   m_encKey;   // 32-byte key; empty = no encryption
+    QByteArray   m_encKey;       // 32-byte key; empty = no encryption
+    QByteArray   m_legacyKey;    // old key for migrating existing encrypted data
 };

@@ -46,10 +46,13 @@ void DatabaseManager::close()
     if (m_db.isOpen()) m_db.close();
 }
 
-void DatabaseManager::setEncryptionKey(const QByteArray &key32)
+void DatabaseManager::setEncryptionKey(const QByteArray &key32,
+                                       const QByteArray &legacyKey32)
 {
     if (key32.size() == crypto_aead_xchacha20poly1305_ietf_KEYBYTES)
         m_encKey = key32;
+    if (legacyKey32.size() == crypto_aead_xchacha20poly1305_ietf_KEYBYTES)
+        m_legacyKey = legacyKey32;
 }
 
 // ── Per-field encryption helpers ─────────────────────────────────────────────
@@ -106,8 +109,25 @@ QString DatabaseManager::decryptField(const QString &stored) const
             blob.size() - nonceLen,
             nullptr, 0,   // no additional data
             reinterpret_cast<const unsigned char*>(blob.constData()),  // nonce
-            reinterpret_cast<const unsigned char*>(m_encKey.constData())) != 0)
+            reinterpret_cast<const unsigned char*>(m_encKey.constData())) != 0) {
+
+        // Try legacy key (old DB key derived from public identity)
+        if (!m_legacyKey.isEmpty()) {
+            ptLen = 0;
+            if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+                    reinterpret_cast<unsigned char*>(pt.data()), &ptLen,
+                    nullptr,
+                    reinterpret_cast<const unsigned char*>(blob.constData()) + nonceLen,
+                    blob.size() - nonceLen,
+                    nullptr, 0,
+                    reinterpret_cast<const unsigned char*>(blob.constData()),
+                    reinterpret_cast<const unsigned char*>(m_legacyKey.constData())) == 0) {
+                pt.resize(int(ptLen));
+                return QString::fromUtf8(pt);
+            }
+        }
         return stored;  // decryption failed — return raw
+    }
 
     pt.resize(int(ptLen));
     return QString::fromUtf8(pt);

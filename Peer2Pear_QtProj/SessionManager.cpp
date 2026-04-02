@@ -199,15 +199,13 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
             return {};
         }
 
+        // Capture ephemeral keypair BEFORE finish() — finish() zeros m_ek
+        QByteArray ephPub  = noise.ephemeralPub();
+        QByteArray ephPriv = noise.ephemeralPriv();
+
         // Complete the handshake
         HandshakeResult hr = noise.finish();
         qDebug() << "[SessionManager] Noise IK handshake complete (responder) for" << senderIdB64u.left(8) + "...";
-
-        // Initialize ratchet session as responder
-        // Use the Noise ephemeral from msg2 as the initial DH ratchet keypair.
-        // The initiator will extract the same pub from noiseMsg2.left(32).
-        QByteArray ephPub  = noise.ephemeralPub();
-        QByteArray ephPriv = noise.ephemeralPriv();
 
         RatchetSession ratchet = RatchetSession::initAsResponder(
             hr.sendCipher.key, ephPub, ephPriv);

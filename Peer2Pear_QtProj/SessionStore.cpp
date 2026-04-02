@@ -144,6 +144,18 @@ void SessionStore::deleteSkippedKeysForPeer(const QString& peerId) {
 }
 
 // ---------------------------
+// Clear all
+// ---------------------------
+
+void SessionStore::clearAll() {
+    QSqlQuery q(m_db);
+    q.exec("DELETE FROM ratchet_sessions;");
+    q.exec("DELETE FROM skipped_message_keys;");
+    q.exec("DELETE FROM pending_handshakes;");
+    qDebug() << "[SessionStore] Cleared all sessions, skipped keys, and pending handshakes";
+}
+
+// ---------------------------
 // Pending handshakes
 // ---------------------------
 
