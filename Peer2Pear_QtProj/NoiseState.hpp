@@ -82,6 +82,11 @@ public:
     // On responder: valid after readMessage1AndWriteMessage2().
     const QByteArray& postMsg1ChainingKey() const { return m_ckAfterMsg1; }
 
+    // Local ephemeral keypair (valid after writeMessage1 / readMessage1AndWriteMessage2).
+    // Used to bootstrap the Double Ratchet with the same DH keys from the handshake.
+    const QByteArray& ephemeralPub()  const { return m_e; }
+    const QByteArray& ephemeralPriv() const { return m_ek; }
+
 private:
     NoiseState() = default;
 

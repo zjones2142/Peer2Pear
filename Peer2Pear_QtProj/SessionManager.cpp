@@ -204,13 +204,11 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         qDebug() << "[SessionManager] Noise IK handshake complete (responder) for" << senderIdB64u.left(8) + "...";
 
         // Initialize ratchet session as responder
-        // Use the responder's Noise ephemeral as the initial DH ratchet key
-        // The initiator's Noise ephemeral (first 32 bytes of msg1) is the remote DH pub
-        QByteArray initiatorEphPub = noiseMsg1.left(32);
+        // Use the Noise ephemeral from msg2 as the initial DH ratchet keypair.
+        // The initiator will extract the same pub from noiseMsg2.left(32).
+        QByteArray ephPub  = noise.ephemeralPub();
+        QByteArray ephPriv = noise.ephemeralPriv();
 
-        // Create ratchet: we are responder, so we use our Noise ephemeral
-        // as our initial DH ratchet keypair
-        auto [ephPub, ephPriv] = CryptoEngine::generateEphemeralX25519();
         RatchetSession ratchet = RatchetSession::initAsResponder(
             hr.sendCipher.key, ephPub, ephPriv);
 
