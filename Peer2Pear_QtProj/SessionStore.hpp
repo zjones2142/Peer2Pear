@@ -32,6 +32,9 @@ public:
     void pruneSkippedKeys(const QString& peerId, int maxCount);
     void deleteSkippedKeysForPeer(const QString& peerId);
 
+    // Clear all sessions, skipped keys, and pending handshakes
+    void clearAll();
+
     // Pending handshakes (survive app restart)
     void savePendingHandshake(const QString& peerId, int role,
                                const QByteArray& handshakeBlob);

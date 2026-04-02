@@ -1,6 +1,7 @@
 #include "RatchetSession.hpp"
 #include "CryptoEngine.hpp"
 #include <sodium.h>
+#include <QDebug>
 #include <QDataStream>
 #include <QIODevice>
 #include <QtEndian>
@@ -109,6 +110,10 @@ RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
     s.m_sendChainKey = sendChain;
     // Receiving chain is empty until we get peer's first DH ratchet message
 
+    qDebug() << "[Ratchet] initAsInitiator: inputRootKey=" << rootKey.left(4).toHex()
+             << "dhPub=" << pub.left(4).toHex()
+             << "remoteDhPub=" << remoteDhPub.left(4).toHex()
+             << "derivedRootKey=" << newRoot.left(4).toHex();
     return s;
 }
 
@@ -121,6 +126,8 @@ RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
     s.m_dhPriv  = localDhPriv;
     // Sending chain is empty until we perform our first DH ratchet
     // Receiving chain will be established when the first message arrives
+    qDebug() << "[Ratchet] initAsResponder: rootKey=" << rootKey.left(4).toHex()
+             << "dhPub=" << localDhPub.left(4).toHex();
     return s;
 }
 
@@ -170,7 +177,10 @@ void RatchetSession::dhRatchetStep(const QByteArray& remoteDhPub) {
 // ---------------------------
 
 QByteArray RatchetSession::encrypt(const QByteArray& plaintext) {
-    if (m_sendChainKey.isEmpty()) return {};
+    if (m_sendChainKey.isEmpty()) {
+        qWarning() << "[Ratchet] encrypt: sendChainKey is empty!";
+        return {};
+    }
 
     auto [newChain, msgKey] = kdfChainKey(m_sendChainKey);
     m_sendChainKey = newChain;
@@ -180,6 +190,10 @@ QByteArray RatchetSession::encrypt(const QByteArray& plaintext) {
     header.dhPub        = m_dhPub;
     header.prevChainLen = m_prevChainLen;
     header.messageNum   = m_sendMsgNum++;
+
+    qDebug() << "[Ratchet] encrypt: msgNum=" << header.messageNum
+             << "dhPub=" << m_dhPub.left(4).toHex()
+             << "rootKey=" << m_rootKey.left(4).toHex();
 
     QByteArray headerBytes = header.serialize();
 
@@ -273,13 +287,25 @@ bool RatchetSession::skipMessageKeys(const QByteArray& dhPub, quint32 until) {
 }
 
 QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
-    if (headerAndCiphertext.size() < RatchetHeader::kSerializedSize) return {};
+    if (headerAndCiphertext.size() < RatchetHeader::kSerializedSize) {
+        qWarning() << "[Ratchet] decrypt: too short" << headerAndCiphertext.size();
+        return {};
+    }
 
     int headerLen = 0;
     RatchetHeader header = RatchetHeader::deserialize(headerAndCiphertext, headerLen);
-    if (headerLen == 0) return {};
+    if (headerLen == 0) {
+        qWarning() << "[Ratchet] decrypt: header deserialize failed";
+        return {};
+    }
 
     QByteArray ciphertext = headerAndCiphertext.mid(headerLen);
+    qDebug() << "[Ratchet] decrypt: msgNum=" << header.messageNum
+             << "prevChain=" << header.prevChainLen
+             << "dhPub=" << header.dhPub.left(4).toHex()
+             << "remoteDhPub=" << m_remoteDhPub.left(4).toHex()
+             << "recvChainEmpty=" << m_recvChainKey.isEmpty()
+             << "rootKey=" << m_rootKey.left(4).toHex();
 
     // Try skipped keys first
     QByteArray skippedResult = trySkippedKeys(header, ciphertext);
@@ -287,10 +313,13 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
 
     // If the DH key changed, perform a DH ratchet step
     if (header.dhPub != m_remoteDhPub) {
+        qDebug() << "[Ratchet] DH key changed — performing ratchet step";
         // Skip any remaining messages in the current receiving chain
         if (!skipMessageKeys(m_remoteDhPub, header.prevChainLen))
             return {};
         dhRatchetStep(header.dhPub);
+        qDebug() << "[Ratchet] after ratchet step: recvChainEmpty=" << m_recvChainKey.isEmpty()
+                 << "rootKey=" << m_rootKey.left(4).toHex();
     }
 
     // Skip ahead in the current chain if needed
