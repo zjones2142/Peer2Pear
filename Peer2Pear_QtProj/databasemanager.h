@@ -37,6 +37,9 @@ public:
     void    saveSetting(const QString &key, const QString &value);
     QString loadSetting(const QString &key, const QString &defaultValue = {}) const;
 
+    // Expose the underlying QSqlDatabase for shared use (e.g., SessionStore)
+    QSqlDatabase database() const { return m_db; }
+
 private:
     void createTables();
     void updateLastActive(const QString &key);

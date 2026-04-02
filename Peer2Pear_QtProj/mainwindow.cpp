@@ -43,9 +43,11 @@ MainWindow::MainWindow(QWidget *parent)
         }
         try {
             m_controller.setPassphrase(pass);
-            // Derive a DB encryption key from identity for at-rest protection
+            // Derive a DB encryption key from the passphrase (secret) for at-rest protection
             m_db.setEncryptionKey(ChatController::blake2b256(
-                m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey")));
+                pass.toUtf8() + QByteArray("peer2pear-dbkey")));
+            // Wire DB to ChatController for Noise/Ratchet session persistence
+            m_controller.setDatabase(m_db.database());
             break;
         } catch (const std::exception &e) {
             QMessageBox::warning(this, "Identity Unlock Failed", e.what());

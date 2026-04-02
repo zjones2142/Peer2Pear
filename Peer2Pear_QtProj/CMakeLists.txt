@@ -70,6 +70,16 @@ set(PROJECT_SOURCES
     NiceConnection.hpp
     onboardingdialog.h
     onboardingdialog.cpp
+    NoiseState.hpp
+    NoiseState.cpp
+    RatchetSession.hpp
+    RatchetSession.cpp
+    SessionStore.hpp
+    SessionStore.cpp
+    SessionManager.hpp
+    SessionManager.cpp
+    SealedEnvelope.hpp
+    SealedEnvelope.cpp
     ${app_icon_resource}
 )
 
@@ -87,6 +97,11 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         NiceConnection.cpp
         onboardingdialog.h
         onboardingdialog.cpp
+        NoiseState.hpp NoiseState.cpp
+        RatchetSession.hpp RatchetSession.cpp
+        SessionStore.hpp SessionStore.cpp
+        SessionManager.hpp SessionManager.cpp
+        SealedEnvelope.hpp SealedEnvelope.cpp
     )
 else()
     if(ANDROID)

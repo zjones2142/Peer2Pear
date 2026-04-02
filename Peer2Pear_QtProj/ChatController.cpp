@@ -24,9 +24,11 @@
 static constexpr qint64 kChunkBytes   = 240LL * 1024;   // 245 760 bytes
 static constexpr qint64 kMaxFileBytes =  25LL * 1024 * 1024;
 
-// Envelope header prefixes
-static const QByteArray kMsgPrefix  = "FROM:";
-static const QByteArray kFilePrefix = "FROMFC:";
+// Envelope header prefixes (legacy + sealed)
+static const QByteArray kMsgPrefix      = "FROM:";
+static const QByteArray kFilePrefix     = "FROMFC:";
+static const QByteArray kSealedPrefix   = "SEALED:";
+static const QByteArray kSealedFCPrefix = "SEALEDFC:";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -87,6 +89,30 @@ void ChatController::setServerBaseUrl(const QUrl& base)
     m_mbox.setBaseUrl(base);
 }
 
+void ChatController::setDatabase(QSqlDatabase db)
+{
+    m_sessionStore = new SessionStore(db);
+    m_sessionMgr   = new SessionManager(m_crypto, *m_sessionStore);
+
+    // When SessionManager needs to send a handshake response, seal it and enqueue
+    m_sessionMgr->setSendResponseFn([this](const QString& peerId, const QByteArray& blob) {
+        // Convert peer's Ed25519 pub to X25519 for sealing
+        QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
+        unsigned char peerCurvePub[32];
+        if (crypto_sign_ed25519_pk_to_curve25519(
+                peerCurvePub,
+                reinterpret_cast<const unsigned char*>(peerEdPub.constData())) != 0) return;
+
+        QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+        QByteArray sealed = SealedEnvelope::seal(
+            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), blob);
+        if (sealed.isEmpty()) return;
+
+        QByteArray env = kSealedPrefix + "\n" + sealed;
+        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+    });
+}
+
 QString ChatController::myIdB64u() const
 {
     return CryptoEngine::toBase64Url(m_crypto.identityPub());
@@ -101,15 +127,45 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
     payload["ts"]    = QDateTime::currentSecsSinceEpoch();
     payload["msgId"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    const QByteArray pt      = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+    // ── Sealed Ratchet path (preferred) ──────────────────────────────────────
+    if (m_sessionMgr) {
+        QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, pt);
+        if (!sessionBlob.isEmpty()) {
+            // Convert peer's Ed25519 pub to X25519 for sealing
+            QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
+            unsigned char peerCurvePub[32];
+            if (crypto_sign_ed25519_pk_to_curve25519(
+                    peerCurvePub,
+                    reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
+
+                QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+                QByteArray sealed = SealedEnvelope::seal(
+                    recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+
+                if (!sealed.isEmpty()) {
+                    if (m_p2pConnections.contains(peerIdB64u) &&
+                        m_p2pConnections[peerIdB64u]->isReady()) {
+                        m_p2pConnections[peerIdB64u]->sendData(kSealedPrefix + "\n" + sealed);
+                    } else {
+                        QByteArray env = kSealedPrefix + "\n" + sealed;
+                        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+                        initiateP2PConnection(peerIdB64u);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Legacy path (fallback) ───────────────────────────────────────────────
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray ct      = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
 
     if (m_p2pConnections.contains(peerIdB64u) && m_p2pConnections[peerIdB64u]->isReady()) {
-        // P2P ready — send directly, skip the mailbox relay
         m_p2pConnections[peerIdB64u]->sendData(ct);
     } else {
-        // No P2P — relay via mailbox and start ICE negotiation
         sendSignalingMessage(peerIdB64u, payload);
         initiateP2PConnection(peerIdB64u);
     }
@@ -331,10 +387,6 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
     for (const QString& peerId : memberPeerIds) {
         if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
 
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
         QJsonObject payload;
         payload["from"]      = myId;
         payload["type"]      = "group_msg";
@@ -345,7 +397,34 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         payload["ts"]        = ts;
         payload["msgId"]     = msgId;
 
-        const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+        // Sealed Ratchet path
+        if (m_sessionMgr) {
+            QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerId, pt);
+            if (!sessionBlob.isEmpty()) {
+                QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
+                unsigned char peerCurvePub[32];
+                if (crypto_sign_ed25519_pk_to_curve25519(
+                        peerCurvePub,
+                        reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
+                    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+                    QByteArray sealed = SealedEnvelope::seal(
+                        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+                    if (!sealed.isEmpty()) {
+                        QByteArray env = kSealedPrefix + "\n" + sealed;
+                        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Legacy fallback
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
         const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
         const QByteArray env = kMsgPrefix + myId.toUtf8() + "\n" + ct;
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
@@ -368,10 +447,6 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         if (peerId.trimmed().isEmpty()) continue;
         if (peerId.trimmed() == myId) continue;
 
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
         QJsonObject payload;
         payload["from"]      = myId;
         payload["type"]      = "group_leave";
@@ -380,10 +455,36 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         payload["members"]   = membersArray;
         payload["ts"]        = ts;
 
-        const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+        // Sealed Ratchet path
+        if (m_sessionMgr) {
+            QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerId, pt);
+            if (!sessionBlob.isEmpty()) {
+                QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
+                unsigned char peerCurvePub[32];
+                if (crypto_sign_ed25519_pk_to_curve25519(
+                        peerCurvePub,
+                        reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
+                    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+                    QByteArray sealed = SealedEnvelope::seal(
+                        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+                    if (!sealed.isEmpty()) {
+                        QByteArray env = kSealedPrefix + "\n" + sealed;
+                        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Legacy fallback
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
         const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
         const QByteArray env = QByteArray("FROM:") + myId.toUtf8() + "\n" + ct;
-
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
     }
 }
@@ -471,16 +572,35 @@ void ChatController::initiateP2PConnection(const QString& peerIdB64u)
 
 void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data)
 {
-    // ── File chunk received over P2P ─────────────────────────────────────────
-    // P2P file chunks arrive in the same wire format as mailbox envelopes:
-    // FROMFC:<senderId>\n<4-byte metaLen><encMeta><encChunk>
-    if (data.startsWith(kFilePrefix)) {
-        // Re-use onEnvelope which already handles the full wire format
+    // ── Sealed envelope over P2P ─────────────────────────────────────────────
+    if (data.startsWith(kSealedPrefix) || data.startsWith(kSealedFCPrefix)) {
         onEnvelope(data, QString());
         return;
     }
 
-    // ── Encrypted JSON message (text, etc.) ──────────────────────────────────
+    // ── File chunk received over P2P (legacy) ────────────────────────────────
+    if (data.startsWith(kFilePrefix)) {
+        onEnvelope(data, QString());
+        return;
+    }
+
+    // ── Try ratchet decrypt first (P2P with session) ─────────────────────────
+    if (m_sessionMgr && m_sessionMgr->hasSession(peerIdB64u)) {
+        // Assume the data is a raw ratchet message (no sealed envelope on P2P)
+        QByteArray pt = m_sessionMgr->decryptFromPeer(peerIdB64u, data);
+        if (!pt.isEmpty()) {
+            const auto o = QJsonDocument::fromJson(pt).object();
+            if (o.value("type").toString() == "text") {
+                const QString msgId = o.value("msgId").toString();
+                if (!msgId.isEmpty() && !markSeen(msgId)) return;
+                emit messageReceived(peerIdB64u, o.value("text").toString(),
+                                     tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
+            }
+            return;
+        }
+    }
+
+    // ── Legacy encrypted JSON message ────────────────────────────────────────
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
     if (pt.isEmpty()) return;
@@ -507,7 +627,67 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     const QByteArray header = body.left(nl);
     const QByteArray rest   = body.mid(nl + 1);
 
-    // ── File chunk envelope ───────────────────────────────────────────────────
+    // ── Sealed sender envelope ───────────────────────────────────────────────
+    if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
+        if (!m_sessionMgr) return; // can't process without session manager
+
+        // Unseal to learn sender identity
+        UnsealResult unsealed = SealedEnvelope::unseal(m_crypto.curvePriv(), rest);
+        if (!unsealed.valid) {
+            qWarning() << "ChatController: failed to unseal envelope";
+            return;
+        }
+
+        QString senderId = CryptoEngine::toBase64Url(unsealed.senderEdPub);
+
+        // Decrypt session layer (Noise handshake or ratchet message)
+        QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
+        if (pt.isEmpty()) {
+            // May be a handshake response with no user payload — that's OK
+            return;
+        }
+
+        // Dispatch based on the decrypted JSON payload
+        // (same logic as legacy message handling below)
+        const auto o = QJsonDocument::fromJson(pt).object();
+        const QString type = o.value("type").toString();
+
+        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        const QDateTime ts = tsFromSecs(tsSecs);
+        const QString msgId = o.value("msgId").toString();
+
+        if (type == "text") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;
+            emit messageReceived(senderId, o.value("text").toString(), ts, msgId);
+        } else if (type == "group_msg") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;
+            QStringList memberKeys;
+            for (const QJsonValue &v : o.value("members").toArray())
+                memberKeys << v.toString();
+            emit groupMessageReceived(senderId, o.value("groupId").toString(),
+                                       o.value("groupName").toString(),
+                                       memberKeys, o.value("text").toString(), ts, msgId);
+        } else if (type == "group_leave") {
+            QStringList memberKeys;
+            for (const QJsonValue &v : o.value("members").toArray())
+                memberKeys << v.toString();
+            emit groupMemberLeft(senderId, o.value("groupId").toString(),
+                                  o.value("groupName").toString(), memberKeys, ts, msgId);
+        } else if (type == "avatar") {
+            emit avatarReceived(senderId, o.value("name").toString(), o.value("avatar").toString());
+        } else if (type == "group_rename") {
+            emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
+        } else if (type == "group_avatar") {
+            emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
+        } else if (type == "file_chunk") {
+            // Sealed file chunk — handle metadata and chunk data from JSON
+            // (for sealed path, the chunk data is embedded in the session payload)
+            // This would require different wire format for sealed files — deferred
+        }
+        return;
+    }
+
+    // ── File chunk envelope (legacy) ─────────────────────────────────────────
     if (header.startsWith(kFilePrefix)) {
         const QString fromId = QString::fromUtf8(header.mid(kFilePrefix.size())).trimmed();
         if (rest.size() < 4) return;

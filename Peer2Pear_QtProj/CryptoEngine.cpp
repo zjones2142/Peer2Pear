@@ -30,15 +30,22 @@ static QByteArray deriveKeyFromPassphrase(const QString& pass, const QByteArray&
     if (salt.size() != SALT_BYTES) return {};
     QByteArray key(KEY_BYTES, 0);
 
-    const QByteArray passUtf8 = pass.toUtf8();
+    QByteArray passUtf8 = pass.toUtf8();
 
     // INTERACTIVE is a good MVP setting; can bump later.
-    if (crypto_pwhash(reinterpret_cast<unsigned char*>(key.data()), KEY_BYTES,
-                      passUtf8.constData(), (unsigned long long)passUtf8.size(),
-                      reinterpret_cast<const unsigned char*>(salt.constData()),
-                      crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                      crypto_pwhash_MEMLIMIT_INTERACTIVE,
-                      crypto_pwhash_ALG_DEFAULT) != 0) {
+    const int rc = crypto_pwhash(
+        reinterpret_cast<unsigned char*>(key.data()), KEY_BYTES,
+        passUtf8.constData(), (unsigned long long)passUtf8.size(),
+        reinterpret_cast<const unsigned char*>(salt.constData()),
+        crypto_pwhash_OPSLIMIT_INTERACTIVE,
+        crypto_pwhash_MEMLIMIT_INTERACTIVE,
+        crypto_pwhash_ALG_DEFAULT);
+
+    // Zero the UTF-8 passphrase copy immediately after Argon2 is done with it
+    CryptoEngine::secureZero(passUtf8);
+
+    if (rc != 0) {
+        CryptoEngine::secureZero(key);
         return {};
     }
     return key;
@@ -93,7 +100,29 @@ CryptoEngine::CryptoEngine() {
     if (sodium_init() < 0) throw std::runtime_error("libsodium init failed");
 }
 
+CryptoEngine::~CryptoEngine() {
+    secureZero(m_passphrase);
+    secureZero(m_edPriv);
+    secureZero(m_curvePriv);
+    // Public keys are not secret, but zero for hygiene
+    secureZero(m_edPub);
+    secureZero(m_curvePub);
+}
+
+void CryptoEngine::secureZero(QByteArray& buf) {
+    if (!buf.isEmpty())
+        sodium_memzero(buf.data(), static_cast<size_t>(buf.size()));
+    buf.clear();
+}
+
+void CryptoEngine::secureZero(QString& str) {
+    if (!str.isEmpty())
+        sodium_memzero(str.data(), static_cast<size_t>(str.size()) * sizeof(QChar));
+    str.clear();
+}
+
 void CryptoEngine::setPassphrase(const QString& pass) {
+    secureZero(m_passphrase);
     m_passphrase = pass;
 }
 
@@ -163,11 +192,13 @@ bool CryptoEngine::loadIdentityFromDisk() {
     const QByteArray nonce = fromBase64Url(enc.value("nonce_b64u").toString());
     const QByteArray ct    = fromBase64Url(enc.value("ct_b64u").toString());
 
-    const QByteArray key32 = deriveKeyFromPassphrase(m_passphrase, salt);
+    QByteArray key32 = deriveKeyFromPassphrase(m_passphrase, salt);
     if (key32.isEmpty())
         return false;
 
     const QByteArray priv = secretboxDecrypt(key32, nonce, ct);
+    secureZero(key32);
+
     if (priv.size() != crypto_sign_SECRETKEYBYTES)
         return false;
 
@@ -189,13 +220,15 @@ bool CryptoEngine::saveIdentityToDisk() const {
     randombytes_buf(salt.data(), SALT_BYTES);
 
     // Derive key
-    const QByteArray key32 = deriveKeyFromPassphrase(m_passphrase, salt);
+    QByteArray key32 = deriveKeyFromPassphrase(m_passphrase, salt);
     if (key32.isEmpty()) return false;
 
     // Encrypt private key
     QByteArray nonce, ct;
     QByteArray dummySalt; // not used; kept signature compatible
-    if (!secretboxEncrypt(key32, m_edPriv, dummySalt, nonce, ct)) return false;
+    const bool ok = secretboxEncrypt(key32, m_edPriv, dummySalt, nonce, ct);
+    secureZero(key32);
+    if (!ok) return false;
 
     QJsonObject enc;
     enc["salt_b64u"]  = toBase64Url(salt);
@@ -232,6 +265,8 @@ void CryptoEngine::deriveCurveKeysFromEd() {
 
     m_curvePub  = QByteArray(reinterpret_cast<const char*>(cpk), sizeof(cpk));
     m_curvePriv = QByteArray(reinterpret_cast<const char*>(csk), sizeof(csk));
+
+    sodium_memzero(csk, sizeof(csk));
 }
 
 void CryptoEngine::ensureIdentity() {
@@ -246,10 +281,11 @@ void CryptoEngine::ensureIdentity() {
             throw std::runtime_error("Identity exists but no passphrase provided");
         }
         if (!loadIdentityFromDisk()) {
-            // Wrong passphrase OR file tampered
+            secureZero(m_passphrase);
             throw std::runtime_error("Failed to decrypt identity (wrong passphrase or corrupted file)");
         }
         deriveCurveKeysFromEd();
+        secureZero(m_passphrase);
         return;
     }
 
@@ -265,12 +301,17 @@ void CryptoEngine::ensureIdentity() {
 
     m_edPub  = QByteArray(reinterpret_cast<const char*>(pk), sizeof(pk));
     m_edPriv = QByteArray(reinterpret_cast<const char*>(sk), sizeof(sk));
+    sodium_memzero(sk, sizeof(sk));
 
     deriveCurveKeysFromEd();
 
     if (!saveIdentityToDisk()) {
+        secureZero(m_passphrase);
         throw std::runtime_error("Failed to save encrypted identity to disk");
     }
+
+    // Passphrase is no longer needed — identity keys are in memory
+    secureZero(m_passphrase);
 }
 
 // ---------------------------
@@ -302,7 +343,9 @@ QByteArray CryptoEngine::deriveSharedKey32(const QByteArray& peerEd25519Pub) con
     unsigned char key[32];
     crypto_generichash(key, sizeof(key), shared, sizeof(shared), nullptr, 0);
     sodium_memzero(shared, sizeof(shared));
-    return QByteArray(reinterpret_cast<const char*>(key), sizeof(key));
+    QByteArray result(reinterpret_cast<const char*>(key), sizeof(key));
+    sodium_memzero(key, sizeof(key));
+    return result;
 }
 
 QByteArray CryptoEngine::aeadEncrypt(const QByteArray& key32,
@@ -360,4 +403,66 @@ QByteArray CryptoEngine::aeadDecrypt(const QByteArray& key32,
 
     out.resize(int(plen));
     return out;
+}
+
+// ---------------------------
+// Ephemeral X25519 keypair
+// ---------------------------
+
+std::pair<QByteArray, QByteArray> CryptoEngine::generateEphemeralX25519() {
+    unsigned char pk[crypto_box_PUBLICKEYBYTES];
+    unsigned char sk[crypto_box_SECRETKEYBYTES];
+    crypto_box_keypair(pk, sk);
+
+    QByteArray pub(reinterpret_cast<const char*>(pk), sizeof(pk));
+    QByteArray priv(reinterpret_cast<const char*>(sk), sizeof(sk));
+    sodium_memzero(sk, sizeof(sk));
+    return { pub, priv };
+}
+
+// ---------------------------
+// HKDF using BLAKE2b
+// ---------------------------
+
+QByteArray CryptoEngine::hkdf(const QByteArray& ikm, const QByteArray& salt,
+                               const QByteArray& info, int outputLen) {
+    if (outputLen <= 0 || outputLen > 64) return {};
+
+    // Extract: PRK = BLAKE2b(key=salt, input=ikm)
+    unsigned char prk[64];
+    const auto* saltPtr = salt.isEmpty() ? nullptr
+                          : reinterpret_cast<const unsigned char*>(salt.constData());
+    const size_t saltLen = salt.isEmpty() ? 0 : static_cast<size_t>(salt.size());
+
+    crypto_generichash(prk, 32,
+                       reinterpret_cast<const unsigned char*>(ikm.constData()),
+                       static_cast<size_t>(ikm.size()),
+                       saltPtr, saltLen);
+
+    // Expand: output = BLAKE2b(key=PRK, input=info || 0x01)
+    QByteArray expand = info + QByteArray(1, 0x01);
+    unsigned char out[64];
+    crypto_generichash(out, static_cast<size_t>(outputLen),
+                       reinterpret_cast<const unsigned char*>(expand.constData()),
+                       static_cast<size_t>(expand.size()),
+                       prk, 32);
+
+    sodium_memzero(prk, sizeof(prk));
+    return QByteArray(reinterpret_cast<const char*>(out), outputLen);
+}
+
+// ---------------------------
+// Signature verification
+// ---------------------------
+
+bool CryptoEngine::verifySignature(const QByteArray& sig, const QByteArray& message,
+                                    const QByteArray& edPub) {
+    if (sig.size() != crypto_sign_BYTES) return false;
+    if (edPub.size() != crypto_sign_PUBLICKEYBYTES) return false;
+
+    return crypto_sign_verify_detached(
+        reinterpret_cast<const unsigned char*>(sig.constData()),
+        reinterpret_cast<const unsigned char*>(message.constData()),
+        static_cast<unsigned long long>(message.size()),
+        reinterpret_cast<const unsigned char*>(edPub.constData())) == 0;
 }

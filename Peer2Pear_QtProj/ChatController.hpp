@@ -9,6 +9,10 @@
 #include "CryptoEngine.hpp"
 #include "MailboxClient.hpp"
 #include "RendezvousClient.hpp"
+#include "SessionManager.hpp"
+#include "SealedEnvelope.hpp"
+
+#include <QtSql/QSqlDatabase>
 
 
 class ChatController : public QObject {
@@ -18,6 +22,7 @@ public:
 
     void setPassphrase(const QString& pass);
     void setServerBaseUrl(const QUrl& base);
+    void setDatabase(QSqlDatabase db);
     QString myIdB64u() const;
 
     // Send encrypted text to a peer
@@ -148,6 +153,10 @@ private:
     CryptoEngine     m_crypto;
     RendezvousClient m_rvz;
     MailboxClient    m_mbox;
+
+    // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
+    SessionStore*    m_sessionStore = nullptr;
+    SessionManager*  m_sessionMgr   = nullptr;
 
     QTimer      m_pollTimer;
     QStringList m_selfKeys;
