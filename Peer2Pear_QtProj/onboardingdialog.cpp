@@ -1,5 +1,6 @@
 #include "onboardingdialog.h"
 
+#include <utility>
 #include <QStackedWidget>
 #include <QLineEdit>
 #include <QLabel>
@@ -231,11 +232,11 @@ void OnboardingDialog::buildStep2()
     swatchRow->addStretch();
 
     const QList<QColor> presets = {
-        QColor("#2e8b3a"),
-        QColor("#3a6bbf"),
-        QColor("#7b3abf"),
-        QColor("#bf7b3a"),
-        QColor("#bf3a3a"),
+        QColor(0x2e, 0x8b, 0x3a),
+        QColor(0x3a, 0x6b, 0xbf),
+        QColor(0x7b, 0x3a, 0xbf),
+        QColor(0xbf, 0x7b, 0x3a),
+        QColor(0xbf, 0x3a, 0x3a),
     };
 
     m_swatchBtns.clear();
@@ -456,7 +457,7 @@ void OnboardingDialog::onPickCustomColor()
     if (col.isValid()) {
         m_selectedSwatch = nullptr; // no swatch selected for custom
         // Deselect all swatches visually
-        for (QPushButton *btn : m_swatchBtns) {
+        for (QPushButton *btn : std::as_const(m_swatchBtns)) {
             QString hex = btn->styleSheet();
             // Extract background color from existing style and rebuild without selection
             // Simpler: just remove white border

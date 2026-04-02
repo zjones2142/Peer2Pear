@@ -107,6 +107,8 @@ void ChatController::setDatabase(QSqlDatabase db)
         QByteArray sealed = SealedEnvelope::seal(
             recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), blob);
         if (sealed.isEmpty()) return;
+        qDebug() << "[ChatController] Sending sealed handshake response to" << peerId.left(8) + "..."
+                 << "via mailbox";
 
         QByteArray env = kSealedPrefix + "\n" + sealed;
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
@@ -147,9 +149,13 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
                 if (!sealed.isEmpty()) {
                     if (m_p2pConnections.contains(peerIdB64u) &&
                         m_p2pConnections[peerIdB64u]->isReady()) {
+                        qDebug() << "[ChatController] sendText -> sealed P2P to" << peerIdB64u.left(8) + "..."
+                                 << "| size:" << sealed.size() << "B";
                         m_p2pConnections[peerIdB64u]->sendData(kSealedPrefix + "\n" + sealed);
                     } else {
                         QByteArray env = kSealedPrefix + "\n" + sealed;
+                        qDebug() << "[ChatController] sendText -> sealed mailbox to" << peerIdB64u.left(8) + "..."
+                                 << "| size:" << env.size() << "B";
                         m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
                         initiateP2PConnection(peerIdB64u);
                     }
@@ -160,6 +166,7 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
     }
 
     // ── Legacy path (fallback) ───────────────────────────────────────────────
+    qDebug() << "[ChatController] sendText -> LEGACY fallback to" << peerIdB64u.left(8) + "...";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray ct      = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
 
@@ -413,6 +420,7 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
                         recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
                     if (!sealed.isEmpty()) {
                         QByteArray env = kSealedPrefix + "\n" + sealed;
+                        qDebug() << "[ChatController] sendGroupMsg -> sealed mailbox to" << peerId.left(8) + "...";
                         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
                         continue;
                     }
@@ -421,6 +429,7 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         }
 
         // Legacy fallback
+        qDebug() << "[ChatController] sendGroupMsg -> LEGACY fallback to" << peerId.left(8) + "...";
         const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
         const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
         if (key32.size() != 32) continue;
@@ -510,7 +519,7 @@ void ChatController::pollOnce()
     // Falls back to single fetch() automatically if the server doesn't yet
     // support /mbox/fetch_all (404/405 response).
     m_mbox.fetchAll(myIdB64u());
-    for (const QString &key : m_selfKeys) {
+    for (const QString &key : std::as_const(m_selfKeys)) {
         if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u()) m_mbox.fetchAll(key.trimmed());
     }
 
@@ -572,8 +581,12 @@ void ChatController::initiateP2PConnection(const QString& peerIdB64u)
 
 void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data)
 {
+    qDebug() << "[ChatController] P2P data received from" << peerIdB64u.left(8) + "..."
+             << "| size:" << data.size() << "B";
+
     // ── Sealed envelope over P2P ─────────────────────────────────────────────
     if (data.startsWith(kSealedPrefix) || data.startsWith(kSealedFCPrefix)) {
+        qDebug() << "[ChatController] P2P -> sealed envelope path";
         onEnvelope(data, QString());
         return;
     }
@@ -586,6 +599,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
 
     // ── Try ratchet decrypt first (P2P with session) ─────────────────────────
     if (m_sessionMgr && m_sessionMgr->hasSession(peerIdB64u)) {
+        qDebug() << "[ChatController] P2P -> attempting raw ratchet decrypt";
         // Assume the data is a raw ratchet message (no sealed envelope on P2P)
         QByteArray pt = m_sessionMgr->decryptFromPeer(peerIdB64u, data);
         if (!pt.isEmpty()) {
@@ -601,6 +615,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     }
 
     // ── Legacy encrypted JSON message ────────────────────────────────────────
+    qDebug() << "[ChatController] P2P -> legacy decrypt fallback";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
     if (pt.isEmpty()) return;
@@ -631,19 +646,24 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
         if (!m_sessionMgr) return; // can't process without session manager
 
+        qDebug() << "[ChatController] Received sealed envelope | size:" << rest.size() << "B";
+
         // Unseal to learn sender identity
         UnsealResult unsealed = SealedEnvelope::unseal(m_crypto.curvePriv(), rest);
         if (!unsealed.valid) {
-            qWarning() << "ChatController: failed to unseal envelope";
+            qWarning() << "[ChatController] Failed to unseal envelope";
             return;
         }
 
         QString senderId = CryptoEngine::toBase64Url(unsealed.senderEdPub);
+        qDebug() << "[ChatController] Unsealed OK | sender:" << senderId.left(8) + "..."
+                 << "| inner:" << unsealed.innerPayload.size() << "B";
 
         // Decrypt session layer (Noise handshake or ratchet message)
         QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
         if (pt.isEmpty()) {
             // May be a handshake response with no user payload — that's OK
+            qDebug() << "[ChatController] Session decrypt returned empty (handshake response or error)";
             return;
         }
 

@@ -17,10 +17,10 @@ void NoiseState::mixHash(const QByteArray& data) {
     // h = BLAKE2b-256(h || data)
     QByteArray combined = m_h + data;
     unsigned char out[32];
-    crypto_generichash(out, 32,
-                       reinterpret_cast<const unsigned char*>(combined.constData()),
-                       static_cast<size_t>(combined.size()),
-                       nullptr, 0);
+    (void)crypto_generichash(out, 32,
+                             reinterpret_cast<const unsigned char*>(combined.constData()),
+                             static_cast<size_t>(combined.size()),
+                             nullptr, 0);
     m_h = QByteArray(reinterpret_cast<const char*>(out), 32);
 }
 
@@ -28,11 +28,11 @@ void NoiseState::mixKey(const QByteArray& ikm) {
     // HKDF(ck, ikm) -> (new_ck, temp_k)
     // Extract: temp = BLAKE2b(key=ck, input=ikm)
     unsigned char temp[64];
-    crypto_generichash(temp, 64,
-                       reinterpret_cast<const unsigned char*>(ikm.constData()),
-                       static_cast<size_t>(ikm.size()),
-                       reinterpret_cast<const unsigned char*>(m_ck.constData()),
-                       static_cast<size_t>(m_ck.size()));
+    (void)crypto_generichash(temp, 64,
+                             reinterpret_cast<const unsigned char*>(ikm.constData()),
+                             static_cast<size_t>(ikm.size()),
+                             reinterpret_cast<const unsigned char*>(m_ck.constData()),
+                             static_cast<size_t>(m_ck.size()));
 
     // Split temp into two 32-byte halves
     m_ck = QByteArray(reinterpret_cast<const char*>(temp), 32);
@@ -120,10 +120,10 @@ void NoiseState::split(CipherState& c1, CipherState& c2) {
     // HKDF(ck, empty) -> (k1, k2)
     unsigned char temp[64];
     QByteArray empty;
-    crypto_generichash(temp, 64,
-                       reinterpret_cast<const unsigned char*>(empty.constData()), 0,
-                       reinterpret_cast<const unsigned char*>(m_ck.constData()),
-                       static_cast<size_t>(m_ck.size()));
+    (void)crypto_generichash(temp, 64,
+                             reinterpret_cast<const unsigned char*>(empty.constData()), 0,
+                             reinterpret_cast<const unsigned char*>(m_ck.constData()),
+                             static_cast<size_t>(m_ck.size()));
 
     c1.key   = QByteArray(reinterpret_cast<const char*>(temp), 32);
     c1.nonce = 0;
@@ -151,10 +151,10 @@ NoiseState NoiseState::createInitiator(const QByteArray& localStaticPub,
         ns.m_h = kProtocolName + QByteArray(32 - kProtocolName.size(), 0);
     } else {
         unsigned char h[32];
-        crypto_generichash(h, 32,
-                           reinterpret_cast<const unsigned char*>(kProtocolName.constData()),
-                           static_cast<size_t>(kProtocolName.size()),
-                           nullptr, 0);
+        (void)crypto_generichash(h, 32,
+                                 reinterpret_cast<const unsigned char*>(kProtocolName.constData()),
+                                 static_cast<size_t>(kProtocolName.size()),
+                                 nullptr, 0);
         ns.m_h = QByteArray(reinterpret_cast<const char*>(h), 32);
     }
     ns.m_ck = ns.m_h;
@@ -177,10 +177,10 @@ NoiseState NoiseState::createResponder(const QByteArray& localStaticPub,
         ns.m_h = kProtocolName + QByteArray(32 - kProtocolName.size(), 0);
     } else {
         unsigned char h[32];
-        crypto_generichash(h, 32,
-                           reinterpret_cast<const unsigned char*>(kProtocolName.constData()),
-                           static_cast<size_t>(kProtocolName.size()),
-                           nullptr, 0);
+        (void)crypto_generichash(h, 32,
+                                 reinterpret_cast<const unsigned char*>(kProtocolName.constData()),
+                                 static_cast<size_t>(kProtocolName.size()),
+                                 nullptr, 0);
         ns.m_h = QByteArray(reinterpret_cast<const char*>(h), 32);
     }
     ns.m_ck = ns.m_h;

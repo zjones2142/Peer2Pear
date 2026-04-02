@@ -258,10 +258,10 @@ void CryptoEngine::deriveCurveKeysFromEd() {
     unsigned char cpk[crypto_box_PUBLICKEYBYTES];
     unsigned char csk[crypto_box_SECRETKEYBYTES];
 
-    crypto_sign_ed25519_pk_to_curve25519(cpk,
-                                         reinterpret_cast<const unsigned char*>(m_edPub.constData()));
-    crypto_sign_ed25519_sk_to_curve25519(csk,
-                                         reinterpret_cast<const unsigned char*>(m_edPriv.constData()));
+    (void)crypto_sign_ed25519_pk_to_curve25519(cpk,
+                                              reinterpret_cast<const unsigned char*>(m_edPub.constData()));
+    (void)crypto_sign_ed25519_sk_to_curve25519(csk,
+                                              reinterpret_cast<const unsigned char*>(m_edPriv.constData()));
 
     m_curvePub  = QByteArray(reinterpret_cast<const char*>(cpk), sizeof(cpk));
     m_curvePriv = QByteArray(reinterpret_cast<const char*>(csk), sizeof(csk));
@@ -297,7 +297,7 @@ void CryptoEngine::ensureIdentity() {
     // First-run: generate new keypair
     unsigned char pk[crypto_sign_PUBLICKEYBYTES];
     unsigned char sk[crypto_sign_SECRETKEYBYTES];
-    crypto_sign_keypair(pk, sk);
+    (void)crypto_sign_keypair(pk, sk);
 
     m_edPub  = QByteArray(reinterpret_cast<const char*>(pk), sizeof(pk));
     m_edPriv = QByteArray(reinterpret_cast<const char*>(sk), sizeof(sk));
@@ -320,10 +320,10 @@ void CryptoEngine::ensureIdentity() {
 
 QString CryptoEngine::signB64u(const QByteArray& msgUtf8) const {
     unsigned char sig[crypto_sign_BYTES];
-    crypto_sign_detached(sig, nullptr,
-                         reinterpret_cast<const unsigned char*>(msgUtf8.constData()),
-                         msgUtf8.size(),
-                         reinterpret_cast<const unsigned char*>(m_edPriv.constData()));
+    (void)crypto_sign_detached(sig, nullptr,
+                              reinterpret_cast<const unsigned char*>(msgUtf8.constData()),
+                              msgUtf8.size(),
+                              reinterpret_cast<const unsigned char*>(m_edPriv.constData()));
     QByteArray s(reinterpret_cast<const char*>(sig), sizeof(sig));
     return toBase64Url(s);
 }
@@ -341,7 +341,10 @@ QByteArray CryptoEngine::deriveSharedKey32(const QByteArray& peerEd25519Pub) con
                           peerCurvePk) != 0) return {};
 
     unsigned char key[32];
-    crypto_generichash(key, sizeof(key), shared, sizeof(shared), nullptr, 0);
+    if (crypto_generichash(key, sizeof(key), shared, sizeof(shared), nullptr, 0) != 0) {
+        sodium_memzero(shared, sizeof(shared));
+        return {};
+    }
     sodium_memzero(shared, sizeof(shared));
     QByteArray result(reinterpret_cast<const char*>(key), sizeof(key));
     sodium_memzero(key, sizeof(key));
@@ -434,18 +437,22 @@ QByteArray CryptoEngine::hkdf(const QByteArray& ikm, const QByteArray& salt,
                           : reinterpret_cast<const unsigned char*>(salt.constData());
     const size_t saltLen = salt.isEmpty() ? 0 : static_cast<size_t>(salt.size());
 
-    crypto_generichash(prk, 32,
-                       reinterpret_cast<const unsigned char*>(ikm.constData()),
-                       static_cast<size_t>(ikm.size()),
-                       saltPtr, saltLen);
+    if (crypto_generichash(prk, 32,
+                           reinterpret_cast<const unsigned char*>(ikm.constData()),
+                           static_cast<size_t>(ikm.size()),
+                           saltPtr, saltLen) != 0)
+        return {};
 
     // Expand: output = BLAKE2b(key=PRK, input=info || 0x01)
     QByteArray expand = info + QByteArray(1, 0x01);
     unsigned char out[64];
-    crypto_generichash(out, static_cast<size_t>(outputLen),
-                       reinterpret_cast<const unsigned char*>(expand.constData()),
-                       static_cast<size_t>(expand.size()),
-                       prk, 32);
+    if (crypto_generichash(out, static_cast<size_t>(outputLen),
+                           reinterpret_cast<const unsigned char*>(expand.constData()),
+                           static_cast<size_t>(expand.size()),
+                           prk, 32) != 0) {
+        sodium_memzero(prk, sizeof(prk));
+        return {};
+    }
 
     sodium_memzero(prk, sizeof(prk));
     return QByteArray(reinterpret_cast<const char*>(out), outputLen);

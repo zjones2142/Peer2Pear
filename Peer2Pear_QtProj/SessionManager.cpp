@@ -55,6 +55,8 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
 
     if (session) {
         // Existing session — normal ratchet encrypt
+        qDebug() << "[SessionManager] Ratchet encrypting for" << peerIdB64u.left(8) + "..."
+                 << "| plaintext:" << plaintext.size() << "B";
         QByteArray ratchetCt = session->encrypt(plaintext);
         if (ratchetCt.isEmpty()) return {};
 
@@ -84,15 +86,20 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
     QByteArray remoteCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
 
     // Create Noise IK initiator
+    qDebug() << "[SessionManager] Initiating Noise IK handshake with" << peerIdB64u.left(8) + "...";
     NoiseState noise = NoiseState::createInitiator(
         m_crypto.curvePub(), m_crypto.curvePriv(), remoteCurvePub);
 
     // Write handshake message 1 (no payload in the handshake itself)
     QByteArray noiseMsg1 = noise.writeMessage1();
-    if (noiseMsg1.isEmpty()) return {};
+    if (noiseMsg1.isEmpty()) {
+        qWarning() << "[SessionManager] Failed to write Noise msg1 for" << peerIdB64u.left(8) + "...";
+        return {};
+    }
 
     // Save the noise state so we can process the response later
     m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, noise.serialize());
+    qDebug() << "[SessionManager] Saved pending handshake (initiator) for" << peerIdB64u.left(8) + "...";
 
     // We can't create a ratchet session yet (need the response),
     // but we can encrypt the payload with a temporary key derived from
@@ -112,7 +119,12 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
         noise.postMsg1ChainingKey(), QByteArray("prekey-salt"), QByteArray("prekey-payload"), 32);
 
     QByteArray encPayload = m_crypto.aeadEncrypt(prekeyKey, plaintext);
-    if (encPayload.isEmpty()) return {};
+    if (encPayload.isEmpty()) {
+        qWarning() << "[SessionManager] Pre-key payload encryption failed for" << peerIdB64u.left(8) + "...";
+        return {};
+    }
+    qDebug() << "[SessionManager] Encrypted pre-key message for" << peerIdB64u.left(8) + "..."
+             << "| noiseMsg1:" << noiseMsg1.size() << "B | payload:" << encPayload.size() << "B";
 
     // [0x01][4-byte noiseMsg1Len][noiseMsg1][encPayload]
     quint32 msg1Len = static_cast<quint32>(noiseMsg1.size());
@@ -141,13 +153,20 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         // Normal ratchet message
         RatchetSession* session = getSession(senderIdB64u);
         if (!session) {
-            qWarning() << "SessionManager: no session for ratchet message from" << senderIdB64u;
+            qWarning() << "[SessionManager] No ratchet session for" << senderIdB64u.left(8) + "...";
             return {};
         }
 
+        qDebug() << "[SessionManager] Decrypting ratchet message from" << senderIdB64u.left(8) + "..."
+                 << "| size:" << blob.size() << "B";
         QByteArray pt = session->decrypt(blob.mid(1));
-        if (pt.isEmpty()) return {};
+        if (pt.isEmpty()) {
+            qWarning() << "[SessionManager] Ratchet decrypt failed from" << senderIdB64u.left(8) + "...";
+            return {};
+        }
 
+        qDebug() << "[SessionManager] Ratchet decrypt OK from" << senderIdB64u.left(8) + "..."
+                 << "| plaintext:" << pt.size() << "B";
         persistSession(senderIdB64u);
         return pt;
     }
@@ -155,6 +174,8 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
     if (msgType == kPreKeyMsg) {
         // Pre-key message: Noise msg1 + encrypted payload
         // We are the responder
+        qDebug() << "[SessionManager] Received pre-key message from" << senderIdB64u.left(8) + "..."
+                 << "| size:" << blob.size() << "B";
 
         if (blob.size() < 5) return {};
         quint32 msg1LenBE;
@@ -166,6 +187,7 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         QByteArray encPayload = blob.mid(5 + static_cast<int>(msg1Len));
 
         // Create Noise responder
+        qDebug() << "[SessionManager] Processing Noise IK handshake (responder) from" << senderIdB64u.left(8) + "...";
         NoiseState noise = NoiseState::createResponder(
             m_crypto.curvePub(), m_crypto.curvePriv());
 
@@ -173,12 +195,13 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         QByteArray noiseMsg2 = noise.readMessage1AndWriteMessage2(
             noiseMsg1, handshakePayload);
         if (noiseMsg2.isEmpty()) {
-            qWarning() << "SessionManager: failed to process Noise msg1 from" << senderIdB64u;
+            qWarning() << "[SessionManager] Failed to process Noise msg1 from" << senderIdB64u.left(8) + "...";
             return {};
         }
 
         // Complete the handshake
         HandshakeResult hr = noise.finish();
+        qDebug() << "[SessionManager] Noise IK handshake complete (responder) for" << senderIdB64u.left(8) + "...";
 
         // Initialize ratchet session as responder
         // Use the responder's Noise ephemeral as the initial DH ratchet key
@@ -193,12 +216,17 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);
+        qDebug() << "[SessionManager] Double Ratchet session initialized (responder) for" << senderIdB64u.left(8) + "...";
 
         // Decrypt the pre-key payload using the Noise chaining key after msg1 (secret)
         // Both sides snapshot m_ck after the same 4 DH ops (e, es, s, ss)
         QByteArray prekeyKey = CryptoEngine::hkdf(
             noise.postMsg1ChainingKey(), QByteArray("prekey-salt"), QByteArray("prekey-payload"), 32);
         QByteArray pt = m_crypto.aeadDecrypt(prekeyKey, encPayload);
+        if (!pt.isEmpty())
+            qDebug() << "[SessionManager] Pre-key payload decrypted OK |" << pt.size() << "B";
+        else
+            qWarning() << "[SessionManager] Pre-key payload decryption FAILED";
 
         // Send back the Noise msg2 as a pre-key response
         if (m_sendResponse) {
@@ -213,6 +241,7 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
             response.append(noiseMsg2);
 
             m_sendResponse(senderIdB64u, response);
+            qDebug() << "[SessionManager] Sent Noise msg2 (pre-key response) to" << senderIdB64u.left(8) + "...";
         }
 
         return pt;
@@ -221,6 +250,7 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
     if (msgType == kPreKeyResponse) {
         // Pre-key response: Noise msg2 from responder
         // We are the initiator — complete the handshake
+        qDebug() << "[SessionManager] Received pre-key response from" << senderIdB64u.left(8) + "...";
 
         if (blob.size() < 5) return {};
         quint32 msg2LenBE;
@@ -234,19 +264,20 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         int role = 0;
         QByteArray hsBlob = m_store.loadPendingHandshake(senderIdB64u, role);
         if (hsBlob.isEmpty() || role != NoiseState::Initiator) {
-            qWarning() << "SessionManager: no pending initiator handshake for" << senderIdB64u;
+            qWarning() << "[SessionManager] No pending initiator handshake for" << senderIdB64u.left(8) + "...";
             return {};
         }
 
         NoiseState noise = NoiseState::deserialize(hsBlob);
         QByteArray responsePayload;
         if (!noise.readMessage2(noiseMsg2, responsePayload)) {
-            qWarning() << "SessionManager: failed to process Noise msg2 from" << senderIdB64u;
+            qWarning() << "[SessionManager] Failed to process Noise msg2 from" << senderIdB64u.left(8) + "...";
             return {};
         }
 
         HandshakeResult hr = noise.finish();
         m_store.deletePendingHandshake(senderIdB64u);
+        qDebug() << "[SessionManager] Noise IK handshake complete (initiator) for" << senderIdB64u.left(8) + "...";
 
         // Initialize ratchet session as initiator
         // The responder's Noise ephemeral (first 32 bytes of msg2) is the remote DH pub
@@ -257,12 +288,13 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);
+        qDebug() << "[SessionManager] Double Ratchet session initialized (initiator) for" << senderIdB64u.left(8) + "...";
 
         // The pre-key response may not carry user payload (it's a handshake completion)
         // Return the response payload if present
         return responsePayload;
     }
 
-    qWarning() << "SessionManager: unknown message type" << msgType;
+    qWarning() << "[SessionManager] Unknown message type" << msgType;
     return {};
 }

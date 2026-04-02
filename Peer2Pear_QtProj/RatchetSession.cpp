@@ -46,11 +46,11 @@ QPair<QByteArray, QByteArray> RatchetSession::kdfRootKey(const QByteArray& rootK
     // HKDF-like: use BLAKE2b keyed hash
     // temp = BLAKE2b-512(key=rootKey, input=dhOutput)
     unsigned char temp[64];
-    crypto_generichash(temp, 64,
-                       reinterpret_cast<const unsigned char*>(dhOutput.constData()),
-                       static_cast<size_t>(dhOutput.size()),
-                       reinterpret_cast<const unsigned char*>(rootKey.constData()),
-                       static_cast<size_t>(rootKey.size()));
+    (void)crypto_generichash(temp, 64,
+                             reinterpret_cast<const unsigned char*>(dhOutput.constData()),
+                             static_cast<size_t>(dhOutput.size()),
+                             reinterpret_cast<const unsigned char*>(rootKey.constData()),
+                             static_cast<size_t>(rootKey.size()));
 
     QByteArray newRootKey(reinterpret_cast<const char*>(temp), 32);
     QByteArray chainKey(reinterpret_cast<const char*>(temp + 32), 32);
@@ -65,12 +65,12 @@ QPair<QByteArray, QByteArray> RatchetSession::kdfChainKey(const QByteArray& chai
     const unsigned char input1 = 0x01;
     const unsigned char input2 = 0x02;
 
-    crypto_generichash(ck, 32, &input1, 1,
-                       reinterpret_cast<const unsigned char*>(chainKey.constData()),
-                       static_cast<size_t>(chainKey.size()));
-    crypto_generichash(mk, 32, &input2, 1,
-                       reinterpret_cast<const unsigned char*>(chainKey.constData()),
-                       static_cast<size_t>(chainKey.size()));
+    (void)crypto_generichash(ck, 32, &input1, 1,
+                             reinterpret_cast<const unsigned char*>(chainKey.constData()),
+                             static_cast<size_t>(chainKey.size()));
+    (void)crypto_generichash(mk, 32, &input2, 1,
+                             reinterpret_cast<const unsigned char*>(chainKey.constData()),
+                             static_cast<size_t>(chainKey.size()));
 
     QByteArray newChain(reinterpret_cast<const char*>(ck), 32);
     QByteArray msgKey(reinterpret_cast<const char*>(mk), 32);

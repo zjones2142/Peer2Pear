@@ -5,6 +5,7 @@
 #include <QtSql/QSqlQuery>
 #include <QtSql/QSqlError>
 #include <QDebug>
+#include <QTimeZone>
 #include <sodium.h>
 
 static QString contactKey(const QString &peerIdB64u, const QString &name)
@@ -196,7 +197,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
         chat.avatarData = decryptField(q.value(7).toString());
         const qint64 laSecs = q.value(8).toLongLong();
         if (laSecs > 0)
-            chat.lastActive = QDateTime::fromSecsSinceEpoch(laSecs, Qt::UTC);
+            chat.lastActive = QDateTime::fromSecsSinceEpoch(laSecs, QTimeZone::utc());
 
         const QString ks = decryptField(q.value(3).toString());
         if (!ks.isEmpty()) chat.keys = ks.split('|', Qt::SkipEmptyParts);
@@ -254,7 +255,7 @@ void DatabaseManager::updateLastActive(const QString &key)
     if (key.isEmpty()) return;
     QSqlQuery q(m_db);
     q.prepare("UPDATE contacts SET last_active=:ts WHERE peer_id=:peer_id;");
-    q.bindValue(":ts",      QDateTime::currentDateTimeUtc().toSecsSinceEpoch());
+    q.bindValue(":ts",      QDateTime::currentSecsSinceEpoch());
     q.bindValue(":peer_id", key);
     if (!q.exec()) qWarning() << "updateLastActive:" << q.lastError().text();
 }
@@ -292,7 +293,7 @@ QVector<Message> DatabaseManager::loadMessages(const QString &peerIdB64u) const
         Message msg;
         msg.sent      = q.value(0).toInt() == 1;
         msg.text      = decryptField(q.value(1).toString());
-        msg.timestamp = QDateTime::fromSecsSinceEpoch(q.value(2).toLongLong(), Qt::UTC).toLocalTime();
+        msg.timestamp = QDateTime::fromSecsSinceEpoch(q.value(2).toLongLong(), QTimeZone::utc()).toLocalTime();
         msg.msgId     = q.value(3).toString();
         msg.senderName = decryptField(q.value(4).toString());
         result.append(msg);
@@ -344,7 +345,7 @@ QVector<FileTransferRecord> DatabaseManager::loadFileRecords(const QString &chat
         rec.fileSize        = q.value(2).toLongLong();
         rec.peerIdB64u      = q.value(3).toString();
         rec.peerName        = decryptField(q.value(4).toString());
-        rec.timestamp       = QDateTime::fromSecsSinceEpoch(q.value(5).toLongLong(), Qt::UTC).toLocalTime();
+        rec.timestamp       = QDateTime::fromSecsSinceEpoch(q.value(5).toLongLong(), QTimeZone::utc()).toLocalTime();
         rec.sent            = q.value(6).toInt() == 1;
         rec.status          = static_cast<FileTransferStatus>(q.value(7).toInt());
         rec.chunksTotal     = q.value(8).toInt();

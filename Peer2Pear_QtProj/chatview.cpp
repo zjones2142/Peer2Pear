@@ -1,6 +1,7 @@
 #include "chatview.h"
 #include "ui_mainwindow.h"
 
+#include <utility>
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -208,7 +209,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             }
             if (px.isNull()) {
                 const QString ch = nameInOut.isEmpty() ? "#" : QString(nameInOut[0]);
-                px = renderInitialsAvatar(ch, QColor("#2e8b3a"), 56);
+                px = renderInitialsAvatar(ch, QColor(0x2e, 0x8b, 0x3a), 56);
             }
             avatarThumb->setPixmap(px);
         };
@@ -601,7 +602,7 @@ void ChatView::startPresencePolling(int intervalMs)
 {
     connect(&m_presenceTimer, &QTimer::timeout, this, [this]() {
         QStringList peerIds;
-        for (const ChatData &c : m_chats) {
+        for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
             for (const QString &k : c.keys)
                 if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
@@ -613,7 +614,7 @@ void ChatView::startPresencePolling(int intervalMs)
     // Immediate first check after a short delay
     QTimer::singleShot(3000, this, [this]() {
         QStringList peerIds;
-        for (const ChatData &c : m_chats) {
+        for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
             for (const QString &k : c.keys)
                 if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
@@ -630,7 +631,7 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 
         bool match = (m_chats[i].peerIdB64u.trimmed() == peerIdB64u);
         if (!match) {
-            for (const QString &k : m_chats[i].keys)
+            for (const QString &k : std::as_const(m_chats[i].keys))
                 if (k.trimmed() == peerIdB64u) { match = true; break; }
         }
         if (!match) continue;
@@ -687,7 +688,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
         if (m_chats[i].isGroup) continue;
 
         bool hit = (m_chats[i].peerIdB64u.trimmed() == from);
-        if (!hit) for (const QString &k : m_chats[i].keys)
+        if (!hit) for (const QString &k : std::as_const(m_chats[i].keys))
                 if (k.trimmed() == from) { hit = true; break; }
         if (!hit) continue;
 
@@ -695,7 +696,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
 
         // UI-side dedup against already-stored messages
         if (!msgId.isEmpty())
-            for (const Message &m : m_chats[i].messages)
+            for (const Message &m : std::as_const(m_chats[i].messages))
                 if (m.msgId == msgId) return;
 
         const bool needsSep = m_chats[i].messages.isEmpty() ||
@@ -781,7 +782,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     if (keysUpdated && m_db)
         m_db->saveContact(chat); // persist the updated key list
     if (!msgId.isEmpty())
-        for (const Message &m : chat.messages)
+        for (const Message &m : std::as_const(chat.messages))
             if (m.msgId == msgId) return;
 
     const bool needsSep = chat.messages.isEmpty() ||
@@ -789,7 +790,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
 
     // Look up sender name from contacts
     QString senderName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
-    for (const ChatData &c : m_chats) {
+    for (const ChatData &c : std::as_const(m_chats)) {
         if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
             senderName = c.name;
             break;
@@ -840,7 +841,7 @@ void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
 
     // Find a display name for the leaver
     QString leaverName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
-    for (const ChatData &c : m_chats) {
+    for (const ChatData &c : std::as_const(m_chats)) {
         if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
             leaverName = c.name;
             break;
@@ -1202,7 +1203,7 @@ void ChatView::onSendMessage()
         m_controller->sendGroupMessageViaMailbox(
             gid, m_chats[m_currentChat].name, m_chats[m_currentChat].keys, text);
     } else {
-        for (const QString &k : m_chats[m_currentChat].keys)
+        for (const QString &k : std::as_const(m_chats[m_currentChat].keys))
             if (!k.trimmed().isEmpty()) m_controller->sendText(k.trimmed(), text);
     }
 }
@@ -1228,7 +1229,7 @@ void ChatView::onEditProfile()
     // ── Avatar state (shared between main dialog and photo popup) ─────────────
     bool usingPhoto = false;
     QPixmap uploadedPhoto;
-    QColor avatarColor("#2e8b3a");
+    QColor avatarColor(0x2e, 0x8b, 0x3a);
 
     const QString currentAvatarB64 = m_db ? m_db->loadSetting("avatarData") : QString();
     if (!currentAvatarB64.isEmpty()) {
@@ -1299,8 +1300,8 @@ void ChatView::onEditProfile()
     poLayout->setSpacing(8);
 
     const QList<QColor> presets = {
-        QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-        QColor("#bf7b3a"), QColor("#bf3a3a"),
+        QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+        QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a),
     };
     auto swatchStyle = [](const QColor &col, bool sel) -> QString {
         return QString("QPushButton{background:%1;border:%2;border-radius:14px;}"
@@ -1387,7 +1388,7 @@ void ChatView::onEditProfile()
     QStringList keys = m_profileKeys;
     const QString myKey = m_controller->myIdB64u();
     if (!myKey.isEmpty() && !keys.contains(myKey)) keys << myKey;
-    for (const QString &k : keys) keyList->addItem(k);
+    for (const QString &k : std::as_const(keys)) keyList->addItem(k);
     root->addWidget(keyList);
 
     auto *keyRow    = new QHBoxLayout;
@@ -1486,7 +1487,7 @@ void ChatView::onEditProfile()
     // receiver falls back to initials derived from their own saved name for us.
     {
         const QString broadcastAvatar = usingPhoto ? newAvatarB64 : QString();
-        for (const ChatData &chat : m_chats) {
+        for (const ChatData &chat : std::as_const(m_chats)) {
             if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
                 m_controller->sendAvatar(chat.peerIdB64u, displayName, broadcastAvatar);
         }
@@ -1644,7 +1645,7 @@ void ChatView::onAddContact()
         auto *gn = new QLineEdit(&gd); gn->setPlaceholderText("Enter group name…");
         gl->addWidget(gn); gl->addWidget(new QLabel("Select Members",&gd));
         auto *ml = new QListWidget(&gd); ml->setFixedHeight(160);
-        for (const ChatData &c : m_chats) {
+        for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
             auto *it = new QListWidgetItem(c.name, ml); it->setCheckState(Qt::Unchecked);
         }
@@ -1662,7 +1663,7 @@ void ChatView::onAddContact()
         QStringList gkeys, mnames;
         for(int i=0;i<ml->count();++i) {
             if(ml->item(i)->checkState()==Qt::Checked)
-                for(const ChatData &c:m_chats)
+                for(const ChatData &c:std::as_const(m_chats))
                     if(c.name==ml->item(i)->text()&&!c.isGroup){
                         gkeys<<c.keys; mnames<<c.name; break; }
         }
@@ -1708,7 +1709,7 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
     for (int i = 0; i < m_chats.size(); ++i) {
         if (m_chats[i].isGroup) continue;
         if (m_chats[i].peerIdB64u.trimmed() == peerIdB64u) return i;
-        for (const QString &k : m_chats[i].keys)
+        for (const QString &k : std::as_const(m_chats[i].keys))
             if (k.trimmed() == peerIdB64u) return i;
     }
     // Unknown sender — auto-create
@@ -1745,7 +1746,7 @@ void ChatView::initChats()
 
     if (m_db) {
         m_chats = m_db->loadAllContacts();
-        for (const auto &c : m_chats) {
+        for (const auto &c : std::as_const(m_chats)) {
             const QString ck = chatKey(c);
             const auto records = m_db->loadFileRecords(ck);
             if (!records.isEmpty())
@@ -1754,7 +1755,7 @@ void ChatView::initChats()
     }
 
     m_ui->chatList->clear();
-    for (const auto &c : m_chats) m_ui->chatList->addItem(c.name);
+    for (const auto &c : std::as_const(m_chats)) m_ui->chatList->addItem(c.name);
 
     if (m_db) {
         const QString sk = m_db->loadSetting("profileKeys");
@@ -1806,15 +1807,15 @@ void ChatView::rebuildChatList()
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
         } else {
             static const QList<QColor> kPalette = {
-                QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-                QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+                QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+                QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
             };
             const QString &nm = m_chats[i].name;
             const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
             int hash = 0;
             for (QChar c : nm) hash += c.unicode();
             const QColor bg = m_chats[i].isGroup
-                ? QColor("#2e8b3a")
+                ? QColor(0x2e, 0x8b, 0x3a)
                 : kPalette[qAbs(hash) % kPalette.size()];
             avatarLbl->setPixmap(renderInitialsAvatar(ch, bg, 34));
         }
@@ -1886,12 +1887,12 @@ void ChatView::loadChat(int index)
         }
     } else if (chat.isGroup) {
         const QString ch = chat.name.isEmpty() ? "#" : QString(chat.name[0]);
-        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor("#2e8b3a"), 44));
+        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor(0x2e, 0x8b, 0x3a), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
         static const QList<QColor> kPalette = {
-            QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-            QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+            QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+            QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
         };
         const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
         int hash = 0;

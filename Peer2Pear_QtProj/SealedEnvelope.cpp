@@ -24,7 +24,7 @@ QByteArray SealedEnvelope::seal(const QByteArray& recipientCurvePub,
 
     // 3. Derive envelope key via BLAKE2b-256
     unsigned char envelopeKey[32];
-    crypto_generichash(envelopeKey, 32, shared, sizeof(shared), nullptr, 0);
+    (void)crypto_generichash(envelopeKey, 32, shared, sizeof(shared), nullptr, 0);
     sodium_memzero(shared, sizeof(shared));
     sodium_memzero(ephPriv.data(), ephPriv.size());
 
@@ -98,7 +98,7 @@ UnsealResult SealedEnvelope::unseal(const QByteArray& recipientCurvePriv,
 
     // 3. Derive envelope key
     unsigned char envelopeKey[32];
-    crypto_generichash(envelopeKey, 32, shared, sizeof(shared), nullptr, 0);
+    (void)crypto_generichash(envelopeKey, 32, shared, sizeof(shared), nullptr, 0);
     sodium_memzero(shared, sizeof(shared));
 
     // 4. AEAD decrypt (AAD = ephemeral public key)
