@@ -36,6 +36,7 @@
 #define crypto_pwhash_OPSLIMIT_INTERACTIVE 2U
 #define crypto_pwhash_MEMLIMIT_INTERACTIVE 67108864U
 #define crypto_pwhash_ALG_ARGON2I13       1
+#define crypto_pwhash_ALG_DEFAULT         crypto_pwhash_ALG_ARGON2I13
 
 #define crypto_generichash_BYTES    32U
 #define crypto_generichash_BYTES_MAX 64U
@@ -196,5 +197,87 @@ inline int crypto_pwhash(unsigned char *out, unsigned long long outlen,
                           int /*alg*/)
 {
     std::memset(out, 0x99, static_cast<size_t>(outlen));
+    return 0;
+}
+
+/* ── base64 encoding / decoding (URL-safe, no padding) ─────────────────── */
+
+#define sodium_base64_VARIANT_URLSAFE_NO_PADDING 7
+
+// Compute the maximum encoded length for base64 (includes NUL terminator)
+#define sodium_base64_ENCODED_LEN(BIN_LEN, VARIANT) \
+    (((BIN_LEN) / 3U) * 4U + (((BIN_LEN) % 3U != 0U) ? 4U : 0U) + 1U)
+
+// Minimal base64url-encode stub (no-padding, URL-safe).
+// Maps '+' → '-', '/' → '_' and strips trailing '='.
+inline char *sodium_bin2base64(char *b64, size_t b64_maxlen,
+                               const unsigned char *bin, size_t bin_len,
+                               int /*variant*/)
+{
+    // Standard base64 alphabet
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789+/";
+    size_t o = 0;
+    size_t i = 0;
+    while (i + 2 < bin_len) {
+        if (o + 4 > b64_maxlen) break;
+        unsigned int v = (unsigned(bin[i]) << 16) | (unsigned(bin[i+1]) << 8) | unsigned(bin[i+2]);
+        b64[o++] = tbl[(v >> 18) & 0x3F];
+        b64[o++] = tbl[(v >> 12) & 0x3F];
+        b64[o++] = tbl[(v >>  6) & 0x3F];
+        b64[o++] = tbl[ v        & 0x3F];
+        i += 3;
+    }
+    if (i < bin_len) {
+        unsigned int v = unsigned(bin[i]) << 16;
+        if (i + 1 < bin_len) v |= unsigned(bin[i+1]) << 8;
+        if (o < b64_maxlen) b64[o++] = tbl[(v >> 18) & 0x3F];
+        if (o < b64_maxlen) b64[o++] = tbl[(v >> 12) & 0x3F];
+        if (i + 1 < bin_len && o < b64_maxlen) b64[o++] = tbl[(v >> 6) & 0x3F];
+    }
+    // Convert to URL-safe: + → -, / → _
+    for (size_t j = 0; j < o; ++j) {
+        if (b64[j] == '+') b64[j] = '-';
+        else if (b64[j] == '/') b64[j] = '_';
+    }
+    if (o < b64_maxlen) b64[o] = '\0';
+    return b64;
+}
+
+// Minimal base64url-decode stub (URL-safe, no padding).
+inline int sodium_base642bin(unsigned char *bin, size_t bin_maxlen,
+                             const char *b64, size_t b64_len,
+                             const char * /*ignore*/, size_t *bin_len,
+                             const char ** /*b64_end*/,
+                             int /*variant*/)
+{
+    // Build decode table
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '-' || c == '+') return 62;
+        if (c == '_' || c == '/') return 63;
+        return -1;
+    };
+
+    size_t o = 0;
+    size_t i = 0;
+    while (i < b64_len) {
+        int a = -1, b2 = -1, c = -1, d = -1;
+        if (i < b64_len) a = val(b64[i++]);
+        if (i < b64_len) b2 = val(b64[i++]);
+        if (i < b64_len) c = val(b64[i++]);
+        if (i < b64_len) d = val(b64[i++]);
+
+        if (a < 0 || b2 < 0) break;
+
+        if (o < bin_maxlen) bin[o++] = static_cast<unsigned char>((a << 2) | (b2 >> 4));
+        if (c >= 0 && o < bin_maxlen) bin[o++] = static_cast<unsigned char>((b2 << 4) | (c >> 2));
+        if (d >= 0 && o < bin_maxlen) bin[o++] = static_cast<unsigned char>((c << 6) | d);
+    }
+    if (bin_len) *bin_len = o;
     return 0;
 }

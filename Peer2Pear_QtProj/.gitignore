@@ -80,6 +80,7 @@ CMakeLists.txt.user*
 .rcc/
 .uic/
 /build*/
+**/build/
 vcpkg/
 vcpkg_installed/
 .vcpkg/

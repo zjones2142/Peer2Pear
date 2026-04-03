@@ -18,6 +18,7 @@
 #include <QtTest/QtTest>
 #include <QTemporaryDir>
 
+#include <sodium.h>
 #include "CryptoEngine.hpp"
 
 /* ═══════════════════════════════════════════════════════════════════════════════

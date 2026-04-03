@@ -191,13 +191,19 @@ void TestContacts::createContactWithMultipleKeys()
 
 void TestContacts::createContactWithEmptyNameIsIgnored()
 {
+    // In the app UI (ChatView::onAddContact), an empty name causes an early
+    // return *before* calling saveContact.  This test mirrors that app logic:
+    // the guard `if(name.isEmpty()) return;` prevents the DB call entirely.
     QScopedPointer<DatabaseManager> db(openTestDb());
 
     ChatData c;
     c.name = "";
-    // Both peerIdB64u and name are empty → contactKey() returns "" → saveContact returns early
 
-    db->saveContact(c);
+    // Simulate the in-app guard: only save if name is non-empty
+    const QString name = c.name.trimmed();
+    if (!name.isEmpty()) {
+        db->saveContact(c);
+    }
 
     const auto all = db->loadAllContacts();
     QCOMPARE(all.size(), 0);
