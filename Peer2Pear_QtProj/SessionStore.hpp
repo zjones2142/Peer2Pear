@@ -20,7 +20,10 @@
 class SessionStore {
 public:
     // storeKey must be exactly 32 bytes to enable at-rest encryption.
-    // Pass an empty QByteArray to disable (legacy/unencrypted mode).
+    // If storeKey is not 32 bytes, encryptBlob/decryptBlob return {} (fail-safe):
+    // save operations will be no-ops and load operations will return nothing,
+    // so sessions will simply be re-established. In practice ChatController
+    // always derives and passes a valid 32-byte key.
     explicit SessionStore(QSqlDatabase db, QByteArray storeKey = {});
     ~SessionStore();
 

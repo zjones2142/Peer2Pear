@@ -80,7 +80,7 @@ QByteArray SessionStore::encryptBlob(const QByteArray& plaintext) const {
 QByteArray SessionStore::decryptBlob(const QByteArray& ciphertext) const {
     const int kMinSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
                          crypto_aead_xchacha20poly1305_ietf_ABYTES;
-    if (m_storeKey.size() != 32) return {};  // no key — treat as invalid
+    if (m_storeKey.size() != 32) return {};  // no valid key — fail safe
     if (ciphertext.size() < kMinSize) return {};   // too short — treat as invalid
 
     const unsigned char* nonce =
