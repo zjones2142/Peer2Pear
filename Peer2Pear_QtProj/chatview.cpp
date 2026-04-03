@@ -1827,9 +1827,10 @@ void ChatView::rebuildChatList()
             };
             const QString &nm = m_chats[i].name;
             const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
+            const uint hash = qHash(nm);
             const QColor bg = m_chats[i].isGroup
                 ? QColor(0x2e, 0x8b, 0x3a)
-                : kPalette[qAbs(hash) % kPalette.size()];
+                : kPalette[hash % static_cast<uint>(kPalette.size())];
             avatarLbl->setPixmap(renderInitialsAvatar(ch, bg, 34));
         }
         hl->addWidget(avatarLbl);
