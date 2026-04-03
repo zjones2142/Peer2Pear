@@ -9,6 +9,11 @@
 #include "CryptoEngine.hpp"
 #include "MailboxClient.hpp"
 #include "RendezvousClient.hpp"
+#include "SessionManager.hpp"
+#include "SealedEnvelope.hpp"
+#include "FileTransferManager.hpp"
+
+#include <QtSql/QSqlDatabase>
 
 
 class ChatController : public QObject {
@@ -18,21 +23,19 @@ public:
 
     void setPassphrase(const QString& pass);
     void setServerBaseUrl(const QUrl& base);
+    void setDatabase(QSqlDatabase db);
     QString myIdB64u() const;
 
     // Send encrypted text to a peer
     void sendText(const QString& peerIdB64u, const QString& text);
 
-    // Send an encrypted file, split into ≤ 256 KB chunks.
+    // Send an encrypted file via FileTransferManager.
     // Returns the transferId on success or an empty string on failure.
-    // The transferId is guaranteed to match the one embedded in every chunk
-    // envelope, so the caller can build a local FileTransferRecord immediately.
     QString sendFile(const QString& peerIdB64u,
                      const QString& fileName,
                      const QByteArray& fileData);
 
     // Send an encrypted file to every member of a group chat.
-    // Returns the transferId (shared across all recipients) or empty on failure.
     QString sendGroupFile(const QString& groupId,
                           const QString& groupName,
                           const QStringList& memberPeerIds,
@@ -40,10 +43,12 @@ public:
                           const QByteArray& fileData);
 
     // Maximum allowed file size in bytes (25 MB).
-    static constexpr qint64 maxFileBytes() { return 25LL * 1024 * 1024; }
+    static constexpr qint64 maxFileBytes() { return FileTransferManager::kMaxFileBytes; }
 
     // Compute BLAKE2b-256 hash of data (used for integrity checks).
-    static QByteArray blake2b256(const QByteArray& data);
+    static QByteArray blake2b256(const QByteArray& data) { return FileTransferManager::blake2b256(data); }
+
+    FileTransferManager& fileTransferMgr() { return m_fileMgr; }
 
     void startPolling(int intervalMs = 2000);
     void stopPolling();
@@ -116,27 +121,6 @@ private:
     void sendSignalingMessage(const QString& peerIdB64u, const QJsonObject& payload);
     void initiateP2PConnection(const QString& peerIdB64u);
 
-    // Send a single file chunk envelope: tries P2P first, falls back to mailbox.
-    void sendFileChunkEnvelope(const QString& peerIdB64u,
-                               const QByteArray& key32,
-                               const QByteArray& env);
-
-    // ── Incoming chunk reassembly ─────────────────────────────────────────────
-    struct IncomingTransfer {
-        QString   fromId;
-        QString   fileName;
-        qint64    fileSize    = 0;
-        int       totalChunks = 0;
-        QDateTime ts;
-        QByteArray fileHash;  // BLAKE2b-256 of original plaintext (for integrity)
-        QString   groupId;    // non-empty if this is a group file transfer
-        QString   groupName;
-        qint64    createdSecs = 0; // monotonic creation time for stale-transfer purge
-        QMap<int, QByteArray> chunks; // chunkIndex → decrypted chunk data
-    };
-    QMap<QString, IncomingTransfer> m_incomingTransfers; // transferId → state
-    void purgeStaleTransfers();
-
     // ── Deduplication ─────────────────────────────────────────────────────────
     // Bounded set (capped at 2 000 entries); used for msgId and transferId.
     // Per-chunk dedup uses a separate key: "<transferId>:<chunkIndex>".
@@ -145,9 +129,14 @@ private:
     QVector<QString> m_seenOrder;
     bool markSeen(const QString& id); // true = first time; false = duplicate
 
-    CryptoEngine     m_crypto;
-    RendezvousClient m_rvz;
-    MailboxClient    m_mbox;
+    CryptoEngine         m_crypto;
+    RendezvousClient     m_rvz;
+    MailboxClient        m_mbox;
+    FileTransferManager  m_fileMgr;
+
+    // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
+    SessionStore*    m_sessionStore = nullptr;
+    SessionManager*  m_sessionMgr   = nullptr;
 
     QTimer      m_pollTimer;
     QStringList m_selfKeys;

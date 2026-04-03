@@ -44,9 +44,19 @@ MainWindow::MainWindow(QWidget *parent)
         }
         try {
             m_controller.setPassphrase(pass);
-            // Derive a DB encryption key from identity for at-rest protection
-            m_db.setEncryptionKey(ChatController::blake2b256(
-                m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey")));
+            // Derive a DB encryption key from the passphrase (secret) for at-rest protection.
+            // Also provide the old key (derived from public ID) so existing encrypted
+            // messages can still be read during migration.
+            QByteArray newKey = ChatController::blake2b256(
+                pass.toUtf8() + QByteArray("peer2pear-dbkey"));
+            QByteArray legacyKey = ChatController::blake2b256(
+                m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey"));
+            m_db.setEncryptionKey(newKey, legacyKey);
+            CryptoEngine::secureZero(newKey);
+            CryptoEngine::secureZero(legacyKey);
+            // Wire DB to ChatController for Noise/Ratchet session persistence
+            m_controller.setDatabase(m_db.database());
+            CryptoEngine::secureZero(pass);
             break;
         } catch (const std::exception &e) {
             QMessageBox::warning(this, "Identity Unlock Failed", e.what());

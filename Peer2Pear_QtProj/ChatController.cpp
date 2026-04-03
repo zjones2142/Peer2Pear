@@ -5,48 +5,16 @@
 #include <QDateTime>
 #include <QTimeZone>
 #include <QUuid>
+#include <QtSql/QSqlQuery>
 #include <sodium.h>
 
-// ── Chunk size ────────────────────────────────────────────────────────────────
-// The server enforces MAX_ENVELOPE_BYTES = 256 KB (262 144 bytes).
-//
-// Per-envelope overhead budget:
-//   "FROMFC:<43-char-key>\n"          =  51 bytes  (header)
-//   4-byte big-endian metaLen field   =   4 bytes
-//   encMeta (JSON ~250 B + AEAD 40 B) = ~290 bytes
-//   encChunk AEAD overhead            =  40 bytes
-//   ─────────────────────────────────────────────
-//   Total fixed overhead              = ~385 bytes
-//
-// Max plaintext chunk = 262 144 - 385 = ~261 759 bytes.
-// We use 240 KB = 245 760 bytes for a comfortable margin.
-// A 25 MB file therefore travels in at most ceil(25600 / 240) = 107 chunks.
-static constexpr qint64 kChunkBytes   = 240LL * 1024;   // 245 760 bytes
-static constexpr qint64 kMaxFileBytes =  25LL * 1024 * 1024;
-
-// Envelope header prefixes
-static const QByteArray kMsgPrefix  = "FROM:";
-static const QByteArray kFilePrefix = "FROMFC:";
+// Envelope header prefixes (legacy + sealed)
+static const QByteArray kMsgPrefix      = "FROM:";
+static const QByteArray kFilePrefix     = "FROMFC:";
+static const QByteArray kSealedPrefix   = "SEALED:";
+static const QByteArray kSealedFCPrefix = "SEALEDFC:";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-static QByteArray pack32(quint32 v)
-{
-    QByteArray b(4, 0);
-    b[0] = char((v >> 24) & 0xFF);
-    b[1] = char((v >> 16) & 0xFF);
-    b[2] = char((v >>  8) & 0xFF);
-    b[3] = char( v        & 0xFF);
-    return b;
-}
-
-static quint32 unpack32(const QByteArray &b, int offset = 0)
-{
-    return (quint8(b[offset])   << 24)
-    | (quint8(b[offset+1]) << 16)
-        | (quint8(b[offset+2]) <<  8)
-        |  quint8(b[offset+3]);
-}
 
 static QDateTime tsFromSecs(qint64 secs)
 {
@@ -61,12 +29,20 @@ ChatController::ChatController(QObject* parent)
     : QObject(parent)
     , m_rvz(&m_crypto, this)
     , m_mbox(&m_crypto, this)
+    , m_fileMgr(m_crypto, m_mbox, this)
 {
     connect(&m_mbox, &MailboxClient::status,           this, &ChatController::status);
     connect(&m_rvz,  &RendezvousClient::status,        this, &ChatController::status);
     connect(&m_mbox, &MailboxClient::envelopeReceived, this, &ChatController::onEnvelope);
     connect(&m_pollTimer, &QTimer::timeout,            this, &ChatController::pollOnce);
     connect(&m_rvz,  &RendezvousClient::presenceResult, this, &ChatController::presenceChanged);
+
+    // Forward FileTransferManager signals
+    connect(&m_fileMgr, &FileTransferManager::status, this, &ChatController::status);
+    connect(&m_fileMgr, &FileTransferManager::fileChunkReceived,
+            this, &ChatController::fileChunkReceived);
+    connect(&m_fileMgr, &FileTransferManager::wantP2PConnection,
+            this, &ChatController::initiateP2PConnection);
 
     // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
     connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
@@ -87,6 +63,50 @@ void ChatController::setServerBaseUrl(const QUrl& base)
     m_mbox.setBaseUrl(base);
 }
 
+void ChatController::setDatabase(QSqlDatabase db)
+{
+    // Derive a 32-byte at-rest encryption key from the identity curve private key.
+    // This key never leaves memory and is tied to the user's unlocked identity.
+    QByteArray storeKey = CryptoEngine::hkdf(
+        m_crypto.curvePriv(), {}, "session-store-at-rest", 32);
+    m_sessionStore = new SessionStore(db, storeKey);
+    CryptoEngine::secureZero(storeKey);
+
+    // One-time migration: clear sessions created with the buggy ratchet init
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT value FROM settings WHERE key='ratchet_v5_cleared';");
+        if (!q.exec() || !q.next()) {
+            m_sessionStore->clearAll();
+            QSqlQuery ins(db);
+            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v5_cleared','1');");
+            ins.exec();
+        }
+    }
+
+    m_sessionMgr = new SessionManager(m_crypto, *m_sessionStore);
+
+    // When SessionManager needs to send a handshake response, seal it and enqueue
+    m_sessionMgr->setSendResponseFn([this](const QString& peerId, const QByteArray& blob) {
+        // Convert peer's Ed25519 pub to X25519 for sealing
+        QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
+        unsigned char peerCurvePub[32];
+        if (crypto_sign_ed25519_pk_to_curve25519(
+                peerCurvePub,
+                reinterpret_cast<const unsigned char*>(peerEdPub.constData())) != 0) return;
+
+        QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+        QByteArray sealed = SealedEnvelope::seal(
+            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), blob);
+        if (sealed.isEmpty()) return;
+        qDebug() << "[ChatController] Sending sealed handshake response to" << peerId.left(8) + "..."
+                 << "via mailbox";
+
+        QByteArray env = kSealedPrefix + "\n" + sealed;
+        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+    });
+}
+
 QString ChatController::myIdB64u() const
 {
     return CryptoEngine::toBase64Url(m_crypto.identityPub());
@@ -101,15 +121,50 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
     payload["ts"]    = QDateTime::currentSecsSinceEpoch();
     payload["msgId"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    const QByteArray pt      = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+    // ── Sealed Ratchet path (preferred) ──────────────────────────────────────
+    if (m_sessionMgr) {
+        QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, pt);
+        if (!sessionBlob.isEmpty()) {
+            // Convert peer's Ed25519 pub to X25519 for sealing
+            QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
+            unsigned char peerCurvePub[32];
+            if (crypto_sign_ed25519_pk_to_curve25519(
+                    peerCurvePub,
+                    reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
+
+                QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+                QByteArray sealed = SealedEnvelope::seal(
+                    recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+
+                if (!sealed.isEmpty()) {
+                    if (m_p2pConnections.contains(peerIdB64u) &&
+                        m_p2pConnections[peerIdB64u]->isReady()) {
+                        qDebug() << "[ChatController] sendText -> sealed P2P to" << peerIdB64u.left(8) + "..."
+                                 << "| size:" << sealed.size() << "B";
+                        m_p2pConnections[peerIdB64u]->sendData(kSealedPrefix + "\n" + sealed);
+                    } else {
+                        QByteArray env = kSealedPrefix + "\n" + sealed;
+                        qDebug() << "[ChatController] sendText -> sealed mailbox to" << peerIdB64u.left(8) + "..."
+                                 << "| size:" << env.size() << "B";
+                        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+                        initiateP2PConnection(peerIdB64u);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Legacy path (fallback) ───────────────────────────────────────────────
+    qDebug() << "[ChatController] sendText -> LEGACY fallback to" << peerIdB64u.left(8) + "...";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray ct      = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
 
     if (m_p2pConnections.contains(peerIdB64u) && m_p2pConnections[peerIdB64u]->isReady()) {
-        // P2P ready — send directly, skip the mailbox relay
         m_p2pConnections[peerIdB64u]->sendData(ct);
     } else {
-        // No P2P — relay via mailbox and start ICE negotiation
         sendSignalingMessage(peerIdB64u, payload);
         initiateP2PConnection(peerIdB64u);
     }
@@ -127,97 +182,13 @@ void ChatController::sendAvatar(const QString& peerIdB64u,
     sendSignalingMessage(peerIdB64u, payload);
 }
 
-// ── BLAKE2b-256 hash ─────────────────────────────────────────────────────────
-
-QByteArray ChatController::blake2b256(const QByteArray& data)
-{
-    QByteArray hash(32, 0);
-    crypto_generichash(reinterpret_cast<unsigned char*>(hash.data()), 32,
-                       reinterpret_cast<const unsigned char*>(data.constData()),
-                       static_cast<unsigned long long>(data.size()),
-                       nullptr, 0);
-    return hash;
-}
-
-// ── Reliable chunk sender (mailbox-primary, P2P-assist) ─────────────────────
-//
-// File chunks ALWAYS go through the mailbox for guaranteed delivery.
-// UDP (the transport beneath ICE/libnice) cannot reliably carry 240 KB+
-// datagrams — IP fragmentation drops are silent and unrecoverable.
-//
-// When a P2P connection is also ready we *additionally* send via P2P as
-// a latency optimisation.  The receiver's per-chunk dedup
-// ("transferId:chunkIndex") ensures only one copy is processed.
-
-void ChatController::sendFileChunkEnvelope(const QString& peerIdB64u,
-                                           const QByteArray& /* key32 */,
-                                           const QByteArray& env)
-{
-    // Always enqueue to mailbox — reliable delivery over HTTP
-    m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
-
-    // Initiate P2P for future text messages (but don't rely on it for files)
-    if (!m_p2pConnections.contains(peerIdB64u))
-        initiateP2PConnection(peerIdB64u);
-}
+// ── File transfer delegation ─────────────────────────────────────────────────
 
 QString ChatController::sendFile(const QString& peerIdB64u,
                                  const QString& fileName,
                                  const QByteArray& fileData)
 {
-    if (fileData.size() > kMaxFileBytes) {
-        emit status(QString("File too large (max %1 MB).")
-                        .arg(kMaxFileBytes / (1024 * 1024)));
-        return {};
-    }
-
-    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-    if (key32.size() != 32) {
-        emit status("Cannot derive shared key for: " + peerIdB64u);
-        return {};
-    }
-
-    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const qint64  ts         = QDateTime::currentSecsSinceEpoch();
-    const qint64  fileSize   = fileData.size();
-    const int totalChunks    = int((fileSize + kChunkBytes - 1) / kChunkBytes);
-
-    // Compute BLAKE2b-256 integrity hash over the entire plaintext file
-    const QByteArray fileHash = blake2b256(fileData);
-    const QString fileHashB64u = CryptoEngine::toBase64Url(fileHash);
-
-    for (int i = 0; i < totalChunks; ++i) {
-        const qint64     offset   = qint64(i) * kChunkBytes;
-        const QByteArray chunk    = fileData.mid(int(offset), int(kChunkBytes));
-
-        QJsonObject meta;
-        meta["from"]        = myIdB64u();
-        meta["type"]        = "file_chunk";
-        meta["transferId"]  = transferId;
-        meta["chunkIndex"]  = i;
-        meta["totalChunks"] = totalChunks;
-        meta["fileName"]    = fileName;
-        meta["fileSize"]    = fileSize;
-        meta["ts"]          = ts;
-        meta["fileHash"]    = fileHashB64u;
-
-        const QByteArray metaJson = QJsonDocument(meta).toJson(QJsonDocument::Compact);
-        const QByteArray encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
-        const QByteArray encChunk = m_crypto.aeadEncrypt(key32, chunk);
-
-        // Wire format: FROMFC:<senderId>\n<4-byte metaLen><encMeta><encChunk>
-        const QByteArray env = kFilePrefix + myIdB64u().toUtf8() + "\n"
-                               + pack32(quint32(encMeta.size()))
-                               + encMeta
-                               + encChunk;
-
-        sendFileChunkEnvelope(peerIdB64u, key32, env);
-    }
-
-    emit status(QString("'%1' queued in %2 chunk(s) → %3")
-                    .arg(fileName).arg(totalChunks).arg(peerIdB64u));
-    return transferId;
+    return m_fileMgr.sendFile(myIdB64u(), peerIdB64u, fileName, fileData);
 }
 
 QString ChatController::sendGroupFile(const QString& groupId,
@@ -226,62 +197,8 @@ QString ChatController::sendGroupFile(const QString& groupId,
                                       const QString& fileName,
                                       const QByteArray& fileData)
 {
-    if (fileData.size() > kMaxFileBytes) {
-        emit status(QString("File too large (max %1 MB).")
-                        .arg(kMaxFileBytes / (1024 * 1024)));
-        return {};
-    }
-
-    const QString myId       = myIdB64u();
-    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const qint64  ts         = QDateTime::currentSecsSinceEpoch();
-    const qint64  fileSize   = fileData.size();
-    const int totalChunks    = int((fileSize + kChunkBytes - 1) / kChunkBytes);
-
-    // Compute BLAKE2b-256 integrity hash over the entire plaintext file
-    const QByteArray fileHash = blake2b256(fileData);
-    const QString fileHashB64u = CryptoEngine::toBase64Url(fileHash);
-
-    for (const QString& peerId : memberPeerIds) {
-        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
-
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
-        for (int i = 0; i < totalChunks; ++i) {
-            const qint64     offset   = qint64(i) * kChunkBytes;
-            const QByteArray chunk    = fileData.mid(int(offset), int(kChunkBytes));
-
-            QJsonObject meta;
-            meta["from"]        = myId;
-            meta["type"]        = "file_chunk";
-            meta["transferId"]  = transferId;
-            meta["chunkIndex"]  = i;
-            meta["totalChunks"] = totalChunks;
-            meta["fileName"]    = fileName;
-            meta["fileSize"]    = fileSize;
-            meta["ts"]          = ts;
-            meta["fileHash"]    = fileHashB64u;
-            meta["groupId"]     = groupId;
-            meta["groupName"]   = groupName;
-
-            const QByteArray metaJson = QJsonDocument(meta).toJson(QJsonDocument::Compact);
-            const QByteArray encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
-            const QByteArray encChunk = m_crypto.aeadEncrypt(key32, chunk);
-
-            const QByteArray env = kFilePrefix + myId.toUtf8() + "\n"
-                                   + pack32(quint32(encMeta.size()))
-                                   + encMeta
-                                   + encChunk;
-
-            sendFileChunkEnvelope(peerId, key32, env);
-        }
-    }
-
-    emit status(QString("'%1' queued in %2 chunk(s) → group %3")
-                    .arg(fileName).arg(totalChunks).arg(groupName));
-    return transferId;
+    return m_fileMgr.sendGroupFile(myIdB64u(), groupId, groupName,
+                                   memberPeerIds, fileName, fileData);
 }
 
 void ChatController::startPolling(int intervalMs)
@@ -331,10 +248,6 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
     for (const QString& peerId : memberPeerIds) {
         if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
 
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
         QJsonObject payload;
         payload["from"]      = myId;
         payload["type"]      = "group_msg";
@@ -345,7 +258,36 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         payload["ts"]        = ts;
         payload["msgId"]     = msgId;
 
-        const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+        // Sealed Ratchet path
+        if (m_sessionMgr) {
+            QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerId, pt);
+            if (!sessionBlob.isEmpty()) {
+                QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
+                unsigned char peerCurvePub[32];
+                if (crypto_sign_ed25519_pk_to_curve25519(
+                        peerCurvePub,
+                        reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
+                    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+                    QByteArray sealed = SealedEnvelope::seal(
+                        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+                    if (!sealed.isEmpty()) {
+                        QByteArray env = kSealedPrefix + "\n" + sealed;
+                        qDebug() << "[ChatController] sendGroupMsg -> sealed mailbox to" << peerId.left(8) + "...";
+                        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Legacy fallback
+        qDebug() << "[ChatController] sendGroupMsg -> LEGACY fallback to" << peerId.left(8) + "...";
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
         const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
         const QByteArray env = kMsgPrefix + myId.toUtf8() + "\n" + ct;
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
@@ -368,10 +310,6 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         if (peerId.trimmed().isEmpty()) continue;
         if (peerId.trimmed() == myId) continue;
 
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
         QJsonObject payload;
         payload["from"]      = myId;
         payload["type"]      = "group_leave";
@@ -380,10 +318,36 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         payload["members"]   = membersArray;
         payload["ts"]        = ts;
 
-        const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+        // Sealed Ratchet path
+        if (m_sessionMgr) {
+            QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerId, pt);
+            if (!sessionBlob.isEmpty()) {
+                QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
+                unsigned char peerCurvePub[32];
+                if (crypto_sign_ed25519_pk_to_curve25519(
+                        peerCurvePub,
+                        reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
+                    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+                    QByteArray sealed = SealedEnvelope::seal(
+                        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+                    if (!sealed.isEmpty()) {
+                        QByteArray env = kSealedPrefix + "\n" + sealed;
+                        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Legacy fallback
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
+        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) continue;
+
         const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
         const QByteArray env = QByteArray("FROM:") + myId.toUtf8() + "\n" + ct;
-
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
     }
 }
@@ -409,30 +373,12 @@ void ChatController::pollOnce()
     // Falls back to single fetch() automatically if the server doesn't yet
     // support /mbox/fetch_all (404/405 response).
     m_mbox.fetchAll(myIdB64u());
-    for (const QString &key : m_selfKeys) {
+    for (const QString &key : std::as_const(m_selfKeys)) {
         if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u()) m_mbox.fetchAll(key.trimmed());
     }
 
     // Purge stale incomplete transfers to bound memory usage
-    purgeStaleTransfers();
-}
-
-void ChatController::purgeStaleTransfers()
-{
-    static constexpr qint64 kMaxTransferAgeSecs = 30 * 60;  // 30 minutes
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    auto it = m_incomingTransfers.begin();
-    while (it != m_incomingTransfers.end()) {
-        if (it->createdSecs > 0 && (now - it->createdSecs) > kMaxTransferAgeSecs) {
-            emit status(QString("Purged stale transfer '%1' (%2/%3 chunks) after 30 min.")
-                            .arg(it->fileName)
-                            .arg(it->chunks.size())
-                            .arg(it->totalChunks));
-            it = m_incomingTransfers.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    m_fileMgr.purgeStaleTransfers();
 }
 
 void ChatController::sendSignalingMessage(const QString& peerIdB64u,
@@ -471,16 +417,41 @@ void ChatController::initiateP2PConnection(const QString& peerIdB64u)
 
 void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data)
 {
-    // ── File chunk received over P2P ─────────────────────────────────────────
-    // P2P file chunks arrive in the same wire format as mailbox envelopes:
-    // FROMFC:<senderId>\n<4-byte metaLen><encMeta><encChunk>
-    if (data.startsWith(kFilePrefix)) {
-        // Re-use onEnvelope which already handles the full wire format
+    qDebug() << "[ChatController] P2P data received from" << peerIdB64u.left(8) + "..."
+             << "| size:" << data.size() << "B";
+
+    // ── Sealed envelope over P2P ─────────────────────────────────────────────
+    if (data.startsWith(kSealedPrefix) || data.startsWith(kSealedFCPrefix)) {
+        qDebug() << "[ChatController] P2P -> sealed envelope path";
         onEnvelope(data, QString());
         return;
     }
 
-    // ── Encrypted JSON message (text, etc.) ──────────────────────────────────
+    // ── File chunk received over P2P (legacy) ────────────────────────────────
+    if (data.startsWith(kFilePrefix)) {
+        onEnvelope(data, QString());
+        return;
+    }
+
+    // ── Try ratchet decrypt first (P2P with session) ─────────────────────────
+    if (m_sessionMgr && m_sessionMgr->hasSession(peerIdB64u)) {
+        qDebug() << "[ChatController] P2P -> attempting raw ratchet decrypt";
+        // Assume the data is a raw ratchet message (no sealed envelope on P2P)
+        QByteArray pt = m_sessionMgr->decryptFromPeer(peerIdB64u, data);
+        if (!pt.isEmpty()) {
+            const auto o = QJsonDocument::fromJson(pt).object();
+            if (o.value("type").toString() == "text") {
+                const QString msgId = o.value("msgId").toString();
+                if (!msgId.isEmpty() && !markSeen(msgId)) return;
+                emit messageReceived(peerIdB64u, o.value("text").toString(),
+                                     tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
+            }
+            return;
+        }
+    }
+
+    // ── Legacy encrypted JSON message ────────────────────────────────────────
+    qDebug() << "[ChatController] P2P -> legacy decrypt fallback";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
     if (pt.isEmpty()) return;
@@ -507,106 +478,76 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     const QByteArray header = body.left(nl);
     const QByteArray rest   = body.mid(nl + 1);
 
-    // ── File chunk envelope ───────────────────────────────────────────────────
+    // ── Sealed sender envelope ───────────────────────────────────────────────
+    if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
+        if (!m_sessionMgr) return; // can't process without session manager
+
+        qDebug() << "[ChatController] Received sealed envelope | size:" << rest.size() << "B";
+
+        // Unseal to learn sender identity
+        UnsealResult unsealed = SealedEnvelope::unseal(m_crypto.curvePriv(), rest);
+        if (!unsealed.valid) {
+            qWarning() << "[ChatController] Failed to unseal envelope";
+            return;
+        }
+
+        QString senderId = CryptoEngine::toBase64Url(unsealed.senderEdPub);
+        qDebug() << "[ChatController] Unsealed OK | sender:" << senderId.left(8) + "..."
+                 << "| inner:" << unsealed.innerPayload.size() << "B";
+
+        // Decrypt session layer (Noise handshake or ratchet message)
+        QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
+        if (pt.isEmpty()) {
+            // May be a handshake response with no user payload — that's OK
+            qDebug() << "[ChatController] Session decrypt returned empty (handshake response or error)";
+            return;
+        }
+
+        // Dispatch based on the decrypted JSON payload
+        // (same logic as legacy message handling below)
+        const auto o = QJsonDocument::fromJson(pt).object();
+        const QString type = o.value("type").toString();
+
+        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        const QDateTime ts = tsFromSecs(tsSecs);
+        const QString msgId = o.value("msgId").toString();
+
+        if (type == "text") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;
+            emit messageReceived(senderId, o.value("text").toString(), ts, msgId);
+        } else if (type == "group_msg") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;
+            QStringList memberKeys;
+            for (const QJsonValue &v : o.value("members").toArray())
+                memberKeys << v.toString();
+            emit groupMessageReceived(senderId, o.value("groupId").toString(),
+                                       o.value("groupName").toString(),
+                                       memberKeys, o.value("text").toString(), ts, msgId);
+        } else if (type == "group_leave") {
+            QStringList memberKeys;
+            for (const QJsonValue &v : o.value("members").toArray())
+                memberKeys << v.toString();
+            emit groupMemberLeft(senderId, o.value("groupId").toString(),
+                                  o.value("groupName").toString(), memberKeys, ts, msgId);
+        } else if (type == "avatar") {
+            emit avatarReceived(senderId, o.value("name").toString(), o.value("avatar").toString());
+        } else if (type == "group_rename") {
+            emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
+        } else if (type == "group_avatar") {
+            emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
+        } else if (type == "file_chunk") {
+            // Sealed file chunk — handle metadata and chunk data from JSON
+            // (for sealed path, the chunk data is embedded in the session payload)
+            // This would require different wire format for sealed files — deferred
+        }
+        return;
+    }
+
+    // ── File chunk envelope ─────────────────────────────────────────────────
     if (header.startsWith(kFilePrefix)) {
         const QString fromId = QString::fromUtf8(header.mid(kFilePrefix.size())).trimmed();
-        if (rest.size() < 4) return;
-
-        const quint32 metaLen = unpack32(rest, 0);
-        if (rest.size() - 4 < int(metaLen)) return;
-
-        const QByteArray encMeta  = rest.mid(4, int(metaLen));
-        const QByteArray encChunk = rest.mid(4 + int(metaLen));
-
-        const QByteArray peerPub  = CryptoEngine::fromBase64Url(fromId);
-        const QByteArray key32    = m_crypto.deriveSharedKey32(peerPub);
-        const QByteArray metaJson = m_crypto.aeadDecrypt(key32, encMeta);
-        if (metaJson.isEmpty()) return;
-
-        const QJsonObject meta   = QJsonDocument::fromJson(metaJson).object();
-        const QString transferId = meta.value("transferId").toString();
-        const int chunkIndex     = meta.value("chunkIndex").toInt(-1);
-        const int totalChunks    = meta.value("totalChunks").toInt(0);
-        if (transferId.isEmpty() || chunkIndex < 0 || totalChunks <= 0) return;
-
-        // ── Receive-side limits ──────────────────────────────────────────────
-        const qint64 claimedSize = meta.value("fileSize").toVariant().toLongLong();
-        // Reject files that exceed the same 25 MB limit we enforce on send
-        if (claimedSize > kMaxFileBytes || totalChunks > (kMaxFileBytes / kChunkBytes + 1)) {
-            emit status(QString("Rejected incoming file: claimed size %1 exceeds limit.")
-                            .arg(claimedSize));
-            return;
-        }
-        // Cap concurrent in-progress transfers to prevent memory exhaustion
-        static constexpr int kMaxConcurrentTransfers = 50;
-        if (!m_incomingTransfers.contains(transferId)
-            && m_incomingTransfers.size() >= kMaxConcurrentTransfers) {
-            emit status("Too many concurrent incoming transfers — dropping chunk.");
-            return;
-        }
-
-        // Per-chunk dedup: "<transferId>:<chunkIndex>"
-        if (!markSeen(transferId + ":" + QString::number(chunkIndex))) return;
-
-        const QByteArray chunkData = m_crypto.aeadDecrypt(key32, encChunk);
-        if (chunkData.isEmpty()) return;
-
-        // ── Reassembly ────────────────────────────────────────────────────────
-        IncomingTransfer &xfer = m_incomingTransfers[transferId];
-        if (xfer.totalChunks == 0) {
-            xfer.fromId      = fromId;
-            // Strip path separators to prevent directory traversal attacks
-            QString rawName  = meta.value("fileName").toString("file");
-            rawName = rawName.section('/', -1).section('\\', -1);
-            xfer.fileName    = rawName.isEmpty() ? "file" : rawName;
-            xfer.fileSize    = meta.value("fileSize").toVariant().toLongLong();
-            xfer.totalChunks = totalChunks;
-            xfer.ts          = tsFromSecs(meta.value("ts").toVariant().toLongLong());
-            xfer.fileHash    = CryptoEngine::fromBase64Url(meta.value("fileHash").toString());
-            xfer.groupId     = meta.value("groupId").toString();
-            xfer.groupName   = meta.value("groupName").toString();
-            xfer.createdSecs = QDateTime::currentSecsSinceEpoch();
-        }
-        xfer.chunks[chunkIndex] = chunkData;
-
-        const int received = xfer.chunks.size();
-
-        if (received < totalChunks) {
-            // Progress update only — no file data yet
-            emit fileChunkReceived(fromId, transferId, xfer.fileName,
-                                   xfer.fileSize, received, totalChunks,
-                                   QByteArray{}, xfer.ts,
-                                   xfer.groupId, xfer.groupName);
-        } else {
-            // Reassemble in chunk order and free reassembly memory immediately
-            QByteArray assembled;
-            assembled.reserve(int(xfer.fileSize));
-            for (int i = 0; i < totalChunks; ++i)
-                assembled.append(xfer.chunks.value(i));
-
-            const IncomingTransfer completed = xfer;
-            m_incomingTransfers.remove(transferId);
-
-            // Verify BLAKE2b-256 integrity hash if the sender included one
-            if (!completed.fileHash.isEmpty()) {
-                const QByteArray actualHash = blake2b256(assembled);
-                if (actualHash != completed.fileHash) {
-                    emit status(QString("⚠ File '%1' integrity check FAILED — data corrupted.")
-                                    .arg(completed.fileName));
-                    // Still emit so the UI can show the failure
-                    emit fileChunkReceived(fromId, transferId, completed.fileName,
-                                           completed.fileSize, totalChunks, totalChunks,
-                                           QByteArray{}, completed.ts,
-                                           completed.groupId, completed.groupName);
-                    return;
-                }
-            }
-
-            emit fileChunkReceived(fromId, transferId, completed.fileName,
-                                   completed.fileSize, totalChunks, totalChunks,
-                                   assembled, completed.ts,
-                                   completed.groupId, completed.groupName);
-        }
+        m_fileMgr.handleFileEnvelope(fromId, rest,
+            [this](const QString& id) { return markSeen(id); });
         return;
     }
 

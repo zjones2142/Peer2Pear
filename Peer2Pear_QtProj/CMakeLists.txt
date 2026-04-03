@@ -70,6 +70,18 @@ set(PROJECT_SOURCES
     NiceConnection.hpp
     onboardingdialog.h
     onboardingdialog.cpp
+    NoiseState.hpp
+    NoiseState.cpp
+    RatchetSession.hpp
+    RatchetSession.cpp
+    SessionStore.hpp
+    SessionStore.cpp
+    SessionManager.hpp
+    SessionManager.cpp
+    SealedEnvelope.hpp
+    SealedEnvelope.cpp
+    FileTransferManager.hpp
+    FileTransferManager.cpp
     ${app_icon_resource}
 )
 
@@ -78,15 +90,6 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     qt_add_executable(Peer2Pear_QtProj
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
-        settingspanel.h settingspanel.cpp
-        chatview.h chatview.cpp
-        ChatNotifier.h
-        databasemanager.h databasemanager.cpp
-        chattypes.h
-        NiceConnection.hpp
-        NiceConnection.cpp
-        onboardingdialog.h
-        onboardingdialog.cpp
     )
 else()
     if(ANDROID)

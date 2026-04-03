@@ -39,7 +39,7 @@ private:
 
     QString  m_displayName;
     QString  m_avatarData;   // base64 PNG — set when user uploads photo
-    QColor   m_avatarColor   { "#2e8b3a" };
+    QColor   m_avatarColor   { 0x2e, 0x8b, 0x3a };
     bool     m_usingPhoto    = false;
     QPixmap  m_uploadedPhoto;
 
