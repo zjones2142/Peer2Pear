@@ -510,14 +510,14 @@ void TestContacts::contactsOrderedByLastActive()
     QScopedPointer<DatabaseManager> db(openTestDb());
 
     // Insert three contacts
-    ChatData a, b, c2;
+    ChatData a, b, g;
     a.name = "Alpha"; a.peerIdB64u = "pk_a"; a.keys = QStringList{"pk_a"};
     b.name = "Beta";  b.peerIdB64u = "pk_b"; b.keys = QStringList{"pk_b"};
-    c2.name = "Gamma"; c2.peerIdB64u = "pk_c"; c2.keys = QStringList{"pk_c"};
+    g.name = "Gamma"; g.peerIdB64u = "pk_c"; g.keys = QStringList{"pk_c"};
 
     db->saveContact(a);
     db->saveContact(b);
-    db->saveContact(c2);
+    db->saveContact(g);
 
     // Send a message to Beta → should update last_active and move Beta to top
     Message msg;

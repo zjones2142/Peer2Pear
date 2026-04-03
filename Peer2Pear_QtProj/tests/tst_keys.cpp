@@ -156,8 +156,8 @@ void TestKeys::identityKeysSizeCorrect()
     engine.setPassphrase("size-check");
     engine.ensureIdentity();
 
-    QCOMPARE(engine.identityPub().size(),  static_cast<int>(crypto_sign_PUBLICKEYBYTES));  // 32
-    QCOMPARE(engine.identityPriv().size(), static_cast<int>(crypto_sign_SECRETKEYBYTES));  // 64
+    QCOMPARE(engine.identityPub().size(),  static_cast<int>(crypto_sign_PUBLICKEYBYTES));
+    QCOMPARE(engine.identityPriv().size(), static_cast<int>(crypto_sign_SECRETKEYBYTES));
 }
 
 void TestKeys::curveKeysSizeCorrect()
@@ -166,8 +166,8 @@ void TestKeys::curveKeysSizeCorrect()
     engine.setPassphrase("curve-check");
     engine.ensureIdentity();
 
-    QCOMPARE(engine.curvePub().size(),  static_cast<int>(crypto_box_PUBLICKEYBYTES));  // 32
-    QCOMPARE(engine.curvePriv().size(), static_cast<int>(crypto_box_SECRETKEYBYTES));  // 32
+    QCOMPARE(engine.curvePub().size(),  static_cast<int>(crypto_box_PUBLICKEYBYTES));
+    QCOMPARE(engine.curvePriv().size(), static_cast<int>(crypto_box_SECRETKEYBYTES));
 }
 
 /* ── Passphrase management ─────────────────────────────────────────────────── */
