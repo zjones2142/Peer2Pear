@@ -13,9 +13,16 @@ static QString contactKey(const QString &peerIdB64u, const QString &name)
     return "name:" + name;
 }
 
+// Unique connection name per DatabaseManager instance
+static QString makeConnectionName()
+{
+    static int counter = 0;
+    return QStringLiteral("peer2pear_conn_%1").arg(counter++);
+}
+
 DatabaseManager::DatabaseManager()
 {
-    m_db = QSqlDatabase::addDatabase("QSQLITE", "peer2pear_conn");
+    m_db = QSqlDatabase::addDatabase("QSQLITE", makeConnectionName());
 }
 
 DatabaseManager::~DatabaseManager() { close(); }
@@ -24,7 +31,21 @@ bool DatabaseManager::open()
 {
     const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(base);
-    m_db.setDatabaseName(base + "/peer2PearUser.db");
+    return openDatabase(base + "/peer2PearUser.db");
+}
+
+bool DatabaseManager::open(const QString &dbPath)
+{
+    if (dbPath != ":memory:") {
+        const QString dir = QFileInfo(dbPath).absolutePath();
+        QDir().mkpath(dir);
+    }
+    return openDatabase(dbPath);
+}
+
+bool DatabaseManager::openDatabase(const QString &dbPath)
+{
+    m_db.setDatabaseName(dbPath);
 
     if (!m_db.open()) {
         qWarning() << "DatabaseManager: failed to open DB:" << m_db.lastError().text();
@@ -43,6 +64,11 @@ bool DatabaseManager::open()
 void DatabaseManager::close()
 {
     if (m_db.isOpen()) m_db.close();
+}
+
+bool DatabaseManager::isOpen() const
+{
+    return m_db.isOpen();
 }
 
 void DatabaseManager::setEncryptionKey(const QByteArray &key32)
@@ -172,6 +198,12 @@ void DatabaseManager::createTables()
         "  saved_path       TEXT"
         ");"
         );
+
+    // ── Performance indexes ──────────────────────────────────────────────
+    q.exec("CREATE INDEX IF NOT EXISTS idx_messages_peer_id   ON messages(peer_id);");
+    q.exec("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);");
+    q.exec("CREATE INDEX IF NOT EXISTS idx_file_transfers_chat_key ON file_transfers(chat_key);");
+    q.exec("CREATE INDEX IF NOT EXISTS idx_contacts_last_active ON contacts(last_active);");
 }
 
 QVector<ChatData> DatabaseManager::loadAllContacts() const
@@ -239,6 +271,58 @@ void DatabaseManager::deleteContact(const QString &peerIdB64u)
     if (!q.exec()) qWarning() << "deleteContact:" << q.lastError().text();
 }
 
+bool DatabaseManager::contactExists(const QString &peerIdB64u) const
+{
+    if (peerIdB64u.isEmpty()) return false;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT 1 FROM contacts WHERE peer_id=:peer_id LIMIT 1;");
+    q.bindValue(":peer_id", peerIdB64u);
+    if (!q.exec()) { qWarning() << "contactExists:" << q.lastError().text(); return false; }
+    return q.next();
+}
+
+ChatData DatabaseManager::getContact(const QString &peerIdB64u) const
+{
+    ChatData chat;
+    if (peerIdB64u.isEmpty()) return chat;
+
+    QSqlQuery q(m_db);
+    q.prepare(
+        "SELECT peer_id, name, subtitle, keys, is_blocked, is_group, group_id, avatar, last_active"
+        " FROM contacts WHERE peer_id=:peer_id;"
+        );
+    q.bindValue(":peer_id", peerIdB64u);
+    if (!q.exec() || !q.next()) return chat;
+
+    const QString stored = q.value(0).toString();
+    chat.peerIdB64u = stored.startsWith("name:") ? QString() : stored;
+    chat.name       = q.value(1).toString();
+    chat.subtitle   = q.value(2).toString();
+    chat.isBlocked  = q.value(4).toInt() == 1;
+    chat.isGroup    = q.value(5).toInt() == 1;
+    chat.groupId    = q.value(6).toString();
+    chat.avatarData = q.value(7).toString();
+    const qint64 laSecs = q.value(8).toLongLong();
+    if (laSecs > 0)
+        chat.lastActive = QDateTime::fromSecsSinceEpoch(laSecs, Qt::UTC);
+
+    const QString ks = q.value(3).toString();
+    if (!ks.isEmpty()) chat.keys = ks.split('|', Qt::SkipEmptyParts);
+
+    chat.messages = loadMessages(stored);
+    return chat;
+}
+
+void DatabaseManager::blockContact(const QString &peerIdB64u, bool blocked)
+{
+    if (peerIdB64u.isEmpty()) return;
+    QSqlQuery q(m_db);
+    q.prepare("UPDATE contacts SET is_blocked=:blocked WHERE peer_id=:peer_id;");
+    q.bindValue(":blocked", blocked ? 1 : 0);
+    q.bindValue(":peer_id", peerIdB64u);
+    if (!q.exec()) qWarning() << "blockContact:" << q.lastError().text();
+}
+
 void DatabaseManager::saveContactAvatar(const QString &peerIdB64u, const QString &avatarB64)
 {
     if (peerIdB64u.isEmpty()) return;
@@ -300,6 +384,25 @@ QVector<Message> DatabaseManager::loadMessages(const QString &peerIdB64u) const
     return result;
 }
 
+void DatabaseManager::clearMessages(const QString &peerIdB64u)
+{
+    if (peerIdB64u.isEmpty()) return;
+    QSqlQuery q(m_db);
+    q.prepare("DELETE FROM messages WHERE peer_id=:peer_id;");
+    q.bindValue(":peer_id", peerIdB64u);
+    if (!q.exec()) qWarning() << "clearMessages:" << q.lastError().text();
+}
+
+int DatabaseManager::messageCount(const QString &peerIdB64u) const
+{
+    if (peerIdB64u.isEmpty()) return 0;
+    QSqlQuery q(m_db);
+    q.prepare("SELECT COUNT(*) FROM messages WHERE peer_id=:peer_id;");
+    q.bindValue(":peer_id", peerIdB64u);
+    if (!q.exec() || !q.next()) return 0;
+    return q.value(0).toInt();
+}
+
 void DatabaseManager::saveFileRecord(const QString &chatKey, const FileTransferRecord &rec)
 {
     if (chatKey.isEmpty() || rec.transferId.isEmpty()) return;
@@ -353,6 +456,15 @@ QVector<FileTransferRecord> DatabaseManager::loadFileRecords(const QString &chat
         result.append(rec);
     }
     return result;
+}
+
+void DatabaseManager::deleteFileRecord(const QString &transferId)
+{
+    if (transferId.isEmpty()) return;
+    QSqlQuery q(m_db);
+    q.prepare("DELETE FROM file_transfers WHERE transfer_id=:tid;");
+    q.bindValue(":tid", transferId);
+    if (!q.exec()) qWarning() << "deleteFileRecord:" << q.lastError().text();
 }
 
 void DatabaseManager::saveSetting(const QString &key, const QString &value)
