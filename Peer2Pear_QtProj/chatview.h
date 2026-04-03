@@ -34,7 +34,7 @@ public:
     void setShouldToastFn(std::function<bool()> fn) { m_shouldToastFn = std::move(fn); }
     void setNotifier(ChatNotifier *notifier)         { m_notifier = notifier; }
 
-    void startPresencePolling(int intervalMs = 180000);
+    void startPresencePolling(int intervalMs = 30000);
 
 public slots:
     void onPresenceChanged(const QString &peerIdB64u, bool online);

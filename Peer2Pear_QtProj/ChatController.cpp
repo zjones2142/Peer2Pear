@@ -65,11 +65,15 @@ void ChatController::setServerBaseUrl(const QUrl& base)
 
 void ChatController::setDatabase(QSqlDatabase db)
 {
+    // Guard against double-call: reset previous instances before reinitializing
+    m_sessionMgr.reset();
+    m_sessionStore.reset();
+
     // Derive a 32-byte at-rest encryption key from the identity curve private key.
     // This key never leaves memory and is tied to the user's unlocked identity.
     QByteArray storeKey = CryptoEngine::hkdf(
         m_crypto.curvePriv(), {}, "session-store-at-rest", 32);
-    m_sessionStore = new SessionStore(db, storeKey);
+    m_sessionStore = std::make_unique<SessionStore>(db, storeKey);
     CryptoEngine::secureZero(storeKey);
 
     // One-time migration: clear sessions created with the buggy ratchet init
@@ -84,7 +88,7 @@ void ChatController::setDatabase(QSqlDatabase db)
         }
     }
 
-    m_sessionMgr = new SessionManager(m_crypto, *m_sessionStore);
+    m_sessionMgr = std::make_unique<SessionManager>(m_crypto, *m_sessionStore);
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
     m_sessionMgr->setSendResponseFn([this](const QString& peerId, const QByteArray& blob) {
@@ -420,6 +424,9 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     qDebug() << "[ChatController] P2P data received from" << peerIdB64u.left(8) + "..."
              << "| size:" << data.size() << "B";
 
+    // P2P data proves the peer is online right now
+    emit presenceChanged(peerIdB64u, true);
+
     // ── Sealed envelope over P2P ─────────────────────────────────────────────
     if (data.startsWith(kSealedPrefix) || data.startsWith(kSealedFCPrefix)) {
         qDebug() << "[ChatController] P2P -> sealed envelope path";
@@ -495,6 +502,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         qDebug() << "[ChatController] Unsealed OK | sender:" << senderId.left(8) + "..."
                  << "| inner:" << unsealed.innerPayload.size() << "B";
 
+        // Successfully decrypted envelope proves the sender is (or was recently) online
+        emit presenceChanged(senderId, true);
+
         // Decrypt session layer (Noise handshake or ratchet message)
         QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
         if (pt.isEmpty()) {
@@ -558,6 +568,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     const QByteArray peerPub = CryptoEngine::fromBase64Url(fromId);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), rest);
     if (pt.isEmpty()) return;
+
+    // Successfully decrypted legacy envelope — sender is (or was recently) online
+    emit presenceChanged(fromId, true);
 
     const auto    o    = QJsonDocument::fromJson(pt).object();
     const QString type = o.value("type").toString();

@@ -609,8 +609,8 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
     rebuildChatList();
     m_ui->chatList->setCurrentRow(0);
 
-    // Start presence polling (check every 3 minutes)
-    startPresencePolling(180000);
+    // Start presence polling (check every 30 seconds)
+    startPresencePolling(30000);
 }
 
 void ChatView::startPresencePolling(int intervalMs)
@@ -626,8 +626,8 @@ void ChatView::startPresencePolling(int intervalMs)
             m_controller->checkPresence(peerIds);
     });
     m_presenceTimer.start(intervalMs);
-    // Immediate first check after a short delay
-    QTimer::singleShot(3000, this, [this]() {
+    // Immediate first check on startup (500ms delay to let connections settle)
+    QTimer::singleShot(500, this, [this]() {
         QStringList peerIds;
         for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
