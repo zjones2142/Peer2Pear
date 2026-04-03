@@ -51,6 +51,21 @@ static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, in
     return pm;
 }
 
+// ── Avatar palette ────────────────────────────────────────────────────────────
+// One palette shared by all avatar-rendering sites in this file.
+static const QList<QColor> kAvatarPalette = {
+    QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
+    QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+};
+
+// Returns a stable palette color derived from the contact name.
+// Uses Qt's qHash for a well-distributed, overflow-safe result.
+static QColor avatarColorForName(const QString &name)
+{
+    const uint hash = qHash(name);
+    return kAvatarPalette[hash % static_cast<uint>(kAvatarPalette.size())];
+}
+
 // ── makeCircularPixmap ────────────────────────────────────────────────────────
 static QPixmap makeCircularPixmap(const QPixmap &src, int size)
 {
@@ -1812,8 +1827,6 @@ void ChatView::rebuildChatList()
             };
             const QString &nm = m_chats[i].name;
             const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
-            int hash = 0;
-            for (QChar c : nm) hash += c.unicode();
             const QColor bg = m_chats[i].isGroup
                 ? QColor(0x2e, 0x8b, 0x3a)
                 : kPalette[qAbs(hash) % kPalette.size()];
@@ -1895,9 +1908,7 @@ void ChatView::loadChat(int index)
             QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
         };
         const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
-        int hash = 0;
-        for (QChar c : chat.name) hash += c.unicode();
-        const QColor bg = kPalette[qAbs(hash) % kPalette.size()];
+        const QColor bg = avatarColorForName(chat.name);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));
         m_ui->chatAvatarLabel->setText("");
     }
