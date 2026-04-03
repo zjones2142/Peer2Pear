@@ -3,11 +3,19 @@
 #include <QtSql/QSqlError>
 #include <QDateTime>
 #include <QDebug>
+#include <sodium.h>
+#include <cstring>
 
-SessionStore::SessionStore(QSqlDatabase db)
+SessionStore::SessionStore(QSqlDatabase db, QByteArray storeKey)
     : m_db(db)
+    , m_storeKey(std::move(storeKey))
 {
     createTables();
+}
+
+SessionStore::~SessionStore() {
+    if (!m_storeKey.isEmpty())
+        sodium_memzero(m_storeKey.data(), static_cast<size_t>(m_storeKey.size()));
 }
 
 void SessionStore::createTables() {
@@ -45,6 +53,57 @@ void SessionStore::createTables() {
 }
 
 // ---------------------------
+// Blob encryption helpers
+// ---------------------------
+
+QByteArray SessionStore::encryptBlob(const QByteArray& plaintext) const {
+    if (m_storeKey.size() != 32) return {};
+
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    randombytes_buf(nonce, sizeof(nonce));
+
+    QByteArray out;
+    out.resize(static_cast<int>(sizeof(nonce)) + plaintext.size() +
+               static_cast<int>(crypto_aead_xchacha20poly1305_ietf_ABYTES));
+    unsigned long long clen = 0;
+    crypto_aead_xchacha20poly1305_ietf_encrypt(
+        reinterpret_cast<unsigned char*>(out.data()) + sizeof(nonce), &clen,
+        reinterpret_cast<const unsigned char*>(plaintext.constData()),
+        static_cast<unsigned long long>(plaintext.size()),
+        nullptr, 0, nullptr, nonce,
+        reinterpret_cast<const unsigned char*>(m_storeKey.constData()));
+    memcpy(out.data(), nonce, sizeof(nonce));
+    out.resize(static_cast<int>(sizeof(nonce) + clen));
+    return out;
+}
+
+QByteArray SessionStore::decryptBlob(const QByteArray& ciphertext) const {
+    const int kMinSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
+                         crypto_aead_xchacha20poly1305_ietf_ABYTES;
+    if (m_storeKey.size() != 32) return {};  // no key — treat as invalid
+    if (ciphertext.size() < kMinSize) return {};   // too short — treat as invalid
+
+    const unsigned char* nonce =
+        reinterpret_cast<const unsigned char*>(ciphertext.constData());
+    const int ctLen = ciphertext.size() - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    QByteArray pt;
+    pt.resize(ctLen - static_cast<int>(crypto_aead_xchacha20poly1305_ietf_ABYTES));
+    unsigned long long plen = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            reinterpret_cast<unsigned char*>(pt.data()), &plen,
+            nullptr,
+            reinterpret_cast<const unsigned char*>(ciphertext.constData()) +
+                crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
+            static_cast<unsigned long long>(ctLen),
+            nullptr, 0, nonce,
+            reinterpret_cast<const unsigned char*>(m_storeKey.constData())) != 0) {
+        return {}; // authentication failed — invalid or old plaintext blob
+    }
+    pt.resize(static_cast<int>(plen));
+    return pt;
+}
+
+// ---------------------------
 // Ratchet sessions
 // ---------------------------
 
@@ -57,7 +116,7 @@ void SessionStore::saveSession(const QString& peerId, const QByteArray& stateBlo
         " ON CONFLICT(peer_id) DO UPDATE SET state_blob=excluded.state_blob, updated_at=excluded.updated_at;"
     );
     q.bindValue(":pid", peerId);
-    q.bindValue(":blob", stateBlob);
+    q.bindValue(":blob", encryptBlob(stateBlob));
     q.bindValue(":now", now);
     if (!q.exec()) qWarning() << "SessionStore::saveSession:" << q.lastError().text();
 }
@@ -66,7 +125,7 @@ QByteArray SessionStore::loadSession(const QString& peerId) const {
     QSqlQuery q(m_db);
     q.prepare("SELECT state_blob FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
-    if (q.exec() && q.next()) return q.value(0).toByteArray();
+    if (q.exec() && q.next()) return decryptBlob(q.value(0).toByteArray());
     return {};
 }
 
@@ -171,7 +230,7 @@ void SessionStore::savePendingHandshake(const QString& peerId, int role,
     );
     q.bindValue(":pid", peerId);
     q.bindValue(":role", role);
-    q.bindValue(":blob", handshakeBlob);
+    q.bindValue(":blob", encryptBlob(handshakeBlob));
     q.bindValue(":now", now);
     if (!q.exec()) qWarning() << "SessionStore::savePendingHandshake:" << q.lastError().text();
 }
@@ -182,7 +241,7 @@ QByteArray SessionStore::loadPendingHandshake(const QString& peerId, int& roleOu
     q.bindValue(":pid", peerId);
     if (q.exec() && q.next()) {
         roleOut = q.value(0).toInt();
-        return q.value(1).toByteArray();
+        return decryptBlob(q.value(1).toByteArray());
     }
     return {};
 }

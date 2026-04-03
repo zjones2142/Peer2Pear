@@ -11,11 +11,18 @@
  *   ratchet_sessions       — serialized RatchetSession per peer
  *   skipped_message_keys   — cached keys for out-of-order messages
  *   pending_handshakes     — in-progress Noise handshakes
+ *
+ * When a 32-byte storeKey is provided all BLOBs (session state and
+ * handshake state) are authenticated-encrypted at rest using
+ * XChaCha20-Poly1305 before being written to SQLite.
  */
 
 class SessionStore {
 public:
-    explicit SessionStore(QSqlDatabase db);
+    // storeKey must be exactly 32 bytes to enable at-rest encryption.
+    // Pass an empty QByteArray to disable (legacy/unencrypted mode).
+    explicit SessionStore(QSqlDatabase db, QByteArray storeKey = {});
+    ~SessionStore();
 
     void createTables();
 
@@ -42,5 +49,12 @@ public:
     void deletePendingHandshake(const QString& peerId);
 
 private:
+    // Encrypt/decrypt a BLOB using XChaCha20-Poly1305 and m_storeKey.
+    // Returns the input unchanged when m_storeKey is not 32 bytes.
+    // decryptBlob() returns {} on authentication failure.
+    QByteArray encryptBlob(const QByteArray& plaintext) const;
+    QByteArray decryptBlob(const QByteArray& ciphertext) const;
+
     QSqlDatabase m_db;
+    QByteArray   m_storeKey; // 32-byte at-rest encryption key; zeroed in destructor
 };

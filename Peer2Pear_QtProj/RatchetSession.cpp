@@ -219,7 +219,12 @@ QByteArray RatchetSession::encrypt(const QByteArray& plaintext) {
 
     auto [newChain, msgKey] = kdfChainKey(m_sendChainKey);
     m_sendChainKey = newChain;
-    m_lastMessageKey = msgKey;
+    // Force a deep copy so m_lastMessageKey has its own independent buffer.
+    // Without this, QByteArray's COW would share the buffer between m_lastMessageKey
+    // and msgKey; when msgKey.data() is called below for sodium_memzero it would detach
+    // msgKey into a fresh copy, zeroing only that copy and leaving the shared buffer
+    // (still referenced by m_lastMessageKey) un-wiped in memory.
+    m_lastMessageKey = QByteArray(msgKey.constData(), msgKey.size());
 
     RatchetHeader header;
     header.dhPub        = m_dhPub;

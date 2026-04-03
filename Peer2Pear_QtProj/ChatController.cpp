@@ -65,7 +65,12 @@ void ChatController::setServerBaseUrl(const QUrl& base)
 
 void ChatController::setDatabase(QSqlDatabase db)
 {
-    m_sessionStore = new SessionStore(db);
+    // Derive a 32-byte at-rest encryption key from the identity curve private key.
+    // This key never leaves memory and is tied to the user's unlocked identity.
+    QByteArray storeKey = CryptoEngine::hkdf(
+        m_crypto.curvePriv(), {}, "session-store-at-rest", 32);
+    m_sessionStore = new SessionStore(db, storeKey);
+    CryptoEngine::secureZero(storeKey);
 
     // One-time migration: clear sessions created with the buggy ratchet init
     {
