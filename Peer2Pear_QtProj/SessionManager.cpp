@@ -97,22 +97,19 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
         return {};
     }
 
-    // Save the noise state so we can process the response later
-    m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, noise.serialize());
-    qDebug() << "[SessionManager] Saved pending handshake (initiator) for" << peerIdB64u.left(8) + "...";
+    // Derive a one-shot key for the pre-key payload from the Noise chaining key
 
-    // We can't create a ratchet session yet (need the response),
-    // but we can encrypt the payload with a temporary key derived from
-    // the Noise state's current chaining key.
-    // For now, we'll encrypt the payload using the static shared key
-    // derived from ECDH (same as legacy) as a "pre-key payload".
-    // The recipient will decrypt this after completing the handshake.
+    // Generate a fresh ratchet DH keypair (independent of Noise ephemeral — key separation)
+    auto [ratchetDhPub, ratchetDhPriv] = CryptoEngine::generateEphemeralX25519();
 
-    // Actually, per the Noise spec, after writing msg1 in IK pattern,
-    // the initiator already has transport encryption available (one-way).
-    // But the Double Ratchet needs both sides' ephemeral keys.
-    // So we bundle the plaintext encrypted with a one-shot key derived
-    // from the Noise handshake's current state.
+    // Save both the Noise state AND the ratchet DH keypair for when the response arrives
+    // Format: [32-byte ratchetDhPub][32-byte ratchetDhPriv][noiseBlob...]
+    QByteArray pendingBlob;
+    pendingBlob.append(ratchetDhPub);
+    pendingBlob.append(ratchetDhPriv);
+    pendingBlob.append(noise.serialize());
+    m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, pendingBlob);
+    qDebug() << "[SessionManager] Saved pending handshake + ratchet DH for" << peerIdB64u.left(8) + "...";
 
     // Derive a one-shot key from the Noise chaining key after msg1 (secret, shared by both sides)
     QByteArray prekeyKey = CryptoEngine::hkdf(
@@ -124,17 +121,19 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
         return {};
     }
     qDebug() << "[SessionManager] Encrypted pre-key message for" << peerIdB64u.left(8) + "..."
-             << "| noiseMsg1:" << noiseMsg1.size() << "B | payload:" << encPayload.size() << "B";
+             << "| noiseMsg1:" << noiseMsg1.size() << "B | ratchetDhPub:" << ratchetDhPub.left(4).toHex()
+             << "| payload:" << encPayload.size() << "B";
 
-    // [0x01][4-byte noiseMsg1Len][noiseMsg1][encPayload]
+    // [0x01][4-byte noiseMsg1Len][noiseMsg1][32-byte ratchetDhPub][encPayload]
     quint32 msg1Len = static_cast<quint32>(noiseMsg1.size());
     quint32 msg1LenBE = qToBigEndian(msg1Len);
 
     QByteArray out;
-    out.reserve(1 + 4 + noiseMsg1.size() + encPayload.size());
+    out.reserve(1 + 4 + noiseMsg1.size() + 32 + encPayload.size());
     out.append(static_cast<char>(kPreKeyMsg));
     out.append(reinterpret_cast<const char*>(&msg1LenBE), 4);
     out.append(noiseMsg1);
+    out.append(ratchetDhPub);   // 32 bytes — responder uses this for initial ratchet DH
     out.append(encPayload);
     return out;
 }
@@ -182,9 +181,11 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         memcpy(&msg1LenBE, blob.constData() + 1, 4);
         quint32 msg1Len = qFromBigEndian(msg1LenBE);
 
-        if (blob.size() < static_cast<int>(5 + msg1Len)) return {};
+        // Wire format: [0x01][4-byte msg1Len][noiseMsg1][32-byte ratchetDhPub][encPayload]
+        if (blob.size() < static_cast<int>(5 + msg1Len + 32)) return {};
         QByteArray noiseMsg1 = blob.mid(5, static_cast<int>(msg1Len));
-        QByteArray encPayload = blob.mid(5 + static_cast<int>(msg1Len));
+        QByteArray initiatorRatchetDhPub = blob.mid(5 + static_cast<int>(msg1Len), 32);
+        QByteArray encPayload = blob.mid(5 + static_cast<int>(msg1Len) + 32);
 
         // Create Noise responder
         qDebug() << "[SessionManager] Processing Noise IK handshake (responder) from" << senderIdB64u.left(8) + "...";
@@ -199,7 +200,7 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
             return {};
         }
 
-        // Capture ephemeral keypair BEFORE finish() — finish() zeros m_ek
+        // Capture our ephemeral keypair BEFORE finish() — finish() zeros m_ek
         QByteArray ephPub  = noise.ephemeralPub();
         QByteArray ephPriv = noise.ephemeralPriv();
 
@@ -207,8 +208,10 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         HandshakeResult hr = noise.finish();
         qDebug() << "[SessionManager] Noise IK handshake complete (responder) for" << senderIdB64u.left(8) + "...";
 
+        // Initialize ratchet with the initiator's fresh ratchet DH pub (from wire format)
+        // This lets us derive both recv and send chains immediately — no LEGACY fallback
         RatchetSession ratchet = RatchetSession::initAsResponder(
-            hr.sendCipher.key, ephPub, ephPriv);
+            hr.sendCipher.key, ephPub, ephPriv, initiatorRatchetDhPub);
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);
@@ -256,13 +259,18 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         if (blob.size() < static_cast<int>(5 + msg2Len)) return {};
         QByteArray noiseMsg2 = blob.mid(5, static_cast<int>(msg2Len));
 
-        // Load our pending handshake state
+        // Load our pending handshake state (format: [32 ratchetPub][32 ratchetPriv][noiseBlob...])
         int role = 0;
-        QByteArray hsBlob = m_store.loadPendingHandshake(senderIdB64u, role);
-        if (hsBlob.isEmpty() || role != NoiseState::Initiator) {
+        QByteArray pendingBlob = m_store.loadPendingHandshake(senderIdB64u, role);
+        if (pendingBlob.size() < 64 || role != NoiseState::Initiator) {
             qWarning() << "[SessionManager] No pending initiator handshake for" << senderIdB64u.left(8) + "...";
             return {};
         }
+
+        // Extract saved ratchet DH keypair (fresh, independent of Noise ephemeral)
+        QByteArray ratchetDhPub  = pendingBlob.left(32);
+        QByteArray ratchetDhPriv = pendingBlob.mid(32, 32);
+        QByteArray hsBlob        = pendingBlob.mid(64);
 
         NoiseState noise = NoiseState::deserialize(hsBlob);
         QByteArray responsePayload;
@@ -275,12 +283,12 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         m_store.deletePendingHandshake(senderIdB64u);
         qDebug() << "[SessionManager] Noise IK handshake complete (initiator) for" << senderIdB64u.left(8) + "...";
 
-        // Initialize ratchet session as initiator
+        // Initialize ratchet with our saved fresh ratchet DH keypair
         // The responder's Noise ephemeral (first 32 bytes of msg2) is the remote DH pub
         QByteArray responderEphPub = noiseMsg2.left(32);
 
         RatchetSession ratchet = RatchetSession::initAsInitiator(
-            hr.recvCipher.key, responderEphPub);
+            hr.recvCipher.key, responderEphPub, ratchetDhPub, ratchetDhPriv);
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);

@@ -33,15 +33,20 @@ public:
     // Initialize as the initiator after Noise handshake
     // rootKey = derived from Noise chaining key
     // remoteDhPub = responder's initial DH public key (from Noise ephemeral)
+    // localDhPub/Priv = our initial DH keypair (Noise ephemeral, so responder knows it)
     static RatchetSession initAsInitiator(const QByteArray& rootKey,
-                                          const QByteArray& remoteDhPub);
+                                          const QByteArray& remoteDhPub,
+                                          const QByteArray& localDhPub,
+                                          const QByteArray& localDhPriv);
 
     // Initialize as the responder after Noise handshake
     // rootKey = derived from Noise chaining key
-    // localDhPub/Priv = our initial DH keypair (can reuse Noise ephemeral)
+    // localDhPub/Priv = our initial DH keypair (Noise ephemeral)
+    // remoteDhPub = initiator's initial DH pub (Noise ephemeral from msg1)
     static RatchetSession initAsResponder(const QByteArray& rootKey,
                                           const QByteArray& localDhPub,
-                                          const QByteArray& localDhPriv);
+                                          const QByteArray& localDhPriv,
+                                          const QByteArray& remoteDhPub);
 
     // Encrypt a plaintext message
     // Returns serialized header + ciphertext

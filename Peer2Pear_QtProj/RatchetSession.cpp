@@ -85,19 +85,20 @@ QPair<QByteArray, QByteArray> RatchetSession::kdfChainKey(const QByteArray& chai
 // ---------------------------
 
 RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
-                                                const QByteArray& remoteDhPub) {
+                                                const QByteArray& remoteDhPub,
+                                                const QByteArray& localDhPub,
+                                                const QByteArray& localDhPriv) {
     RatchetSession s;
     s.m_remoteDhPub = remoteDhPub;
 
-    // Generate our first DH ratchet keypair
-    auto [pub, priv] = CryptoEngine::generateEphemeralX25519();
-    s.m_dhPub  = pub;
-    s.m_dhPriv = priv;
+    // Use the provided DH keypair (Noise ephemeral) so the responder already knows our pub
+    s.m_dhPub  = localDhPub;
+    s.m_dhPriv = localDhPriv;
 
     // Perform initial DH and derive sending chain
     unsigned char shared[crypto_scalarmult_BYTES];
     if (crypto_scalarmult(shared,
-                          reinterpret_cast<const unsigned char*>(priv.constData()),
+                          reinterpret_cast<const unsigned char*>(localDhPriv.constData()),
                           reinterpret_cast<const unsigned char*>(remoteDhPub.constData())) != 0) {
         return {};
     }
@@ -111,7 +112,7 @@ RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
     // Receiving chain is empty until we get peer's first DH ratchet message
 
     qDebug() << "[Ratchet] initAsInitiator: inputRootKey=" << rootKey.left(4).toHex()
-             << "dhPub=" << pub.left(4).toHex()
+             << "dhPub=" << localDhPub.left(4).toHex()
              << "remoteDhPub=" << remoteDhPub.left(4).toHex()
              << "derivedRootKey=" << newRoot.left(4).toHex();
     return s;
@@ -119,15 +120,49 @@ RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
 
 RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
                                                 const QByteArray& localDhPub,
-                                                const QByteArray& localDhPriv) {
+                                                const QByteArray& localDhPriv,
+                                                const QByteArray& remoteDhPub) {
     RatchetSession s;
-    s.m_rootKey = rootKey;
-    s.m_dhPub   = localDhPub;
-    s.m_dhPriv  = localDhPriv;
-    // Sending chain is empty until we perform our first DH ratchet
-    // Receiving chain will be established when the first message arrives
-    qDebug() << "[Ratchet] initAsResponder: rootKey=" << rootKey.left(4).toHex()
-             << "dhPub=" << localDhPub.left(4).toHex();
+    s.m_remoteDhPub = remoteDhPub;
+
+    // Step 1: Derive receiving chain from DH(our priv, initiator's pub)
+    // This matches the initiator's sending chain
+    unsigned char shared[crypto_scalarmult_BYTES];
+    if (crypto_scalarmult(shared,
+                          reinterpret_cast<const unsigned char*>(localDhPriv.constData()),
+                          reinterpret_cast<const unsigned char*>(remoteDhPub.constData())) != 0) {
+        return {};
+    }
+    QByteArray dhOutput(reinterpret_cast<const char*>(shared), sizeof(shared));
+    sodium_memzero(shared, sizeof(shared));
+
+    auto [rk1, recvChain] = kdfRootKey(rootKey, dhOutput);
+    s.m_rootKey      = rk1;
+    s.m_recvChainKey = recvChain;
+
+    // Step 2: Generate new DH keypair and derive sending chain
+    auto [pub, priv] = CryptoEngine::generateEphemeralX25519();
+    s.m_dhPub  = pub;
+    s.m_dhPriv = priv;
+
+    if (crypto_scalarmult(shared,
+                          reinterpret_cast<const unsigned char*>(priv.constData()),
+                          reinterpret_cast<const unsigned char*>(remoteDhPub.constData())) != 0) {
+        return {};
+    }
+    dhOutput = QByteArray(reinterpret_cast<const char*>(shared), sizeof(shared));
+    sodium_memzero(shared, sizeof(shared));
+
+    auto [rk2, sendChain] = kdfRootKey(s.m_rootKey, dhOutput);
+    s.m_rootKey      = rk2;
+    s.m_sendChainKey = sendChain;
+
+    qDebug() << "[Ratchet] initAsResponder: inputRootKey=" << rootKey.left(4).toHex()
+             << "localDhPub=" << pub.left(4).toHex()
+             << "remoteDhPub=" << remoteDhPub.left(4).toHex()
+             << "derivedRootKey=" << rk2.left(4).toHex()
+             << "sendChainKey set=" << !s.m_sendChainKey.isEmpty()
+             << "recvChainKey set=" << !s.m_recvChainKey.isEmpty();
     return s;
 }
 

@@ -97,11 +97,11 @@ void ChatController::setDatabase(QSqlDatabase db)
     // One-time migration: clear sessions created with the buggy ratchet init
     {
         QSqlQuery q(db);
-        q.prepare("SELECT value FROM settings WHERE key='ratchet_v3_cleared';");
+        q.prepare("SELECT value FROM settings WHERE key='ratchet_v5_cleared';");
         if (!q.exec() || !q.next()) {
             m_sessionStore->clearAll();
             QSqlQuery ins(db);
-            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v3_cleared','1');");
+            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v5_cleared','1');");
             ins.exec();
         }
     }
