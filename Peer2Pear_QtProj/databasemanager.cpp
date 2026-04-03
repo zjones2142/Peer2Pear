@@ -14,18 +14,35 @@ static QString contactKey(const QString &peerIdB64u, const QString &name)
     return "name:" + name;
 }
 
-DatabaseManager::DatabaseManager()
+static QString makeConnectionName()
 {
-    m_db = QSqlDatabase::addDatabase("QSQLITE", "peer2pear_conn");
+    static int counter = 0;
+    return QStringLiteral("peer2pear_conn_%1").arg(counter++);
 }
 
-DatabaseManager::~DatabaseManager() { close(); }
+DatabaseManager::DatabaseManager()
+    : m_connName(makeConnectionName())
+{
+    m_db = QSqlDatabase::addDatabase("QSQLITE", m_connName);
+}
+
+DatabaseManager::~DatabaseManager()
+{
+    close();
+    m_db = QSqlDatabase();               // release handle before removing
+    QSqlDatabase::removeDatabase(m_connName);
+}
 
 bool DatabaseManager::open()
 {
     const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(base);
-    m_db.setDatabaseName(base + "/peer2PearUser.db");
+    return open(base + "/peer2PearUser.db");
+}
+
+bool DatabaseManager::open(const QString &path)
+{
+    m_db.setDatabaseName(path);
 
     if (!m_db.open()) {
         qWarning() << "DatabaseManager: failed to open DB:" << m_db.lastError().text();

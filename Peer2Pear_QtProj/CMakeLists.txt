@@ -133,3 +133,9 @@ install(TARGETS Peer2Pear_QtProj
 if(QT_VERSION_MAJOR EQUAL 6)
     qt_finalize_executable(Peer2Pear_QtProj)
 endif()
+
+# --- 8. Tests (opt-in; can also be built standalone from tests/) ---
+option(BUILD_TESTS "Build the Peer2Pear test suite" OFF)
+if(BUILD_TESTS)
+    add_subdirectory(tests)
+endif()

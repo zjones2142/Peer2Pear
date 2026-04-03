@@ -16,6 +16,7 @@ public:
     ~DatabaseManager();
 
     bool open();
+    bool open(const QString &path);   // open an arbitrary DB (use ":memory:" for tests)
     void close();
 
     // Set a 32-byte symmetric key for encrypting sensitive fields at rest.
@@ -51,6 +52,7 @@ private:
     QString decryptField(const QString &stored) const;
 
     QSqlDatabase m_db;
+    QString      m_connName;    // unique per-instance connection name
     QByteArray   m_encKey;       // 32-byte key; empty = no encryption
     QByteArray   m_legacyKey;    // old key for migrating existing encrypted data
 };
