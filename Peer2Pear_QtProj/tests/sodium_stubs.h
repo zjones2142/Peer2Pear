@@ -266,16 +266,16 @@ inline int sodium_base642bin(unsigned char *bin, size_t bin_maxlen,
     size_t o = 0;
     size_t i = 0;
     while (i < b64_len) {
-        int a = -1, b2 = -1, c = -1, d = -1;
+        int a = -1, b = -1, c = -1, d = -1;
         if (i < b64_len) a = val(b64[i++]);
-        if (i < b64_len) b2 = val(b64[i++]);
+        if (i < b64_len) b = val(b64[i++]);
         if (i < b64_len) c = val(b64[i++]);
         if (i < b64_len) d = val(b64[i++]);
 
-        if (a < 0 || b2 < 0) break;
+        if (a < 0 || b < 0) break;
 
-        if (o < bin_maxlen) bin[o++] = static_cast<unsigned char>((a << 2) | (b2 >> 4));
-        if (c >= 0 && o < bin_maxlen) bin[o++] = static_cast<unsigned char>((b2 << 4) | (c >> 2));
+        if (o < bin_maxlen) bin[o++] = static_cast<unsigned char>((a << 2) | (b >> 4));
+        if (c >= 0 && o < bin_maxlen) bin[o++] = static_cast<unsigned char>((b << 4) | (c >> 2));
         if (d >= 0 && o < bin_maxlen) bin[o++] = static_cast<unsigned char>((c << 6) | d);
     }
     if (bin_len) *bin_len = o;
