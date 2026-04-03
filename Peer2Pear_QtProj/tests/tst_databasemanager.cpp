@@ -93,99 +93,112 @@ private slots:
     void initTestCase();
 
     // ── Database lifecycle ───────────────────────────────────────────────
-    void testOpenInMemory();
-    void testOpenFileBased();
-    void testOpenCustomPath();
-    void testDoubleOpen();
-    void testCloseAndReopen();
-    void testIsOpen();
-    void testTablesCreatedOnOpen();
-    void testMigrationSafety();
+    void testOpenInMemory();            // DB can be opened with :memory: for transient use
+    void testOpenFileBased();           // DB can be opened at a file path on disk
+    void testOpenCustomPath();          // DB auto-creates parent directories for custom paths
+    void testDoubleOpen();              // Calling open() twice on the same instance does not crash
+    void testCloseAndReopen();          // Data persists across close() and reopen on the same file
+    void testIsOpen();                  // isOpen() reflects the actual connection state
+    void testTablesCreatedOnOpen();     // All four core tables are created on first open
+    void testMigrationSafety();         // ALTER TABLE migrations are idempotent (safe to run twice)
 
     // ── Contact CRUD ────────────────────────────────────────────────────
-    void testSaveAndLoadContact();
-    void testSaveContactUpsert();
-    void testDeleteContact();
-    void testDeleteNonExistentContact();
-    void testContactExists();
-    void testContactExistsEmpty();
-    void testGetContact();
-    void testGetContactNotFound();
-    void testContactWithKeys();
-    void testContactWithEmptyKeys();
-    void testContactBlockedFlag();
-    void testBlockContact();
-    void testContactGroupFlag();
-    void testContactGroupId();
-    void testContactAvatar();
-    void testSaveContactAvatar();
-    void testContactNameOnlyKey();
-    void testContactEmptyPeerIdAndName();
-    void testLoadAllContactsEmpty();
-    void testLoadAllContactsMultiple();
-    void testContactsOrderedByLastActive();
+    void testSaveAndLoadContact();      // A saved contact can be loaded back with correct fields
+    void testSaveContactUpsert();       // Saving a contact with the same peerId updates (upserts) the existing row
+    void testDeleteContact();           // deleteContact removes the row from the contacts table
+    void testDeleteNonExistentContact();// Deleting a non-existent contact does not error
+    void testContactExists();           // contactExists returns true only for saved contacts
+    void testContactExistsEmpty();      // contactExists returns false for an empty peerId
+    void testGetContact();              // getContact retrieves all fields for a single contact
+    void testGetContactNotFound();      // getContact returns an empty ChatData for missing contacts
+    void testContactWithKeys();         // Public keys are round-tripped through pipe-delimited storage
+    void testContactWithEmptyKeys();    // An empty keys list is stored and loaded correctly
+    void testContactBlockedFlag();      // The isBlocked flag persists and can be toggled via saveContact
+    void testBlockContact();            // blockContact() directly toggles the is_blocked column
+    void testContactGroupFlag();        // The isGroup flag persists correctly
+    void testContactGroupId();          // The groupId string persists correctly
+    void testContactAvatar();           // Avatar data set via saveContact is stored and retrieved
+    void testSaveContactAvatar();       // saveContactAvatar updates only the avatar column
+    void testContactNameOnlyKey();      // Contacts with no peerId are keyed by "name:<name>"
+    void testContactEmptyPeerIdAndName();// Empty peerId + empty name → key "name:" is valid
+    void testLoadAllContactsEmpty();    // loadAllContacts returns empty vector for a fresh DB
+    void testLoadAllContactsMultiple(); // loadAllContacts returns all saved contacts
+    void testContactsOrderedByLastActive();// Contacts are sorted by most-recently-active first
+
+    // ── Duplicate / same-key contact scenarios ──────────────────────────
+    void testSamePeerIdOverwritesContact();          // Two contacts with the same peerId collapse into one row (upsert)
+    void testSamePeerIdDeleteRemovesOnlyRow();        // Deleting a shared peerId removes the single DB row
+    void testSamePeerIdDeleteAndReopenLosesBoth();    // After delete+reopen, neither in-memory contact survives
+    void testSameNameNoPeerIdCollides();               // Two name-only contacts with the same name share one DB row
+    void testSameNameNoPeerIdDeleteRemovesSharedRow(); // Deleting one name-only contact removes the shared row
+    void testSameNameDifferentPeerIdAreDistinct();     // Same display name but different peerIds are separate rows
+    void testDeleteOneSameNameDiffPeerIdKeepsOther();  // Deleting one same-name contact preserves the other
+    void testDeleteOneSameNameDiffPeerIdPreservesMessages(); // Messages for the surviving contact are intact
+    void testSameNameDiffPeerIdDeleteAndReopen();      // After delete+reopen, the surviving contact's data persists
+    void testSharedKeysFieldDoesNotCauseCollision();   // Two contacts with identical keys but different peerIds are distinct
+    void testSamePeerIdMessagesLostOnDelete();         // Messages for a shared-peerId contact vanish after delete
 
     // ── Message operations ──────────────────────────────────────────────
-    void testSaveAndLoadMessage();
-    void testMultipleMessages();
-    void testMessagesOrderedByTimestamp();
-    void testMessagesDontIntermix();
-    void testMessageAllFields();
-    void testMessageEmptyOptionalFields();
-    void testLoadMessagesNonExistentPeer();
-    void testLoadMessagesEmptyPeerId();
-    void testSaveMessageEmptyPeerId();
-    void testSaveMessageUpdatesLastActive();
-    void testClearMessages();
-    void testClearMessagesNonExistent();
-    void testMessageCount();
-    void testMessageCountEmpty();
-    void testDeleteContactCascadesMessages();
+    void testSaveAndLoadMessage();      // A saved message can be loaded back with correct fields
+    void testMultipleMessages();        // Multiple messages for the same contact are all persisted
+    void testMessagesOrderedByTimestamp();// Messages are returned in ascending timestamp order
+    void testMessagesDontIntermix();    // Messages are scoped to their contact's peerId
+    void testMessageAllFields();        // All optional message fields (msgId, senderName) persist
+    void testMessageEmptyOptionalFields();// Empty optional fields are stored and loaded as empty strings
+    void testLoadMessagesNonExistentPeer();// Loading messages for a non-existent peer returns empty
+    void testLoadMessagesEmptyPeerId(); // Loading messages with an empty peerId returns empty
+    void testSaveMessageEmptyPeerId();  // Saving a message with an empty peerId is silently ignored
+    void testSaveMessageUpdatesLastActive();// Saving a message bumps the contact's last_active timestamp
+    void testClearMessages();           // clearMessages removes all messages but keeps the contact
+    void testClearMessagesNonExistent();// clearMessages for a non-existent peer does not error
+    void testMessageCount();            // messageCount returns the correct count for a contact
+    void testMessageCountEmpty();       // messageCount returns 0 for empty or non-existent peerIds
+    void testDeleteContactCascadesMessages();// Deleting a contact cascades to delete its messages
 
     // ── File transfer operations ────────────────────────────────────────
-    void testSaveAndLoadFileRecord();
-    void testUpdateFileRecord();
-    void testFileRecordAllStatuses();
-    void testFileRecordsOrderedByTimestamp();
-    void testFileRecordsDontIntermix();
-    void testLoadFileRecordsEmptyKey();
-    void testSaveFileRecordEmptyKey();
-    void testSaveFileRecordEmptyTransferId();
-    void testDeleteFileRecord();
-    void testDeleteNonExistentFileRecord();
+    void testSaveAndLoadFileRecord();   // A saved file record can be loaded back with correct fields
+    void testUpdateFileRecord();        // Re-saving a file record with the same transferId updates it
+    void testFileRecordAllStatuses();   // All FileTransferStatus enum values round-trip correctly
+    void testFileRecordsOrderedByTimestamp();// File records are returned in ascending timestamp order
+    void testFileRecordsDontIntermix(); // File records are scoped to their chat key
+    void testLoadFileRecordsEmptyKey(); // Loading with an empty chat key returns empty
+    void testSaveFileRecordEmptyKey();  // Saving with an empty chat key is silently ignored
+    void testSaveFileRecordEmptyTransferId();// Saving with an empty transferId is silently ignored
+    void testDeleteFileRecord();        // deleteFileRecord removes only the specified record
+    void testDeleteNonExistentFileRecord();// Deleting a non-existent file record does not error
 
     // ── Settings operations ─────────────────────────────────────────────
-    void testSaveAndLoadSetting();
-    void testLoadSettingDefault();
-    void testLoadSettingCustomDefault();
-    void testOverwriteSetting();
-    void testMultipleSettings();
+    void testSaveAndLoadSetting();      // A saved setting can be loaded back with the correct value
+    void testLoadSettingDefault();       // Loading a non-existent key returns empty string by default
+    void testLoadSettingCustomDefault(); // Loading a non-existent key returns the caller's default
+    void testOverwriteSetting();         // Saving the same key twice replaces the old value
+    void testMultipleSettings();         // Multiple independent settings coexist correctly
 
     // ── Encryption ──────────────────────────────────────────────────────
-    void testEncryptedMessageRoundTrip();
-    void testPlaintextWithoutKey();
-    void testEncryptedEmptyString();
-    void testEncryptedUnicodeText();
-    void testEncryptedLongText();
-    void testWrongKeyCannotDecrypt();
-    void testLegacyPlaintextReadable();
-    void testEncryptionKeyMustBe32Bytes();
-    void testSetEncryptionKeyAfterOpen();
+    void testEncryptedMessageRoundTrip();// Messages encrypted with a key can be decrypted on load
+    void testPlaintextWithoutKey();      // Without an encryption key, messages are stored as plaintext
+    void testEncryptedEmptyString();     // An empty string can be encrypted and decrypted correctly
+    void testEncryptedUnicodeText();     // Unicode text survives encryption round-trip
+    void testEncryptedLongText();        // Large text (10 KB) survives encryption round-trip
+    void testWrongKeyCannotDecrypt();    // A different key cannot decrypt the ciphertext
+    void testLegacyPlaintextReadable();  // Plaintext written without encryption is readable even with a key set
+    void testEncryptionKeyMustBe32Bytes();// Keys that are not exactly 32 bytes are rejected
+    void testSetEncryptionKeyAfterOpen();// Setting an encryption key mid-session works correctly
 
     // ── Edge cases ──────────────────────────────────────────────────────
-    void testUnicodeContactNames();
-    void testEmojiInMessages();
-    void testVeryLongTextValues();
-    void testSpecialCharsInSettingsKeys();
-    void testSqlInjectionSafe();
-    void testLargeNumberOfContacts();
-    void testLargeNumberOfMessages();
-    void testReopenPreservesData();
-    void testMultipleDatabaseInstances();
+    void testUnicodeContactNames();     // Unicode names (Latin, CJK, Cyrillic) persist correctly
+    void testEmojiInMessages();         // Emoji characters in messages persist correctly
+    void testVeryLongTextValues();      // 100 KB messages are stored and retrieved without truncation
+    void testSpecialCharsInSettingsKeys();// Settings keys with spaces, slashes, dots work correctly
+    void testSqlInjectionSafe();        // SQL injection attempts are safely handled via parameterized queries
+    void testLargeNumberOfContacts();   // 200 contacts can be stored and retrieved
+    void testLargeNumberOfMessages();   // 500 messages are stored, retrieved, and ordered correctly
+    void testReopenPreservesData();     // All data types survive a close+reopen cycle on disk
+    void testMultipleDatabaseInstances();// Two separate DB instances with different files are isolated
 
     // ── Data integrity ──────────────────────────────────────────────────
-    void testForeignKeyEnforcement();
-    void testIndexesExist();
+    void testForeignKeyEnforcement();   // FK constraint prevents orphan messages (no matching contact)
+    void testIndexesExist();            // Performance indexes are created on the expected columns
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -601,6 +614,288 @@ void TestDatabaseManager::testContactsOrderedByLastActive()
     QCOMPARE(contacts[0].peerIdB64u, QStringLiteral("peerA"));
     QCOMPARE(contacts[1].peerIdB64u, QStringLiteral("peerB"));
     QCOMPARE(contacts[2].peerIdB64u, QStringLiteral("peerC"));
+    db.close();
+}
+
+// ── Duplicate / same-key contact scenarios ──────────────────────────────────
+// These tests document and verify the database behavior when two contacts
+// share the same primary key (peer_id). Because peer_id is a PRIMARY KEY,
+// only one row can exist per key. The second saveContact() silently upserts
+// (overwrites) the first. Deleting that key removes the single shared row.
+//
+// This is the root cause of the reported bug: if the application holds two
+// in-memory ChatData objects with the same peerIdB64u, they map to one DB
+// row, so deleting one deletes the other on next reload.
+
+void TestDatabaseManager::testSamePeerIdOverwritesContact()
+{
+    // Two contacts saved with the same peerId — the second overwrites the first.
+    // The DB should contain exactly one row with the second contact's data.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    db.saveContact(makeChatData("peerA", "Alice",   "first subtitle"));
+    db.saveContact(makeChatData("peerA", "Alice v2", "second subtitle"));
+
+    auto contacts = db.loadAllContacts();
+    QVERIFY2(contacts.size() == 1,
+             "Two contacts with the same peerId must collapse into one DB row");
+    QCOMPARE(contacts[0].name, QStringLiteral("Alice v2"));
+    QCOMPARE(contacts[0].subtitle, QStringLiteral("second subtitle"));
+    db.close();
+}
+
+void TestDatabaseManager::testSamePeerIdDeleteRemovesOnlyRow()
+{
+    // Saving two contacts with the same peerId creates one row.
+    // Deleting that peerId removes the only row — loadAllContacts returns empty.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    db.saveContact(makeChatData("peerA", "Alice",   "v1"));
+    db.saveContact(makeChatData("peerA", "Alice v2", "v2"));
+
+    db.deleteContact("peerA");
+
+    auto contacts = db.loadAllContacts();
+    QVERIFY2(contacts.isEmpty(),
+             "Deleting the shared peerId must remove the only DB row");
+    QVERIFY2(!db.contactExists("peerA"),
+             "contactExists must return false after deletion");
+    db.close();
+}
+
+void TestDatabaseManager::testSamePeerIdDeleteAndReopenLosesBoth()
+{
+    // Simulates the reported bug: save two contacts with the same peerId,
+    // delete one (which deletes the single DB row), close, and reopen.
+    // On reload, no contact with that peerId exists — both are gone.
+    const QString path = freshDbPath();
+
+    {
+        DatabaseManager db;
+        QVERIFY(db.open(path));
+        db.saveContact(makeChatData("peerA", "Alice",   "first"));
+        db.saveContact(makeChatData("peerA", "Alice v2", "second"));
+        QVERIFY2(db.loadAllContacts().size() == 1,
+                 "Before delete: one row expected for shared peerId");
+
+        db.deleteContact("peerA");
+        db.close();
+    }
+    {
+        DatabaseManager db;
+        QVERIFY(db.open(path));
+        QVERIFY2(db.loadAllContacts().isEmpty(),
+                 "After reopen: both in-memory contacts are gone because they shared one DB row");
+        QVERIFY2(!db.contactExists("peerA"),
+                 "The peerId must not exist after delete+reopen");
+        db.close();
+    }
+}
+
+void TestDatabaseManager::testSameNameNoPeerIdCollides()
+{
+    // Two contacts with the same name and no peerId both map to key "name:<name>".
+    // The second overwrites the first — only one row exists.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    ChatData c1;
+    c1.name     = "SharedName";
+    c1.subtitle = "first";
+    db.saveContact(c1);
+
+    ChatData c2;
+    c2.name     = "SharedName";
+    c2.subtitle = "second";
+    db.saveContact(c2);
+
+    auto contacts = db.loadAllContacts();
+    QVERIFY2(contacts.size() == 1,
+             "Two name-only contacts with the same name must share one DB row");
+    QCOMPARE(contacts[0].subtitle, QStringLiteral("second"));
+    db.close();
+}
+
+void TestDatabaseManager::testSameNameNoPeerIdDeleteRemovesSharedRow()
+{
+    // When two name-only contacts share the same name, they share one DB row.
+    // Deleting by the key "name:<name>" removes that row for both.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    ChatData c1;
+    c1.name     = "SharedName";
+    c1.subtitle = "first";
+    db.saveContact(c1);
+
+    ChatData c2;
+    c2.name     = "SharedName";
+    c2.subtitle = "second";
+    db.saveContact(c2);
+
+    // Delete using the name-based key (same key both contacts map to)
+    db.deleteContact("name:SharedName");
+
+    auto contacts = db.loadAllContacts();
+    QVERIFY2(contacts.isEmpty(),
+             "Deleting the shared name-key must remove the only DB row");
+    db.close();
+}
+
+void TestDatabaseManager::testSameNameDifferentPeerIdAreDistinct()
+{
+    // Two contacts with the same display name but different peerIds are separate rows.
+    // This is the safe scenario — no collision occurs.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    db.saveContact(makeChatData("peerA", "Alice", "from phone"));
+    db.saveContact(makeChatData("peerB", "Alice", "from laptop"));
+
+    auto contacts = db.loadAllContacts();
+    QVERIFY2(contacts.size() == 2,
+             "Same name but different peerIds must create two distinct rows");
+
+    // Both should be retrievable by their own peerId
+    QVERIFY2(db.contactExists("peerA"), "peerA must exist");
+    QVERIFY2(db.contactExists("peerB"), "peerB must exist");
+    db.close();
+}
+
+void TestDatabaseManager::testDeleteOneSameNameDiffPeerIdKeepsOther()
+{
+    // Two contacts with the same name but different peerIds.
+    // Deleting one leaves the other intact.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    db.saveContact(makeChatData("peerA", "Alice", "from phone"));
+    db.saveContact(makeChatData("peerB", "Alice", "from laptop"));
+
+    db.deleteContact("peerA");
+
+    auto contacts = db.loadAllContacts();
+    QVERIFY2(contacts.size() == 1,
+             "After deleting one same-name contact, exactly one must remain");
+    QCOMPARE(contacts[0].peerIdB64u, QStringLiteral("peerB"));
+    QCOMPARE(contacts[0].subtitle, QStringLiteral("from laptop"));
+    QVERIFY2(!db.contactExists("peerA"), "Deleted contact must not exist");
+    QVERIFY2(db.contactExists("peerB"),  "Surviving contact must still exist");
+    db.close();
+}
+
+void TestDatabaseManager::testDeleteOneSameNameDiffPeerIdPreservesMessages()
+{
+    // Two contacts with the same name but different peerIds.
+    // Messages for the surviving contact must not be affected by the other's deletion.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    db.saveContact(makeChatData("peerA", "Alice", "from phone"));
+    db.saveContact(makeChatData("peerB", "Alice", "from laptop"));
+
+    db.saveMessage("peerA", makeMessage(true, "msg for peerA"));
+    db.saveMessage("peerB", makeMessage(true, "msg for peerB"));
+
+    // Delete peerA — peerB's messages should survive
+    db.deleteContact("peerA");
+
+    QVERIFY2(db.loadMessages("peerA").isEmpty(),
+             "Messages for the deleted contact must be cascade-deleted");
+    auto msgsB = db.loadMessages("peerB");
+    QVERIFY2(msgsB.size() == 1,
+             "Messages for the surviving contact must be intact");
+    QCOMPARE(msgsB[0].text, QStringLiteral("msg for peerB"));
+    db.close();
+}
+
+void TestDatabaseManager::testSameNameDiffPeerIdDeleteAndReopen()
+{
+    // Same name, different peerIds. Delete one, close, reopen.
+    // The surviving contact and its messages must persist on disk.
+    const QString path = freshDbPath();
+
+    {
+        DatabaseManager db;
+        QVERIFY(db.open(path));
+        db.saveContact(makeChatData("peerA", "Alice", "from phone"));
+        db.saveContact(makeChatData("peerB", "Alice", "from laptop"));
+        db.saveMessage("peerA", makeMessage(true, "msg for A"));
+        db.saveMessage("peerB", makeMessage(true, "msg for B"));
+
+        db.deleteContact("peerA");
+        db.close();
+    }
+    {
+        DatabaseManager db;
+        QVERIFY(db.open(path));
+
+        QVERIFY2(!db.contactExists("peerA"),
+                 "Deleted contact must stay deleted after reopen");
+        QVERIFY2(db.contactExists("peerB"),
+                 "Surviving contact must persist after reopen");
+
+        auto msgs = db.loadMessages("peerB");
+        QVERIFY2(msgs.size() == 1,
+                 "Surviving contact's messages must persist after reopen");
+        QCOMPARE(msgs[0].text, QStringLiteral("msg for B"));
+
+        QVERIFY2(db.loadMessages("peerA").isEmpty(),
+                 "Deleted contact's messages must remain gone after reopen");
+        db.close();
+    }
+}
+
+void TestDatabaseManager::testSharedKeysFieldDoesNotCauseCollision()
+{
+    // Two contacts with different peerIds but identical public keys in their
+    // keys field. The keys field is NOT part of the primary key, so they are
+    // separate rows that happen to share the same key material.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    QStringList sharedKeys = {"pubKeyABC", "pubKeyXYZ"};
+    db.saveContact(makeChatData("peerA", "Alice", {}, false, false, {}, sharedKeys));
+    db.saveContact(makeChatData("peerB", "Bob",   {}, false, false, {}, sharedKeys));
+
+    auto contacts = db.loadAllContacts();
+    QVERIFY2(contacts.size() == 2,
+             "Shared keys field must NOT cause a primary-key collision");
+
+    // Both contacts should have the same keys
+    for (const auto &c : contacts) {
+        QCOMPARE(c.keys, sharedKeys);
+    }
+    db.close();
+}
+
+void TestDatabaseManager::testSamePeerIdMessagesLostOnDelete()
+{
+    // If two in-memory contacts share a peerId, their messages are on the same
+    // DB row's foreign key. Deleting the peerId cascades to all messages.
+    DatabaseManager db;
+    db.open(":memory:");
+
+    // First save creates the row
+    db.saveContact(makeChatData("peerA", "Alice", "v1"));
+    db.saveMessage("peerA", makeMessage(true, "msg from v1"));
+
+    // Second save upserts (overwrites) the same row
+    db.saveContact(makeChatData("peerA", "Alice v2", "v2"));
+    db.saveMessage("peerA", makeMessage(true, "msg from v2"));
+
+    QVERIFY2(db.messageCount("peerA") == 2,
+             "Both messages should be stored under the shared peerId");
+
+    // Delete the shared peerId — all messages cascade
+    db.deleteContact("peerA");
+
+    QVERIFY2(db.messageCount("peerA") == 0,
+             "All messages must be cascade-deleted when the shared peerId is deleted");
+    QVERIFY2(db.loadMessages("peerA").isEmpty(),
+             "loadMessages must return empty after cascade delete");
     db.close();
 }
 
