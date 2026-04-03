@@ -52,8 +52,11 @@ MainWindow::MainWindow(QWidget *parent)
             QByteArray legacyKey = ChatController::blake2b256(
                 m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey"));
             m_db.setEncryptionKey(newKey, legacyKey);
+            CryptoEngine::secureZero(newKey);
+            CryptoEngine::secureZero(legacyKey);
             // Wire DB to ChatController for Noise/Ratchet session persistence
             m_controller.setDatabase(m_db.database());
+            CryptoEngine::secureZero(pass);
             break;
         } catch (const std::exception &e) {
             QMessageBox::warning(this, "Identity Unlock Failed", e.what());
