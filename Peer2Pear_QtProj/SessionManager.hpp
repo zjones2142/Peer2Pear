@@ -12,13 +12,15 @@
  * SessionManager — orchestrates Noise handshake + Double Ratchet lifecycle.
  *
  * Message type bytes (first byte of session-layer blobs):
- *   0x01 = PREKEY_MSG      — Noise msg1 + first ratchet-encrypted payload
- *   0x02 = PREKEY_RESPONSE — Noise msg2 + ratchet-encrypted payload
+ *   0x01 = PREKEY_MSG      — Noise msg1 + initial payload encrypted with a
+ *                            one-shot pre-key derived from the Noise chaining key
+ *   0x02 = PREKEY_RESPONSE — Noise msg2 + initial payload encrypted with a
+ *                            one-shot pre-key derived from the Noise chaining key
  *   0x03 = RATCHET_MSG     — normal ratchet-encrypted message
  *
  * Pre-key flow (offline delivery):
- *   Alice -> Bob:  [0x01][noise_msg1][ratchet(payload)]
- *   Bob -> Alice:  [0x02][noise_msg2][ratchet(payload)]
+ *   Alice -> Bob:  [0x01][noise_msg1][prekey(payload)]
+ *   Bob -> Alice:  [0x02][noise_msg2][prekey(payload)]
  *   After:         [0x03][ratchet(payload)]
  */
 
