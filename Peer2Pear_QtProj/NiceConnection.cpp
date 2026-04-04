@@ -5,6 +5,9 @@ NiceConnection::NiceConnection(QObject* parent)
     : QThread(parent), m_state(NICE_COMPONENT_STATE_DISCONNECTED) {}
 
 NiceConnection::~NiceConnection() {
+    if (m_agent) {
+        nice_agent_close_async(m_agent, nullptr, nullptr);
+    }
     if (m_loop) {
         g_main_loop_quit(m_loop);
         wait(); // Wait for thread to exit
