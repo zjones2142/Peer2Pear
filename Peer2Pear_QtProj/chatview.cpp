@@ -1061,6 +1061,23 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         // Rebuild the list so the avatar label updates immediately
         rebuildChatList();
 
+        // Refresh the active chat header avatar if this contact is selected
+        if (m_currentChat == i) {
+            if (!avatarB64.isEmpty()) {
+                QPixmap px;
+                px.loadFromData(QByteArray::fromBase64(avatarB64.toUtf8()));
+                if (!px.isNull()) {
+                    m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
+                    m_ui->chatAvatarLabel->setText("");
+                }
+            } else {
+                const QString ch = m_chats[i].name.isEmpty() ? "?" : QString(m_chats[i].name[0]);
+                m_ui->chatAvatarLabel->setPixmap(
+                    renderInitialsAvatar(ch, avatarColorForName(m_chats[i].name), 44));
+                m_ui->chatAvatarLabel->setText("");
+            }
+        }
+
         if (firstTime)
             showToast(m_chats[i].name + "'s profile has been updated");
         return;
