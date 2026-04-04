@@ -14,7 +14,10 @@ public:
     ~NiceConnection();
 
     // Initialize the ICE agent. One side must be 'controlling' (the offerer).
+    // Optionally provide TURN relay credentials for symmetric-NAT fallback.
     void initIce(bool controlling);
+    void setTurnServer(const QString& host, int port,
+                       const QString& username, const QString& password);
 
     // Parse the SDP string received from the peer via the mailbox
     void setRemoteSdp(const QString& sdp);
@@ -43,4 +46,10 @@ private:
     GMainLoop* m_loop = nullptr;
     guint m_streamId = 0;
     std::atomic<int> m_state;
+
+    // TURN relay config (set before initIce)
+    QString m_turnHost;
+    int     m_turnPort = 0;
+    QString m_turnUser;
+    QString m_turnPass;
 };

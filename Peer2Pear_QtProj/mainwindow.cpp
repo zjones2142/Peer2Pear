@@ -87,6 +87,15 @@ MainWindow::MainWindow(QWidget *parent)
     }
     const QString serverUrl = m_db.loadSetting("serverUrl", "https://peer2pear.com");
     m_controller.setServerBaseUrl(QUrl(serverUrl));
+
+    // TURN relay for symmetric NAT fallback — configure before polling starts
+    const QString turnHost = m_db.loadSetting("turnHost", "peer2pear.com");
+    const int     turnPort = m_db.loadSetting("turnPort", "3478").toInt();
+    const QString turnUser = m_db.loadSetting("turnUser", "peer2pear");
+    const QString turnPass = m_db.loadSetting("turnPass", "peer2pear");
+    if (!turnHost.isEmpty())
+        m_controller.setTurnServer(turnHost, turnPort, turnUser, turnPass);
+
     m_controller.startPolling(2000);
 
     // ── Profile handle: first 8 chars of public key ───────────────────────────
@@ -173,7 +182,10 @@ MainWindow::MainWindow(QWidget *parent)
     });
 }
 
-MainWindow::~MainWindow() { delete ui; }
+MainWindow::~MainWindow() {
+    m_controller.stopPolling();   // unpublish presence so peers see us offline
+    delete ui;
+}
 
 void MainWindow::resizeEvent(QResizeEvent *event)
 {

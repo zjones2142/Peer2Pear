@@ -14,6 +14,14 @@ NiceConnection::~NiceConnection() {
     if (m_agent) g_object_unref(m_agent);
 }
 
+void NiceConnection::setTurnServer(const QString& host, int port,
+                                    const QString& username, const QString& password) {
+    m_turnHost = host;
+    m_turnPort = port;
+    m_turnUser = username;
+    m_turnPass = password;
+}
+
 void NiceConnection::initIce(bool controlling) {
     m_context = g_main_context_new();
     m_loop = g_main_loop_new(m_context, FALSE);
@@ -26,6 +34,15 @@ void NiceConnection::initIce(bool controlling) {
     g_object_set(G_OBJECT(m_agent), "stun-server-port", 19302, NULL);
 
     m_streamId = nice_agent_add_stream(m_agent, 1);
+
+    // Add TURN relay server if configured (required for symmetric NAT)
+    if (!m_turnHost.isEmpty() && m_turnPort > 0) {
+        nice_agent_set_relay_info(m_agent, m_streamId, 1,
+            m_turnHost.toUtf8().constData(), m_turnPort,
+            m_turnUser.toUtf8().constData(), m_turnPass.toUtf8().constData(),
+            NICE_RELAY_TYPE_TURN_UDP);
+        qDebug() << "[ICE] TURN relay configured:" << m_turnHost << ":" << m_turnPort;
+    }
 
     g_signal_connect(G_OBJECT(m_agent), "candidate-gathering-done", G_CALLBACK(cbCandidateGatheringDone), this);
     g_signal_connect(G_OBJECT(m_agent), "component-state-changed", G_CALLBACK(cbComponentStateChanged), this);

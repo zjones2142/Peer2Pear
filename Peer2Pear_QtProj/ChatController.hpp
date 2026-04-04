@@ -66,6 +66,9 @@ public:
 
     void checkPresence(const QStringList& peerIds);
 
+    void setTurnServer(const QString& host, int port,
+                       const QString& username, const QString& password);
+
     void sendAvatar(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
 
     void sendGroupRename(const QString& groupId, const QString& newName, const QStringList& memberKeys);
@@ -144,6 +147,12 @@ private:
 
     QMap<QString, NiceConnection*> m_p2pConnections;
 
-    // Refreshes rendezvous registration every 9 minutes (just under the 10-min TTL)
+    // TURN relay config for symmetric NAT fallback
+    QString m_turnHost;
+    int     m_turnPort = 0;
+    QString m_turnUser;
+    QString m_turnPass;
+
+    // Refreshes rendezvous presence every 50 seconds (just under the 60-s TTL)
     QTimer m_rvzRefreshTimer;
 };
