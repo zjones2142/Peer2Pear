@@ -43,6 +43,22 @@ ChatController::ChatController(QObject* parent)
             this, &ChatController::fileChunkReceived);
     connect(&m_fileMgr, &FileTransferManager::wantP2PConnection,
             this, &ChatController::initiateP2PConnection);
+    // M1 fix: remove ratchet-derived file key when transfer completes.
+    // M4 fix: keys are stored as "senderId:transferId" — match on suffix.
+    connect(&m_fileMgr, &FileTransferManager::transferCompleted,
+            this, [this](const QString& transferId) {
+        const QString suffix = ":" + transferId;
+        auto it = m_fileKeys.begin();
+        while (it != m_fileKeys.end()) {
+            if (it.key().endsWith(suffix) || it.key() == transferId) {
+                sodium_memzero(it.value().data(), it.value().size());
+                m_fileKeyTimes.remove(it.key());  // M8 fix
+                it = m_fileKeys.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    });
 
     // Refresh rendezvous registration every 50 seconds (TTL is 60s).
     // Short TTL means peers detect offline status within ~60s of app close.
@@ -126,6 +142,26 @@ void ChatController::setDatabase(QSqlDatabase db)
         QByteArray env = kSealedPrefix + "\n" + sealed;
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
     });
+
+    // M2 fix: Set seal callback on FileTransferManager so file chunks get sealed envelopes.
+    // This wraps the inner payload (already encrypted with ratchet-derived file key)
+    // in a SealedEnvelope for metadata privacy — the relay never sees sender identity.
+    m_fileMgr.setSealFn([this](const QString& peerId, const QByteArray& payload) -> QByteArray {
+        QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
+        unsigned char peerCurvePub[32];
+        if (crypto_sign_ed25519_pk_to_curve25519(
+                peerCurvePub,
+                reinterpret_cast<const unsigned char*>(peerEdPub.constData())) != 0)
+            return {};
+
+        QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+        sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
+        QByteArray sealed = SealedEnvelope::seal(
+            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), payload);
+        if (sealed.isEmpty()) return {};
+
+        return kSealedFCPrefix + "\n" + sealed;
+    });
 }
 
 QString ChatController::myIdB64u() const
@@ -181,7 +217,43 @@ QString ChatController::sendFile(const QString& peerIdB64u,
                                  const QString& fileName,
                                  const QByteArray& fileData)
 {
-    return m_fileMgr.sendFile(myIdB64u(), peerIdB64u, fileName, fileData);
+    if (fileData.size() > FileTransferManager::kMaxFileBytes) {
+        emit status(QString("File too large (max %1 MB).")
+                        .arg(FileTransferManager::kMaxFileBytes / (1024 * 1024)));
+        return {};
+    }
+
+    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    // Send file_key announcement through the ratchet to derive a forward-secret key
+    QJsonObject announce;
+    announce["from"]       = myIdB64u();
+    announce["type"]       = "file_key";
+    announce["transferId"] = transferId;
+    announce["fileName"]   = fileName;
+    announce["fileSize"]   = fileData.size();
+    announce["ts"]         = QDateTime::currentSecsSinceEpoch();
+
+    const QByteArray pt = QJsonDocument(announce).toJson(QJsonDocument::Compact);
+    QByteArray sealedEnv = sealForPeer(peerIdB64u, pt);
+    if (sealedEnv.isEmpty()) {
+        qWarning() << "[FILE] BLOCKED — cannot seal file_key for" << peerIdB64u.left(8) + "...";
+        emit status("File not sent — encrypted session unavailable.");
+        return {};
+    }
+
+    // Send the announcement (always via mailbox for reliability)
+    m_mbox.enqueue(peerIdB64u, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
+
+    // Extract the ratchet-derived key for chunk encryption
+    QByteArray fileKey = m_sessionMgr->lastMessageKey();
+    qDebug() << "[FILE] file_key announced for" << transferId.left(8) + "..."
+             << "to" << peerIdB64u.left(8) + "...";
+
+    const QString result = m_fileMgr.sendFileWithKey(myIdB64u(), peerIdB64u, fileKey,
+                                                      transferId, fileName, fileData);
+    sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
+    return result;
 }
 
 QString ChatController::sendGroupFile(const QString& groupId,
@@ -190,8 +262,53 @@ QString ChatController::sendGroupFile(const QString& groupId,
                                       const QString& fileName,
                                       const QByteArray& fileData)
 {
-    return m_fileMgr.sendGroupFile(myIdB64u(), groupId, groupName,
-                                   memberPeerIds, fileName, fileData);
+    if (fileData.size() > FileTransferManager::kMaxFileBytes) {
+        emit status(QString("File too large (max %1 MB).")
+                        .arg(FileTransferManager::kMaxFileBytes / (1024 * 1024)));
+        return {};
+    }
+
+    const QString myId = myIdB64u();
+    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    // Send per-member file_key announcements through the ratchet
+    for (const QString& peerId : memberPeerIds) {
+        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
+
+        QJsonObject announce;
+        announce["from"]       = myId;
+        announce["type"]       = "file_key";
+        announce["transferId"] = transferId;
+        announce["fileName"]   = fileName;
+        announce["fileSize"]   = fileData.size();
+        announce["ts"]         = QDateTime::currentSecsSinceEpoch();
+        announce["groupId"]    = groupId;
+        announce["groupName"]  = groupName;
+
+        const QByteArray pt = QJsonDocument(announce).toJson(QJsonDocument::Compact);
+        QByteArray sealedEnv = sealForPeer(peerId, pt);
+        if (sealedEnv.isEmpty()) {
+            qWarning() << "[FILE] BLOCKED — cannot seal file_key for" << peerId.left(8) + "...";
+            continue;
+        }
+
+        m_mbox.enqueue(peerId, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
+
+        QByteArray fileKey = m_sessionMgr->lastMessageKey();
+        qDebug() << "[FILE] file_key announced for" << transferId.left(8) + "..."
+                 << "to" << peerId.left(8) + "...";
+
+        m_fileMgr.sendFileWithKey(myId, peerId, fileKey,
+                                  transferId, fileName, fileData,
+                                  groupId, groupName);
+        sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
+    }
+
+    const int totalChunks = int((fileData.size() + FileTransferManager::kChunkBytes - 1)
+                                / FileTransferManager::kChunkBytes);
+    emit status(QString("'%1' queued in %2 chunk(s) -> group %3")
+                    .arg(fileName).arg(totalChunks).arg(groupName));
+    return transferId;
 }
 
 void ChatController::startPolling(int intervalMs)
@@ -341,6 +458,27 @@ void ChatController::pollOnce()
 
     // Purge stale incomplete transfers to bound memory usage
     m_fileMgr.purgeStaleTransfers();
+
+    // M8 fix: purge orphaned file keys older than 30 minutes.
+    // If a file_key announcement arrives but chunks never follow (sender crash,
+    // network issue), the key would sit in memory indefinitely without this.
+    {
+        static constexpr qint64 kFileKeyMaxAgeSecs = 30 * 60;
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        auto it = m_fileKeyTimes.begin();
+        while (it != m_fileKeyTimes.end()) {
+            if ((now - it.value()) > kFileKeyMaxAgeSecs) {
+                auto keyIt = m_fileKeys.find(it.key());
+                if (keyIt != m_fileKeys.end()) {
+                    sodium_memzero(keyIt.value().data(), keyIt.value().size());
+                    m_fileKeys.erase(keyIt);
+                }
+                it = m_fileKeyTimes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 }
 
 // ── Core sealing primitive ────────────────────────────────────────────────────
@@ -510,9 +648,10 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 
     // ── Sealed sender envelope ───────────────────────────────────────────────
     if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
-        if (!m_sessionMgr) return; // can't process without session manager
+        const bool isFileChunk = header.startsWith(kSealedFCPrefix);
 
-        qDebug() << "[RECV" << via << "] sealed envelope | size:" << rest.size() << "B";
+        qDebug() << "[RECV" << via << "] sealed envelope | size:" << rest.size() << "B"
+                 << (isFileChunk ? "(file chunk)" : "");
 
         // Unseal to learn sender identity
         UnsealResult unsealed = SealedEnvelope::unseal(m_crypto.curvePriv(), rest);
@@ -525,6 +664,36 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         qDebug() << "[RECV" << via << "] unsealed OK | sender:" << senderId.left(8) + "..."
                  << "| inner:" << unsealed.innerPayload.size() << "B";
 
+        // M2 fix: Sealed file chunk — pass directly to FileTransferManager.
+        // The inner payload is already encrypted with the ratchet-derived file key;
+        // no session decrypt is needed (the sealed envelope just hides the sender).
+        if (isFileChunk) {
+            // M7 fix: verify we have at least one file_key from this sender
+            // before allowing trial decryption. This prevents an attacker who can
+            // craft valid sealed envelopes from causing unnecessary crypto work.
+            bool hasKeyFromSender = false;
+            const QString senderPrefix = senderId + ":";
+            for (auto it = m_fileKeys.constBegin(); it != m_fileKeys.constEnd(); ++it) {
+                if (it.key().startsWith(senderPrefix)) {
+                    hasKeyFromSender = true;
+                    break;
+                }
+            }
+            if (!hasKeyFromSender) {
+                qWarning() << "[RECV" << via << "] sealed file chunk from" << senderId.left(8) + "..."
+                           << "— no file_key on record, dropping";
+                return;
+            }
+
+            qDebug() << "[RECV" << via << "] sealed file chunk from" << senderId.left(8) + "...";
+            m_fileMgr.handleFileEnvelope(senderId, unsealed.innerPayload,
+                [this](const QString& id) { return markSeen(id); },
+                m_fileKeys);
+            return;
+        }
+
+        if (!m_sessionMgr) return; // can't process without session manager
+
         // Only emit "online" if the envelope is recent (within 2 minutes).
         // Old mailbox messages should not trigger false online presence.  (L3 fix)
         // Note: sealed envelopes carry no timestamp, so we infer freshness from
@@ -532,7 +701,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         if (via == "P2P") emit presenceChanged(senderId, true);
 
         // Decrypt session layer (Noise handshake or ratchet message)
-        QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
+        QByteArray msgKey;  // M3 fix: capture message key directly from decrypt
+        QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload, &msgKey);
         if (pt.isEmpty()) {
             // Pre-key response (0x02) completes the Noise IK handshake and creates
             // a ratchet session inside decryptFromPeer(), but returns no user payload.
@@ -610,10 +780,24 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             if (m_p2pConnections.contains(senderId) &&
                 !m_p2pConnections[senderId]->isReady())
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
+        } else if (type == "file_key") {
+            // File key announcement: store the ratchet-derived key for chunk decryption.
+            // M4 fix: key on senderId:transferId to avoid collisions when multiple
+            // senders use the same transferId (e.g., group file transfers).
+            const QString transferId = o.value("transferId").toString();
+            if (!transferId.isEmpty() && msgKey.size() == 32) {
+                const QString compoundKey = senderId + ":" + transferId;
+                m_fileKeys[compoundKey] = msgKey;  // M3+M4 fix
+                m_fileKeyTimes[compoundKey] = QDateTime::currentSecsSinceEpoch();  // M8 fix
+                sodium_memzero(msgKey.data(), msgKey.size());
+                qDebug() << "[FILE] stored ratchet key for transfer" << transferId.left(8) + "..."
+                         << "from" << senderId.left(8) + "...";
+            }
         } else if (type == "file_chunk") {
-            // G1 fix: log instead of silently dropping
-            qWarning() << "[RECV" << via << "] sealed file_chunk from" << senderId.left(8) + "..."
-                       << "— sealed file transfer not yet implemented, chunk dropped";
+            // Sealed file_chunk in JSON payload shouldn't happen — file chunks
+            // use SEALEDFC: prefix and are handled above before session decrypt.
+            qWarning() << "[RECV" << via << "] unexpected file_chunk in session payload from"
+                       << senderId.left(8) + "...";
         }
         return;
     }
@@ -623,7 +807,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         const QString fromId = QString::fromUtf8(header.mid(kFilePrefix.size())).trimmed();
         qDebug() << "[RECV" << via << "] file chunk from" << fromId.left(8) + "...";
         m_fileMgr.handleFileEnvelope(fromId, rest,
-            [this](const QString& id) { return markSeen(id); });
+            [this](const QString& id) { return markSeen(id); },
+            m_fileKeys);
         return;
     }
 

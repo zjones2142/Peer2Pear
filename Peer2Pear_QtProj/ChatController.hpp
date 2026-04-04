@@ -157,6 +157,12 @@ private:
     // G5 fix: per-(group,sender) last-seen sequence — detects gaps
     QMap<QString, qint64> m_groupSeqIn;  // key: "groupId:senderId"
 
+    // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
+    // Populated by file_key announcements, consumed by handleFileEnvelope()
+    QMap<QString, QByteArray> m_fileKeys;
+    // M8 fix: creation timestamps for m_fileKeys entries (epoch seconds)
+    QMap<QString, qint64> m_fileKeyTimes;
+
     // TURN relay config for symmetric NAT fallback
     QString m_turnHost;
     int     m_turnPort = 0;

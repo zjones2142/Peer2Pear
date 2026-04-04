@@ -105,12 +105,26 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
         const QByteArray encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
         const QByteArray encChunk = m_crypto.aeadEncrypt(key32, chunk);
 
-        // Wire format: FROMFC:<senderId>\n<4-byte metaLen><encMeta><encChunk>
-        const QByteArray env = kFilePrefix + senderIdB64u.toUtf8() + "\n"
-                               + pack32(quint32(encMeta.size()))
-                               + encMeta
-                               + encChunk;
+        // Inner payload: <4-byte metaLen><encMeta><encChunk>
+        const QByteArray innerPayload = pack32(quint32(encMeta.size()))
+                                        + encMeta
+                                        + encChunk;
 
+        // M2 fix: seal file chunk envelopes to hide sender identity from relay
+        if (m_sealFn) {
+            QByteArray sealedEnv = m_sealFn(peerIdB64u, innerPayload);
+            if (!sealedEnv.isEmpty()) {
+                m_mbox.enqueue(peerIdB64u, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
+                continue;
+            }
+            qWarning() << "[FileTransfer] Seal failed for chunk" << i
+                       << "of" << transferId.left(8) + "... — BLOCKED";
+            continue;
+        }
+
+        // Legacy fallback (no seal callback set)
+        const QByteArray env = kFilePrefix + senderIdB64u.toUtf8() + "\n"
+                               + innerPayload;
         m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
     }
 
@@ -118,75 +132,43 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
     emit wantP2PConnection(peerIdB64u);
 }
 
-// ── Send file (1-to-1) ──────────────────────────────────────────────────────
+// ── Send file with ratchet-derived key ──────────────────────────────────────
+//
+// ChatController sends a file_key announcement through the ratchet first,
+// then calls this with the resulting lastMessageKey(). Each file gets a
+// unique forward-secret key — independent of the static ECDH shared secret.
 
-QString FileTransferManager::sendFile(const QString& senderIdB64u,
-                                      const QString& peerIdB64u,
-                                      const QString& fileName,
-                                      const QByteArray& fileData)
+QString FileTransferManager::sendFileWithKey(const QString& senderIdB64u,
+                                             const QString& peerIdB64u,
+                                             const QByteArray& fileKey,
+                                             const QString& transferId,
+                                             const QString& fileName,
+                                             const QByteArray& fileData,
+                                             const QString& groupId,
+                                             const QString& groupName)
 {
     if (fileData.size() > kMaxFileBytes) {
         emit status(QString("File too large (max %1 MB).")
                         .arg(kMaxFileBytes / (1024 * 1024)));
         return {};
     }
-
-    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-    if (key32.size() != 32) {
-        emit status("Cannot derive shared key for: " + peerIdB64u);
+    if (fileKey.size() != 32) {
+        emit status("Invalid file encryption key.");
         return {};
     }
 
-    const QString transferId   = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const qint64  ts           = QDateTime::currentSecsSinceEpoch();
-    // Compute BLAKE2b-256 integrity hash over the entire plaintext file
     const QString fileHashB64u = CryptoEngine::toBase64Url(blake2b256(fileData));
     const int totalChunks      = int((fileData.size() + kChunkBytes - 1) / kChunkBytes);
 
-    sendChunkEnvelopes(senderIdB64u, peerIdB64u, key32, fileData,
-                       transferId, fileName, fileHashB64u, ts);
+    sendChunkEnvelopes(senderIdB64u, peerIdB64u, fileKey, fileData,
+                       transferId, fileName, fileHashB64u, ts,
+                       groupId, groupName);
 
-    emit status(QString("'%1' queued in %2 chunk(s) -> %3")
-                    .arg(fileName).arg(totalChunks).arg(peerIdB64u));
-    return transferId;
-}
-
-// ── Send file (group) ────────────────────────────────────────────────────────
-
-QString FileTransferManager::sendGroupFile(const QString& senderIdB64u,
-                                           const QString& groupId,
-                                           const QString& groupName,
-                                           const QStringList& memberPeerIds,
-                                           const QString& fileName,
-                                           const QByteArray& fileData)
-{
-    if (fileData.size() > kMaxFileBytes) {
-        emit status(QString("File too large (max %1 MB).")
-                        .arg(kMaxFileBytes / (1024 * 1024)));
-        return {};
+    if (groupId.isEmpty()) {
+        emit status(QString("'%1' queued in %2 chunk(s) -> %3")
+                        .arg(fileName).arg(totalChunks).arg(peerIdB64u));
     }
-
-    const QString transferId   = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const qint64  ts           = QDateTime::currentSecsSinceEpoch();
-    // Compute BLAKE2b-256 integrity hash over the entire plaintext file
-    const QString fileHashB64u = CryptoEngine::toBase64Url(blake2b256(fileData));
-    const int totalChunks      = int((fileData.size() + kChunkBytes - 1) / kChunkBytes);
-
-    for (const QString& peerId : memberPeerIds) {
-        if (peerId.trimmed().isEmpty() || peerId.trimmed() == senderIdB64u) continue;
-
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
-        sendChunkEnvelopes(senderIdB64u, peerId, key32, fileData,
-                           transferId, fileName, fileHashB64u, ts,
-                           groupId, groupName);
-    }
-
-    emit status(QString("'%1' queued in %2 chunk(s) -> group %3")
-                    .arg(fileName).arg(totalChunks).arg(groupName));
     return transferId;
 }
 
@@ -194,7 +176,8 @@ QString FileTransferManager::sendGroupFile(const QString& senderIdB64u,
 
 bool FileTransferManager::handleFileEnvelope(const QString& fromId,
                                              const QByteArray& payload,
-                                             std::function<bool(const QString&)> markSeen)
+                                             std::function<bool(const QString&)> markSeen,
+                                             const QMap<QString, QByteArray>& fileKeys)
 {
     if (payload.size() < 4) return false;
 
@@ -204,10 +187,29 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
     const QByteArray encMeta  = payload.mid(4, int(metaLen));
     const QByteArray encChunk = payload.mid(4 + int(metaLen));
 
-    const QByteArray peerPub  = CryptoEngine::fromBase64Url(fromId);
-    const QByteArray key32    = m_crypto.deriveSharedKey32(peerPub);
-    const QByteArray metaJson = m_crypto.aeadDecrypt(key32, encMeta);
-    if (metaJson.isEmpty()) return false;
+    // ── Key selection: try ratchet keys first, fall back to ECDH ────────────
+    // Ratchet keys provide forward secrecy; ECDH is the legacy fallback.
+    // We try each stored ratchet key (typically 0-3) via trial decryption.
+    QByteArray metaJson;
+    QByteArray key32;
+
+    for (auto it = fileKeys.begin(); it != fileKeys.end(); ++it) {
+        if (it.value().size() != 32) continue;
+        metaJson = m_crypto.aeadDecrypt(it.value(), encMeta);
+        if (!metaJson.isEmpty()) {
+            key32 = it.value();
+            break;
+        }
+    }
+
+    // L8 fix: no ECDH fallback — the fromId in FROMFC: header is unauthenticated,
+    // so deriving a key from it would be trusting unverified sender identity.
+    // All file transfers must use ratchet-derived keys from file_key announcements.
+    if (metaJson.isEmpty()) {
+        qWarning() << "[FileTransfer] No ratchet key found for file chunk from"
+                   << fromId.left(8) + "... — ECDH fallback removed (L8)";
+        return false;
+    }
 
     const QJsonObject meta   = QJsonDocument::fromJson(metaJson).object();
     const QString transferId = meta.value("transferId").toString();
@@ -268,6 +270,7 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
 
         const IncomingTransfer completed = xfer;
         m_incomingTransfers.remove(transferId);
+        emit transferCompleted(transferId);  // M1: allow key cleanup
 
         // Verify BLAKE2b-256 integrity hash
         if (!completed.fileHash.isEmpty()) {
@@ -275,6 +278,7 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
             if (actualHash != completed.fileHash) {
                 emit status(QString("File '%1' integrity check FAILED — data corrupted.")
                                 .arg(completed.fileName));
+                emit transferCompleted(transferId);  // M1: key cleanup even on hash failure
                 emit fileChunkReceived(fromId, transferId, completed.fileName,
                                        completed.fileSize, totalChunks, totalChunks,
                                        QByteArray{}, completed.ts,
@@ -300,11 +304,13 @@ void FileTransferManager::purgeStaleTransfers()
     auto it = m_incomingTransfers.begin();
     while (it != m_incomingTransfers.end()) {
         if (it->createdSecs > 0 && (now - it->createdSecs) > kMaxTransferAgeSecs) {
+            const QString tid = it.key();
             emit status(QString("Purged stale transfer '%1' (%2/%3 chunks) after 30 min.")
                             .arg(it->fileName)
                             .arg(it->chunks.size())
                             .arg(it->totalChunks));
             it = m_incomingTransfers.erase(it);
+            emit transferCompleted(tid);  // M1: key cleanup on purge
         } else {
             ++it;
         }

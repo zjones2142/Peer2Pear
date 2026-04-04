@@ -293,6 +293,8 @@ QByteArray RatchetSession::trySkippedKeys(const RatchetHeader& header,
     }
 
     pt.resize(static_cast<int>(plen));
+    // L7 fix: store message key so callers can extract it for file sub-keys
+    m_lastMessageKey = QByteArray(msgKey.constData(), msgKey.size());
     sodium_memzero(msgKey.data(), msgKey.size());
     return pt;
 }
@@ -382,6 +384,9 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
     }
 
     pt.resize(static_cast<int>(plen));
+
+    // Store the message key before zeroing (deep copy for same reason as encrypt)
+    m_lastMessageKey = QByteArray(msgKey.constData(), msgKey.size());
     sodium_memzero(msgKey.data(), msgKey.size());
     return pt;
 }
