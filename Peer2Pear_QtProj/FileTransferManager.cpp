@@ -24,6 +24,8 @@ static QByteArray pack32(quint32 v)
 
 static quint32 unpack32(const QByteArray& b, int offset = 0)
 {
+    // G6 fix: bounds check before reading 4 bytes
+    if (b.size() < offset + 4) return 0;
     return (quint8(b[offset])     << 24)
          | (quint8(b[offset + 1]) << 16)
          | (quint8(b[offset + 2]) <<  8)

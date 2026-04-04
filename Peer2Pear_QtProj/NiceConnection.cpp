@@ -15,6 +15,9 @@ NiceConnection::~NiceConnection() {
         g_main_context_unref(m_context);
     }
     if (m_agent) g_object_unref(m_agent);
+    // G7 fix: zero TURN credentials in memory
+    if (!m_turnUser.isEmpty()) { m_turnUser.fill(QChar(0)); m_turnUser.clear(); }
+    if (!m_turnPass.isEmpty()) { m_turnPass.fill(QChar(0)); m_turnPass.clear(); }
 }
 
 void NiceConnection::setTurnServer(const QString& host, int port,

@@ -50,6 +50,23 @@ ChatController::ChatController(QObject* parent)
         m_rvz.publish("present", 0, 60LL * 1000);
     });
     m_rvzRefreshTimer.setInterval(50 * 1000);
+
+    // G4 fix: periodically clean up failed ICE connections (not READY after 60s)
+    auto *iceCleanup = new QTimer(this);
+    connect(iceCleanup, &QTimer::timeout, this, [this]() {
+        QStringList toRemove;
+        for (auto it = m_p2pConnections.begin(); it != m_p2pConnections.end(); ++it) {
+            if (!it.value()->isReady() && !it.value()->isRunning()) {
+                toRemove << it.key();
+            }
+        }
+        for (const QString &key : toRemove) {
+            qDebug() << "[ICE] Cleaning up stale connection to" << key.left(8) + "...";
+            m_p2pConnections[key]->deleteLater();
+            m_p2pConnections.remove(key);
+        }
+    });
+    iceCleanup->start(60 * 1000);
 }
 
 void ChatController::setPassphrase(const QString& pass)
@@ -522,8 +539,11 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         qDebug() << "[RECV" << via << "] unsealed OK | sender:" << senderId.left(8) + "..."
                  << "| inner:" << unsealed.innerPayload.size() << "B";
 
-        // Successfully decrypted envelope proves the sender is (or was recently) online
-        emit presenceChanged(senderId, true);
+        // Only emit "online" if the envelope is recent (within 2 minutes).
+        // Old mailbox messages should not trigger false online presence.  (L3 fix)
+        // Note: sealed envelopes carry no timestamp, so we infer freshness from
+        // the transport — P2P is always live; mailbox may have stale messages.
+        if (via == "P2P") emit presenceChanged(senderId, true);
 
         // Decrypt session layer (Noise handshake or ratchet message)
         QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
@@ -629,14 +649,16 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), rest);
     if (pt.isEmpty()) return;
 
-    // Successfully decrypted legacy envelope — sender is (or was recently) online
-    emit presenceChanged(fromId, true);
-
     const auto    o    = QJsonDocument::fromJson(pt).object();
     const QString type = o.value("type").toString();
     qDebug() << "[RECV" << via << "] legacy type:" << type << "from" << fromId.left(8) + "...";
 
     const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+
+    // L3 fix: Only emit "online" if message is fresh (< 2 min old) or via P2P
+    if (via == "P2P" ||
+        (tsSecs > 0 && QDateTime::currentSecsSinceEpoch() - tsSecs < 120))
+        emit presenceChanged(fromId, true);
     const QDateTime ts = tsSecs > 0
                              ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
                              : QDateTime::currentDateTime();
@@ -644,7 +666,6 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     const QString msgId = o.value("msgId").toString();
 
     if (type == "text") {
-        const QString msgId = o.value("msgId").toString();
         if (!msgId.isEmpty() && !markSeen(msgId)) return;
         emit messageReceived(fromId, o.value("text").toString(),
                              tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
@@ -693,7 +714,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             ts,
             msgId
             );
-    } else if (o.value("type").toString() == "group_leave") {
+    } else if (type == "group_leave") {
         QStringList memberKeys;
         for (const QJsonValue &v : o.value("members").toArray())
             memberKeys << v.toString();

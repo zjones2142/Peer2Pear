@@ -123,6 +123,8 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
     pendingBlob.append(ratchetDhPriv);
     pendingBlob.append(noise.serialize());
     m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, pendingBlob);
+    // L4 fix: zero the local private key copy now that it's persisted (encrypted)
+    sodium_memzero(ratchetDhPriv.data(), ratchetDhPriv.size());
     qDebug() << "[SessionManager] Saved pending handshake + ratchet DH for" << peerIdB64u.left(8) + "...";
 
     // Derive a one-shot key from the Noise chaining key after msg1 (secret, shared by both sides)
@@ -303,6 +305,9 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
 
         RatchetSession ratchet = RatchetSession::initAsInitiator(
             hr.recvCipher.key, responderEphPub, ratchetDhPub, ratchetDhPriv);
+        // L4 fix: zero extracted private key now that ratchet owns it
+        sodium_memzero(ratchetDhPriv.data(), ratchetDhPriv.size());
+        sodium_memzero(pendingBlob.data(), pendingBlob.size());
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);
