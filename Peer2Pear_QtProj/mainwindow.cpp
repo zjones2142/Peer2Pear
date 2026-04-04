@@ -75,6 +75,30 @@ MainWindow::MainWindow(QWidget *parent)
             m_db.saveSetting("avatarData", dlg.avatarData());
             m_db.saveSetting("avatarIsPhoto", dlg.isPhotoAvatar() ? "true" : "false");
         }
+
+        // ── Welcome guide (shown once after first onboarding) ────────────────
+        QMessageBox welcome(this);
+        welcome.setWindowTitle("Welcome to Peer2Pear");
+        welcome.setIcon(QMessageBox::Information);
+        welcome.setText(
+            "<h3>You're all set!</h3>"
+            "<p>Here's how to get started:</p>"
+            "<ol>"
+            "<li><b>Copy your public key</b> from Settings and share it with friends.</li>"
+            "<li><b>Add a contact</b> by tapping New Chat and pasting their key.</li>"
+            "<li><b>Send a message</b> — it's encrypted end-to-end automatically.</li>"
+            "</ol>"
+            "<p style='color:gray;'>You can find a full guide anytime in "
+            "<b>Settings > About & Help</b>.</p>"
+            );
+        welcome.setStyleSheet(
+            "QMessageBox { background-color: #1a1a1a; }"
+            "QLabel { color: #cccccc; font-size: 13px; }"
+            "QPushButton { background-color: #2e8b3a; color: white; border: none; "
+            "border-radius: 6px; padding: 8px 20px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #38a844; }"
+            );
+        welcome.exec();
     }
 
     // ── Server + polling ──────────────────────────────────────────────────────

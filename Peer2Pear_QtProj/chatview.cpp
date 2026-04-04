@@ -2324,21 +2324,12 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         auto reply = QMessageBox::question(
             m_ui->centralwidget, "Delete File",
             "Remove this file from your file list?\n\n"
-            "This will also delete the saved copy on disk.",
+            "The file will remain on your disk.",
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (reply != QMessageBox::Yes) return;
 
         // 1. Delete from database
         m_db->deleteFileRecord(delTransferId);
-
-        // 2. Delete saved file on disk (if it exists)
-        if (!delSavedPath.isEmpty() && QFile::exists(delSavedPath)) {
-            QFile::remove(delSavedPath);
-            // Remove parent dir if now empty (e.g. Downloads/Peer2Pear/<transferId>/)
-            QDir parentDir = QFileInfo(delSavedPath).absoluteDir();
-            if (parentDir.isEmpty())
-                parentDir.rmdir(parentDir.absolutePath());
-        }
 
         // 3. Remove from in-memory map
         if (m_currentChat >= 0 && m_currentChat < m_chats.size()) {
