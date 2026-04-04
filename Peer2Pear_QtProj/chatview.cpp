@@ -54,8 +54,8 @@ static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, in
 // ── Avatar palette ────────────────────────────────────────────────────────────
 // One palette shared by all avatar-rendering sites in this file.
 static const QList<QColor> kAvatarPalette = {
-    QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-    QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+    QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+    QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
 };
 
 // Returns a stable palette color derived from the contact name.
@@ -609,8 +609,8 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
     rebuildChatList();
     m_ui->chatList->setCurrentRow(0);
 
-    // Start presence polling (check every 3 minutes)
-    startPresencePolling(180000);
+    // Start presence polling (check every 30 seconds)
+    startPresencePolling(30000);
 }
 
 void ChatView::startPresencePolling(int intervalMs)
@@ -626,8 +626,8 @@ void ChatView::startPresencePolling(int intervalMs)
             m_controller->checkPresence(peerIds);
     });
     m_presenceTimer.start(intervalMs);
-    // Immediate first check after a short delay
-    QTimer::singleShot(3000, this, [this]() {
+    // Immediate first check on startup (500ms delay to let connections settle)
+    QTimer::singleShot(500, this, [this]() {
         QStringList peerIds;
         for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
@@ -1229,7 +1229,7 @@ void ChatView::onSearchChanged(const QString &text)
     for (int i = 0; i < m_ui->chatList->count(); ++i) {
         const ChatData &c = m_chats[i];
         bool match = q.isEmpty() || c.name.toLower().contains(q);
-        if (!match) for (const auto &m : c.messages)
+        if (!match) for (const auto &m : std::as_const(c.messages))
                 if (m.text.toLower().contains(q)) { match = true; break; }
         m_ui->chatList->item(i)->setHidden(!match);
     }
@@ -1534,6 +1534,21 @@ void ChatView::onEditContact(int index)
                           wasGroup ? &avatar : nullptr);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
+        // Prevent duplicate keys: check if any new key collides with another contact
+        bool conflict = false;
+        for (const QString &k : std::as_const(keys)) {
+            for (int i = 0; i < m_chats.size(); ++i) {
+                if (i == index || m_chats[i].isGroup) continue;
+                if (m_chats[i].peerIdB64u == k || m_chats[i].keys.contains(k)) {
+                    QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
+                        QString("Key already belongs to contact \"%1\".").arg(m_chats[i].name));
+                    conflict = true; break;
+                }
+            }
+            if (conflict) break;
+        }
+        if (conflict) return;
+
         m_chats[index].name = name; m_chats[index].keys = keys;
         if (wasGroup) m_chats[index].avatarData = avatar;
         if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
@@ -1700,6 +1715,19 @@ void ChatView::onAddContact()
 
     name = nameEdit->text().trimmed(); if(name.isEmpty()) return;
     for(int i=0;i<keyList->count();++i) keys<<keyList->item(i)->text();
+
+    // Prevent duplicate contacts: check if any key is already used by an existing contact
+    for (const QString &k : std::as_const(keys)) {
+        for (const ChatData &c : std::as_const(m_chats)) {
+            if (c.isGroup) continue;
+            if (c.peerIdB64u == k || c.keys.contains(k)) {
+                QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
+                    QString("Key already belongs to contact \"%1\".").arg(c.name));
+                return;
+            }
+        }
+    }
+
     ChatData nc; nc.name=name; nc.subtitle="Secure chat"; nc.keys=keys;
     if(!keys.isEmpty()) nc.peerIdB64u=keys.first();
     m_chats.append(nc);

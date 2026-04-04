@@ -46,7 +46,7 @@ ChatController::ChatController(QObject* parent)
 
     // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
     connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
-        m_rvz.publish("3.141.14.234", 0, 10LL * 60 * 1000);
+        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
     });
     m_rvzRefreshTimer.setInterval(9 * 60 * 1000);
 }
@@ -65,11 +65,15 @@ void ChatController::setServerBaseUrl(const QUrl& base)
 
 void ChatController::setDatabase(QSqlDatabase db)
 {
+    // Guard against double-call: reset previous instances before reinitializing
+    m_sessionMgr.reset();
+    m_sessionStore.reset();
+
     // Derive a 32-byte at-rest encryption key from the identity curve private key.
     // This key never leaves memory and is tied to the user's unlocked identity.
     QByteArray storeKey = CryptoEngine::hkdf(
         m_crypto.curvePriv(), {}, "session-store-at-rest", 32);
-    m_sessionStore = new SessionStore(db, storeKey);
+    m_sessionStore = std::make_unique<SessionStore>(db, storeKey);
     CryptoEngine::secureZero(storeKey);
 
     // One-time migration: clear sessions created with the buggy ratchet init
@@ -84,7 +88,7 @@ void ChatController::setDatabase(QSqlDatabase db)
         }
     }
 
-    m_sessionMgr = new SessionManager(m_crypto, *m_sessionStore);
+    m_sessionMgr = std::make_unique<SessionManager>(m_crypto, *m_sessionStore);
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
     m_sessionMgr->setSendResponseFn([this](const QString& peerId, const QByteArray& blob) {
@@ -99,8 +103,7 @@ void ChatController::setDatabase(QSqlDatabase db)
         QByteArray sealed = SealedEnvelope::seal(
             recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), blob);
         if (sealed.isEmpty()) return;
-        qDebug() << "[ChatController] Sending sealed handshake response to" << peerId.left(8) + "..."
-                 << "via mailbox";
+        qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "...";
 
         QByteArray env = kSealedPrefix + "\n" + sealed;
         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
@@ -141,12 +144,12 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
                 if (!sealed.isEmpty()) {
                     if (m_p2pConnections.contains(peerIdB64u) &&
                         m_p2pConnections[peerIdB64u]->isReady()) {
-                        qDebug() << "[ChatController] sendText -> sealed P2P to" << peerIdB64u.left(8) + "..."
+                        qDebug() << "[SEND P2P] sealed text to" << peerIdB64u.left(8) + "..."
                                  << "| size:" << sealed.size() << "B";
                         m_p2pConnections[peerIdB64u]->sendData(kSealedPrefix + "\n" + sealed);
                     } else {
                         QByteArray env = kSealedPrefix + "\n" + sealed;
-                        qDebug() << "[ChatController] sendText -> sealed mailbox to" << peerIdB64u.left(8) + "..."
+                        qDebug() << "[SEND MAILBOX] sealed text to" << peerIdB64u.left(8) + "..."
                                  << "| size:" << env.size() << "B";
                         m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
                         initiateP2PConnection(peerIdB64u);
@@ -158,13 +161,14 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
     }
 
     // ── Legacy path (fallback) ───────────────────────────────────────────────
-    qDebug() << "[ChatController] sendText -> LEGACY fallback to" << peerIdB64u.left(8) + "...";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray ct      = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
 
     if (m_p2pConnections.contains(peerIdB64u) && m_p2pConnections[peerIdB64u]->isReady()) {
+        qDebug() << "[SEND P2P] legacy text to" << peerIdB64u.left(8) + "...";
         m_p2pConnections[peerIdB64u]->sendData(ct);
     } else {
+        qDebug() << "[SEND MAILBOX] legacy text to" << peerIdB64u.left(8) + "...";
         sendSignalingMessage(peerIdB64u, payload);
         initiateP2PConnection(peerIdB64u);
     }
@@ -208,7 +212,7 @@ void ChatController::startPolling(int intervalMs)
         // Publish our identity to the rendezvous server so peers can discover us.
         // host="0.0.0.0" is a placeholder — the server records the request's source IP.
         // TTL of 10 minutes; we refresh on every poll start.
-        m_rvz.publish("3.141.14.234", 0, 10LL * 60 * 1000);
+        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
         m_rvzRefreshTimer.start();
         // Immediately drain the mailbox on startup rather than waiting for first tick
         pollOnce();
@@ -274,7 +278,7 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
                         recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
                     if (!sealed.isEmpty()) {
                         QByteArray env = kSealedPrefix + "\n" + sealed;
-                        qDebug() << "[ChatController] sendGroupMsg -> sealed mailbox to" << peerId.left(8) + "...";
+                        qDebug() << "[SEND MAILBOX] sealed group_msg to" << peerId.left(8) + "...";
                         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
                         continue;
                     }
@@ -283,7 +287,7 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         }
 
         // Legacy fallback
-        qDebug() << "[ChatController] sendGroupMsg -> LEGACY fallback to" << peerId.left(8) + "...";
+        qDebug() << "[SEND MAILBOX] legacy group_msg to" << peerId.left(8) + "...";
         const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
         const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
         if (key32.size() != 32) continue;
@@ -333,6 +337,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
                     QByteArray sealed = SealedEnvelope::seal(
                         recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
                     if (!sealed.isEmpty()) {
+                        qDebug() << "[SEND MAILBOX] sealed group_leave to" << peerId.left(8) + "...";
                         QByteArray env = kSealedPrefix + "\n" + sealed;
                         m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
                         continue;
@@ -342,6 +347,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         }
 
         // Legacy fallback
+        qDebug() << "[SEND MAILBOX] legacy group_leave to" << peerId.left(8) + "...";
         const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
         const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
         if (key32.size() != 32) continue;
@@ -420,27 +426,30 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     qDebug() << "[ChatController] P2P data received from" << peerIdB64u.left(8) + "..."
              << "| size:" << data.size() << "B";
 
+    // P2P data proves the peer is online right now
+    emit presenceChanged(peerIdB64u, true);
+
     // ── Sealed envelope over P2P ─────────────────────────────────────────────
     if (data.startsWith(kSealedPrefix) || data.startsWith(kSealedFCPrefix)) {
-        qDebug() << "[ChatController] P2P -> sealed envelope path";
+        qDebug() << "[RECV P2P] sealed envelope from" << peerIdB64u.left(8) + "...";
         onEnvelope(data, QString());
         return;
     }
 
     // ── File chunk received over P2P (legacy) ────────────────────────────────
     if (data.startsWith(kFilePrefix)) {
+        qDebug() << "[RECV P2P] file chunk from" << peerIdB64u.left(8) + "...";
         onEnvelope(data, QString());
         return;
     }
 
     // ── Try ratchet decrypt first (P2P with session) ─────────────────────────
     if (m_sessionMgr && m_sessionMgr->hasSession(peerIdB64u)) {
-        qDebug() << "[ChatController] P2P -> attempting raw ratchet decrypt";
-        // Assume the data is a raw ratchet message (no sealed envelope on P2P)
         QByteArray pt = m_sessionMgr->decryptFromPeer(peerIdB64u, data);
         if (!pt.isEmpty()) {
             const auto o = QJsonDocument::fromJson(pt).object();
             if (o.value("type").toString() == "text") {
+                qDebug() << "[RECV P2P] ratchet text from" << peerIdB64u.left(8) + "...";
                 const QString msgId = o.value("msgId").toString();
                 if (!msgId.isEmpty() && !markSeen(msgId)) return;
                 emit messageReceived(peerIdB64u, o.value("text").toString(),
@@ -451,7 +460,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     }
 
     // ── Legacy encrypted JSON message ────────────────────────────────────────
-    qDebug() << "[ChatController] P2P -> legacy decrypt fallback";
+    qDebug() << "[RECV P2P] legacy text from" << peerIdB64u.left(8) + "...";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
     if (pt.isEmpty()) return;
@@ -472,6 +481,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     // forward compatibility.  We do NOT call ack here to avoid the extra HTTP round-trip.
     Q_UNUSED(envId)
 
+    // Determine transport: P2P forwards call us with empty envId
+    const QString via = envId.isEmpty() ? "P2P" : "MAILBOX";
+
     const int nl = body.indexOf('\n');
     if (nl < 0) return;
 
@@ -482,7 +494,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
         if (!m_sessionMgr) return; // can't process without session manager
 
-        qDebug() << "[ChatController] Received sealed envelope | size:" << rest.size() << "B";
+        qDebug() << "[RECV" << via << "] sealed envelope | size:" << rest.size() << "B";
 
         // Unseal to learn sender identity
         UnsealResult unsealed = SealedEnvelope::unseal(m_crypto.curvePriv(), rest);
@@ -492,14 +504,17 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         }
 
         QString senderId = CryptoEngine::toBase64Url(unsealed.senderEdPub);
-        qDebug() << "[ChatController] Unsealed OK | sender:" << senderId.left(8) + "..."
+        qDebug() << "[RECV" << via << "] unsealed OK | sender:" << senderId.left(8) + "..."
                  << "| inner:" << unsealed.innerPayload.size() << "B";
+
+        // Successfully decrypted envelope proves the sender is (or was recently) online
+        emit presenceChanged(senderId, true);
 
         // Decrypt session layer (Noise handshake or ratchet message)
         QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
         if (pt.isEmpty()) {
             // May be a handshake response with no user payload — that's OK
-            qDebug() << "[ChatController] Session decrypt returned empty (handshake response or error)";
+            qDebug() << "[RECV" << via << "] session decrypt empty (handshake response or error)";
             return;
         }
 
@@ -511,6 +526,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
         const QDateTime ts = tsFromSecs(tsSecs);
         const QString msgId = o.value("msgId").toString();
+
+        qDebug() << "[RECV" << via << "] sealed type:" << type << "from" << senderId.left(8) + "...";
 
         if (type == "text") {
             if (!msgId.isEmpty() && !markSeen(msgId)) return;
@@ -546,6 +563,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     // ── File chunk envelope ─────────────────────────────────────────────────
     if (header.startsWith(kFilePrefix)) {
         const QString fromId = QString::fromUtf8(header.mid(kFilePrefix.size())).trimmed();
+        qDebug() << "[RECV" << via << "] file chunk from" << fromId.left(8) + "...";
         m_fileMgr.handleFileEnvelope(fromId, rest,
             [this](const QString& id) { return markSeen(id); });
         return;
@@ -559,8 +577,12 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), rest);
     if (pt.isEmpty()) return;
 
+    // Successfully decrypted legacy envelope — sender is (or was recently) online
+    emit presenceChanged(fromId, true);
+
     const auto    o    = QJsonDocument::fromJson(pt).object();
     const QString type = o.value("type").toString();
+    qDebug() << "[RECV" << via << "] legacy type:" << type << "from" << fromId.left(8) + "...";
 
     const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
     const QDateTime ts = tsSecs > 0

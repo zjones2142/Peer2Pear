@@ -51,7 +51,10 @@ QByteArray NoiseState::encryptAndHash(const QByteArray& plaintext) {
     // AEAD encrypt with m_k, nonce = m_n, aad = m_h
     // Nonce: 8-byte little-endian counter padded to 24 bytes for XChaCha20
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES] = {};
-    memcpy(nonce, &m_n, sizeof(m_n)); // little-endian on x86/ARM
+    // Explicit little-endian encoding so the protocol is stable across architectures
+    for (size_t i = 0; i < sizeof(m_n); ++i) {
+        nonce[i] = static_cast<unsigned char>((m_n >> (8 * i)) & 0xff);
+    }
 
     QByteArray ct;
     ct.resize(plaintext.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
@@ -79,7 +82,9 @@ QByteArray NoiseState::decryptAndHash(const QByteArray& ciphertext) {
     }
 
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES] = {};
-    memcpy(nonce, &m_n, sizeof(m_n));
+    for (size_t i = 0; i < sizeof(m_n); ++i) {
+        nonce[i] = static_cast<unsigned char>((m_n >> (8 * i)) & 0xff);
+    }
 
     QByteArray pt;
     pt.resize(ciphertext.size() - crypto_aead_xchacha20poly1305_ietf_ABYTES);

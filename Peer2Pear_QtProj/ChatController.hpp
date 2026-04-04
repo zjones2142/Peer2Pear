@@ -14,6 +14,7 @@
 #include "FileTransferManager.hpp"
 
 #include <QtSql/QSqlDatabase>
+#include <memory>
 
 
 class ChatController : public QObject {
@@ -135,8 +136,8 @@ private:
     FileTransferManager  m_fileMgr;
 
     // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
-    SessionStore*    m_sessionStore = nullptr;
-    SessionManager*  m_sessionMgr   = nullptr;
+    std::unique_ptr<SessionStore>   m_sessionStore;
+    std::unique_ptr<SessionManager> m_sessionMgr;
 
     QTimer      m_pollTimer;
     QStringList m_selfKeys;
