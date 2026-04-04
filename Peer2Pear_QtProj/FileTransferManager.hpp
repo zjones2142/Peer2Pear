@@ -25,8 +25,15 @@ class MailboxClient;
 class FileTransferManager : public QObject {
     Q_OBJECT
 public:
+    // Callback for sealing envelopes (metadata privacy).
+    // Takes (peerIdB64u, innerPayload) and returns sealed envelope bytes, or empty on failure.
+    using SealFn = std::function<QByteArray(const QString& peerIdB64u, const QByteArray& payload)>;
+
     explicit FileTransferManager(CryptoEngine& crypto, MailboxClient& mbox,
                                  QObject* parent = nullptr);
+
+    // Set the callback for sealing file chunk envelopes (M2 fix).
+    void setSealFn(SealFn fn) { m_sealFn = std::move(fn); }
 
     // The server enforces MAX_ENVELOPE_BYTES = 256 KB (262 144 bytes).
     //
@@ -44,27 +51,28 @@ public:
     static constexpr qint64 kChunkBytes   = 240LL * 1024;   // 245 760 bytes
     static constexpr qint64 kMaxFileBytes  =  25LL * 1024 * 1024;
 
-    // Send a file to a single peer.  Returns transferId or empty on failure.
-    QString sendFile(const QString& senderIdB64u,
-                     const QString& peerIdB64u,
-                     const QString& fileName,
-                     const QByteArray& fileData);
-
-    // Send a file to every member of a group chat.
-    // Returns the transferId (shared across all recipients) or empty on failure.
-    QString sendGroupFile(const QString& senderIdB64u,
-                          const QString& groupId,
-                          const QString& groupName,
-                          const QStringList& memberPeerIds,
-                          const QString& fileName,
-                          const QByteArray& fileData);
+    // Send a file to a single peer using a ratchet-derived key.
+    // The caller (ChatController) sends a file_key announcement through the
+    // ratchet first, then passes the resulting key and transferId here.
+    // Returns transferId or empty on failure.
+    QString sendFileWithKey(const QString& senderIdB64u,
+                            const QString& peerIdB64u,
+                            const QByteArray& fileKey,
+                            const QString& transferId,
+                            const QString& fileName,
+                            const QByteArray& fileData,
+                            const QString& groupId = {},
+                            const QString& groupName = {});
 
     // Try to handle an envelope payload as a file chunk.
     // markSeen is called for per-chunk dedup; returns false if already seen.
+    // fileKeys: map of transferId -> 32-byte ratchet key from file_key announcements.
+    //           If a matching key is found, it's used instead of ECDH.
     // Returns true if the envelope was a file chunk (handled), false otherwise.
     bool handleFileEnvelope(const QString& fromId,
                             const QByteArray& payload,
-                            std::function<bool(const QString&)> markSeen);
+                            std::function<bool(const QString&)> markSeen,
+                            const QMap<QString, QByteArray>& fileKeys = {});
 
     // Purge incomplete transfers older than 30 minutes to bound memory.
     void purgeStaleTransfers();
@@ -78,6 +86,10 @@ signals:
     // Emitted when a P2P connection should be initiated for a peer
     // (as a side effect of sending file chunks via mailbox).
     void wantP2PConnection(const QString& peerIdB64u);
+
+    // Emitted when a transfer completes (success or hash failure) or is purged.
+    // ChatController uses this to remove the ratchet-derived key from m_fileKeys.
+    void transferCompleted(const QString& transferId);
 
     void fileChunkReceived(const QString& fromPeerIdB64u,
                            const QString& transferId,
@@ -120,4 +132,5 @@ private:
 
     CryptoEngine& m_crypto;
     MailboxClient& m_mbox;
+    SealFn m_sealFn;
 };

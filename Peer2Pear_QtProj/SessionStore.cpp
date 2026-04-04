@@ -11,6 +11,7 @@ SessionStore::SessionStore(QSqlDatabase db, QByteArray storeKey)
     , m_storeKey(std::move(storeKey))
 {
     createTables();
+    pruneStaleHandshakes();   // G2 fix: clean up on startup
 }
 
 SessionStore::~SessionStore() {
@@ -154,7 +155,7 @@ void SessionStore::saveSkippedKey(const QString& peerId, const QByteArray& dhPub
     q.bindValue(":pid", peerId);
     q.bindValue(":dh", dhPub);
     q.bindValue(":mn", msgNum);
-    q.bindValue(":mk", messageKey);
+    q.bindValue(":mk", encryptBlob(messageKey));   // S2 fix: encrypt at rest
     q.bindValue(":now", now);
     if (!q.exec()) qWarning() << "SessionStore::saveSkippedKey:" << q.lastError().text();
 }
@@ -172,7 +173,7 @@ QByteArray SessionStore::loadAndDeleteSkippedKey(const QString& peerId,
     if (!q.exec() || !q.next()) return {};
 
     qint64 id = q.value(0).toLongLong();
-    QByteArray key = q.value(1).toByteArray();
+    QByteArray key = decryptBlob(q.value(1).toByteArray());  // S2 fix: decrypt
 
     QSqlQuery del(m_db);
     del.prepare("DELETE FROM skipped_message_keys WHERE id=:id;");
@@ -251,4 +252,14 @@ void SessionStore::deletePendingHandshake(const QString& peerId) {
     q.prepare("DELETE FROM pending_handshakes WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     q.exec();
+}
+
+void SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
+    // G2 fix: remove pending handshakes older than maxAgeSecs (default 24h)
+    const qint64 cutoff = QDateTime::currentSecsSinceEpoch() - maxAgeSecs;
+    QSqlQuery q(m_db);
+    q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
+    q.bindValue(":cutoff", cutoff);
+    if (q.exec() && q.numRowsAffected() > 0)
+        qDebug() << "[SessionStore] Pruned" << q.numRowsAffected() << "stale pending handshakes";
 }

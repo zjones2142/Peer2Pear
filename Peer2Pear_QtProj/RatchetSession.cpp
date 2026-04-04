@@ -111,10 +111,7 @@ RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
     s.m_sendChainKey = sendChain;
     // Receiving chain is empty until we get peer's first DH ratchet message
 
-    qDebug() << "[Ratchet] initAsInitiator: inputRootKey=" << rootKey.left(4).toHex()
-             << "dhPub=" << localDhPub.left(4).toHex()
-             << "remoteDhPub=" << remoteDhPub.left(4).toHex()
-             << "derivedRootKey=" << newRoot.left(4).toHex();
+    qDebug() << "[Ratchet] initAsInitiator: session created";
     return s;
 }
 
@@ -157,12 +154,7 @@ RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
     s.m_rootKey      = rk2;
     s.m_sendChainKey = sendChain;
 
-    qDebug() << "[Ratchet] initAsResponder: inputRootKey=" << rootKey.left(4).toHex()
-             << "localDhPub=" << pub.left(4).toHex()
-             << "remoteDhPub=" << remoteDhPub.left(4).toHex()
-             << "derivedRootKey=" << rk2.left(4).toHex()
-             << "sendChainKey set=" << !s.m_sendChainKey.isEmpty()
-             << "recvChainKey set=" << !s.m_recvChainKey.isEmpty();
+    qDebug() << "[Ratchet] initAsResponder: session created";
     return s;
 }
 
@@ -231,9 +223,7 @@ QByteArray RatchetSession::encrypt(const QByteArray& plaintext) {
     header.prevChainLen = m_prevChainLen;
     header.messageNum   = m_sendMsgNum++;
 
-    qDebug() << "[Ratchet] encrypt: msgNum=" << header.messageNum
-             << "dhPub=" << m_dhPub.left(4).toHex()
-             << "rootKey=" << m_rootKey.left(4).toHex();
+    qDebug() << "[Ratchet] encrypt: msgNum=" << header.messageNum;
 
     QByteArray headerBytes = header.serialize();
 
@@ -303,6 +293,8 @@ QByteArray RatchetSession::trySkippedKeys(const RatchetHeader& header,
     }
 
     pt.resize(static_cast<int>(plen));
+    // L7 fix: store message key so callers can extract it for file sub-keys
+    m_lastMessageKey = QByteArray(msgKey.constData(), msgKey.size());
     sodium_memzero(msgKey.data(), msgKey.size());
     return pt;
 }
@@ -341,11 +333,7 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
 
     QByteArray ciphertext = headerAndCiphertext.mid(headerLen);
     qDebug() << "[Ratchet] decrypt: msgNum=" << header.messageNum
-             << "prevChain=" << header.prevChainLen
-             << "dhPub=" << header.dhPub.left(4).toHex()
-             << "remoteDhPub=" << m_remoteDhPub.left(4).toHex()
-             << "recvChainEmpty=" << m_recvChainKey.isEmpty()
-             << "rootKey=" << m_rootKey.left(4).toHex();
+             << "prevChain=" << header.prevChainLen;
 
     // Try skipped keys first
     QByteArray skippedResult = trySkippedKeys(header, ciphertext);
@@ -353,13 +341,12 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
 
     // If the DH key changed, perform a DH ratchet step
     if (header.dhPub != m_remoteDhPub) {
-        qDebug() << "[Ratchet] DH key changed — performing ratchet step";
+        qDebug() << "[Ratchet] DH ratchet step";
         // Skip any remaining messages in the current receiving chain
         if (!skipMessageKeys(m_remoteDhPub, header.prevChainLen))
             return {};
         dhRatchetStep(header.dhPub);
-        qDebug() << "[Ratchet] after ratchet step: recvChainEmpty=" << m_recvChainKey.isEmpty()
-                 << "rootKey=" << m_rootKey.left(4).toHex();
+        qDebug() << "[Ratchet] ratchet step complete";
     }
 
     // Skip ahead in the current chain if needed
@@ -397,6 +384,9 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
     }
 
     pt.resize(static_cast<int>(plen));
+
+    // Store the message key before zeroing (deep copy for same reason as encrypt)
+    m_lastMessageKey = QByteArray(msgKey.constData(), msgKey.size());
     sodium_memzero(msgKey.data(), msgKey.size());
     return pt;
 }

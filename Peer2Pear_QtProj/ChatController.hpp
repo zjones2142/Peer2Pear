@@ -74,6 +74,9 @@ public:
     void sendGroupRename(const QString& groupId, const QString& newName, const QStringList& memberKeys);
     void sendGroupAvatar(const QString& groupId, const QString& avatarB64, const QStringList& memberKeys);
 
+    // G3: Wipe ratchet session for a peer, forcing a fresh Noise IK handshake
+    void resetSession(const QString& peerIdB64u);
+
 signals:
     void status(const QString& s);
     void presenceChanged(const QString& peerIdB64u, bool online);
@@ -122,7 +125,9 @@ private slots:
     void onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data);
 
 private:
-    void sendSignalingMessage(const QString& peerIdB64u, const QJsonObject& payload);
+    QByteArray sealForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
+    void sendSealedPayload(const QString& peerIdB64u, const QJsonObject& payload);
+    NiceConnection* setupP2PConnection(const QString& peerIdB64u, bool controlling);
     void initiateP2PConnection(const QString& peerIdB64u);
 
     // ── Deduplication ─────────────────────────────────────────────────────────
@@ -146,6 +151,17 @@ private:
     QStringList m_selfKeys;
 
     QMap<QString, NiceConnection*> m_p2pConnections;
+
+    // G5 fix: per-group outbound sequence counter (monotonic, not persisted)
+    QMap<QString, qint64> m_groupSeqOut;
+    // G5 fix: per-(group,sender) last-seen sequence — detects gaps
+    QMap<QString, qint64> m_groupSeqIn;  // key: "groupId:senderId"
+
+    // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
+    // Populated by file_key announcements, consumed by handleFileEnvelope()
+    QMap<QString, QByteArray> m_fileKeys;
+    // M8 fix: creation timestamps for m_fileKeys entries (epoch seconds)
+    QMap<QString, qint64> m_fileKeyTimes;
 
     // TURN relay config for symmetric NAT fallback
     QString m_turnHost;

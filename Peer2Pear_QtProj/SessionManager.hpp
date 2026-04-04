@@ -47,8 +47,10 @@ public:
 
     // Decrypt a session-layer blob received from a peer.
     // Returns decrypted plaintext, or empty on failure.
-    // senderIdOut is set to the sender's peer ID (known after decrypt)
-    QByteArray decryptFromPeer(const QString& senderIdB64u, const QByteArray& blob);
+    // If msgKeyOut is non-null, receives the message key used for decryption
+    // (used by file_key announcements to derive per-file encryption keys).
+    QByteArray decryptFromPeer(const QString& senderIdB64u, const QByteArray& blob,
+                               QByteArray* msgKeyOut = nullptr);
 
     // Check if a ratchet session exists for a peer
     bool hasSession(const QString& peerIdB64u) const;

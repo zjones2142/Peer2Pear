@@ -270,13 +270,8 @@ void MailboxClient::fetchAll(const QString& myIdB64u)
                     const QString     envId = entry.value("env_id").toString();
                     const QString     b64   = entry.value("payload_b64").toString();
 
-                    // Server stores payload as url-safe base64, no padding.
-                    // Qt's fromBase64 needs standard base64 with padding.
-                    QByteArray padded = b64.toUtf8();
-                    while (padded.size() % 4) padded.append('=');
-                    padded.replace('-', '+');
-                    padded.replace('_', '/');
-                    const QByteArray body = QByteArray::fromBase64(padded);
+                    // G8 fix: use CryptoEngine helper instead of manual conversion
+                    const QByteArray body = CryptoEngine::fromBase64Url(b64);
 
                     if (!body.isEmpty())
                         emit envelopeReceived(body, envId);
