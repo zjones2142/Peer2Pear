@@ -46,7 +46,7 @@ ChatController::ChatController(QObject* parent)
 
     // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
     connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
-        m_rvz.publish("3.141.14.234", 0, 10LL * 60 * 1000);
+        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
     });
     m_rvzRefreshTimer.setInterval(9 * 60 * 1000);
 }
@@ -212,7 +212,7 @@ void ChatController::startPolling(int intervalMs)
         // Publish our identity to the rendezvous server so peers can discover us.
         // host="0.0.0.0" is a placeholder — the server records the request's source IP.
         // TTL of 10 minutes; we refresh on every poll start.
-        m_rvz.publish("3.141.14.234", 0, 10LL * 60 * 1000);
+        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
         m_rvzRefreshTimer.start();
         // Immediately drain the mailbox on startup rather than waiting for first tick
         pollOnce();

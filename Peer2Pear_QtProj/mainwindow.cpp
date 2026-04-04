@@ -78,8 +78,14 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // ── Server + polling ──────────────────────────────────────────────────────
-    // TODO: switch default to https:// once TLS is configured on the server
-    const QString serverUrl = m_db.loadSetting("serverUrl", "http://3.141.14.234");
+    // One-time migration: move existing users from the old HTTP IP to the new HTTPS domain
+    {
+        const QString old = m_db.loadSetting("serverUrl");
+        if (old == "http://3.141.14.234" || old == "http://3.141.14.234/") {
+            m_db.saveSetting("serverUrl", "https://peer2pear.com");
+        }
+    }
+    const QString serverUrl = m_db.loadSetting("serverUrl", "https://peer2pear.com");
     m_controller.setServerBaseUrl(QUrl(serverUrl));
     m_controller.startPolling(2000);
 
