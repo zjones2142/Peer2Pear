@@ -1,4 +1,5 @@
 #include "NiceConnection.hpp"
+#include <QDebug>
 
 NiceConnection::NiceConnection(QObject* parent)
     : QThread(parent), m_state(NICE_COMPONENT_STATE_DISCONNECTED) {}
@@ -37,7 +38,11 @@ void NiceConnection::initIce(bool controlling) {
 
 void NiceConnection::setRemoteSdp(const QString& sdp) {
     if (m_agent) {
-        nice_agent_parse_remote_sdp(m_agent, sdp.toUtf8().constData());
+        int parsed = nice_agent_parse_remote_sdp(m_agent, sdp.toUtf8().constData());
+        qDebug() << "[ICE] setRemoteSdp: parsed" << parsed << "candidates"
+                 << "| sdp length:" << sdp.size();
+    } else {
+        qDebug() << "[ICE] setRemoteSdp: agent is null!";
     }
 }
 
@@ -58,13 +63,23 @@ void NiceConnection::run() {
 void NiceConnection::cbCandidateGatheringDone(NiceAgent* agent, guint stream_id, gpointer data) {
     NiceConnection* self = static_cast<NiceConnection*>(data);
     gchar* sdp = nice_agent_generate_local_sdp(agent);
-    emit self->localSdpReady(QString::fromUtf8(sdp));
+    QString sdpStr = QString::fromUtf8(sdp);
+    qDebug() << "[ICE] Candidate gathering done | sdp length:" << sdpStr.size();
+    emit self->localSdpReady(sdpStr);
     g_free(sdp);
 }
 
 void NiceConnection::cbComponentStateChanged(NiceAgent* agent, guint stream_id, guint component_id, guint state, gpointer data) {
     NiceConnection* self = static_cast<NiceConnection*>(data);
     self->m_state = state;
+
+    static const char* stateNames[] = {
+        "DISCONNECTED", "GATHERING", "CONNECTING",
+        "CONNECTED", "READY", "FAILED", "LAST"
+    };
+    const char* name = (state < 7) ? stateNames[state] : "UNKNOWN";
+    qDebug() << "[ICE] State changed:" << name << "(" << state << ")";
+
     emit self->stateChanged(state);
 }
 

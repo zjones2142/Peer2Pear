@@ -46,7 +46,7 @@ ChatController::ChatController(QObject* parent)
 
     // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
     connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
-        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
+        m_rvz.publish("present", 0, 10LL * 60 * 1000);
     });
     m_rvzRefreshTimer.setInterval(9 * 60 * 1000);
 }
@@ -210,9 +210,9 @@ void ChatController::startPolling(int intervalMs)
     if (!m_pollTimer.isActive()) {
         m_pollTimer.start(intervalMs);
         // Publish our identity to the rendezvous server so peers can discover us.
-        // host="0.0.0.0" is a placeholder — the server records the request's source IP.
-        // TTL of 10 minutes; we refresh on every poll start.
-        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
+        // host="present" is a non-empty marker — the lookup check treats any non-empty,
+        // non-"0.0.0.0" host as "online".  TTL of 10 minutes; we refresh on every poll start.
+        m_rvz.publish("present", 0, 10LL * 60 * 1000);
         m_rvzRefreshTimer.start();
         // Immediately drain the mailbox on startup rather than waiting for first tick
         pollOnce();
@@ -513,8 +513,13 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         // Decrypt session layer (Noise handshake or ratchet message)
         QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
         if (pt.isEmpty()) {
-            // May be a handshake response with no user payload — that's OK
-            qDebug() << "[RECV" << via << "] session decrypt empty (handshake response or error)";
+            // Pre-key response (0x02) completes the Noise IK handshake and creates
+            // a ratchet session inside decryptFromPeer(), but returns no user payload.
+            // This is expected — future messages will use the ratchet session.
+            if (!unsealed.innerPayload.isEmpty() && static_cast<quint8>(unsealed.innerPayload[0]) == 0x02)
+                qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
+            else
+                qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";
             return;
         }
 
@@ -552,6 +557,29 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
         } else if (type == "group_avatar") {
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
+        } else if (type == "ice_offer") {
+            qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
+            if (!m_p2pConnections.contains(senderId)) {
+                NiceConnection* conn = new NiceConnection(this);
+                m_p2pConnections[senderId] = conn;
+                connect(conn, &NiceConnection::localSdpReady, this, [this, senderId](const QString& sdp) {
+                    QJsonObject p; p["type"]="ice_answer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
+                    sendSignalingMessage(senderId, p);
+                });
+                connect(conn, &NiceConnection::stateChanged, this, [this, senderId](int state) {
+                    if (state == NICE_COMPONENT_STATE_READY)
+                        emit status("P2P ready with " + senderId);
+                });
+                connect(conn, &NiceConnection::dataReceived, this, [this, senderId](const QByteArray& d) {
+                    onP2PDataReceived(senderId, d);
+                });
+                conn->initIce(false);
+            }
+            m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
+        } else if (type == "ice_answer") {
+            qDebug() << "[RECV" << via << "] ice_answer from" << senderId.left(8) + "...";
+            if (m_p2pConnections.contains(senderId))
+                m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
         } else if (type == "file_chunk") {
             // Sealed file chunk — handle metadata and chunk data from JSON
             // (for sealed path, the chunk data is embedded in the session payload)
