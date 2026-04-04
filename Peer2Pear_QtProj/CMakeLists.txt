@@ -100,6 +100,11 @@ else()
 endif()
 
 # --- 5. Link Dependencies ---
+# Suppress qDebug output in non-Debug builds so sensitive debug info is not baked in
+target_compile_definitions(Peer2Pear_QtProj PRIVATE
+    $<$<NOT:$<CONFIG:Debug>>:QT_NO_DEBUG_OUTPUT>
+)
+
 target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
