@@ -144,50 +144,21 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
 
     const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
 
-    // ── Sealed Ratchet path (preferred) ──────────────────────────────────────
-    if (m_sessionMgr) {
-        QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, pt);
-        if (!sessionBlob.isEmpty()) {
-            // Convert peer's Ed25519 pub to X25519 for sealing
-            QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
-            unsigned char peerCurvePub[32];
-            if (crypto_sign_ed25519_pk_to_curve25519(
-                    peerCurvePub,
-                    reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
-
-                QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
-                QByteArray sealed = SealedEnvelope::seal(
-                    recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
-
-                if (!sealed.isEmpty()) {
-                    if (m_p2pConnections.contains(peerIdB64u) &&
-                        m_p2pConnections[peerIdB64u]->isReady()) {
-                        qDebug() << "[SEND P2P] sealed text to" << peerIdB64u.left(8) + "..."
-                                 << "| size:" << sealed.size() << "B";
-                        m_p2pConnections[peerIdB64u]->sendData(kSealedPrefix + "\n" + sealed);
-                    } else {
-                        QByteArray env = kSealedPrefix + "\n" + sealed;
-                        qDebug() << "[SEND MAILBOX] sealed text to" << peerIdB64u.left(8) + "..."
-                                 << "| size:" << env.size() << "B";
-                        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
-                        initiateP2PConnection(peerIdB64u);
-                    }
-                    return;
-                }
-            }
-        }
+    // ── Sealed path (always required for text) ──────────────────────────────
+    QByteArray sealedEnv = sealForPeer(peerIdB64u, pt);
+    if (sealedEnv.isEmpty()) {
+        qWarning() << "[SEND] BLOCKED — cannot seal text to" << peerIdB64u.left(8) + "...";
+        emit status("Message not sent — encrypted session unavailable. Try again shortly.");
+        return;
     }
 
-    // ── Legacy path (fallback) ───────────────────────────────────────────────
-    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray ct      = m_crypto.aeadEncrypt(m_crypto.deriveSharedKey32(peerPub), pt);
-
-    if (m_p2pConnections.contains(peerIdB64u) && m_p2pConnections[peerIdB64u]->isReady()) {
-        qDebug() << "[SEND P2P] legacy text to" << peerIdB64u.left(8) + "...";
-        m_p2pConnections[peerIdB64u]->sendData(ct);
+    if (m_p2pConnections.contains(peerIdB64u) &&
+        m_p2pConnections[peerIdB64u]->isReady()) {
+        qDebug() << "[SEND P2P] sealed text to" << peerIdB64u.left(8) + "...";
+        m_p2pConnections[peerIdB64u]->sendData(sealedEnv);
     } else {
-        qDebug() << "[SEND MAILBOX] legacy text to" << peerIdB64u.left(8) + "...";
-        sendSignalingMessage(peerIdB64u, payload);
+        qDebug() << "[SEND MAILBOX] sealed text to" << peerIdB64u.left(8) + "...";
+        m_mbox.enqueue(peerIdB64u, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
         initiateP2PConnection(peerIdB64u);
     }
 }
@@ -201,7 +172,7 @@ void ChatController::sendAvatar(const QString& peerIdB64u,
     payload["type"]   = "avatar";
     payload["name"]   = displayName;
     payload["avatar"] = avatarB64;
-    sendSignalingMessage(peerIdB64u, payload);
+    sendSealedPayload(peerIdB64u, payload);   // S7 fix: use sealed path
 }
 
 // ── File transfer delegation ─────────────────────────────────────────────────
@@ -276,9 +247,13 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
 
     QJsonArray membersArray;
     for (const QString &key : memberPeerIds) {
-        if (key.trimmed() == myId) continue; // don't include yourself in member list
+        if (key.trimmed() == myId) continue;
         membersArray.append(key);
     }
+
+    // G5 fix: monotonic per-group sequence counter
+    const qint64 seq = ++m_groupSeqOut[groupId];
+
     for (const QString& peerId : memberPeerIds) {
         if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
 
@@ -291,40 +266,16 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         payload["text"]      = text;
         payload["ts"]        = ts;
         payload["msgId"]     = msgId;
+        payload["seq"]       = seq;   // G5 fix
 
         const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-
-        // Sealed Ratchet path
-        if (m_sessionMgr) {
-            QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerId, pt);
-            if (!sessionBlob.isEmpty()) {
-                QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
-                unsigned char peerCurvePub[32];
-                if (crypto_sign_ed25519_pk_to_curve25519(
-                        peerCurvePub,
-                        reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
-                    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
-                    QByteArray sealed = SealedEnvelope::seal(
-                        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
-                    if (!sealed.isEmpty()) {
-                        QByteArray env = kSealedPrefix + "\n" + sealed;
-                        qDebug() << "[SEND MAILBOX] sealed group_msg to" << peerId.left(8) + "...";
-                        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
-                        continue;
-                    }
-                }
-            }
+        QByteArray env = sealForPeer(peerId, pt);
+        if (!env.isEmpty()) {
+            qDebug() << "[SEND MAILBOX] sealed group_msg to" << peerId.left(8) + "...";
+            m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+        } else {
+            qWarning() << "[SEND] BLOCKED — cannot seal group_msg to" << peerId.left(8) + "...";
         }
-
-        // Legacy fallback
-        qDebug() << "[SEND MAILBOX] legacy group_msg to" << peerId.left(8) + "...";
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
-        const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
-        const QByteArray env = kMsgPrefix + myId.toUtf8() + "\n" + ct;
-        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
     }
 }
 
@@ -353,38 +304,13 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         payload["ts"]        = ts;
 
         const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-
-        // Sealed Ratchet path
-        if (m_sessionMgr) {
-            QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerId, pt);
-            if (!sessionBlob.isEmpty()) {
-                QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerId);
-                unsigned char peerCurvePub[32];
-                if (crypto_sign_ed25519_pk_to_curve25519(
-                        peerCurvePub,
-                        reinterpret_cast<const unsigned char*>(peerEdPub.constData())) == 0) {
-                    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
-                    QByteArray sealed = SealedEnvelope::seal(
-                        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
-                    if (!sealed.isEmpty()) {
-                        qDebug() << "[SEND MAILBOX] sealed group_leave to" << peerId.left(8) + "...";
-                        QByteArray env = kSealedPrefix + "\n" + sealed;
-                        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
-                        continue;
-                    }
-                }
-            }
+        QByteArray env = sealForPeer(peerId, pt);
+        if (!env.isEmpty()) {
+            qDebug() << "[SEND MAILBOX] sealed group_leave to" << peerId.left(8) + "...";
+            m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+        } else {
+            qWarning() << "[SEND] BLOCKED — cannot seal group_leave to" << peerId.left(8) + "...";
         }
-
-        // Legacy fallback
-        qDebug() << "[SEND MAILBOX] legacy group_leave to" << peerId.left(8) + "...";
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerId);
-        const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) continue;
-
-        const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
-        const QByteArray env = QByteArray("FROM:") + myId.toUtf8() + "\n" + ct;
-        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
     }
 }
 
@@ -417,40 +343,100 @@ void ChatController::pollOnce()
     m_fileMgr.purgeStaleTransfers();
 }
 
-void ChatController::sendSignalingMessage(const QString& peerIdB64u,
-                                          const QJsonObject& payload)
+// ── Core sealing primitive ────────────────────────────────────────────────────
+// Returns the sealed envelope bytes (SEALED:<version>\n<ciphertext>), or empty
+// on failure.  Every outbound path should call this instead of inlining the
+// encrypt→convert→seal→prefix logic.
+QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
+                                       const QByteArray& plaintext)
 {
-    const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const QByteArray key32   = m_crypto.deriveSharedKey32(peerPub);
-    if (key32.size() != 32) return;
+    if (!m_sessionMgr) return {};
+    QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext);
+    if (sessionBlob.isEmpty()) return {};
 
-    const QByteArray pt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-    const QByteArray ct  = m_crypto.aeadEncrypt(key32, pt);
-    const QByteArray env = kMsgPrefix + myIdB64u().toUtf8() + "\n" + ct;
-    m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+    QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    unsigned char peerCurvePub[32];
+    if (crypto_sign_ed25519_pk_to_curve25519(
+            peerCurvePub,
+            reinterpret_cast<const unsigned char*>(peerEdPub.constData())) != 0)
+        return {};
+
+    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+    sodium_memzero(peerCurvePub, sizeof(peerCurvePub));  // G11 fix
+    QByteArray sealed = SealedEnvelope::seal(
+        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+    if (sealed.isEmpty()) return {};
+
+    return kSealedPrefix + "\n" + sealed;
 }
 
-void ChatController::initiateP2PConnection(const QString& peerIdB64u)
+// ── S3/S7/S8 fix: Sealed payload via mailbox, fail-closed ───────────────────
+void ChatController::sendSealedPayload(const QString& peerIdB64u,
+                                       const QJsonObject& payload)
 {
-    if (m_p2pConnections.contains(peerIdB64u)) return;
+    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const QString type = payload.value("type").toString();
 
+    QByteArray env = sealForPeer(peerIdB64u, pt);
+    if (!env.isEmpty()) {
+        qDebug() << "[SEND MAILBOX] sealed" << type << "to" << peerIdB64u.left(8) + "...";
+        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        return;
+    }
+
+    // ── Fail closed: only ICE signaling may fall back to legacy ─────────────
+    // S10 fix: inlined legacy send — sendSignalingMessage() removed as standalone method
+    if (type == "ice_offer" || type == "ice_answer") {
+        qWarning() << "[SEND MAILBOX] legacy fallback for" << type
+                    << "to" << peerIdB64u.left(8) + "..." << "(ICE signaling)";
+        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
+        const QByteArray key32  = m_crypto.deriveSharedKey32(peerPub);
+        if (key32.size() != 32) return;
+        const QByteArray icePt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        const QByteArray ct     = m_crypto.aeadEncrypt(key32, icePt);
+        const QByteArray env    = kMsgPrefix + myIdB64u().toUtf8() + "\n" + ct;
+        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        return;
+    }
+
+    qWarning() << "[SEND] BLOCKED — cannot seal" << type
+               << "to" << peerIdB64u.left(8) + "...";
+    emit status(QString("Could not send %1 — encrypted session unavailable. "
+                        "Try sending a text message first to establish the session.")
+                    .arg(type));
+}
+
+// ── L2 fix: shared ICE connection setup ──────────────────────────────────────
+NiceConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bool controlling)
+{
     NiceConnection* conn = new NiceConnection(this);
     if (!m_turnHost.isEmpty())
         conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
     m_p2pConnections[peerIdB64u] = conn;
 
-    connect(conn, &NiceConnection::localSdpReady, this, [this, peerIdB64u](const QString& sdp) {
-        QJsonObject p; p["type"]="ice_offer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
-        sendSignalingMessage(peerIdB64u, p);
+    const QString iceType = controlling ? "ice_offer" : "ice_answer";
+    connect(conn, &NiceConnection::localSdpReady, this, [this, peerIdB64u, iceType](const QString& sdp) {
+        QJsonObject p;
+        p["type"] = iceType;
+        p["from"] = myIdB64u();
+        p["sdp"]  = sdp;
+        sendSealedPayload(peerIdB64u, p);   // S8 fix: use sealed path for ICE signaling
     });
     connect(conn, &NiceConnection::stateChanged, this, [this, peerIdB64u](int state) {
         if      (state == NICE_COMPONENT_STATE_READY)  emit status("P2P ready with " + peerIdB64u);
         else if (state == NICE_COMPONENT_STATE_FAILED) emit status("P2P failed for " + peerIdB64u);
     });
-    connect(conn, &NiceConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& ct) {
-        onP2PDataReceived(peerIdB64u, ct);
+    connect(conn, &NiceConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& d) {
+        onP2PDataReceived(peerIdB64u, d);
     });
-    conn->initIce(true);
+    conn->initIce(controlling);
+    return conn;
+}
+
+void ChatController::initiateP2PConnection(const QString& peerIdB64u)
+{
+    if (m_p2pConnections.contains(peerIdB64u)) return;
+    setupP2PConnection(peerIdB64u, true);
 }
 
 void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data)
@@ -574,10 +560,26 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             emit messageReceived(senderId, o.value("text").toString(), ts, msgId);
         } else if (type == "group_msg") {
             if (!msgId.isEmpty() && !markSeen(msgId)) return;
+
+            // G5 fix: sequence gap detection
+            const QString gid = o.value("groupId").toString();
+            if (o.contains("seq")) {
+                const qint64 seq = o.value("seq").toVariant().toLongLong();
+                const QString seqKey = gid + ":" + senderId;
+                if (m_groupSeqIn.contains(seqKey)) {
+                    const qint64 expected = m_groupSeqIn[seqKey] + 1;
+                    if (seq > expected)
+                        qWarning() << "[GROUP] seq gap from" << senderId.left(8) + "..."
+                                   << "in" << gid.left(8) + "..."
+                                   << "expected" << expected << "got" << seq;
+                }
+                m_groupSeqIn[seqKey] = seq;
+            }
+
             QStringList memberKeys;
             for (const QJsonValue &v : o.value("members").toArray())
                 memberKeys << v.toString();
-            emit groupMessageReceived(senderId, o.value("groupId").toString(),
+            emit groupMessageReceived(senderId, gid,
                                        o.value("groupName").toString(),
                                        memberKeys, o.value("text").toString(), ts, msgId);
         } else if (type == "group_leave") {
@@ -599,24 +601,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                 m_p2pConnections[senderId]->isReady()) {
                 qDebug() << "[ICE] Already connected to" << senderId.left(8) + "... — ignoring ice_offer";
             } else {
-                if (!m_p2pConnections.contains(senderId)) {
-                    NiceConnection* conn = new NiceConnection(this);
-                    if (!m_turnHost.isEmpty())
-                        conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
-                    m_p2pConnections[senderId] = conn;
-                    connect(conn, &NiceConnection::localSdpReady, this, [this, senderId](const QString& sdp) {
-                        QJsonObject p; p["type"]="ice_answer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
-                        sendSignalingMessage(senderId, p);
-                    });
-                    connect(conn, &NiceConnection::stateChanged, this, [this, senderId](int state) {
-                        if (state == NICE_COMPONENT_STATE_READY)
-                            emit status("P2P ready with " + senderId);
-                    });
-                    connect(conn, &NiceConnection::dataReceived, this, [this, senderId](const QByteArray& d) {
-                        onP2PDataReceived(senderId, d);
-                    });
-                    conn->initIce(false);
-                }
+                if (!m_p2pConnections.contains(senderId))
+                    setupP2PConnection(senderId, false);  // L2 fix
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
             }
         } else if (type == "ice_answer") {
@@ -625,9 +611,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                 !m_p2pConnections[senderId]->isReady())
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
         } else if (type == "file_chunk") {
-            // Sealed file chunk — handle metadata and chunk data from JSON
-            // (for sealed path, the chunk data is embedded in the session payload)
-            // This would require different wire format for sealed files — deferred
+            // G1 fix: log instead of silently dropping
+            qWarning() << "[RECV" << via << "] sealed file_chunk from" << senderId.left(8) + "..."
+                       << "— sealed file transfer not yet implemented, chunk dropped";
         }
         return;
     }
@@ -651,91 +637,44 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 
     const auto    o    = QJsonDocument::fromJson(pt).object();
     const QString type = o.value("type").toString();
+
+    // S9 fix: Legacy receive path — only accept ICE signaling and text.
+    // ICE is needed for P2P bootstrapping before a sealed session exists.
+    // Text is accepted (with warning) for backward compat with older peers.
+    // All other types (group_msg, avatar, group_rename, etc.) are rejected —
+    // they must come through the sealed path where sender identity is verified.
+    if (type != "ice_offer" && type != "ice_answer" && type != "text") {
+        qWarning() << "[RECV" << via << "] REJECTED legacy" << type
+                   << "from" << fromId.left(8) + "..."
+                   << "— must use sealed path";
+        return;
+    }
+
     qDebug() << "[RECV" << via << "] legacy type:" << type << "from" << fromId.left(8) + "...";
 
-    const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
-
-    // L3 fix: Only emit "online" if message is fresh (< 2 min old) or via P2P
-    if (via == "P2P" ||
-        (tsSecs > 0 && QDateTime::currentSecsSinceEpoch() - tsSecs < 120))
-        emit presenceChanged(fromId, true);
-    const QDateTime ts = tsSecs > 0
-                             ? QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime()
-                             : QDateTime::currentDateTime();
-
-    const QString msgId = o.value("msgId").toString();
-
     if (type == "text") {
+        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        // L3 fix: Only emit "online" if message is fresh (< 2 min old) or via P2P
+        if (via == "P2P" ||
+            (tsSecs > 0 && QDateTime::currentSecsSinceEpoch() - tsSecs < 120))
+            emit presenceChanged(fromId, true);
+        const QString msgId = o.value("msgId").toString();
         if (!msgId.isEmpty() && !markSeen(msgId)) return;
         emit messageReceived(fromId, o.value("text").toString(),
-                             tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
+                             tsFromSecs(tsSecs), msgId);
     } else if (type == "ice_offer") {
-        // Skip if we already have a working P2P connection
         if (m_p2pConnections.contains(fromId) &&
             m_p2pConnections[fromId]->isReady()) {
             qDebug() << "[ICE] Already connected to" << fromId.left(8) + "... — ignoring ice_offer";
         } else {
-            if (!m_p2pConnections.contains(fromId)) {
-                NiceConnection* conn = new NiceConnection(this);
-                if (!m_turnHost.isEmpty())
-                    conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
-                m_p2pConnections[fromId] = conn;
-                connect(conn, &NiceConnection::localSdpReady, this, [this, fromId](const QString& sdp) {
-                    QJsonObject p; p["type"]="ice_answer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
-                    sendSignalingMessage(fromId, p);
-                });
-                connect(conn, &NiceConnection::stateChanged, this, [this, fromId](int state) {
-                    if (state == NICE_COMPONENT_STATE_READY)
-                        emit status("P2P ready with " + fromId);
-                });
-                connect(conn, &NiceConnection::dataReceived, this, [this, fromId](const QByteArray& d) {
-                    onP2PDataReceived(fromId, d);
-                });
-                conn->initIce(false);
-            }
+            if (!m_p2pConnections.contains(fromId))
+                setupP2PConnection(fromId, false);  // L2 fix
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
         }
     } else if (type == "ice_answer") {
         if (m_p2pConnections.contains(fromId) &&
             !m_p2pConnections[fromId]->isReady())
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
-
-    } else if (type == "group_msg") {
-        if (!msgId.isEmpty() && !markSeen(msgId)) return;
-        QStringList memberKeys;
-        for (const QJsonValue &v : o.value("members").toArray())
-            memberKeys << v.toString();
-        emit groupMessageReceived(
-            fromId,
-            o.value("groupId").toString(),
-            o.value("groupName").toString(),
-            memberKeys,
-            o.value("text").toString(),
-            ts,
-            msgId
-            );
-    } else if (type == "group_leave") {
-        QStringList memberKeys;
-        for (const QJsonValue &v : o.value("members").toArray())
-            memberKeys << v.toString();
-
-        emit groupMemberLeft(
-            fromId,
-            o.value("groupId").toString(),
-            o.value("groupName").toString(),
-            memberKeys,
-            ts,
-            msgId);
-    } else if (type == "avatar") {
-        emit avatarReceived(fromId,
-                            o.value("name").toString(),
-                            o.value("avatar").toString());
-    } else if (type == "group_rename") {
-        emit groupRenamed(o.value("groupId").toString(),
-                          o.value("newName").toString());
-    } else if (type == "group_avatar") {
-        emit groupAvatarReceived(o.value("groupId").toString(),
-                                 o.value("avatar").toString());
     }
 }
 
@@ -749,7 +688,7 @@ void ChatController::sendGroupRename(const QString& groupId,
     payload["groupId"] = groupId;
     payload["newName"] = newName;
     for (const QString &key : memberKeys)
-        sendSignalingMessage(key, payload);
+        sendSealedPayload(key, payload);   // S7 fix
 }
 
 void ChatController::sendGroupAvatar(const QString& groupId,
@@ -762,5 +701,15 @@ void ChatController::sendGroupAvatar(const QString& groupId,
     payload["groupId"] = groupId;
     payload["avatar"]  = avatarB64;
     for (const QString &key : memberKeys)
-        sendSignalingMessage(key, payload);
+        sendSealedPayload(key, payload);   // S7 fix
+}
+
+// ── G3: Reset encrypted session ──────────────────────────────────────────────
+void ChatController::resetSession(const QString& peerIdB64u)
+{
+    if (m_sessionMgr) {
+        m_sessionMgr->deleteSession(peerIdB64u);
+        qDebug() << "[SESSION] Reset ratchet session for" << peerIdB64u.left(8) + "...";
+        emit status("Session reset — next message will establish a fresh handshake.");
+    }
 }

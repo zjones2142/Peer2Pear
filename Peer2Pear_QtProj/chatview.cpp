@@ -179,7 +179,7 @@ static const char *kDlgStyle =
 
 // Opens a modal dialog to edit a contact name + list of public keys.
 // nameInOut and keysInOut are updated on Save; returns false on Cancel.
-enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed, Left };
+enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed, Left, SessionReset };
 static ContactEditorResult openContactEditor(QWidget *parent,
                                              const QString &title,
                                              QString &nameInOut,
@@ -476,6 +476,21 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                 if (QMessageBox::question(&dlg, isBlocked ? "Unblock Contact" : "Block Contact",
                                           msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
                     result = ContactEditorResult::Blocked;
+                    dlg.accept();
+                }
+            });
+
+            // Reset Session — wipe ratchet state to force fresh handshake (G3 fix)
+            auto *resetBtn = new QPushButton("Reset Session", &dlg);
+            resetBtn->setStyleSheet(destructiveStyle);
+            actionRow->addWidget(resetBtn);
+            QObject::connect(resetBtn, &QPushButton::clicked, [&]() {
+                if (QMessageBox::question(&dlg, "Reset Session",
+                        "Reset the encrypted session with this contact?\n\n"
+                        "A new handshake will happen automatically on the next message. "
+                        "Use this if messages aren't decrypting properly.",
+                        QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                    result = ContactEditorResult::SessionReset;
                     dlg.accept();
                 }
             });
@@ -1716,6 +1731,11 @@ void ChatView::onEditContact(int index)
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
 
+    } else if (result == ContactEditorResult::SessionReset) {
+        // G3 fix: wipe ratchet state so next message triggers a fresh handshake
+        const QString peerId = m_chats[index].peerIdB64u;
+        if (!peerId.isEmpty())
+            m_controller->resetSession(peerId);
     } else if (result == ContactEditorResult::Left) {
         // Notify all members you're leaving
         const QString groupId = m_chats[index].groupId;
