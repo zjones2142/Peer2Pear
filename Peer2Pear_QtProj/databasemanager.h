@@ -34,6 +34,7 @@ public:
     QVector<Message> loadMessages(const QString &peerIdB64u) const;
 
     void saveFileRecord(const QString &chatKey, const FileTransferRecord &rec);
+    void deleteFileRecord(const QString &transferId);
     QVector<FileTransferRecord> loadFileRecords(const QString &chatKey) const;
 
     void    saveSetting(const QString &key, const QString &value);

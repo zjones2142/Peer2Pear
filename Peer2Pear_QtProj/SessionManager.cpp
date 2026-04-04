@@ -71,7 +71,21 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
         return out;
     }
 
-    // No session — initiate Noise IK handshake + bundle first ratchet message
+    // No session — check if we already have a pending handshake in-flight.
+    // If so, DON'T start a new one (that would overwrite the pending state
+    // and cause a cryptographic mismatch when the response to the first arrives).
+    // The caller will fall back to legacy encryption for this message.
+    {
+        int pendingRole = 0;
+        QByteArray existing = m_store.loadPendingHandshake(peerIdB64u, pendingRole);
+        if (!existing.isEmpty()) {
+            qDebug() << "[SessionManager] Handshake already in-flight for"
+                     << peerIdB64u.left(8) + "... — skipping, caller uses legacy path";
+            return {};
+        }
+    }
+
+    // Initiate Noise IK handshake + bundle first ratchet message
 
     // Get peer's Ed25519 public key and convert to X25519
     QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);

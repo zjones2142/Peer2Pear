@@ -1,6 +1,7 @@
 #include "chatview.h"
 #include "ui_mainwindow.h"
 
+#include <algorithm>
 #include <utility>
 #include <QLabel>
 #include <QVBoxLayout>
@@ -33,6 +34,15 @@
 #include <QPainterPath>
 #include <QBuffer>
 #include <QColorDialog>
+#include <QRegularExpression>
+
+// ── Key validation ───────────────────────────────────────────────────────────
+// Ed25519 public key: 32 bytes → 43 base64url characters (no padding).
+static bool isValidPublicKey(const QString &key)
+{
+    static const QRegularExpression rx("^[A-Za-z0-9_-]{43}$");
+    return rx.match(key).hasMatch();
+}
 
 // ── renderInitialsAvatar ──────────────────────────────────────────────────────
 static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, int size)
@@ -451,6 +461,11 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
             QString k = keyInput->text().trimmed();
             if (!k.isEmpty()) {
+                if (!isValidPublicKey(k)) {
+                    QMessageBox::warning(&dlg, "Invalid Key",
+                                         "Public key must be exactly 43 base64url characters.");
+                    return;
+                }
                 bool duplicate = false;
                 for (int i = 0; i < keyList->count(); ++i) {
                     if (keyList->item(i)->text() == k) { duplicate = true; break; }
@@ -1422,6 +1437,11 @@ void ChatView::onEditProfile()
     QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
         const QString k = keyInput->text().trimmed();
         if (k.isEmpty()) return;
+        if (!isValidPublicKey(k)) {
+            QMessageBox::warning(&dlg, "Invalid Key",
+                                 "Public key must be exactly 43 base64url characters.");
+            return;
+        }
         for (int i = 0; i < keyList->count(); ++i) {
             if (keyList->item(i)->text() == k) {
                 QMessageBox::warning(&dlg, "Duplicate Key", "This key already exists.");
@@ -1635,6 +1655,11 @@ void ChatView::onAddContact()
 
     QObject::connect(addK,&QPushButton::clicked,[&](){
         const QString k = ki->text().trimmed(); if(k.isEmpty()) return;
+        if (!isValidPublicKey(k)) {
+            QMessageBox::warning(&dlg, "Invalid Key",
+                                 "Public key must be exactly 43 base64url characters.");
+            return;
+        }
         for(int i=0;i<keyList->count();++i) if(keyList->item(i)->text()==k){
                 QMessageBox::warning(&dlg,"Duplicate Key","Key already present."); return; }
         keyList->addItem(k); ki->clear();
@@ -2266,6 +2291,58 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
 
     auto *thumbLayout = new QVBoxLayout(thumbWidget);
     thumbLayout->setContentsMargins(0, 0, 0, 0);
+    thumbLayout->setSpacing(0);
+
+    // ── Delete button (✕) — right-aligned at top of thumbnail area ───────────
+    auto *delBtn = new QPushButton("\u2715", thumbWidget);  // ✕
+    delBtn->setFixedSize(28, 28);
+    delBtn->setCursor(Qt::PointingHandCursor);
+    delBtn->setToolTip("Delete file");
+    delBtn->setStyleSheet(
+        "QPushButton{"
+        "  background-color:rgba(60,60,60,200);"
+        "  color:#cccccc;"
+        "  border:none;"
+        "  border-radius:14px;"
+        "  font-size:14px;"
+        "  font-weight:bold;"
+        "}"
+        "QPushButton:hover{ background-color:rgba(180,50,50,220); color:#ffffff; }"
+        "QPushButton:pressed{ background-color:rgba(140,30,30,255); }"
+        );
+    {
+        auto *delRow = new QHBoxLayout;
+        delRow->setContentsMargins(0, 6, 6, 0);
+        delRow->addStretch();
+        delRow->addWidget(delBtn);
+        thumbLayout->addLayout(delRow);
+    }
+
+    const QString delTransferId = rec.transferId;
+    const QString delSavedPath  = rec.savedPath;
+    QObject::connect(delBtn, &QPushButton::clicked, [this, delTransferId, delSavedPath]() {
+        auto reply = QMessageBox::question(
+            m_ui->centralwidget, "Delete File",
+            "Remove this file from your file list?\n\n"
+            "The file will remain on your disk.",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (reply != QMessageBox::Yes) return;
+
+        // 1. Delete from database
+        m_db->deleteFileRecord(delTransferId);
+
+        // 3. Remove from in-memory map
+        if (m_currentChat >= 0 && m_currentChat < m_chats.size()) {
+            const QString ck = chatKey(m_chats[m_currentChat]);
+            auto &files = m_filesByKey[ck];
+            files.erase(std::remove_if(files.begin(), files.end(),
+                [&](const FileTransferRecord &r){ return r.transferId == delTransferId; }),
+                files.end());
+        }
+
+        // 4. Rebuild the files tab
+        rebuildFilesTab();
+    });
 
     if (isImage) {
         QPixmap px(rec.savedPath);

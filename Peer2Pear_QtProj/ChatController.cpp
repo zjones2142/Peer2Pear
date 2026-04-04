@@ -44,11 +44,12 @@ ChatController::ChatController(QObject* parent)
     connect(&m_fileMgr, &FileTransferManager::wantP2PConnection,
             this, &ChatController::initiateP2PConnection);
 
-    // Refresh rendezvous registration every 9 minutes (TTL is 10 min)
+    // Refresh rendezvous registration every 50 seconds (TTL is 60s).
+    // Short TTL means peers detect offline status within ~60s of app close.
     connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
-        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
+        m_rvz.publish("present", 0, 60LL * 1000);
     });
-    m_rvzRefreshTimer.setInterval(9 * 60 * 1000);
+    m_rvzRefreshTimer.setInterval(50 * 1000);
 }
 
 void ChatController::setPassphrase(const QString& pass)
@@ -210,9 +211,9 @@ void ChatController::startPolling(int intervalMs)
     if (!m_pollTimer.isActive()) {
         m_pollTimer.start(intervalMs);
         // Publish our identity to the rendezvous server so peers can discover us.
-        // host="0.0.0.0" is a placeholder — the server records the request's source IP.
-        // TTL of 10 minutes; we refresh on every poll start.
-        m_rvz.publish("0.0.0.0", 0, 10LL * 60 * 1000);
+        // host="present" is a non-empty marker — the lookup check treats any non-empty,
+        // non-"0.0.0.0" host as "online".  TTL of 60s; we refresh every 50s.
+        m_rvz.publish("present", 0, 60LL * 1000);
         m_rvzRefreshTimer.start();
         // Immediately drain the mailbox on startup rather than waiting for first tick
         pollOnce();
@@ -222,10 +223,22 @@ void ChatController::startPolling(int intervalMs)
 void ChatController::stopPolling()
 {
     m_pollTimer.stop();
-    m_rvzRefreshTimer.stop();   // stop advertising presence to rendezvous
+    m_rvzRefreshTimer.stop();
+    // Immediately expire our presence so peers see us as offline
+    m_rvz.publish("", 0, 1);
 }
 
 void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
+
+void ChatController::setTurnServer(const QString& host, int port,
+                                    const QString& username, const QString& password)
+{
+    m_turnHost = host;
+    m_turnPort = port;
+    m_turnUser = username;
+    m_turnPass = password;
+    qDebug() << "[ChatController] TURN server set:" << host << ":" << port;
+}
 
 void ChatController::checkPresence(const QStringList& peerIds)
 {
@@ -405,6 +418,8 @@ void ChatController::initiateP2PConnection(const QString& peerIdB64u)
     if (m_p2pConnections.contains(peerIdB64u)) return;
 
     NiceConnection* conn = new NiceConnection(this);
+    if (!m_turnHost.isEmpty())
+        conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
     m_p2pConnections[peerIdB64u] = conn;
 
     connect(conn, &NiceConnection::localSdpReady, this, [this, peerIdB64u](const QString& sdp) {
@@ -513,8 +528,13 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         // Decrypt session layer (Noise handshake or ratchet message)
         QByteArray pt = m_sessionMgr->decryptFromPeer(senderId, unsealed.innerPayload);
         if (pt.isEmpty()) {
-            // May be a handshake response with no user payload — that's OK
-            qDebug() << "[RECV" << via << "] session decrypt empty (handshake response or error)";
+            // Pre-key response (0x02) completes the Noise IK handshake and creates
+            // a ratchet session inside decryptFromPeer(), but returns no user payload.
+            // This is expected — future messages will use the ratchet session.
+            if (!unsealed.innerPayload.isEmpty() && static_cast<quint8>(unsealed.innerPayload[0]) == 0x02)
+                qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
+            else
+                qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";
             return;
         }
 
@@ -552,6 +572,38 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
         } else if (type == "group_avatar") {
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
+        } else if (type == "ice_offer") {
+            qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
+            // Skip if we already have a working P2P connection
+            if (m_p2pConnections.contains(senderId) &&
+                m_p2pConnections[senderId]->isReady()) {
+                qDebug() << "[ICE] Already connected to" << senderId.left(8) + "... — ignoring ice_offer";
+            } else {
+                if (!m_p2pConnections.contains(senderId)) {
+                    NiceConnection* conn = new NiceConnection(this);
+                    if (!m_turnHost.isEmpty())
+                        conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
+                    m_p2pConnections[senderId] = conn;
+                    connect(conn, &NiceConnection::localSdpReady, this, [this, senderId](const QString& sdp) {
+                        QJsonObject p; p["type"]="ice_answer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
+                        sendSignalingMessage(senderId, p);
+                    });
+                    connect(conn, &NiceConnection::stateChanged, this, [this, senderId](int state) {
+                        if (state == NICE_COMPONENT_STATE_READY)
+                            emit status("P2P ready with " + senderId);
+                    });
+                    connect(conn, &NiceConnection::dataReceived, this, [this, senderId](const QByteArray& d) {
+                        onP2PDataReceived(senderId, d);
+                    });
+                    conn->initIce(false);
+                }
+                m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
+            }
+        } else if (type == "ice_answer") {
+            qDebug() << "[RECV" << via << "] ice_answer from" << senderId.left(8) + "...";
+            if (m_p2pConnections.contains(senderId) &&
+                !m_p2pConnections[senderId]->isReady())
+                m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
         } else if (type == "file_chunk") {
             // Sealed file chunk — handle metadata and chunk data from JSON
             // (for sealed path, the chunk data is embedded in the session payload)
@@ -597,25 +649,34 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         emit messageReceived(fromId, o.value("text").toString(),
                              tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
     } else if (type == "ice_offer") {
-        if (!m_p2pConnections.contains(fromId)) {
-            NiceConnection* conn = new NiceConnection(this);
-            m_p2pConnections[fromId] = conn;
-            connect(conn, &NiceConnection::localSdpReady, this, [this, fromId](const QString& sdp) {
-                QJsonObject p; p["type"]="ice_answer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
-                sendSignalingMessage(fromId, p);
-            });
-            connect(conn, &NiceConnection::stateChanged, this, [this, fromId](int state) {
-                if (state == NICE_COMPONENT_STATE_READY)
-                    emit status("P2P ready with " + fromId);
-            });
-            connect(conn, &NiceConnection::dataReceived, this, [this, fromId](const QByteArray& d) {
-                onP2PDataReceived(fromId, d);
-            });
-            conn->initIce(false);
+        // Skip if we already have a working P2P connection
+        if (m_p2pConnections.contains(fromId) &&
+            m_p2pConnections[fromId]->isReady()) {
+            qDebug() << "[ICE] Already connected to" << fromId.left(8) + "... — ignoring ice_offer";
+        } else {
+            if (!m_p2pConnections.contains(fromId)) {
+                NiceConnection* conn = new NiceConnection(this);
+                if (!m_turnHost.isEmpty())
+                    conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
+                m_p2pConnections[fromId] = conn;
+                connect(conn, &NiceConnection::localSdpReady, this, [this, fromId](const QString& sdp) {
+                    QJsonObject p; p["type"]="ice_answer"; p["from"]=myIdB64u(); p["sdp"]=sdp;
+                    sendSignalingMessage(fromId, p);
+                });
+                connect(conn, &NiceConnection::stateChanged, this, [this, fromId](int state) {
+                    if (state == NICE_COMPONENT_STATE_READY)
+                        emit status("P2P ready with " + fromId);
+                });
+                connect(conn, &NiceConnection::dataReceived, this, [this, fromId](const QByteArray& d) {
+                    onP2PDataReceived(fromId, d);
+                });
+                conn->initIce(false);
+            }
+            m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
         }
-        m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
     } else if (type == "ice_answer") {
-        if (m_p2pConnections.contains(fromId))
+        if (m_p2pConnections.contains(fromId) &&
+            !m_p2pConnections[fromId]->isReady())
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
 
     } else if (type == "group_msg") {

@@ -346,6 +346,15 @@ void DatabaseManager::saveFileRecord(const QString &chatKey, const FileTransferR
     if (!q.exec()) qWarning() << "saveFileRecord:" << q.lastError().text();
 }
 
+void DatabaseManager::deleteFileRecord(const QString &transferId)
+{
+    if (transferId.isEmpty()) return;
+    QSqlQuery q(m_db);
+    q.prepare("DELETE FROM file_transfers WHERE transfer_id=:tid;");
+    q.bindValue(":tid", transferId);
+    if (!q.exec()) qWarning() << "deleteFileRecord:" << q.lastError().text();
+}
+
 QVector<FileTransferRecord> DatabaseManager::loadFileRecords(const QString &chatKey) const
 {
     QVector<FileTransferRecord> result;
