@@ -57,6 +57,9 @@ RatchetHeader RatchetHeader::deserialize(const QByteArray& data, int& bytesRead)
         memcpy(&ctLenBE, data.constData() + bytesRead, 2);
         quint16 ctLen = qFromBigEndian(ctLenBE);
 
+        // Validate KEM ciphertext size: must be 0 (no CT) or exactly 1088 (ML-KEM-768)
+        if (ctLen != 0 && ctLen != kKemCtLen) return h;  // reject malformed
+
         const int pqSize = 2 + ctLen + kKemPubLen;
         if (data.size() >= bytesRead + pqSize) {
             bytesRead += 2;
@@ -575,6 +578,16 @@ RatchetSession RatchetSession::deserialize(const QByteArray& data) {
     if (version >= 2) {
         ds >> s.m_hybrid;
         ds >> s.m_kemPub >> s.m_kemPriv >> s.m_remoteKemPub >> s.m_pendingKemCt;
+
+        // Validate PQ key sizes — reject corrupted state
+        if (s.m_hybrid) {
+            if ((!s.m_kemPub.isEmpty() && s.m_kemPub.size() != kKemPubLen) ||
+                (!s.m_kemPriv.isEmpty() && s.m_kemPriv.size() != 2400) ||
+                (!s.m_remoteKemPub.isEmpty() && s.m_remoteKemPub.size() != kKemPubLen) ||
+                (!s.m_pendingKemCt.isEmpty() && s.m_pendingKemCt.size() != kKemCtLen)) {
+                return RatchetSession{};  // corrupted — return invalid
+            }
+        }
     }
 
     return s;

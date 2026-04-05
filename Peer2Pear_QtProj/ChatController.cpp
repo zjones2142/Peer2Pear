@@ -113,14 +113,15 @@ void ChatController::setDatabase(QSqlDatabase db)
     m_sessionStore = std::make_unique<SessionStore>(db, storeKey);
     CryptoEngine::secureZero(storeKey);
 
-    // One-time migration: clear sessions created with the buggy ratchet init
+    // One-time migration: clear sessions when serialization format changes.
+    // v5: ratchet init fix.  v6: PQ hybrid (Noise v4 + RatchetSession v2).
     {
         QSqlQuery q(db);
-        q.prepare("SELECT value FROM settings WHERE key='ratchet_v5_cleared';");
+        q.prepare("SELECT value FROM settings WHERE key='ratchet_v6_cleared';");
         if (!q.exec() || !q.next()) {
             m_sessionStore->clearAll();
             QSqlQuery ins(db);
-            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v5_cleared','1');");
+            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v6_cleared','1');");
             ins.exec();
         }
     }

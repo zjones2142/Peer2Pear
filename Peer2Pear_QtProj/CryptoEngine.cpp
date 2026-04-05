@@ -457,8 +457,8 @@ KemEncapsResult CryptoEngine::kemEncaps(const QByteArray& recipientKemPub) {
                         reinterpret_cast<uint8_t*>(result.ciphertext.data()),
                         reinterpret_cast<uint8_t*>(result.sharedSecret.data()),
                         reinterpret_cast<const uint8_t*>(recipientKemPub.constData())) != OQS_SUCCESS) {
-        result.ciphertext.clear();
-        result.sharedSecret.clear();
+        secureZero(result.ciphertext);
+        secureZero(result.sharedSecret);
         OQS_KEM_free(kem);
         return result;
     }

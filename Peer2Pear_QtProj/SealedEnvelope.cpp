@@ -77,8 +77,14 @@ QByteArray SealedEnvelope::seal(const QByteArray& recipientCurvePub,
     // 5b. Hybrid: also sign with ML-DSA-65 if we have DSA keys
     const bool hybridSig = !senderDsaPub.isEmpty() && !senderDsaPriv.isEmpty();
     QByteArray dsaSig;
-    if (hybridSig)
+    if (hybridSig) {
         dsaSig = CryptoEngine::dsaSign(innerPayload, senderDsaPriv);
+        if (dsaSig.isEmpty()) {
+            // Fail-closed: if we have DSA keys but signing fails, don't send at all
+            sodium_memzero(envelopeKey, sizeof(envelopeKey));
+            return {};
+        }
+    }
 
     // 6. Build plaintext:
     //   Classical: senderEdPub(32) || edSig(64) || dsaPubLen(2, =0) || innerPayload
@@ -301,8 +307,9 @@ UnsealResult SealedEnvelope::unseal(const QByteArray& recipientCurvePriv,
                 dsaSig = pt.mid(parseOffset, dsaSigLen);
                 parseOffset += dsaSigLen;
             } else {
-                // Unknown DSA variant or malformed — skip DSA verification,
-                // but still verify Ed25519 (fail-open on PQ, fail-closed on classical)
+                // Fail-closed: if DSA extension is present but malformed, reject entirely.
+                // This prevents downgrade attacks where an attacker strips the PQ signature.
+                return result;
             }
         } else if (dsaPubLen == 0) {
             // Explicit "no DSA" marker
