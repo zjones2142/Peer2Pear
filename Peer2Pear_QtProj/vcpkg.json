@@ -4,6 +4,7 @@
   "dependencies": [
     "libsodium",
     "libnice",
-    "glib"
+    "glib",
+    "liboqs"
   ]
 }

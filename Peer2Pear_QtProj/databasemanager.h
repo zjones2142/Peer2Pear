@@ -27,6 +27,8 @@ public:
     QVector<ChatData> loadAllContacts() const;
     void saveContact(const ChatData &chat);
     void saveContactAvatar(const QString &peerIdB64u, const QString &avatarB64);
+    void saveContactKemPub(const QString &peerIdB64u, const QByteArray &kemPub);
+    QByteArray loadContactKemPub(const QString &peerIdB64u) const;
     void deleteContact(const QString &peerIdB64u);
 
     // saveMessage also updates last_active on the contact row

@@ -1,5 +1,6 @@
 #include "CryptoEngine.hpp"
 #include <sodium.h>
+#include <oqs/oqs.h>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QStandardPaths>
@@ -20,7 +21,7 @@ static QString identityPath() {
     return base + "/keys/identity.json";
 }
 
-static constexpr int kIdentityVersion = 2;
+static constexpr int kIdentityVersion = 3;  // v3 adds ML-KEM-768 PQ keys
 
 static constexpr int SALT_BYTES  = crypto_pwhash_SALTBYTES;        // 16
 static constexpr int KEY_BYTES   = crypto_secretbox_KEYBYTES;      // 32
@@ -104,9 +105,11 @@ CryptoEngine::~CryptoEngine() {
     secureZero(m_passphrase);
     secureZero(m_edPriv);
     secureZero(m_curvePriv);
+    secureZero(m_kemPriv);
     // Public keys are not secret, but zero for hygiene
     secureZero(m_edPub);
     secureZero(m_curvePub);
+    secureZero(m_kemPub);
 }
 
 void CryptoEngine::secureZero(QByteArray& buf) {
@@ -205,8 +208,26 @@ bool CryptoEngine::loadIdentityFromDisk() {
     m_edPub = pub;
     m_edPriv = priv;
 
+    // Load ML-KEM-768 keys if present (v3+ identity files)
+    if (o.contains("kem_pub_b64u")) {
+        m_kemPub = fromBase64Url(o.value("kem_pub_b64u").toString());
+
+        const auto kemEnc = o.value("kem_priv_enc").toObject();
+        const QByteArray kemNonce = fromBase64Url(kemEnc.value("nonce_b64u").toString());
+        const QByteArray kemCt    = fromBase64Url(kemEnc.value("ct_b64u").toString());
+
+        // Derive a separate key for KEM private key encryption (key separation)
+        QByteArray kemKey32 = deriveKeyFromPassphrase(m_passphrase, salt);
+        if (!kemKey32.isEmpty()) {
+            // Use a different nonce domain — the salt is shared but nonces differ
+            m_kemPriv = secretboxDecrypt(kemKey32, kemNonce, kemCt);
+            secureZero(kemKey32);
+        }
+    }
+
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[CryptoEngine] Identity loaded from:" << path;
+    qDebug() << "[CryptoEngine] Identity loaded from:" << path
+             << "| PQ keys:" << (hasPQKeys() ? "yes" : "no");
 #endif
 
     return true;
@@ -241,6 +262,25 @@ bool CryptoEngine::saveIdentityToDisk() const {
     j["v"] = kIdentityVersion;
     j["ed_pub_b64u"] = toBase64Url(m_edPub);
     j["ed_priv_enc"] = enc;
+
+    // Persist ML-KEM-768 keys if available
+    if (hasPQKeys()) {
+        j["kem_pub_b64u"] = toBase64Url(m_kemPub);
+
+        // Encrypt KEM private key with a separate nonce (same derived key)
+        QByteArray kemNonce, kemCt;
+        QByteArray kemDummySalt;
+        QByteArray kemKey32 = deriveKeyFromPassphrase(m_passphrase, salt);
+        if (!kemKey32.isEmpty()) {
+            if (secretboxEncrypt(kemKey32, m_kemPriv, kemDummySalt, kemNonce, kemCt)) {
+                QJsonObject kemEnc;
+                kemEnc["nonce_b64u"] = toBase64Url(kemNonce);
+                kemEnc["ct_b64u"]    = toBase64Url(kemCt);
+                j["kem_priv_enc"] = kemEnc;
+            }
+            secureZero(kemKey32);
+        }
+    }
 
     QString path = identityPath();
 
@@ -289,6 +329,7 @@ void CryptoEngine::ensureIdentity() {
             throw std::runtime_error("Failed to decrypt identity (wrong passphrase or corrupted file)");
         }
         deriveCurveKeysFromEd();
+        ensurePQKeys();  // generate + persist PQ keys if this is a v2 identity
         secureZero(m_passphrase);
         return;
     }
@@ -309,6 +350,12 @@ void CryptoEngine::ensureIdentity() {
 
     deriveCurveKeysFromEd();
 
+    // Generate ML-KEM-768 keypair on first run
+    auto [kemPub, kemPriv] = generateKemKeypair();
+    m_kemPub  = kemPub;
+    m_kemPriv = kemPriv;
+    secureZero(kemPriv);
+
     if (!saveIdentityToDisk()) {
         secureZero(m_passphrase);
         throw std::runtime_error("Failed to save encrypted identity to disk");
@@ -316,6 +363,103 @@ void CryptoEngine::ensureIdentity() {
 
     // Passphrase is no longer needed — identity keys are in memory
     secureZero(m_passphrase);
+}
+
+// ---------------------------
+// ML-KEM-768 (Post-Quantum)
+// ---------------------------
+
+std::pair<QByteArray, QByteArray> CryptoEngine::generateKemKeypair() {
+    OQS_KEM* kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
+    if (!kem) return {};
+
+    QByteArray pub(static_cast<int>(kem->length_public_key), 0);
+    QByteArray priv(static_cast<int>(kem->length_secret_key), 0);
+
+    if (OQS_KEM_keypair(kem,
+                         reinterpret_cast<uint8_t*>(pub.data()),
+                         reinterpret_cast<uint8_t*>(priv.data())) != OQS_SUCCESS) {
+        OQS_KEM_free(kem);
+        return {};
+    }
+
+    OQS_KEM_free(kem);
+    return { pub, priv };
+}
+
+KemEncapsResult CryptoEngine::kemEncaps(const QByteArray& recipientKemPub) {
+    KemEncapsResult result;
+    OQS_KEM* kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
+    if (!kem) return result;
+
+    if (recipientKemPub.size() != static_cast<int>(kem->length_public_key)) {
+        OQS_KEM_free(kem);
+        return result;
+    }
+
+    result.ciphertext.resize(static_cast<int>(kem->length_ciphertext));
+    result.sharedSecret.resize(static_cast<int>(kem->length_shared_secret));
+
+    if (OQS_KEM_encaps(kem,
+                        reinterpret_cast<uint8_t*>(result.ciphertext.data()),
+                        reinterpret_cast<uint8_t*>(result.sharedSecret.data()),
+                        reinterpret_cast<const uint8_t*>(recipientKemPub.constData())) != OQS_SUCCESS) {
+        result.ciphertext.clear();
+        result.sharedSecret.clear();
+        OQS_KEM_free(kem);
+        return result;
+    }
+
+    OQS_KEM_free(kem);
+    return result;
+}
+
+QByteArray CryptoEngine::kemDecaps(const QByteArray& ciphertext, const QByteArray& kemPriv) {
+    OQS_KEM* kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
+    if (!kem) return {};
+
+    if (ciphertext.size() != static_cast<int>(kem->length_ciphertext) ||
+        kemPriv.size() != static_cast<int>(kem->length_secret_key)) {
+        OQS_KEM_free(kem);
+        return {};
+    }
+
+    QByteArray sharedSecret(static_cast<int>(kem->length_shared_secret), 0);
+
+    if (OQS_KEM_decaps(kem,
+                        reinterpret_cast<uint8_t*>(sharedSecret.data()),
+                        reinterpret_cast<const uint8_t*>(ciphertext.constData()),
+                        reinterpret_cast<const uint8_t*>(kemPriv.constData())) != OQS_SUCCESS) {
+        OQS_KEM_free(kem);
+        return {};
+    }
+
+    OQS_KEM_free(kem);
+    return sharedSecret;
+}
+
+void CryptoEngine::ensurePQKeys() {
+    if (hasPQKeys()) return;  // already have them
+    if (!hasPassphrase()) return;  // can't persist without passphrase
+
+    auto [pub, priv] = generateKemKeypair();
+    if (pub.isEmpty()) {
+        qWarning() << "[CryptoEngine] Failed to generate ML-KEM-768 keypair";
+        return;
+    }
+
+    m_kemPub  = pub;
+    m_kemPriv = priv;
+    secureZero(priv);
+
+    // Re-save identity file with PQ keys included
+    if (saveIdentityToDisk()) {
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[CryptoEngine] ML-KEM-768 keys generated and persisted (identity upgraded to v3)";
+#endif
+    } else {
+        qWarning() << "[CryptoEngine] Failed to persist ML-KEM-768 keys";
+    }
 }
 
 // ---------------------------

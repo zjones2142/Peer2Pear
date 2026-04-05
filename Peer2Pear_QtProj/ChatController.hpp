@@ -146,6 +146,7 @@ private:
     // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
     std::unique_ptr<SessionStore>   m_sessionStore;
     std::unique_ptr<SessionManager> m_sessionMgr;
+    QSqlDatabase m_db;  // stored for KEM pub lookups
 
     QTimer      m_pollTimer;
     QStringList m_selfKeys;
@@ -156,6 +157,13 @@ private:
     QMap<QString, qint64> m_groupSeqOut;
     // G5 fix: per-(group,sender) last-seen sequence — detects gaps
     QMap<QString, qint64> m_groupSeqIn;  // key: "groupId:senderId"
+
+    // Peer ML-KEM-768 public keys: peerIdB64u -> 1184-byte KEM pub
+    // Populated by kem_pub_announce messages, used by sealForPeer() for hybrid envelopes
+    QMap<QString, QByteArray> m_peerKemPubs;
+    QSet<QString> m_kemPubAnnounced;  // peers we've already announced to this session
+    QByteArray lookupPeerKemPub(const QString& peerIdB64u);
+    void announceKemPub(const QString& peerIdB64u);
 
     // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
     // Populated by file_key announcements, consumed by handleFileEnvelope()

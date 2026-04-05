@@ -32,6 +32,9 @@ endif()
 # libsodium uses an unofficial wrapper name in vcpkg
 find_package(unofficial-sodium CONFIG REQUIRED)
 
+# liboqs for post-quantum KEM (ML-KEM-768) and signatures (ML-DSA-65)
+find_package(liboqs CONFIG REQUIRED)
+
 # libnice and glib use pkg-config instead of standard CMake configs
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
@@ -111,6 +114,7 @@ target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Network
     Qt${QT_VERSION_MAJOR}::Sql
     unofficial-sodium::sodium
+    OQS::oqs
     PkgConfig::NICE
     PkgConfig::GLIB
 )

@@ -3,6 +3,12 @@
 #include <QString>
 #include <utility>
 
+// ML-KEM-768 encapsulation result
+struct KemEncapsResult {
+    QByteArray ciphertext;   // KEM ciphertext (1088 bytes for ML-KEM-768)
+    QByteArray sharedSecret; // 32-byte shared secret
+};
+
 class CryptoEngine {
 public:
     CryptoEngine();
@@ -30,6 +36,24 @@ public:
     // X25519 key accessors (derived from Ed25519 identity)
     const QByteArray& curvePub()  const { return m_curvePub;  }
     const QByteArray& curvePriv() const { return m_curvePriv; }
+
+    // ML-KEM-768 key accessors (generated alongside Ed25519 identity)
+    // Empty if PQ keys haven't been generated yet (legacy identity file)
+    const QByteArray& kemPub()  const { return m_kemPub;  }
+    const QByteArray& kemPriv() const { return m_kemPriv; }
+    bool hasPQKeys() const { return !m_kemPub.isEmpty(); }
+
+    // ML-KEM-768 operations (static — work with any keys, not just ours)
+    // Returns (pub, priv) keypair. pub=1184 bytes, priv=2400 bytes.
+    static std::pair<QByteArray, QByteArray> generateKemKeypair();
+
+    // Encapsulate: generate shared secret and ciphertext for a recipient's KEM pub.
+    // Returns empty on failure.
+    static KemEncapsResult kemEncaps(const QByteArray& recipientKemPub);
+
+    // Decapsulate: recover shared secret from ciphertext using our KEM private key.
+    // Returns empty 0-byte array on failure.
+    static QByteArray kemDecaps(const QByteArray& ciphertext, const QByteArray& kemPriv);
 
     // Generate a fresh ephemeral X25519 keypair (pub, priv)
     static std::pair<QByteArray, QByteArray> generateEphemeralX25519();
@@ -63,6 +87,7 @@ private:
     bool loadIdentityFromDisk();
     bool saveIdentityToDisk() const;
     void deriveCurveKeysFromEd();
+    void ensurePQKeys();  // generate + persist ML-KEM-768 keys if missing
 
     QString m_passphrase;   // zeroed after ensureIdentity() completes
 
@@ -71,4 +96,7 @@ private:
 
     QByteArray m_curvePub;  // 32
     QByteArray m_curvePriv; // 32  (secret — zeroed in destructor)
+
+    QByteArray m_kemPub;    // 1184 (ML-KEM-768 public key)
+    QByteArray m_kemPriv;   // 2400 (ML-KEM-768 secret key — zeroed in destructor)
 };

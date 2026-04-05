@@ -104,6 +104,7 @@ void ChatController::setDatabase(QSqlDatabase db)
     // Guard against double-call: reset previous instances before reinitializing
     m_sessionMgr.reset();
     m_sessionStore.reset();
+    m_db = db;
 
     // Derive a 32-byte at-rest encryption key from the identity curve private key.
     // This key never leaves memory and is tied to the user's unlocked identity.
@@ -136,11 +137,14 @@ void ChatController::setDatabase(QSqlDatabase db)
                 reinterpret_cast<const unsigned char*>(peerEdPub.constData())) != 0) return;
 
         QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+        QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
-            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), blob);
+            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+            blob, peerKemPub);
         if (sealed.isEmpty()) return;
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "...";
+        qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "..."
+                 << (peerKemPub.isEmpty() ? "(classical)" : "(hybrid PQ)");
 #endif
 
         QByteArray env = kSealedPrefix + "\n" + sealed;
@@ -160,8 +164,10 @@ void ChatController::setDatabase(QSqlDatabase db)
 
         QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
         sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
+        QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
-            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), payload);
+            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+            payload, peerKemPub);
         if (sealed.isEmpty()) return {};
 
         return kSealedFCPrefix + "\n" + sealed;
@@ -526,8 +532,12 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
 
     QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
     sodium_memzero(peerCurvePub, sizeof(peerCurvePub));  // G11 fix
+
+    // Use hybrid seal if we know the peer's ML-KEM-768 public key
+    QByteArray peerKemPub = lookupPeerKemPub(peerIdB64u);
     QByteArray sealed = SealedEnvelope::seal(
-        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+        sessionBlob, peerKemPub);
     if (sealed.isEmpty()) return {};
 
     return kSealedPrefix + "\n" + sealed;
@@ -692,8 +702,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                  << (isFileChunk ? "(file chunk)" : "");
 #endif
 
-        // Unseal to learn sender identity
-        UnsealResult unsealed = SealedEnvelope::unseal(m_crypto.curvePriv(), rest);
+        // Unseal to learn sender identity (pass KEM priv for hybrid PQ envelopes)
+        UnsealResult unsealed = SealedEnvelope::unseal(
+            m_crypto.curvePriv(), rest, m_crypto.kemPriv());
         if (!unsealed.valid) {
             qWarning() << "[ChatController] Failed to unseal envelope";
             return;
@@ -763,6 +774,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
 #endif
+                // Announce our PQ KEM pub now that we have an authenticated channel
+                announceKemPub(senderId);
             } else {
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";
@@ -859,6 +872,32 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                 qDebug() << "[FILE] stored ratchet key for transfer" << transferId.left(8) + "..."
                          << "from" << senderId.left(8) + "...";
 #endif
+            }
+        } else if (type == "kem_pub_announce") {
+            // Post-quantum KEM public key exchange — store the peer's ML-KEM-768 pub
+            QByteArray kemPub = CryptoEngine::fromBase64Url(o.value("kem_pub_b64u").toString());
+            if (kemPub.size() == 1184) {  // ML-KEM-768 pub key size
+                m_peerKemPubs[senderId] = kemPub;
+                // Persist to DB
+                if (m_db.isOpen()) {
+                    QSqlQuery q(m_db);
+                    q.prepare("UPDATE contacts SET kem_pub=:kp WHERE peer_id=:pid;");
+                    q.bindValue(":kp", kemPub);
+                    q.bindValue(":pid", senderId);
+                    q.exec();
+                }
+#ifndef QT_NO_DEBUG_OUTPUT
+                qDebug() << "[PQ] Stored ML-KEM-768 pub from" << senderId.left(8) + "..."
+                         << "| hybrid sealing now active for this peer";
+#endif
+                // Reciprocate: send our KEM pub back if we haven't already
+                if (m_crypto.hasPQKeys() && !lookupPeerKemPub(senderId).isEmpty()) {
+                    // They sent theirs, we have theirs — send ours if they might not have it
+                    announceKemPub(senderId);
+                }
+            } else {
+                qWarning() << "[PQ] Invalid kem_pub_announce from" << senderId.left(8) + "..."
+                           << "| size:" << kemPub.size() << "(expected 1184)";
             }
         } else if (type == "file_chunk") {
             // Sealed file_chunk in JSON payload shouldn't happen — file chunks
@@ -972,4 +1011,49 @@ void ChatController::resetSession(const QString& peerIdB64u)
 #endif
         emit status("Session reset — next message will establish a fresh handshake.");
     }
+}
+
+// ---------------------------
+// Post-Quantum KEM pub exchange
+// ---------------------------
+
+QByteArray ChatController::lookupPeerKemPub(const QString& peerIdB64u)
+{
+    // Check in-memory cache first
+    auto it = m_peerKemPubs.find(peerIdB64u);
+    if (it != m_peerKemPubs.end()) return it.value();
+
+    // Load from DB
+    if (!m_db.isOpen()) return {};
+    QSqlQuery q(m_db);
+    q.prepare("SELECT kem_pub FROM contacts WHERE peer_id=:pid;");
+    q.bindValue(":pid", peerIdB64u);
+    if (q.exec() && q.next()) {
+        QByteArray pub = q.value(0).toByteArray();
+        if (!pub.isEmpty()) {
+            m_peerKemPubs[peerIdB64u] = pub;
+            return pub;
+        }
+    }
+    return {};
+}
+
+void ChatController::announceKemPub(const QString& peerIdB64u)
+{
+    if (!m_crypto.hasPQKeys()) return;
+    if (!m_sessionMgr) return;
+    if (m_kemPubAnnounced.contains(peerIdB64u)) return;  // already sent this session
+
+    m_kemPubAnnounced.insert(peerIdB64u);
+
+    QJsonObject payload;
+    payload["from"] = myIdB64u();
+    payload["type"] = "kem_pub_announce";
+    payload["kem_pub_b64u"] = CryptoEngine::toBase64Url(m_crypto.kemPub());
+    payload["ts"] = QDateTime::currentSecsSinceEpoch();
+
+    sendSealedPayload(peerIdB64u, payload);
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[PQ] Announced ML-KEM-768 pub to" << peerIdB64u.left(8) + "...";
+#endif
 }
