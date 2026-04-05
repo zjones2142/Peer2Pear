@@ -140,7 +140,7 @@ void ChatController::setDatabase(QSqlDatabase db)
         QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
             recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
-            blob, peerKemPub);
+            blob, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.isEmpty()) return;
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "..."
@@ -167,7 +167,7 @@ void ChatController::setDatabase(QSqlDatabase db)
         QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
             recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
-            payload, peerKemPub);
+            payload, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.isEmpty()) return {};
 
         return kSealedFCPrefix + "\n" + sealed;
@@ -536,9 +536,10 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
     sodium_memzero(peerCurvePub, sizeof(peerCurvePub));  // G11 fix
 
     // Use hybrid seal if we know the peer's ML-KEM-768 public key (already looked up above)
+    // Include ML-DSA-65 signature if we have DSA keys
     QByteArray sealed = SealedEnvelope::seal(
         recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
-        sessionBlob, peerKemPub);
+        sessionBlob, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
     if (sealed.isEmpty()) return {};
 
     return kSealedPrefix + "\n" + sealed;

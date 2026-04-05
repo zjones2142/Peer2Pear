@@ -1,6 +1,8 @@
 #include "SealedEnvelope.hpp"
 #include "CryptoEngine.hpp"
 #include <sodium.h>
+#include <QDebug>
+#include <QtEndian>
 #include <cstring>
 
 // Version bytes for wire format
@@ -14,7 +16,9 @@ QByteArray SealedEnvelope::seal(const QByteArray& recipientCurvePub,
                                  const QByteArray& senderEdPub,
                                  const QByteArray& senderEdPriv,
                                  const QByteArray& innerPayload,
-                                 const QByteArray& recipientKemPub) {
+                                 const QByteArray& recipientKemPub,
+                                 const QByteArray& senderDsaPub,
+                                 const QByteArray& senderDsaPriv) {
     if (recipientCurvePub.size() != 32) return {};
     if (senderEdPub.size() != crypto_sign_PUBLICKEYBYTES) return {};
     if (senderEdPriv.size() != crypto_sign_SECRETKEYBYTES) return {};
@@ -40,6 +44,7 @@ QByteArray SealedEnvelope::seal(const QByteArray& recipientCurvePub,
     if (hybrid) {
         KemEncapsResult kemResult = CryptoEngine::kemEncaps(recipientKemPub);
         if (kemResult.ciphertext.isEmpty()) {
+            CryptoEngine::secureZero(kemResult.sharedSecret);
             sodium_memzero(ecdhShared, sizeof(ecdhShared));
             return {};
         }
@@ -63,17 +68,36 @@ QByteArray SealedEnvelope::seal(const QByteArray& recipientCurvePub,
     CryptoEngine::secureZero(combinedIkm);
 
     // 5. Sign the inner payload with sender's Ed25519 key
-    unsigned char sig[crypto_sign_BYTES];
-    crypto_sign_detached(sig, nullptr,
+    unsigned char edSig[crypto_sign_BYTES];
+    crypto_sign_detached(edSig, nullptr,
                          reinterpret_cast<const unsigned char*>(innerPayload.constData()),
                          static_cast<unsigned long long>(innerPayload.size()),
                          reinterpret_cast<const unsigned char*>(senderEdPriv.constData()));
 
-    // 6. Build plaintext: senderEdPub(32) || signature(64) || innerPayload
+    // 5b. Hybrid: also sign with ML-DSA-65 if we have DSA keys
+    const bool hybridSig = !senderDsaPub.isEmpty() && !senderDsaPriv.isEmpty();
+    QByteArray dsaSig;
+    if (hybridSig)
+        dsaSig = CryptoEngine::dsaSign(innerPayload, senderDsaPriv);
+
+    // 6. Build plaintext:
+    //   Classical: senderEdPub(32) || edSig(64) || dsaPubLen(2, =0) || innerPayload
+    //   Hybrid:    senderEdPub(32) || edSig(64) || dsaPubLen(2) || dsaPub(1952) || dsaSig(~3309) || innerPayload
     QByteArray envPlaintext;
-    envPlaintext.reserve(32 + 64 + innerPayload.size());
     envPlaintext.append(senderEdPub);
-    envPlaintext.append(reinterpret_cast<const char*>(sig), crypto_sign_BYTES);
+    envPlaintext.append(reinterpret_cast<const char*>(edSig), crypto_sign_BYTES);
+
+    if (hybridSig && !dsaSig.isEmpty()) {
+        quint16 dpLen = qToBigEndian(static_cast<quint16>(senderDsaPub.size()));
+        envPlaintext.append(reinterpret_cast<const char*>(&dpLen), 2);
+        envPlaintext.append(senderDsaPub);
+        envPlaintext.append(dsaSig);
+    } else {
+        // No DSA signature — write 0 length marker
+        quint16 zero = 0;
+        envPlaintext.append(reinterpret_cast<const char*>(&zero), 2);
+    }
+
     envPlaintext.append(innerPayload);
 
     // 7. AEAD encrypt with envelope key (random nonce, AAD = ephPub)
@@ -237,18 +261,73 @@ UnsealResult SealedEnvelope::unseal(const QByteArray& recipientCurvePriv,
     pt.resize(static_cast<int>(plen));
     sodium_memzero(envelopeKey, sizeof(envelopeKey));
 
-    // 6. Parse: senderEdPub(32) || signature(64) || innerPayload
+    // 6. Parse envelope plaintext
+    //   senderEdPub(32) || edSig(64) || dsaPubLen(2) || [dsaPub || dsaSig] || innerPayload
+    //   Legacy (no dsaPubLen): senderEdPub(32) || edSig(64) || innerPayload
     if (pt.size() < kPubLen + kSigLen) return result;
 
     result.senderEdPub = pt.left(kPubLen);
-    QByteArray sig = pt.mid(kPubLen, kSigLen);
-    result.innerPayload = pt.mid(kPubLen + kSigLen);
+    QByteArray edSig = pt.mid(kPubLen, kSigLen);
+    int parseOffset = kPubLen + kSigLen;
 
-    // 7. Verify Ed25519 signature
-    if (!CryptoEngine::verifySignature(sig, result.innerPayload, result.senderEdPub)) {
+    // Check for DSA signature extension (dsaPubLen field).
+    // Safety: only attempt to parse dsaPubLen if the value makes sense —
+    // it must be 0 (explicit no-DSA) or a known ML-DSA pub size (1312, 1952, 2592).
+    // This prevents legacy envelopes (where these 2 bytes are innerPayload) from
+    // being misinterpreted as a DSA header.
+    QByteArray dsaPub, dsaSig;
+    if (pt.size() >= parseOffset + 2) {
+        quint16 dsaPubLenBE;
+        memcpy(&dsaPubLenBE, pt.constData() + parseOffset, 2);
+        quint16 dsaPubLen = qFromBigEndian(dsaPubLenBE);
+
+        // Only recognized values: 0, 1312, 1952, 2592
+        const bool knownDsaLen = (dsaPubLen == 0 || dsaPubLen == 1312 ||
+                                  dsaPubLen == 1952 || dsaPubLen == 2592);
+        if (!knownDsaLen) dsaPubLen = 0;  // treat as legacy (no DSA field)
+
+        if (dsaPubLen > 0) {
+            // Hybrid DSA signature present. Determine sig length from the pub key size.
+            // ML-DSA-65: pub=1952, sig=3309.  ML-DSA-44: pub=1312, sig=2420.  ML-DSA-87: pub=2592, sig=4627.
+            int dsaSigLen = 0;
+            if (dsaPubLen == 1952)      dsaSigLen = 3309;  // ML-DSA-65
+            else if (dsaPubLen == 1312) dsaSigLen = 2420;  // ML-DSA-44
+            else if (dsaPubLen == 2592) dsaSigLen = 4627;  // ML-DSA-87
+
+            parseOffset += 2;
+            if (dsaSigLen > 0 && pt.size() >= parseOffset + dsaPubLen + dsaSigLen) {
+                dsaPub = pt.mid(parseOffset, dsaPubLen);
+                parseOffset += dsaPubLen;
+                dsaSig = pt.mid(parseOffset, dsaSigLen);
+                parseOffset += dsaSigLen;
+            } else {
+                // Unknown DSA variant or malformed — skip DSA verification,
+                // but still verify Ed25519 (fail-open on PQ, fail-closed on classical)
+            }
+        } else if (dsaPubLen == 0) {
+            // Explicit "no DSA" marker
+            parseOffset += 2;
+        }
+        // else: legacy format (no dsaPubLen field) — parseOffset stays at kPubLen + kSigLen
+    }
+
+    result.innerPayload = pt.mid(parseOffset);
+
+    // 7. Verify Ed25519 signature (always required)
+    if (!CryptoEngine::verifySignature(edSig, result.innerPayload, result.senderEdPub)) {
         result.senderEdPub.clear();
         result.innerPayload.clear();
         return result;
+    }
+
+    // 8. Verify ML-DSA-65 signature if present (hybrid — both must pass)
+    if (!dsaSig.isEmpty() && !dsaPub.isEmpty()) {
+        if (!CryptoEngine::dsaVerify(dsaSig, result.innerPayload, dsaPub)) {
+            qWarning() << "[SealedEnvelope] ML-DSA-65 signature verification FAILED";
+            result.senderEdPub.clear();
+            result.innerPayload.clear();
+            return result;
+        }
     }
 
     result.valid = true;

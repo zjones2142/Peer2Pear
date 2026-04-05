@@ -32,16 +32,23 @@ public:
     // If recipientKemPub is non-empty (1184 bytes), a hybrid X25519 + ML-KEM-768
     // envelope is produced. Otherwise, a classical X25519-only envelope is used.
     //
+    // If senderDsaPub/Priv are non-empty, a hybrid Ed25519 + ML-DSA-65 signature
+    // is included alongside the classical Ed25519 signature.
+    //
     // recipientCurvePub: recipient's X25519 public key (32)
     // senderEdPub:       sender's Ed25519 public key (32)
     // senderEdPriv:      sender's Ed25519 private key (64)
     // innerPayload:      the ratchet ciphertext to seal
     // recipientKemPub:   recipient's ML-KEM-768 public key (1184, optional)
+    // senderDsaPub:      sender's ML-DSA-65 public key (1952, optional)
+    // senderDsaPriv:     sender's ML-DSA-65 private key (4032, optional)
     static QByteArray seal(const QByteArray& recipientCurvePub,
                            const QByteArray& senderEdPub,
                            const QByteArray& senderEdPriv,
                            const QByteArray& innerPayload,
-                           const QByteArray& recipientKemPub = {});
+                           const QByteArray& recipientKemPub = {},
+                           const QByteArray& senderDsaPub = {},
+                           const QByteArray& senderDsaPriv = {});
 
     // Unseal an envelope using the recipient's keys.
     //

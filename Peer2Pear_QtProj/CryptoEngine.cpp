@@ -21,7 +21,7 @@ static QString identityPath() {
     return base + "/keys/identity.json";
 }
 
-static constexpr int kIdentityVersion = 3;  // v3 adds ML-KEM-768 PQ keys
+static constexpr int kIdentityVersion = 4;  // v4 adds ML-DSA-65 signatures
 
 static constexpr int SALT_BYTES  = crypto_pwhash_SALTBYTES;        // 16
 static constexpr int KEY_BYTES   = crypto_secretbox_KEYBYTES;      // 32
@@ -106,10 +106,12 @@ CryptoEngine::~CryptoEngine() {
     secureZero(m_edPriv);
     secureZero(m_curvePriv);
     secureZero(m_kemPriv);
+    secureZero(m_dsaPriv);
     // Public keys are not secret, but zero for hygiene
     secureZero(m_edPub);
     secureZero(m_curvePub);
     secureZero(m_kemPub);
+    secureZero(m_dsaPub);
 }
 
 void CryptoEngine::secureZero(QByteArray& buf) {
@@ -227,9 +229,28 @@ bool CryptoEngine::loadIdentityFromDisk() {
         }
     }
 
+    // Load ML-DSA-65 keys if present (v4+ identity files)
+    if (o.contains("dsa_pub_b64u")) {
+        m_dsaPub = fromBase64Url(o.value("dsa_pub_b64u").toString());
+
+        const auto dsaEnc = o.value("dsa_priv_enc").toObject();
+        const QByteArray dsaSalt  = fromBase64Url(dsaEnc.value("salt_b64u").toString());
+        const QByteArray dsaNonce = fromBase64Url(dsaEnc.value("nonce_b64u").toString());
+        const QByteArray dsaCt    = fromBase64Url(dsaEnc.value("ct_b64u").toString());
+
+        if (!dsaSalt.isEmpty()) {
+            QByteArray dsaKey32 = deriveKeyFromPassphrase(m_passphrase, dsaSalt);
+            if (!dsaKey32.isEmpty()) {
+                m_dsaPriv = secretboxDecrypt(dsaKey32, dsaNonce, dsaCt);
+                secureZero(dsaKey32);
+            }
+        }
+    }
+
 #ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[CryptoEngine] Identity loaded from:" << path
-             << "| PQ keys:" << (hasPQKeys() ? "yes" : "no");
+             << "| KEM:" << (hasPQKeys() ? "yes" : "no")
+             << "| DSA:" << (hasDSAKeys() ? "yes" : "no");
 #endif
 
     return true;
@@ -283,6 +304,26 @@ bool CryptoEngine::saveIdentityToDisk() const {
                 j["kem_priv_enc"] = kemEnc;
             }
             secureZero(kemKey32);
+        }
+    }
+
+    // Persist ML-DSA-65 keys if available
+    if (hasDSAKeys()) {
+        j["dsa_pub_b64u"] = toBase64Url(m_dsaPub);
+
+        QByteArray dsaSalt(SALT_BYTES, 0);
+        randombytes_buf(dsaSalt.data(), SALT_BYTES);
+        QByteArray dsaKey32 = deriveKeyFromPassphrase(m_passphrase, dsaSalt);
+        if (!dsaKey32.isEmpty()) {
+            QByteArray dsaNonce, dsaCt, dsaDummySalt;
+            if (secretboxEncrypt(dsaKey32, m_dsaPriv, dsaDummySalt, dsaNonce, dsaCt)) {
+                QJsonObject dsaEnc;
+                dsaEnc["salt_b64u"]  = toBase64Url(dsaSalt);
+                dsaEnc["nonce_b64u"] = toBase64Url(dsaNonce);
+                dsaEnc["ct_b64u"]    = toBase64Url(dsaCt);
+                j["dsa_priv_enc"] = dsaEnc;
+            }
+            secureZero(dsaKey32);
         }
     }
 
@@ -354,11 +395,19 @@ void CryptoEngine::ensureIdentity() {
 
     deriveCurveKeysFromEd();
 
-    // Generate ML-KEM-768 keypair on first run
-    auto [kemPub, kemPriv] = generateKemKeypair();
-    m_kemPub  = kemPub;
-    m_kemPriv = kemPriv;
-    secureZero(kemPriv);
+    // Generate PQ keypairs on first run
+    {
+        auto [kPub, kPriv] = generateKemKeypair();
+        m_kemPub  = kPub;
+        m_kemPriv = kPriv;
+        secureZero(kPriv);
+    }
+    {
+        auto [dPub, dPriv] = generateDsaKeypair();
+        m_dsaPub  = dPub;
+        m_dsaPriv = dPriv;
+        secureZero(dPriv);
+    }
 
     if (!saveIdentityToDisk()) {
         secureZero(m_passphrase);
@@ -443,27 +492,114 @@ QByteArray CryptoEngine::kemDecaps(const QByteArray& ciphertext, const QByteArra
 }
 
 void CryptoEngine::ensurePQKeys() {
-    if (hasPQKeys()) return;  // already have them
     if (!hasPassphrase()) return;  // can't persist without passphrase
 
-    auto [pub, priv] = generateKemKeypair();
-    if (pub.isEmpty()) {
-        qWarning() << "[CryptoEngine] Failed to generate ML-KEM-768 keypair";
-        return;
+    bool changed = false;
+
+    // Generate ML-KEM-768 keypair if missing
+    if (!hasPQKeys()) {
+        auto [pub, priv] = generateKemKeypair();
+        if (pub.isEmpty()) {
+            qWarning() << "[CryptoEngine] Failed to generate ML-KEM-768 keypair";
+            return;
+        }
+        m_kemPub  = pub;
+        m_kemPriv = priv;
+        secureZero(priv);
+        changed = true;
     }
 
-    m_kemPub  = pub;
-    m_kemPriv = priv;
-    secureZero(priv);
+    // Generate ML-DSA-65 keypair if missing
+    if (!hasDSAKeys()) {
+        auto [pub, priv] = generateDsaKeypair();
+        if (pub.isEmpty()) {
+            qWarning() << "[CryptoEngine] Failed to generate ML-DSA-65 keypair";
+        } else {
+            m_dsaPub  = pub;
+            m_dsaPriv = priv;
+            secureZero(priv);
+            changed = true;
+        }
+    }
 
-    // Re-save identity file with PQ keys included
-    if (saveIdentityToDisk()) {
+    if (changed) {
+        if (saveIdentityToDisk()) {
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[CryptoEngine] ML-KEM-768 keys generated and persisted (identity upgraded to v3)";
+            qDebug() << "[CryptoEngine] PQ keys generated and persisted"
+                     << "| KEM:" << hasPQKeys() << "| DSA:" << hasDSAKeys();
 #endif
-    } else {
-        qWarning() << "[CryptoEngine] Failed to persist ML-KEM-768 keys";
+        } else {
+            qWarning() << "[CryptoEngine] Failed to persist PQ keys";
+        }
     }
+}
+
+// ---------------------------
+// ML-DSA-65 (Post-Quantum Signatures)
+// ---------------------------
+
+std::pair<QByteArray, QByteArray> CryptoEngine::generateDsaKeypair() {
+    OQS_SIG* dsa = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+    if (!dsa) return {};
+
+    QByteArray pub(static_cast<int>(dsa->length_public_key), 0);
+    QByteArray priv(static_cast<int>(dsa->length_secret_key), 0);
+
+    if (OQS_SIG_keypair(dsa,
+                         reinterpret_cast<uint8_t*>(pub.data()),
+                         reinterpret_cast<uint8_t*>(priv.data())) != OQS_SUCCESS) {
+        OQS_SIG_free(dsa);
+        return {};
+    }
+
+    OQS_SIG_free(dsa);
+    return { pub, priv };
+}
+
+QByteArray CryptoEngine::dsaSign(const QByteArray& message, const QByteArray& dsaPriv) {
+    OQS_SIG* dsa = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+    if (!dsa) return {};
+
+    if (dsaPriv.size() != static_cast<int>(dsa->length_secret_key)) {
+        OQS_SIG_free(dsa);
+        return {};
+    }
+
+    QByteArray sig(static_cast<int>(dsa->length_signature), 0);
+    size_t sigLen = 0;
+
+    if (OQS_SIG_sign(dsa,
+                      reinterpret_cast<uint8_t*>(sig.data()), &sigLen,
+                      reinterpret_cast<const uint8_t*>(message.constData()),
+                      static_cast<size_t>(message.size()),
+                      reinterpret_cast<const uint8_t*>(dsaPriv.constData())) != OQS_SUCCESS) {
+        OQS_SIG_free(dsa);
+        return {};
+    }
+
+    sig.resize(static_cast<int>(sigLen));
+    OQS_SIG_free(dsa);
+    return sig;
+}
+
+bool CryptoEngine::dsaVerify(const QByteArray& sig, const QByteArray& message,
+                              const QByteArray& dsaPub) {
+    OQS_SIG* dsa = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+    if (!dsa) return false;
+
+    if (dsaPub.size() != static_cast<int>(dsa->length_public_key)) {
+        OQS_SIG_free(dsa);
+        return false;
+    }
+
+    const bool ok = OQS_SIG_verify(dsa,
+                                    reinterpret_cast<const uint8_t*>(message.constData()),
+                                    static_cast<size_t>(message.size()),
+                                    reinterpret_cast<const uint8_t*>(sig.constData()),
+                                    static_cast<size_t>(sig.size()),
+                                    reinterpret_cast<const uint8_t*>(dsaPub.constData())) == OQS_SUCCESS;
+    OQS_SIG_free(dsa);
+    return ok;
 }
 
 // ---------------------------

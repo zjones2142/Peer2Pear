@@ -43,6 +43,11 @@ public:
     const QByteArray& kemPriv() const { return m_kemPriv; }
     bool hasPQKeys() const { return !m_kemPub.isEmpty(); }
 
+    // ML-DSA-65 signature key accessors (generated alongside identity)
+    const QByteArray& dsaPub()  const { return m_dsaPub;  }
+    const QByteArray& dsaPriv() const { return m_dsaPriv; }
+    bool hasDSAKeys() const { return !m_dsaPub.isEmpty(); }
+
     // ML-KEM-768 operations (static — work with any keys, not just ours)
     // Returns (pub, priv) keypair. pub=1184 bytes, priv=2400 bytes.
     static std::pair<QByteArray, QByteArray> generateKemKeypair();
@@ -76,6 +81,12 @@ public:
     static bool verifySignature(const QByteArray& sig, const QByteArray& message,
                                 const QByteArray& edPub);
 
+    // ML-DSA-65 operations (static)
+    static std::pair<QByteArray, QByteArray> generateDsaKeypair();  // (pub, priv)
+    static QByteArray dsaSign(const QByteArray& message, const QByteArray& dsaPriv);
+    static bool dsaVerify(const QByteArray& sig, const QByteArray& message,
+                          const QByteArray& dsaPub);
+
     // Securely zero a QByteArray's backing buffer in-place.
     static void secureZero(QByteArray& buf);
 
@@ -87,7 +98,7 @@ private:
     bool loadIdentityFromDisk();
     bool saveIdentityToDisk() const;
     void deriveCurveKeysFromEd();
-    void ensurePQKeys();  // generate + persist ML-KEM-768 keys if missing
+    void ensurePQKeys();  // generate + persist ML-KEM/ML-DSA keys if missing
 
     QString m_passphrase;   // zeroed after ensureIdentity() completes
 
@@ -99,4 +110,7 @@ private:
 
     QByteArray m_kemPub;    // 1184 (ML-KEM-768 public key)
     QByteArray m_kemPriv;   // 2400 (ML-KEM-768 secret key — zeroed in destructor)
+
+    QByteArray m_dsaPub;    // 1952 (ML-DSA-65 public key)
+    QByteArray m_dsaPriv;   // 4032 (ML-DSA-65 secret key — zeroed in destructor)
 };
