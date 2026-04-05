@@ -213,6 +213,13 @@ QByteArray RatchetSession::encrypt(const QByteArray& plaintext) {
         return {};
     }
 
+    // H1 fix: prevent nonce reuse from counter overflow.
+    // quint32 wraps at 2^32. Force a session reset well before that.
+    if (m_sendMsgNum >= 0xFFFFFFF0u) {
+        qWarning() << "[Ratchet] encrypt: message counter near overflow — refusing to encrypt";
+        return {};
+    }
+
     auto [newChain, msgKey] = kdfChainKey(m_sendChainKey);
     m_sendChainKey = newChain;
     // Force a deep copy so m_lastMessageKey has its own independent buffer.

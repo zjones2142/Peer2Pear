@@ -385,11 +385,13 @@ QByteArray NoiseState::serialize() const {
     QDataStream ds(&buf, QIODevice::WriteOnly);
     ds.setVersion(QDataStream::Qt_5_15);
 
-    ds << quint8(2); // version
+    // C3 fix: version 3 — m_sk (static private key) is NOT persisted.
+    // Caller must re-inject via setStaticPrivateKey() after deserialization.
+    ds << quint8(3); // version
     ds << quint8(m_role);
     ds << m_complete;
     ds << m_ck << m_h << m_k << m_n;
-    ds << m_s << m_sk << m_rs;
+    ds << m_s << m_rs;         // no m_sk — re-derived from identity
     ds << m_e << m_ek << m_re;
     ds << m_ckAfterMsg1;
 
@@ -403,13 +405,21 @@ NoiseState NoiseState::deserialize(const QByteArray& data) {
 
     quint8 version, role;
     ds >> version;
-    if (version != 1 && version != 2) return ns;
+    if (version < 1 || version > 3) return ns;
 
     ds >> role;
     ns.m_role = static_cast<Role>(role);
     ds >> ns.m_complete;
     ds >> ns.m_ck >> ns.m_h >> ns.m_k >> ns.m_n;
-    ds >> ns.m_s >> ns.m_sk >> ns.m_rs;
+
+    if (version <= 2) {
+        // Legacy: m_sk was serialized between m_s and m_rs
+        ds >> ns.m_s >> ns.m_sk >> ns.m_rs;
+    } else {
+        // C3 fix (v3): m_sk not persisted — caller must re-inject
+        ds >> ns.m_s >> ns.m_rs;
+    }
+
     ds >> ns.m_e >> ns.m_ek >> ns.m_re;
     if (version >= 2)
         ds >> ns.m_ckAfterMsg1;

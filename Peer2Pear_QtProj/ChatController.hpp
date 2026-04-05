@@ -163,6 +163,11 @@ private:
     // M8 fix: creation timestamps for m_fileKeys entries (epoch seconds)
     QMap<QString, qint64> m_fileKeyTimes;
 
+    // H3 fix: per-sender envelope rate limiting
+    // Tracks (senderId -> count) within current poll cycle; reset each poll.
+    QMap<QString, int> m_envelopeCount;
+    static constexpr int kMaxEnvelopesPerSenderPerPoll = 200;
+
     // TURN relay config for symmetric NAT fallback
     QString m_turnHost;
     int     m_turnPort = 0;

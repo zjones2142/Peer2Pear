@@ -50,7 +50,8 @@ public:
                                const QByteArray& handshakeBlob);
     QByteArray loadPendingHandshake(const QString& peerId, int& roleOut) const;
     void deletePendingHandshake(const QString& peerId);
-    void pruneStaleHandshakes(int maxAgeSecs = 86400);  // G2: default 24h
+    // H2 fix: reduced from 24h to 5 min — stuck handshakes block messaging
+    void pruneStaleHandshakes(int maxAgeSecs = 300);
 
 private:
     // Encrypt/decrypt a BLOB using XChaCha20-Poly1305 and m_storeKey.
