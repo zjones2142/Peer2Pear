@@ -458,8 +458,10 @@ QByteArray CryptoEngine::hkdf(const QByteArray& ikm, const QByteArray& salt,
         return {};
     }
 
+    QByteArray result(reinterpret_cast<const char*>(out), outputLen);
+    sodium_memzero(out, static_cast<size_t>(outputLen));
     sodium_memzero(prk, sizeof(prk));
-    return QByteArray(reinterpret_cast<const char*>(out), outputLen);
+    return result;
 }
 
 // ---------------------------
