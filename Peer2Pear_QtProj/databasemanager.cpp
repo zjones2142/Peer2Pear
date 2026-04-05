@@ -33,8 +33,10 @@ bool DatabaseManager::open()
     }
 
     QSqlQuery pragma(m_db);
-    pragma.exec("PRAGMA journal_mode=WAL;");
-    pragma.exec("PRAGMA foreign_keys=ON;");
+    if (!pragma.exec("PRAGMA journal_mode=WAL;"))
+        qWarning() << "DatabaseManager: PRAGMA journal_mode failed:" << pragma.lastError().text();
+    if (!pragma.exec("PRAGMA foreign_keys=ON;"))
+        qWarning() << "DatabaseManager: PRAGMA foreign_keys failed:" << pragma.lastError().text();
 
     createTables();
     qDebug() << "DatabaseManager: opened" << m_db.databaseName();
