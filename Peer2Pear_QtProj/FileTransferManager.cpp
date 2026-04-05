@@ -281,7 +281,6 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
             if (actualHash != completed.fileHash) {
                 emit status(QString("File '%1' integrity check FAILED — data corrupted.")
                                 .arg(completed.fileName));
-                emit transferCompleted(transferId);  // M1: key cleanup even on hash failure
                 emit fileChunkReceived(fromId, transferId, completed.fileName,
                                        completed.fileSize, totalChunks, totalChunks,
                                        QByteArray{}, completed.ts,
