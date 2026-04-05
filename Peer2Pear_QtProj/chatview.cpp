@@ -1,6 +1,8 @@
 #include "chatview.h"
 #include "ui_mainwindow.h"
 
+#include <algorithm>
+#include <utility>
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -26,12 +28,23 @@
 #include <QDir>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QRegularExpression>
 #include <QDesktopServices>
 #include <QUrl>
 #include <QPainter>
 #include <QPainterPath>
 #include <QBuffer>
 #include <QColorDialog>
+#include <QKeyEvent>
+#include <QClipboard>
+
+// ── Key validation ───────────────────────────────────────────────────────────
+// Ed25519 public key: 32 bytes → 43 base64url characters (no padding).
+static bool isValidPublicKey(const QString &key)
+{
+    static const QRegularExpression rx("^[A-Za-z0-9_-]{43}$");
+    return rx.match(key).hasMatch();
+}
 
 // ── renderInitialsAvatar ──────────────────────────────────────────────────────
 static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, int size)
@@ -53,8 +66,8 @@ static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, in
 // ── Avatar palette ────────────────────────────────────────────────────────────
 // One palette shared by all avatar-rendering sites in this file.
 static const QList<QColor> kAvatarPalette = {
-    QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-    QColor("#bf7b3a"), QColor("#bf3a3a"), QColor("#1a4a6a"),
+    QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+    QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
 };
 
 // Returns a stable palette color derived from the contact name.
@@ -166,7 +179,7 @@ static const char *kDlgStyle =
 
 // Opens a modal dialog to edit a contact name + list of public keys.
 // nameInOut and keysInOut are updated on Save; returns false on Cancel.
-enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed, Left };
+enum class ContactEditorResult { Cancelled, Saved, Blocked, Removed, Left, SessionReset };
 static ContactEditorResult openContactEditor(QWidget *parent,
                                              const QString &title,
                                              QString &nameInOut,
@@ -223,7 +236,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             }
             if (px.isNull()) {
                 const QString ch = nameInOut.isEmpty() ? "#" : QString(nameInOut[0]);
-                px = renderInitialsAvatar(ch, QColor("#2e8b3a"), 56);
+                px = renderInitialsAvatar(ch, QColor(0x2e, 0x8b, 0x3a), 56);
             }
             avatarThumb->setPixmap(px);
         };
@@ -425,47 +438,14 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         });
 
     } else {
-        // ── Regular contact — raw key list ────────────────────────────────────
-        auto *keysLbl = new QLabel("Public Keys", &dlg);
-        root->addWidget(keysLbl);
+        // ── Regular contact — single public key ──────────────────────────────
+        root->addWidget(new QLabel("Public Key", &dlg));
 
-        keyList = new QListWidget(&dlg);
-        keyList->setFixedHeight(130);
-        for (const QString &k : keysInOut)
-            keyList->addItem(k);
-        root->addWidget(keyList);
-
-        auto *keyRow = new QHBoxLayout;
-        keyRow->setSpacing(8);
-        auto *keyInput     = new QLineEdit(&dlg);
-        keyInput->setPlaceholderText("Paste public key...");
-        auto *addKeyBtn    = new QPushButton("Add Key", &dlg);
-        auto *removeKeyBtn = new QPushButton("Remove", &dlg);
-        removeKeyBtn->setObjectName("removeKeyBtn");
-        keyRow->addWidget(keyInput, 1);
-        keyRow->addWidget(addKeyBtn);
-        keyRow->addWidget(removeKeyBtn);
-        root->addLayout(keyRow);
-
-        QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
-            QString k = keyInput->text().trimmed();
-            if (!k.isEmpty()) {
-                bool duplicate = false;
-                for (int i = 0; i < keyList->count(); ++i) {
-                    if (keyList->item(i)->text() == k) { duplicate = true; break; }
-                }
-                if (duplicate) {
-                    QMessageBox::warning(&dlg, "Duplicate Key",
-                                         "This key already exists and was not added.");
-                } else {
-                    keyList->addItem(k);
-                    keyInput->clear();
-                }
-            }
-        });
-        QObject::connect(removeKeyBtn, &QPushButton::clicked, [&]() {
-            delete keyList->currentItem();
-        });
+        auto *keyInput = new QLineEdit(&dlg);
+        keyInput->setPlaceholderText("Paste their 43-character public key…");
+        if (!keysInOut.isEmpty()) keyInput->setText(keysInOut.first());
+        keyInput->setProperty("_singleKeyInput", true);   // tag for save logic
+        root->addWidget(keyInput);
     }
 
     root->addStretch();
@@ -496,6 +476,21 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                 if (QMessageBox::question(&dlg, isBlocked ? "Unblock Contact" : "Block Contact",
                                           msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
                     result = ContactEditorResult::Blocked;
+                    dlg.accept();
+                }
+            });
+
+            // Reset Session — wipe ratchet state to force fresh handshake (G3 fix)
+            auto *resetBtn = new QPushButton("Reset Session", &dlg);
+            resetBtn->setStyleSheet(destructiveStyle);
+            actionRow->addWidget(resetBtn);
+            QObject::connect(resetBtn, &QPushButton::clicked, [&]() {
+                if (QMessageBox::question(&dlg, "Reset Session",
+                        "Reset the encrypted session with this contact?\n\n"
+                        "A new handshake will happen automatically on the next message. "
+                        "Use this if messages aren't decrypting properly.",
+                        QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+                    result = ContactEditorResult::SessionReset;
                     dlg.accept();
                 }
             });
@@ -562,9 +557,15 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         if (isGroup && memberList) {
             for (int i = 0; i < memberList->count(); ++i)
                 keysInOut << memberList->item(i)->data(Qt::UserRole).toString();
-        } else if (keyList) {
-            for (int i = 0; i < keyList->count(); ++i)
-                keysInOut << keyList->item(i)->text();
+        } else {
+            // Find the single-key QLineEdit we tagged earlier
+            for (QLineEdit *le : dlg.findChildren<QLineEdit*>()) {
+                if (le->property("_singleKeyInput").toBool()) {
+                    const QString k = le->text().trimmed();
+                    if (!k.isEmpty()) keysInOut << k;
+                    break;
+                }
+            }
         }
         if (avatarInOut) {
             if (!localAvatarRaw.isNull()) {
@@ -601,6 +602,10 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
     connect(m_ui->sendBtn,       &QPushButton::clicked,           this, &ChatView::onSendMessage);
     connect(m_ui->messageInput,  &QLineEdit::returnPressed,       this, &ChatView::onSendMessage);
     connect(m_ui->searchEdit_12, &QLineEdit::textChanged,         this, &ChatView::onSearchChanged);
+
+    // Enter / Shift+Enter to navigate search matches
+    m_ui->searchEdit_12->installEventFilter(this);
+
     connect(m_ui->editProfileBtn,&QToolButton::clicked,           this, &ChatView::onEditProfile);
     connect(m_ui->addContactBtn, &QToolButton::clicked,           this, &ChatView::onAddContact);
     connect(m_ui->attachBtn,     &QToolButton::clicked,           this, &ChatView::onAttachFile);
@@ -608,15 +613,35 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
     rebuildChatList();
     m_ui->chatList->setCurrentRow(0);
 
-    // Start presence polling (check every 3 minutes)
-    startPresencePolling(180000);
+    // Start presence polling (check every 30 seconds)
+    startPresencePolling(30000);
+}
+
+bool ChatView::eventFilter(QObject *obj, QEvent *event)
+{
+    if (obj == m_ui->searchEdit_12 && event->type() == QEvent::KeyPress) {
+        auto *ke = static_cast<QKeyEvent*>(event);
+        if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter) {
+            if (ke->modifiers() & Qt::ShiftModifier)
+                navigateSearch(-1);   // Shift+Enter = previous
+            else
+                navigateSearch(+1);   // Enter = next
+            return true;              // consume the event
+        }
+        if (ke->key() == Qt::Key_Escape) {
+            m_ui->searchEdit_12->clear();
+            m_ui->searchEdit_12->clearFocus();
+            return true;
+        }
+    }
+    return QObject::eventFilter(obj, event);
 }
 
 void ChatView::startPresencePolling(int intervalMs)
 {
     connect(&m_presenceTimer, &QTimer::timeout, this, [this]() {
         QStringList peerIds;
-        for (const ChatData &c : m_chats) {
+        for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
             for (const QString &k : c.keys)
                 if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
@@ -625,10 +650,10 @@ void ChatView::startPresencePolling(int intervalMs)
             m_controller->checkPresence(peerIds);
     });
     m_presenceTimer.start(intervalMs);
-    // Immediate first check after a short delay
-    QTimer::singleShot(3000, this, [this]() {
+    // Immediate first check on startup (500ms delay to let connections settle)
+    QTimer::singleShot(500, this, [this]() {
         QStringList peerIds;
-        for (const ChatData &c : m_chats) {
+        for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
             for (const QString &k : c.keys)
                 if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
@@ -645,7 +670,7 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 
         bool match = (m_chats[i].peerIdB64u.trimmed() == peerIdB64u);
         if (!match) {
-            for (const QString &k : m_chats[i].keys)
+            for (const QString &k : std::as_const(m_chats[i].keys))
                 if (k.trimmed() == peerIdB64u) { match = true; break; }
         }
         if (!match) continue;
@@ -702,7 +727,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
         if (m_chats[i].isGroup) continue;
 
         bool hit = (m_chats[i].peerIdB64u.trimmed() == from);
-        if (!hit) for (const QString &k : m_chats[i].keys)
+        if (!hit) for (const QString &k : std::as_const(m_chats[i].keys))
                 if (k.trimmed() == from) { hit = true; break; }
         if (!hit) continue;
 
@@ -710,7 +735,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
 
         // UI-side dedup against already-stored messages
         if (!msgId.isEmpty())
-            for (const Message &m : m_chats[i].messages)
+            for (const Message &m : std::as_const(m_chats[i].messages))
                 if (m.msgId == msgId) return;
 
         const bool needsSep = m_chats[i].messages.isEmpty() ||
@@ -787,7 +812,6 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     for (const QString &key : memberKeys) {
         if (key.trimmed().isEmpty()) continue;
         if (key.trimmed() == myKey) continue; // don't add own key to group member list
-        if (m_profileKeys.contains(key.trimmed())) continue; // Also skip any of our self-device keys
         if (!chat.keys.contains(key)) {
             chat.keys << key;
             keysUpdated = true;
@@ -796,7 +820,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     if (keysUpdated && m_db)
         m_db->saveContact(chat); // persist the updated key list
     if (!msgId.isEmpty())
-        for (const Message &m : chat.messages)
+        for (const Message &m : std::as_const(chat.messages))
             if (m.msgId == msgId) return;
 
     const bool needsSep = chat.messages.isEmpty() ||
@@ -804,7 +828,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
 
     // Look up sender name from contacts
     QString senderName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
-    for (const ChatData &c : m_chats) {
+    for (const ChatData &c : std::as_const(m_chats)) {
         if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
             senderName = c.name;
             break;
@@ -855,7 +879,7 @@ void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
 
     // Find a display name for the leaver
     QString leaverName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
-    for (const ChatData &c : m_chats) {
+    for (const ChatData &c : std::as_const(m_chats)) {
         if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
             leaverName = c.name;
             break;
@@ -1037,6 +1061,23 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         // Rebuild the list so the avatar label updates immediately
         rebuildChatList();
 
+        // Refresh the active chat header avatar if this contact is selected
+        if (m_currentChat == i) {
+            if (!avatarB64.isEmpty()) {
+                QPixmap px;
+                px.loadFromData(QByteArray::fromBase64(avatarB64.toUtf8()));
+                if (!px.isNull()) {
+                    m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
+                    m_ui->chatAvatarLabel->setText("");
+                }
+            } else {
+                const QString ch = m_chats[i].name.isEmpty() ? "?" : QString(m_chats[i].name[0]);
+                m_ui->chatAvatarLabel->setPixmap(
+                    renderInitialsAvatar(ch, avatarColorForName(m_chats[i].name), 44));
+                m_ui->chatAvatarLabel->setText("");
+            }
+        }
+
         if (firstTime)
             showToast(m_chats[i].name + "'s profile has been updated");
         return;
@@ -1175,6 +1216,17 @@ void ChatView::onChatSelected(int index)
         emit unreadChanged(totalUnread());
         rebuildChatList();
     }
+
+    // Re-apply search highlights when switching chats
+    if (!m_searchQuery.isEmpty()) {
+        m_searchMatchIndices.clear();
+        m_searchMatchCurrent = -1;
+        const auto &msgs = m_chats[m_currentChat].messages;
+        for (int i = 0; i < msgs.size(); ++i)
+            if (msgs[i].text.toLower().contains(m_searchQuery))
+                m_searchMatchIndices.append(i);
+        highlightSearchMatches();
+    }
 }
 
 void ChatView::onSendMessage()
@@ -1217,7 +1269,7 @@ void ChatView::onSendMessage()
         m_controller->sendGroupMessageViaMailbox(
             gid, m_chats[m_currentChat].name, m_chats[m_currentChat].keys, text);
     } else {
-        for (const QString &k : m_chats[m_currentChat].keys)
+        for (const QString &k : std::as_const(m_chats[m_currentChat].keys))
             if (!k.trimmed().isEmpty()) m_controller->sendText(k.trimmed(), text);
     }
 }
@@ -1225,10 +1277,15 @@ void ChatView::onSendMessage()
 void ChatView::onSearchChanged(const QString &text)
 {
     const QString q = text.trimmed().toLower();
+    m_searchQuery = q;
+    m_searchMatchIndices.clear();
+    m_searchMatchCurrent = -1;
+
+    // ── 1. Filter sidebar chats ──────────────────────────────────────────────
     for (int i = 0; i < m_ui->chatList->count(); ++i) {
         const ChatData &c = m_chats[i];
         bool match = q.isEmpty() || c.name.toLower().contains(q);
-        if (!match) for (const auto &m : c.messages)
+        if (!match) for (const auto &m : std::as_const(c.messages))
                 if (m.text.toLower().contains(q)) { match = true; break; }
         m_ui->chatList->item(i)->setHidden(!match);
     }
@@ -1236,6 +1293,114 @@ void ChatView::onSearchChanged(const QString &text)
         auto *cur = m_ui->chatList->item(m_currentChat);
         if (cur && cur->isHidden()) m_ui->chatList->clearSelection();
     }
+
+    // ── 2. Highlight matching messages in current chat ────────────────────────
+    if (m_currentChat >= 0 && m_currentChat < m_chats.size() && !q.isEmpty()) {
+        const auto &msgs = m_chats[m_currentChat].messages;
+        for (int i = 0; i < msgs.size(); ++i)
+            if (msgs[i].text.toLower().contains(q))
+                m_searchMatchIndices.append(i);
+    }
+    highlightSearchMatches();
+
+    // ── 3. Filter file cards in Files tab ────────────────────────────────────
+    rebuildFilesTab();
+}
+
+// ── Search highlight helpers ─────────────────────────────────────────────────
+
+void ChatView::highlightSearchMatches()
+{
+    QLayout *layout = m_ui->scrollAreaWidgetContents->layout();
+    if (!layout) return;
+
+    // Walk the layout items — each is either a date separator or a message row.
+    // Date separators have a fixed height of 28 (see addDateSeparator).
+    // We track message index separately.
+    const bool hasQuery = !m_searchQuery.isEmpty();
+    int msgIdx = 0;
+    const QSet<int> matchSet(m_searchMatchIndices.begin(), m_searchMatchIndices.end());
+
+    for (int i = 0; i < layout->count(); ++i) {
+        QWidget *w = layout->itemAt(i)->widget();
+        if (!w) continue;
+
+        // Skip date separators (fixed height 28) and the bottom spacer
+        if (w->maximumHeight() == 28) continue;
+
+        // Find the QLabel bubble inside this message row
+        QList<QLabel*> labels = w->findChildren<QLabel*>();
+        for (QLabel *lbl : labels) {
+            // Bubbles have border-radius:14px in their style; sender name labels don't
+            if (!lbl->styleSheet().contains("border-radius:14px")) continue;
+
+            if (hasQuery && matchSet.contains(msgIdx)) {
+                // Highlight: add a gold border, shrink padding to compensate
+                // so total box size stays the same and text doesn't reflow.
+                // Original padding: 10px 14px
+                const bool isFocused = (m_searchMatchCurrent >= 0 &&
+                                        m_searchMatchCurrent < m_searchMatchIndices.size() &&
+                                        m_searchMatchIndices[m_searchMatchCurrent] == msgIdx);
+                const QString borderColor = isFocused ? "#ffb300" : "#997a00";
+                const int bw = isFocused ? 2 : 1;
+                const int pV = 10 - bw, pH = 14 - bw;   // compensated padding
+                QString ss = lbl->styleSheet();
+                ss.remove(QRegularExpression("border:\\d+px solid #[0-9a-fA-F]+;"));
+                ss.replace(QRegularExpression("padding:\\d+px \\d+px;"),
+                           QString("padding:%1px %2px;").arg(pV).arg(pH));
+                ss.append(QString("border:%1px solid %2;").arg(bw).arg(borderColor));
+                lbl->setStyleSheet(ss);
+            } else {
+                // Remove search border, restore original padding
+                QString ss = lbl->styleSheet();
+                ss.remove(QRegularExpression("border:\\d+px solid #[0-9a-fA-F]+;"));
+                ss.replace(QRegularExpression("padding:\\d+px \\d+px;"),
+                           QString("padding:10px 14px;"));
+                lbl->setStyleSheet(ss);
+            }
+        }
+        msgIdx++;
+    }
+
+    // If we have matches and none is focused yet, focus the first
+    if (!m_searchMatchIndices.isEmpty() && m_searchMatchCurrent < 0) {
+        m_searchMatchCurrent = 0;
+        highlightSearchMatches();          // re-run to apply focused style
+        scrollToMatch(m_searchMatchCurrent);
+    }
+}
+
+void ChatView::scrollToMatch(int matchIdx)
+{
+    if (matchIdx < 0 || matchIdx >= m_searchMatchIndices.size()) return;
+
+    const int targetMsgIdx = m_searchMatchIndices[matchIdx];
+    QLayout *layout = m_ui->scrollAreaWidgetContents->layout();
+    if (!layout) return;
+
+    int msgIdx = 0;
+    for (int i = 0; i < layout->count(); ++i) {
+        QWidget *w = layout->itemAt(i)->widget();
+        if (!w) continue;
+        if (w->maximumHeight() == 28) continue; // date separator
+        if (msgIdx == targetMsgIdx) {
+            m_ui->messageScroll->ensureWidgetVisible(w, 50, 80);
+            return;
+        }
+        msgIdx++;
+    }
+}
+
+void ChatView::navigateSearch(int delta)
+{
+    if (m_searchMatchIndices.isEmpty()) return;
+    m_searchMatchCurrent += delta;
+    if (m_searchMatchCurrent >= m_searchMatchIndices.size())
+        m_searchMatchCurrent = 0;
+    if (m_searchMatchCurrent < 0)
+        m_searchMatchCurrent = m_searchMatchIndices.size() - 1;
+    highlightSearchMatches();
+    scrollToMatch(m_searchMatchCurrent);
 }
 
 void ChatView::onEditProfile()
@@ -1243,7 +1408,7 @@ void ChatView::onEditProfile()
     // ── Avatar state (shared between main dialog and photo popup) ─────────────
     bool usingPhoto = false;
     QPixmap uploadedPhoto;
-    QColor avatarColor("#2e8b3a");
+    QColor avatarColor(0x2e, 0x8b, 0x3a);
 
     const QString currentAvatarB64 = m_db ? m_db->loadSetting("avatarData") : QString();
     if (!currentAvatarB64.isEmpty()) {
@@ -1314,8 +1479,8 @@ void ChatView::onEditProfile()
     poLayout->setSpacing(8);
 
     const QList<QColor> presets = {
-        QColor("#2e8b3a"), QColor("#3a6bbf"), QColor("#7b3abf"),
-        QColor("#bf7b3a"), QColor("#bf3a3a"),
+        QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+        QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a),
     };
     auto swatchStyle = [](const QColor &col, bool sel) -> QString {
         return QString("QPushButton{background:%1;border:%2;border-radius:14px;}"
@@ -1394,44 +1559,39 @@ void ChatView::onEditProfile()
     auto *nameEdit = new QLineEdit(m_ui->profileNameLabel->text(), &dlg);
     root->addWidget(nameEdit);
 
-    // ── Keys ─────────────────────────────────────────────────────────────────
-    root->addWidget(new QLabel("Public Keys", &dlg));
-    auto *keyList = new QListWidget(&dlg);
-    keyList->setFixedHeight(130);
+    // ── Your Public Key (read-only) ─────────────────────────────────────────
+    root->addWidget(new QLabel("Your Public Key", &dlg));
 
-    QStringList keys = m_profileKeys;
     const QString myKey = m_controller->myIdB64u();
-    if (!myKey.isEmpty() && !keys.contains(myKey)) keys << myKey;
-    for (const QString &k : keys) keyList->addItem(k);
-    root->addWidget(keyList);
 
-    auto *keyRow    = new QHBoxLayout;
-    auto *keyInput  = new QLineEdit(&dlg);
-    keyInput->setPlaceholderText("Paste public key...");
-    auto *addKeyBtn    = new QPushButton("Add Key", &dlg);
-    auto *removeKeyBtn = new QPushButton("Remove",  &dlg);
-    addKeyBtn->setAutoDefault(false);
-    removeKeyBtn->setAutoDefault(false);
-    removeKeyBtn->setObjectName("removeKeyBtn");
-    keyRow->addWidget(keyInput, 1);
-    keyRow->addWidget(addKeyBtn);
-    keyRow->addWidget(removeKeyBtn);
+    auto *keyRow = new QHBoxLayout;
+    keyRow->setSpacing(8);
+
+    auto *keyDisplay = new QLineEdit(myKey, &dlg);
+    keyDisplay->setReadOnly(true);
+    keyDisplay->setStyleSheet(
+        "QLineEdit{background:#111;color:#999;border:1px solid #2a2a2a;"
+        "border-radius:8px;padding:8px 12px;font-size:12px;font-family:monospace;}");
+    keyRow->addWidget(keyDisplay, 1);
+
+    auto *copyBtn = new QPushButton("Copy", &dlg);
+    copyBtn->setAutoDefault(false);
+    copyBtn->setStyleSheet(
+        "QPushButton{background:#1a2e1c;color:#5dd868;border:1px solid #2e5e30;"
+        "border-radius:8px;padding:8px 14px;font-size:12px;}"
+        "QPushButton:hover{background:#223a24;}");
+    QObject::connect(copyBtn, &QPushButton::clicked, [&dlg, myKey, copyBtn]() {
+        QApplication::clipboard()->setText(myKey);
+        copyBtn->setText("Copied!");
+        QTimer::singleShot(1500, [copyBtn]() { copyBtn->setText("Copy"); });
+    });
+    keyRow->addWidget(copyBtn);
     root->addLayout(keyRow);
 
-    QObject::connect(addKeyBtn, &QPushButton::clicked, [&]() {
-        const QString k = keyInput->text().trimmed();
-        if (k.isEmpty()) return;
-        for (int i = 0; i < keyList->count(); ++i) {
-            if (keyList->item(i)->text() == k) {
-                QMessageBox::warning(&dlg, "Duplicate Key", "This key already exists.");
-                return;
-            }
-        }
-        keyList->addItem(k);
-        keyInput->clear();
-    });
-    QObject::connect(removeKeyBtn, &QPushButton::clicked,
-                     [&]() { delete keyList->currentItem(); });
+    auto *keyHint = new QLabel("Share this key with contacts so they can message you.", &dlg);
+    keyHint->setStyleSheet("color:#555;font-size:11px;background:transparent;");
+    keyHint->setWordWrap(true);
+    root->addWidget(keyHint);
 
     root->addStretch();
 
@@ -1478,30 +1638,22 @@ void ChatView::onEditProfile()
     finalPx.save(&buf, "PNG");
     const QString newAvatarB64 = QString::fromLatin1(bytes.toBase64());
 
-    keys.clear();
-    for (int i = 0; i < keyList->count(); ++i)
-        keys << keyList->item(i)->text();
-
     const QString displayName = newName.isEmpty() ? "Me" : newName;
     m_ui->profileNameLabel->setText(displayName);
     m_ui->profileAvatarLabel->setPixmap(makeCircularPixmap(finalPx, 40));
     m_ui->profileAvatarLabel->setText("");
 
-    m_profileKeys = keys;
-    m_controller->setSelfKeys(m_profileKeys);
-
     if (m_db) {
         m_db->saveSetting("displayName",  displayName);
         m_db->saveSetting("avatarData",   newAvatarB64);
         m_db->saveSetting("avatarIsPhoto", usingPhoto ? "true" : "false");
-        m_db->saveSetting("profileKeys",  m_profileKeys.join(','));
     }
 
     // Broadcast to all contacts. Send empty avatar when using default so the
     // receiver falls back to initials derived from their own saved name for us.
     {
         const QString broadcastAvatar = usingPhoto ? newAvatarB64 : QString();
-        for (const ChatData &chat : m_chats) {
+        for (const ChatData &chat : std::as_const(m_chats)) {
             if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
                 m_controller->sendAvatar(chat.peerIdB64u, displayName, broadcastAvatar);
         }
@@ -1533,6 +1685,35 @@ void ChatView::onEditContact(int index)
                           wasGroup ? &avatar : nullptr);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
+        // Validate key format for 1:1 contacts
+        if (!wasGroup) {
+            if (keys.isEmpty()) {
+                QMessageBox::warning(m_ui->centralwidget, "Missing Key",
+                                     "A public key is required.");
+                return;
+            }
+            if (!isValidPublicKey(keys.first())) {
+                QMessageBox::warning(m_ui->centralwidget, "Invalid Key",
+                                     "Public key must be exactly 43 base64url characters.");
+                return;
+            }
+        }
+
+        // Prevent duplicate keys: check if any new key collides with another contact
+        bool conflict = false;
+        for (const QString &k : std::as_const(keys)) {
+            for (int i = 0; i < m_chats.size(); ++i) {
+                if (i == index || m_chats[i].isGroup) continue;
+                if (m_chats[i].peerIdB64u == k || m_chats[i].keys.contains(k)) {
+                    QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
+                        QString("Key already belongs to contact \"%1\".").arg(m_chats[i].name));
+                    conflict = true; break;
+                }
+            }
+            if (conflict) break;
+        }
+        if (conflict) return;
+
         m_chats[index].name = name; m_chats[index].keys = keys;
         if (wasGroup) m_chats[index].avatarData = avatar;
         if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
@@ -1567,6 +1748,11 @@ void ChatView::onEditContact(int index)
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
 
+    } else if (result == ContactEditorResult::SessionReset) {
+        // G3 fix: wipe ratchet state so next message triggers a fresh handshake
+        const QString peerId = m_chats[index].peerIdB64u;
+        if (!peerId.isEmpty())
+            m_controller->resetSession(peerId);
     } else if (result == ContactEditorResult::Left) {
         // Notify all members you're leaving
         const QString groupId = m_chats[index].groupId;
@@ -1606,24 +1792,10 @@ void ChatView::onAddContact()
     sp->setStyleSheet("color:#2a2a2a;"); layout->addWidget(sp);
     layout->addWidget(new QLabel("Display Name",&dlg));
     auto *nameEdit = new QLineEdit(&dlg); layout->addWidget(nameEdit);
-    layout->addWidget(new QLabel("Public Keys",&dlg));
-    auto *keyList = new QListWidget(&dlg); keyList->setFixedHeight(130);
-    layout->addWidget(keyList);
-
-    auto *kr   = new QHBoxLayout;
-    auto *ki   = new QLineEdit(&dlg); ki->setPlaceholderText("Paste public key…");
-    auto *addK = new QPushButton("Add Key",&dlg);
-    auto *remK = new QPushButton("Remove",&dlg); remK->setObjectName("removeKeyBtn");
-    kr->addWidget(ki,1); kr->addWidget(addK); kr->addWidget(remK);
-    layout->addLayout(kr);
-
-    QObject::connect(addK,&QPushButton::clicked,[&](){
-        const QString k = ki->text().trimmed(); if(k.isEmpty()) return;
-        for(int i=0;i<keyList->count();++i) if(keyList->item(i)->text()==k){
-                QMessageBox::warning(&dlg,"Duplicate Key","Key already present."); return; }
-        keyList->addItem(k); ki->clear();
-    });
-    QObject::connect(remK,&QPushButton::clicked,[&](){ delete keyList->currentItem(); });
+    layout->addWidget(new QLabel("Public Key",&dlg));
+    auto *keyInput = new QLineEdit(&dlg);
+    keyInput->setPlaceholderText("Paste their 43-character public key…");
+    layout->addWidget(keyInput);
 
     layout->addStretch();
 
@@ -1659,7 +1831,7 @@ void ChatView::onAddContact()
         auto *gn = new QLineEdit(&gd); gn->setPlaceholderText("Enter group name…");
         gl->addWidget(gn); gl->addWidget(new QLabel("Select Members",&gd));
         auto *ml = new QListWidget(&gd); ml->setFixedHeight(160);
-        for (const ChatData &c : m_chats) {
+        for (const ChatData &c : std::as_const(m_chats)) {
             if (c.isGroup) continue;
             auto *it = new QListWidgetItem(c.name, ml); it->setCheckState(Qt::Unchecked);
         }
@@ -1677,7 +1849,7 @@ void ChatView::onAddContact()
         QStringList gkeys, mnames;
         for(int i=0;i<ml->count();++i) {
             if(ml->item(i)->checkState()==Qt::Checked)
-                for(const ChatData &c:m_chats)
+                for(const ChatData &c:std::as_const(m_chats))
                     if(c.name==ml->item(i)->text()&&!c.isGroup){
                         gkeys<<c.keys; mnames<<c.name; break; }
         }
@@ -1698,7 +1870,24 @@ void ChatView::onAddContact()
     }
 
     name = nameEdit->text().trimmed(); if(name.isEmpty()) return;
-    for(int i=0;i<keyList->count();++i) keys<<keyList->item(i)->text();
+    const QString singleKey = keyInput->text().trimmed();
+    if (singleKey.isEmpty()) return;
+    if (!isValidPublicKey(singleKey)) {
+        QMessageBox::warning(m_ui->centralwidget, "Invalid Key",
+                             "Public key must be exactly 43 base64url characters.");
+        return;
+    }
+    // Prevent duplicate contacts
+    for (const ChatData &c : std::as_const(m_chats)) {
+        if (c.isGroup) continue;
+        if (c.peerIdB64u == singleKey || c.keys.contains(singleKey)) {
+            QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
+                QString("Key already belongs to contact \"%1\".").arg(c.name));
+            return;
+        }
+    }
+    keys << singleKey;
+
     ChatData nc; nc.name=name; nc.subtitle="Secure chat"; nc.keys=keys;
     if(!keys.isEmpty()) nc.peerIdB64u=keys.first();
     m_chats.append(nc);
@@ -1723,7 +1912,7 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
     for (int i = 0; i < m_chats.size(); ++i) {
         if (m_chats[i].isGroup) continue;
         if (m_chats[i].peerIdB64u.trimmed() == peerIdB64u) return i;
-        for (const QString &k : m_chats[i].keys)
+        for (const QString &k : std::as_const(m_chats[i].keys))
             if (k.trimmed() == peerIdB64u) return i;
     }
     // Unknown sender — auto-create
@@ -1760,7 +1949,7 @@ void ChatView::initChats()
 
     if (m_db) {
         m_chats = m_db->loadAllContacts();
-        for (const auto &c : m_chats) {
+        for (const auto &c : std::as_const(m_chats)) {
             const QString ck = chatKey(c);
             const auto records = m_db->loadFileRecords(ck);
             if (!records.isEmpty())
@@ -1769,13 +1958,7 @@ void ChatView::initChats()
     }
 
     m_ui->chatList->clear();
-    for (const auto &c : m_chats) m_ui->chatList->addItem(c.name);
-
-    if (m_db) {
-        const QString sk = m_db->loadSetting("profileKeys");
-        if (!sk.isEmpty()) m_profileKeys = sk.split(',', Qt::SkipEmptyParts);
-    }
-    m_controller->setSelfKeys(m_profileKeys);
+    for (const auto &c : std::as_const(m_chats)) m_ui->chatList->addItem(c.name);
 
     // Show first 8 chars of public key as handle
     const QString fullKey = m_controller->myIdB64u();
@@ -1820,11 +2003,16 @@ void ChatView::rebuildChatList()
             if (!px.isNull())
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
         } else {
+            static const QList<QColor> kPalette = {
+                QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+                QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
+            };
             const QString &nm = m_chats[i].name;
             const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
+            const uint hash = qHash(nm);
             const QColor bg = m_chats[i].isGroup
-                ? QColor("#2e8b3a")
-                : avatarColorForName(nm);
+                ? QColor(0x2e, 0x8b, 0x3a)
+                : kPalette[hash % static_cast<uint>(kPalette.size())];
             avatarLbl->setPixmap(renderInitialsAvatar(ch, bg, 34));
         }
         hl->addWidget(avatarLbl);
@@ -1895,9 +2083,13 @@ void ChatView::loadChat(int index)
         }
     } else if (chat.isGroup) {
         const QString ch = chat.name.isEmpty() ? "#" : QString(chat.name[0]);
-        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor("#2e8b3a"), 44));
+        m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor(0x2e, 0x8b, 0x3a), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
+        static const QList<QColor> kPalette = {
+            QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
+            QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
+        };
         const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
         const QColor bg = avatarColorForName(chat.name);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));
@@ -2146,10 +2338,24 @@ void ChatView::rebuildFilesTab()
     const QString key     = chatKey(m_chats[m_currentChat]);
     const auto   &records = m_filesByKey.value(key);
 
-    if (records.isEmpty()) {
+    // ── Filter records by search query if active ───────────────────────────
+    QVector<FileTransferRecord> filtered;
+    if (!m_searchQuery.isEmpty()) {
+        for (const auto &r : records)
+            if (r.fileName.toLower().contains(m_searchQuery) ||
+                r.peerName.toLower().contains(m_searchQuery))
+                filtered.append(r);
+    } else {
+        filtered = records;
+    }
+
+    if (filtered.isEmpty()) {
         // ── Empty state ───────────────────────────────────────────────────────
         auto *ph = new QLabel(m_ui->filesScrollContents);
-        ph->setText("📎\n\nNo files shared yet\n\nClick the  ⬆  button below to send a file");
+        if (!m_searchQuery.isEmpty())
+            ph->setText("🔍\n\nNo files matching \"" + m_searchQuery + "\"");
+        else
+            ph->setText("📎\n\nNo files shared yet\n\nClick the  ⬆  button below to send a file");
         ph->setAlignment(Qt::AlignCenter);
         ph->setWordWrap(true);
         ph->setStyleSheet(
@@ -2168,8 +2374,8 @@ void ChatView::rebuildFilesTab()
     grid->setContentsMargins(0, 0, 0, 0);
 
     static constexpr int kCols = 3;
-    for (int i = 0; i < records.size(); ++i)
-        grid->addWidget(buildFileCard(records[i], gridWidget), i / kCols, i % kCols);
+    for (int i = 0; i < filtered.size(); ++i)
+        grid->addWidget(buildFileCard(filtered[i], gridWidget), i / kCols, i % kCols);
 
     // Equal-width columns so cards fill the available space
     for (int c = 0; c < kCols; ++c)
@@ -2228,6 +2434,58 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
 
     auto *thumbLayout = new QVBoxLayout(thumbWidget);
     thumbLayout->setContentsMargins(0, 0, 0, 0);
+    thumbLayout->setSpacing(0);
+
+    // ── Delete button (✕) — right-aligned at top of thumbnail area ───────────
+    auto *delBtn = new QPushButton("\u2715", thumbWidget);  // ✕
+    delBtn->setFixedSize(28, 28);
+    delBtn->setCursor(Qt::PointingHandCursor);
+    delBtn->setToolTip("Delete file");
+    delBtn->setStyleSheet(
+        "QPushButton{"
+        "  background-color:rgba(60,60,60,200);"
+        "  color:#cccccc;"
+        "  border:none;"
+        "  border-radius:14px;"
+        "  font-size:14px;"
+        "  font-weight:bold;"
+        "}"
+        "QPushButton:hover{ background-color:rgba(180,50,50,220); color:#ffffff; }"
+        "QPushButton:pressed{ background-color:rgba(140,30,30,255); }"
+        );
+    {
+        auto *delRow = new QHBoxLayout;
+        delRow->setContentsMargins(0, 6, 6, 0);
+        delRow->addStretch();
+        delRow->addWidget(delBtn);
+        thumbLayout->addLayout(delRow);
+    }
+
+    const QString delTransferId = rec.transferId;
+    const QString delSavedPath  = rec.savedPath;
+    QObject::connect(delBtn, &QPushButton::clicked, [this, delTransferId, delSavedPath]() {
+        auto reply = QMessageBox::question(
+            m_ui->centralwidget, "Delete File",
+            "Remove this file from your file list?\n\n"
+            "The file will remain on your disk.",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (reply != QMessageBox::Yes) return;
+
+        // 1. Delete from database
+        m_db->deleteFileRecord(delTransferId);
+
+        // 3. Remove from in-memory map
+        if (m_currentChat >= 0 && m_currentChat < m_chats.size()) {
+            const QString ck = chatKey(m_chats[m_currentChat]);
+            auto &files = m_filesByKey[ck];
+            files.erase(std::remove_if(files.begin(), files.end(),
+                [&](const FileTransferRecord &r){ return r.transferId == delTransferId; }),
+                files.end());
+        }
+
+        // 4. Rebuild the files tab
+        rebuildFilesTab();
+    });
 
     if (isImage) {
         QPixmap px(rec.savedPath);

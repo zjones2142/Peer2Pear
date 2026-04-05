@@ -1,5 +1,6 @@
 #include "MailboxClient.hpp"
 #include "CryptoEngine.hpp"
+#include <QDebug>
 #include <QNetworkRequest>
 #include <QNetworkReply>
 #include <QDateTime>
@@ -29,7 +30,19 @@ void MailboxClient::enqueue(const QString& toIdB64u,
     req.setRawHeader("X-TtlMs", QByteArray::number(ttlMs));
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
 
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[Mailbox] Enqueue to" << toIdB64u.left(8) + "..."
+             << "| size:" << envelopeBytes.size() << "B | ttl:" << ttlMs << "ms";
+#endif
+
     auto* rep = m_nam.post(req, envelopeBytes);
+    if (!rep) {
+        qWarning() << "[Mailbox] Failed to create POST request to" << toIdB64u.left(8) + "...";
+        m_retryQueue.append({ toIdB64u, envelopeBytes, ttlMs, 0 });
+        if (!m_retryTimer.isActive())
+            scheduleRetry();
+        return;
+    }
     connect(rep, &QNetworkReply::finished, this,
             [this, rep, toIdB64u, envelopeBytes, ttlMs]()
     {
@@ -37,9 +50,14 @@ void MailboxClient::enqueue(const QString& toIdB64u,
             QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
         if (rep->error() == QNetworkReply::NoError) {
+#ifndef QT_NO_DEBUG_OUTPUT
+            qDebug() << "[Mailbox] Enqueue OK to" << toIdB64u.left(8) + "...";
+#endif
             rep->deleteLater();
             return;   // success — nothing to do
         }
+        qWarning() << "[Mailbox] Enqueue failed to" << toIdB64u.left(8) + "..."
+                   << "| HTTP" << http << "|" << rep->errorString();
 
         // ── Permanent failures — don't retry ────────────────────────────────
         if (http == 413) {
@@ -181,6 +199,9 @@ void MailboxClient::fetch(const QString& myIdB64u)
                 const QString    envId = QString::fromUtf8(rep->rawHeader("X-EnvId"));
                 rep->deleteLater();
 
+#ifndef QT_NO_DEBUG_OUTPUT
+                qDebug() << "[Mailbox] Fetched envelope | size:" << body.size() << "B | envId:" << envId.left(8);
+#endif
                 emit envelopeReceived(body, envId);
 
                 // Drain: immediately fetch the next envelope without waiting for the
@@ -262,13 +283,8 @@ void MailboxClient::fetchAll(const QString& myIdB64u)
                     const QString     envId = entry.value("env_id").toString();
                     const QString     b64   = entry.value("payload_b64").toString();
 
-                    // Server stores payload as url-safe base64, no padding.
-                    // Qt's fromBase64 needs standard base64 with padding.
-                    QByteArray padded = b64.toUtf8();
-                    while (padded.size() % 4) padded.append('=');
-                    padded.replace('-', '+');
-                    padded.replace('_', '/');
-                    const QByteArray body = QByteArray::fromBase64(padded);
+                    // G8 fix: use CryptoEngine helper instead of manual conversion
+                    const QByteArray body = CryptoEngine::fromBase64Url(b64);
 
                     if (!body.isEmpty())
                         emit envelopeReceived(body, envId);

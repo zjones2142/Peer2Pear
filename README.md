@@ -1,34 +1,53 @@
 # Peer2Pear
 
-A hybrid peer-to-peer file sharing and messaging application built with Qt, featuring end-to-end encryption powered by [libsodium](https://libsodium.org/).
+A hybrid peer-to-peer messaging and file sharing application built with Qt and C++17, featuring end-to-end encryption powered by [libsodium](https://libsodium.org/).
 
 ---
 
 ## Features
 
-- **End-to-end encrypted messaging** — all messages are encrypted with XChaCha20-Poly1305 (AEAD) using per-contact shared keys derived via X25519 from Ed25519 identity keys.
-- **Encrypted file transfer** — send files up to 8 MB (likely to increase in future), automatically split into chunks and encrypted before transmission.
-- **Group chats** — create and participate in group conversations.
-- **Hybrid P2P networking** — attempts direct peer-to-peer connections via ICE/NAT traversal (libnice), falling back to a relay mailbox server when a direct path is not available.
-- **Persistent storage** — chat history and contacts are stored locally in a SQLite database.
-- **Contact management** — add contacts by peer ID, block unwanted contacts.
+- **End-to-end encrypted messaging** — Noise IK handshake establishes sessions, then a Signal-style Double Ratchet provides forward secrecy and post-compromise security for every message.
+- **Sealed Sender** — relay servers see only the recipient; the sender's identity is hidden inside an encrypted envelope, preventing metadata leakage.
+- **Encrypted file transfer** — send files up to 25 MB, automatically chunked (256 KB) and encrypted before transmission.
+- **Group chats** — create group conversations with encrypted broadcasts to all members.
+- **Hybrid P2P networking** — direct peer-to-peer connections via ICE/NAT traversal (libnice), falling back to an HTTP mailbox relay for offline delivery.
+- **Encrypted storage** — chat history and contacts are stored in a local SQLite database with per-field XChaCha20-Poly1305 encryption at rest.
+- **Contact management** — add contacts by Peer ID, block unwanted contacts, import/export contact lists.
 - **Cross-platform** — builds on Linux, macOS, and Windows using Qt 5 or Qt 6.
 
 ## How It Works
 
-Each user has an Ed25519 identity key pair generated locally (optionally protected by a passphrase). The public key serves as the user's **Peer ID** (base64url-encoded), which is shared with contacts out-of-band.
+Each user has an Ed25519 identity key pair generated locally, protected by a passphrase (Argon2id KDF). The public key serves as the user's **Peer ID** (base64url-encoded), shared with contacts out-of-band.
 
-When sending a message or file:
-1. A 32-byte shared secret is derived from the sender's private key and the recipient's public key (X25519 ECDH).
-2. The plaintext is encrypted with XChaCha20-Poly1305 using the shared secret.
-3. The encrypted envelope is delivered via the mailbox relay server and/or directly over a P2P connection negotiated by a rendezvous server.
+### Session Establishment
+
+1. The initiator performs a **Noise IK handshake** (`Noise_IK_25519_XChaChaPoly_BLAKE2b`), sending the first message along with a fresh ratchet DH public key.
+2. The responder completes the handshake and derives both sending and receiving chain keys from the bundled ratchet DH key.
+3. Both sides initialize a **Double Ratchet** session with forward secrecy from the first message.
+
+### Sending a Message
+
+1. The plaintext is encrypted via the Double Ratchet (XChaCha20-Poly1305 AEAD, per-message key derived from the symmetric chain).
+2. The ratchet ciphertext is wrapped in a **Sealed Sender envelope** — an ephemeral X25519 DH hides the sender's identity from the relay.
+3. The envelope is delivered directly over P2P (if online) or queued on the mailbox relay (if offline).
+
+### Cryptographic Primitives
+
+| Primitive | Usage |
+|---|---|
+| Ed25519 | Identity keys, signatures |
+| X25519 | ECDH key agreement (Noise, Sealed Sender) |
+| XChaCha20-Poly1305 | AEAD encryption (messages, files, DB fields) |
+| BLAKE2b | Hashing, KDF chains (root chain, message chain) |
+| Argon2id | Passphrase-based key derivation |
+| HKDF (BLAKE2b) | Deriving sub-keys (pre-key payloads, DB encryption) |
 
 ## Dependencies
 
 | Dependency | Purpose |
 |---|---|
-| [Qt 5/Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
-| [libsodium](https://libsodium.org/) | Cryptographic primitives (Ed25519, X25519, XChaCha20-Poly1305) |
+| [Qt 5 / Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
+| [libsodium](https://libsodium.org/) | Cryptographic primitives |
 | [libnice](https://libnice.freedesktop.org/) | ICE agent for P2P NAT traversal |
 | [GLib](https://docs.gtk.org/glib/) | Required by libnice |
 
@@ -38,12 +57,13 @@ Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io
 
 ### Prerequisites
 
-- CMake ≥ 3.16
-- Qt 5 / Qt 6 (Widgets, Network, Sql modules)
+- CMake >= 3.16
+- Qt 5 or Qt 6 (Widgets, Network, Sql modules)
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
 
-#### Run the following before opening in Qt!  (they clone vcpkg to correct directory)
+#### Run the setup script before opening in Qt Creator (it clones vcpkg to the correct directory):
+
 ### Linux / macOS
 
 ```bash
@@ -57,6 +77,8 @@ cd Peer2Pear_QtProj
 cd Peer2Pear_QtProj
 winsetup.bat
 ```
+
+The setup scripts bootstrap vcpkg, install the required libraries, and configure the CMake build.
 
 ## License
 

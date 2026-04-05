@@ -11,6 +11,10 @@ RendezvousClient::RendezvousClient(CryptoEngine* crypto, QObject* parent)
 void RendezvousClient::setBaseUrl(const QUrl& u) { m_base = u; }
 
 void RendezvousClient::publish(const QString& host, int port, qint64 expiresMs) {
+    if (!m_crypto) {
+        qWarning() << "[Rendezvous] publish called with null CryptoEngine";
+        return;
+    }
     const QString id = CryptoEngine::toBase64Url(m_crypto->identityPub());
     const QString msg = QString("RVZ1|%1|%2|%3|%4").arg(id, host).arg(port).arg(expiresMs);
     const QString sig = m_crypto->signB64u(msg.toUtf8());

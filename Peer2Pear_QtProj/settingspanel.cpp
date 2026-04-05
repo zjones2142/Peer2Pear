@@ -89,8 +89,11 @@ void SettingsPanel::buildUI()
     // ── About section ─────────────────────────────────────────────────────────
     bodyLayout->addWidget(makeSection("ABOUT", {
                                                 { "Version",  "0.1.0"     },
-                                                { "Protocol", "Peer2Pear" },
+                                                { "Protocol", "Peer2Pear P2P + Sealed Sender" },
                                                 }));
+
+    // ── Getting Started / Help section ───────────────────────────────────────
+    bodyLayout->addWidget(makeAboutHelpSection());
 
     bodyLayout->addStretch();
     scroll->setWidget(body);
@@ -651,4 +654,74 @@ void SettingsPanel::onToggleDnd()
 
     // DND suppresses notifications; restores them when turned off if global toggle is on
     emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
+}
+
+// ── About & Help section ─────────────────────────────────────────────────────
+QWidget *SettingsPanel::makeAboutHelpSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    // ── Section heading ──────────────────────────────────────────────────────
+    QLabel *heading = new QLabel("GETTING STARTED");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    // ── How to Use guide ─────────────────────────────────────────────────────
+    QLabel *guideLabel = new QLabel(
+        "<p style='color:#999999; font-size:12px; line-height:1.6;'>"
+        "<b style='color:#cccccc; font-size:13px;'>Getting Started</b><br>"
+        "<br>"
+        "<b style='color:#4caf50;'>1. Share your public key</b><br>"
+        "Your public key is your identity. Copy it from the Profile "
+        "section above and share it with your contacts.<br>"
+        "<br>"
+        "<b style='color:#4caf50;'>2. Add a contact</b><br>"
+        "Tap <b>New Chat</b>, enter a name, and paste their "
+        "public key (43 characters, base64url).<br>"
+        "<br>"
+        "<b style='color:#4caf50;'>3. Start messaging</b><br>"
+        "Select a contact and type a message. Messages are "
+        "end-to-end encrypted automatically.<br>"
+        "<br>"
+        "<b style='color:#4caf50;'>4. Send files</b><br>"
+        "Use the attach button (paperclip) to send files up to 25 MB. "
+        "Files appear in the <b>Files</b> tab.<br>"
+        "<br>"
+        "<b style='color:#4caf50;'>5. Group chats</b><br>"
+        "Create a group by adding multiple keys when creating a new chat. "
+        "All group messages are individually encrypted for each member.<br>"
+        "<br>"
+        "<b style='color:#cccccc;'>How it works</b><br>"
+        "Peer2Pear uses direct peer-to-peer connections when possible "
+        "(via ICE/STUN/TURN) for real-time delivery, and an encrypted "
+        "mailbox relay for offline messages. Your messages are encrypted "
+        "with the Noise Protocol (IK handshake) and Double Ratchet, "
+        "providing forward secrecy and post-compromise security. "
+        "The server never sees your plaintext."
+        "</p>"
+        );
+    guideLabel->setWordWrap(true);
+    guideLabel->setTextFormat(Qt::RichText);
+    guideLabel->setStyleSheet(
+        "background: transparent; border: none; padding: 10px 16px 14px 16px;"
+        );
+    cardLayout->addWidget(guideLabel);
+
+    return card;
 }

@@ -44,9 +44,19 @@ MainWindow::MainWindow(QWidget *parent)
         }
         try {
             m_controller.setPassphrase(pass);
-            // Derive a DB encryption key from identity for at-rest protection
-            m_db.setEncryptionKey(ChatController::blake2b256(
-                m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey")));
+            // Derive a DB encryption key from the passphrase (secret) for at-rest protection.
+            // Also provide the old key (derived from public ID) so existing encrypted
+            // messages can still be read during migration.
+            QByteArray newKey = ChatController::blake2b256(
+                pass.toUtf8() + QByteArray("peer2pear-dbkey"));
+            QByteArray legacyKey = ChatController::blake2b256(
+                m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey"));
+            m_db.setEncryptionKey(newKey, legacyKey);
+            CryptoEngine::secureZero(newKey);
+            CryptoEngine::secureZero(legacyKey);
+            // Wire DB to ChatController for Noise/Ratchet session persistence
+            m_controller.setDatabase(m_db.database());
+            CryptoEngine::secureZero(pass);
             break;
         } catch (const std::exception &e) {
             QMessageBox::warning(this, "Identity Unlock Failed", e.what());
@@ -65,12 +75,51 @@ MainWindow::MainWindow(QWidget *parent)
             m_db.saveSetting("avatarData", dlg.avatarData());
             m_db.saveSetting("avatarIsPhoto", dlg.isPhotoAvatar() ? "true" : "false");
         }
+
+        // ── Welcome guide (shown once after first onboarding) ────────────────
+        QMessageBox welcome(this);
+        welcome.setWindowTitle("Welcome to Peer2Pear");
+        welcome.setIcon(QMessageBox::Information);
+        welcome.setText(
+            "<h3>You're all set!</h3>"
+            "<p>Here's how to get started:</p>"
+            "<ol>"
+            "<li><b>Copy your public key</b> from Settings and share it with friends.</li>"
+            "<li><b>Add a contact</b> by tapping New Chat and pasting their key.</li>"
+            "<li><b>Send a message</b> — it's encrypted end-to-end automatically.</li>"
+            "</ol>"
+            "<p style='color:gray;'>You can find a full guide anytime in "
+            "<b>Settings > About & Help</b>.</p>"
+            );
+        welcome.setStyleSheet(
+            "QMessageBox { background-color: #1a1a1a; }"
+            "QLabel { color: #cccccc; font-size: 13px; }"
+            "QPushButton { background-color: #2e8b3a; color: white; border: none; "
+            "border-radius: 6px; padding: 8px 20px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #38a844; }"
+            );
+        welcome.exec();
     }
 
     // ── Server + polling ──────────────────────────────────────────────────────
-    // TODO: switch default to https:// once TLS is configured on the server
-    const QString serverUrl = m_db.loadSetting("serverUrl", "http://3.141.14.234");
+    // One-time migration: move existing users from the old HTTP IP to the new HTTPS domain
+    {
+        const QString old = m_db.loadSetting("serverUrl");
+        if (old == "http://3.141.14.234" || old == "http://3.141.14.234/") {
+            m_db.saveSetting("serverUrl", "https://peer2pear.com");
+        }
+    }
+    const QString serverUrl = m_db.loadSetting("serverUrl", "https://peer2pear.com");
     m_controller.setServerBaseUrl(QUrl(serverUrl));
+
+    // TURN relay for symmetric NAT fallback — configure before polling starts
+    const QString turnHost = m_db.loadSetting("turnHost", "peer2pear.com");
+    const int     turnPort = m_db.loadSetting("turnPort", "3478").toInt();
+    const QString turnUser = m_db.loadSetting("turnUser", "peer2pear");
+    const QString turnPass = m_db.loadSetting("turnPass", "peer2pear");
+    if (!turnHost.isEmpty())
+        m_controller.setTurnServer(turnHost, turnPort, turnUser, turnPass);
+
     m_controller.startPolling(2000);
 
     // ── Profile handle: first 8 chars of public key ───────────────────────────
@@ -157,7 +206,10 @@ MainWindow::MainWindow(QWidget *parent)
     });
 }
 
-MainWindow::~MainWindow() { delete ui; }
+MainWindow::~MainWindow() {
+    m_controller.stopPolling();   // unpublish presence so peers see us offline
+    delete ui;
+}
 
 void MainWindow::resizeEvent(QResizeEvent *event)
 {

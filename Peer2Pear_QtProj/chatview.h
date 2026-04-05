@@ -30,11 +30,12 @@ public:
                       QObject *parent = nullptr);
 
     void reloadCurrentChat();
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
     void setShouldToastFn(std::function<bool()> fn) { m_shouldToastFn = std::move(fn); }
     void setNotifier(ChatNotifier *notifier)         { m_notifier = notifier; }
 
-    void startPresencePolling(int intervalMs = 180000);
+    void startPresencePolling(int intervalMs = 30000);
 
 public slots:
     void onPresenceChanged(const QString &peerIdB64u, bool online);
@@ -122,7 +123,6 @@ private:
     QVector<ChatData> m_chats;
     int               m_currentChat = -1;
 
-    QStringList m_profileKeys;
     QVector<int> m_unread;
     QTimer       m_presenceTimer;
 
@@ -134,4 +134,12 @@ private:
 
     void showToast(const QString &message);
     QLabel *m_toastLabel = nullptr;
+
+    // ── Search state ────────────────────────────────────────────────────────
+    QString m_searchQuery;                    // current lowered search text
+    QVector<int> m_searchMatchIndices;        // indices into current chat's messages
+    int          m_searchMatchCurrent = -1;   // which match is focused (-1 = none)
+    void highlightSearchMatches();            // apply/remove gold highlight on bubbles
+    void scrollToMatch(int matchIdx);         // scroll message area to a matched bubble
+    void navigateSearch(int delta);           // +1 = next, -1 = prev
 };

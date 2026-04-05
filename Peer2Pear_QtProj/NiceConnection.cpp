@@ -1,9 +1,13 @@
 #include "NiceConnection.hpp"
+#include <QDebug>
 
 NiceConnection::NiceConnection(QObject* parent)
     : QThread(parent), m_state(NICE_COMPONENT_STATE_DISCONNECTED) {}
 
 NiceConnection::~NiceConnection() {
+    if (m_agent) {
+        nice_agent_close_async(m_agent, nullptr, nullptr);
+    }
     if (m_loop) {
         g_main_loop_quit(m_loop);
         wait(); // Wait for thread to exit
@@ -11,6 +15,17 @@ NiceConnection::~NiceConnection() {
         g_main_context_unref(m_context);
     }
     if (m_agent) g_object_unref(m_agent);
+    // G7 fix: zero TURN credentials in memory
+    if (!m_turnUser.isEmpty()) { m_turnUser.fill(QChar(0)); m_turnUser.clear(); }
+    if (!m_turnPass.isEmpty()) { m_turnPass.fill(QChar(0)); m_turnPass.clear(); }
+}
+
+void NiceConnection::setTurnServer(const QString& host, int port,
+                                    const QString& username, const QString& password) {
+    m_turnHost = host;
+    m_turnPort = port;
+    m_turnUser = username;
+    m_turnPass = password;
 }
 
 void NiceConnection::initIce(bool controlling) {
@@ -26,6 +41,17 @@ void NiceConnection::initIce(bool controlling) {
 
     m_streamId = nice_agent_add_stream(m_agent, 1);
 
+    // Add TURN relay server if configured (required for symmetric NAT)
+    if (!m_turnHost.isEmpty() && m_turnPort > 0) {
+        nice_agent_set_relay_info(m_agent, m_streamId, 1,
+            m_turnHost.toUtf8().constData(), m_turnPort,
+            m_turnUser.toUtf8().constData(), m_turnPass.toUtf8().constData(),
+            NICE_RELAY_TYPE_TURN_UDP);
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[ICE] TURN relay configured:" << m_turnHost << ":" << m_turnPort;
+#endif
+    }
+
     g_signal_connect(G_OBJECT(m_agent), "candidate-gathering-done", G_CALLBACK(cbCandidateGatheringDone), this);
     g_signal_connect(G_OBJECT(m_agent), "component-state-changed", G_CALLBACK(cbComponentStateChanged), this);
 
@@ -37,7 +63,15 @@ void NiceConnection::initIce(bool controlling) {
 
 void NiceConnection::setRemoteSdp(const QString& sdp) {
     if (m_agent) {
-        nice_agent_parse_remote_sdp(m_agent, sdp.toUtf8().constData());
+        int parsed = nice_agent_parse_remote_sdp(m_agent, sdp.toUtf8().constData());
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[ICE] setRemoteSdp: parsed" << parsed << "candidates"
+                 << "| sdp length:" << sdp.size();
+#endif
+    } else {
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[ICE] setRemoteSdp: agent is null!";
+#endif
     }
 }
 
@@ -58,13 +92,27 @@ void NiceConnection::run() {
 void NiceConnection::cbCandidateGatheringDone(NiceAgent* agent, guint stream_id, gpointer data) {
     NiceConnection* self = static_cast<NiceConnection*>(data);
     gchar* sdp = nice_agent_generate_local_sdp(agent);
-    emit self->localSdpReady(QString::fromUtf8(sdp));
+    QString sdpStr = QString::fromUtf8(sdp);
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[ICE] Candidate gathering done | sdp length:" << sdpStr.size();
+#endif
+    emit self->localSdpReady(sdpStr);
     g_free(sdp);
 }
 
 void NiceConnection::cbComponentStateChanged(NiceAgent* agent, guint stream_id, guint component_id, guint state, gpointer data) {
     NiceConnection* self = static_cast<NiceConnection*>(data);
     self->m_state = state;
+
+    static const char* stateNames[] = {
+        "DISCONNECTED", "GATHERING", "CONNECTING",
+        "CONNECTED", "READY", "FAILED", "LAST"
+    };
+    const char* name = (state < 7) ? stateNames[state] : "UNKNOWN";
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[ICE] State changed:" << name << "(" << state << ")";
+#endif
+
     emit self->stateChanged(state);
 }
 

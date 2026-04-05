@@ -44,6 +44,7 @@ private:
                          const QList<QPair<QString, QString>> &rows);
     QWidget *makeNotificationsSection();
     QWidget *makeDataSection();
+    QWidget *makeAboutHelpSection();
 
     // Profile
     QLabel      *m_displayNameLabel     = nullptr;
