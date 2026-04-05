@@ -36,6 +36,13 @@ void MailboxClient::enqueue(const QString& toIdB64u,
 #endif
 
     auto* rep = m_nam.post(req, envelopeBytes);
+    if (!rep) {
+        qWarning() << "[Mailbox] Failed to create POST request to" << toIdB64u.left(8) + "...";
+        m_retryQueue.append({ toIdB64u, envelopeBytes, ttlMs, 0 });
+        if (!m_retryTimer.isActive())
+            scheduleRetry();
+        return;
+    }
     connect(rep, &QNetworkReply::finished, this,
             [this, rep, toIdB64u, envelopeBytes, ttlMs]()
     {
