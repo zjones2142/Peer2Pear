@@ -213,13 +213,15 @@ bool CryptoEngine::loadIdentityFromDisk() {
         m_kemPub = fromBase64Url(o.value("kem_pub_b64u").toString());
 
         const auto kemEnc = o.value("kem_priv_enc").toObject();
+        const QByteArray kemSalt  = fromBase64Url(kemEnc.value("salt_b64u").toString());
         const QByteArray kemNonce = fromBase64Url(kemEnc.value("nonce_b64u").toString());
         const QByteArray kemCt    = fromBase64Url(kemEnc.value("ct_b64u").toString());
 
-        // Derive a separate key for KEM private key encryption (key separation)
-        QByteArray kemKey32 = deriveKeyFromPassphrase(m_passphrase, salt);
+        // Key separation: derive a distinct key using the KEM-specific salt
+        QByteArray kemKey32 = kemSalt.isEmpty()
+            ? deriveKeyFromPassphrase(m_passphrase, salt)   // fallback for early v3 files
+            : deriveKeyFromPassphrase(m_passphrase, kemSalt);
         if (!kemKey32.isEmpty()) {
-            // Use a different nonce domain — the salt is shared but nonces differ
             m_kemPriv = secretboxDecrypt(kemKey32, kemNonce, kemCt);
             secureZero(kemKey32);
         }
@@ -267,13 +269,15 @@ bool CryptoEngine::saveIdentityToDisk() const {
     if (hasPQKeys()) {
         j["kem_pub_b64u"] = toBase64Url(m_kemPub);
 
-        // Encrypt KEM private key with a separate nonce (same derived key)
-        QByteArray kemNonce, kemCt;
-        QByteArray kemDummySalt;
-        QByteArray kemKey32 = deriveKeyFromPassphrase(m_passphrase, salt);
+        // Key separation: generate a distinct salt for the KEM private key
+        QByteArray kemSalt(SALT_BYTES, 0);
+        randombytes_buf(kemSalt.data(), SALT_BYTES);
+        QByteArray kemKey32 = deriveKeyFromPassphrase(m_passphrase, kemSalt);
         if (!kemKey32.isEmpty()) {
+            QByteArray kemNonce, kemCt, kemDummySalt;
             if (secretboxEncrypt(kemKey32, m_kemPriv, kemDummySalt, kemNonce, kemCt)) {
                 QJsonObject kemEnc;
+                kemEnc["salt_b64u"]  = toBase64Url(kemSalt);
                 kemEnc["nonce_b64u"] = toBase64Url(kemNonce);
                 kemEnc["ct_b64u"]    = toBase64Url(kemCt);
                 j["kem_priv_enc"] = kemEnc;

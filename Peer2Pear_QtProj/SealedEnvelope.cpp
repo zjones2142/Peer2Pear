@@ -126,27 +126,35 @@ UnsealResult SealedEnvelope::unseal(const QByteArray& recipientCurvePriv,
     if (recipientCurvePriv.size() != 32) return result;
     if (sealedBytes.size() < 2) return result;  // need at least version + data
 
-    // Parse version byte
-    const quint8 version = static_cast<quint8>(sealedBytes[0]);
+    // Detect envelope version:
+    //   0x01 + size >= 1257  → hybrid (version 0x01)
+    //   0x00 + size >= 169   → classical versioned (version 0x00)
+    //   anything else        → legacy (no version byte, first byte is ephPub[0])
+    //
+    // Legacy envelopes: ephPub(32) + nonce(24) + ... = min 168 bytes, no version prefix.
+    // A hybrid envelope is always >= 1257 bytes (1+32+1088+24+32+64+16), so if the
+    // first byte is 0x01 but size < 1257, it's a legacy envelope whose ephPub starts with 0x01.
+    const quint8 firstByte = static_cast<quint8>(sealedBytes[0]);
 
-    // Handle legacy envelopes (no version byte — first byte is part of ephPub)
-    // Legacy format: ephPub(32) || AEAD(...)  — no version prefix.
-    // We detect legacy by checking if the version byte is NOT 0x00 or 0x01
-    // AND the total size matches a classical envelope without a version byte.
-    bool isLegacy = (version != kVersionClassical && version != kVersionHybrid);
+    const int hybridMinSize    = 1 + kPubLen + kKemCtLen + kNonceLen + kPubLen + kSigLen + kTagLen; // 1257
+    const int classicalMinSize = 1 + kPubLen + kNonceLen + kPubLen + kSigLen + kTagLen;              // 169
+    const int legacyMinSize    = kPubLen + kNonceLen + kPubLen + kSigLen + kTagLen;                   // 168
 
-    int offset = 0;
-    if (!isLegacy) {
-        offset = 1;  // skip version byte
+    bool hybrid = false;
+    bool isLegacy = false;
+
+    if (firstByte == kVersionHybrid && sealedBytes.size() >= hybridMinSize) {
+        hybrid = true;
+    } else if (firstByte == kVersionClassical && sealedBytes.size() >= classicalMinSize) {
+        // versioned classical
+    } else {
+        // Legacy (no version byte) or ambiguous — treat as legacy
+        isLegacy = true;
     }
 
-    bool hybrid = (!isLegacy && version == kVersionHybrid);
-
-    // Minimum sizes
-    const int classicalMin = offset + kPubLen + kNonceLen + kPubLen + kSigLen + kTagLen;
-    const int hybridMin    = offset + kPubLen + kKemCtLen + kNonceLen + kPubLen + kSigLen + kTagLen;
-    if (hybrid && sealedBytes.size() < hybridMin) return result;
-    if (!hybrid && sealedBytes.size() < classicalMin) return result;
+    int offset = isLegacy ? 0 : 1;
+    if (!hybrid && !isLegacy && sealedBytes.size() < classicalMinSize) return result;
+    if (isLegacy && sealedBytes.size() < legacyMinSize) return result;
 
     // 1. Extract ephemeral X25519 public key
     QByteArray ephPub = sealedBytes.mid(offset, kPubLen);

@@ -27,9 +27,11 @@
 class SessionManager {
 public:
     // Message type constants
-    static constexpr quint8 kPreKeyMsg      = 0x01;
-    static constexpr quint8 kPreKeyResponse = 0x02;
-    static constexpr quint8 kRatchetMsg     = 0x03;
+    static constexpr quint8 kPreKeyMsg          = 0x01;
+    static constexpr quint8 kPreKeyResponse     = 0x02;
+    static constexpr quint8 kRatchetMsg         = 0x03;
+    static constexpr quint8 kHybridPreKeyMsg    = 0x04;  // Phase 2: hybrid PQ handshake
+    static constexpr quint8 kHybridPreKeyResp   = 0x05;  // Phase 2: hybrid PQ response
 
     // Callback for sending handshake responses back to peers
     // Called with (peerId, sessionBlob) when a handshake response needs to be sent
@@ -42,8 +44,11 @@ public:
 
     // Encrypt a plaintext for a peer.
     // peerEdPub: peer's Ed25519 public key (base64url)
+    // peerKemPub: peer's ML-KEM-768 public key (1184 bytes, optional)
+    //             If provided and we have PQ keys, uses hybrid Noise IK handshake.
     // Returns a session-layer blob (type byte + content)
-    QByteArray encryptForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
+    QByteArray encryptForPeer(const QString& peerIdB64u, const QByteArray& plaintext,
+                              const QByteArray& peerKemPub = {});
 
     // Decrypt a session-layer blob received from a peer.
     // Returns decrypted plaintext, or empty on failure.

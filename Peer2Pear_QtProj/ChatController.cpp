@@ -520,7 +520,9 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
                                        const QByteArray& plaintext)
 {
     if (!m_sessionMgr) return {};
-    QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext);
+    // Pass peer's KEM pub so SessionManager can do hybrid Noise handshake if available
+    QByteArray peerKemPub = lookupPeerKemPub(peerIdB64u);
+    QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext, peerKemPub);
     if (sessionBlob.isEmpty()) return {};
 
     QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
@@ -533,8 +535,7 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
     QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
     sodium_memzero(peerCurvePub, sizeof(peerCurvePub));  // G11 fix
 
-    // Use hybrid seal if we know the peer's ML-KEM-768 public key
-    QByteArray peerKemPub = lookupPeerKemPub(peerIdB64u);
+    // Use hybrid seal if we know the peer's ML-KEM-768 public key (already looked up above)
     QByteArray sealed = SealedEnvelope::seal(
         recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
         sessionBlob, peerKemPub);
@@ -770,7 +771,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             // Pre-key response (0x02) completes the Noise IK handshake and creates
             // a ratchet session inside decryptFromPeer(), but returns no user payload.
             // This is expected — future messages will use the ratchet session.
-            if (!unsealed.innerPayload.isEmpty() && static_cast<quint8>(unsealed.innerPayload[0]) == 0x02) {
+            const quint8 innerType = unsealed.innerPayload.isEmpty() ? 0 : static_cast<quint8>(unsealed.innerPayload[0]);
+            if (innerType == SessionManager::kPreKeyResponse || innerType == SessionManager::kHybridPreKeyResp) {
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
 #endif

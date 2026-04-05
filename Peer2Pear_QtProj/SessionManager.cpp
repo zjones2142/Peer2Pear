@@ -50,7 +50,8 @@ void SessionManager::deleteSession(const QString& peerIdB64u) {
 // ---------------------------
 
 QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
-                                           const QByteArray& plaintext) {
+                                           const QByteArray& plaintext,
+                                           const QByteArray& peerKemPub) {
     RatchetSession* session = getSession(peerIdB64u);
 
     if (session) {
@@ -103,12 +104,18 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
     }
     QByteArray remoteCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
 
-    // Create Noise IK initiator
+    // Choose hybrid or classical Noise IK based on PQ key availability
+    const bool useHybrid = (peerKemPub.size() == 1184 && m_crypto.hasPQKeys());
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[SessionManager] Initiating Noise IK handshake with" << peerIdB64u.left(8) + "...";
+    qDebug() << "[SessionManager] Initiating" << (useHybrid ? "HYBRID PQ" : "classical")
+             << "Noise IK handshake with" << peerIdB64u.left(8) + "...";
 #endif
-    NoiseState noise = NoiseState::createInitiator(
-        m_crypto.curvePub(), m_crypto.curvePriv(), remoteCurvePub);
+    NoiseState noise = useHybrid
+        ? NoiseState::createHybridInitiator(
+              m_crypto.curvePub(), m_crypto.curvePriv(), remoteCurvePub,
+              m_crypto.kemPub(), m_crypto.kemPriv(), peerKemPub)
+        : NoiseState::createInitiator(
+              m_crypto.curvePub(), m_crypto.curvePriv(), remoteCurvePub);
 
     // Write handshake message 1 (no payload in the handshake itself)
     QByteArray noiseMsg1 = noise.writeMessage1();
@@ -150,13 +157,14 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
              << "| payload:" << encPayload.size() << "B";
 #endif
 
-    // [0x01][4-byte noiseMsg1Len][noiseMsg1][32-byte ratchetDhPub][encPayload]
+    // Wire: [type][4-byte noiseMsg1Len][noiseMsg1][32-byte ratchetDhPub][encPayload]
+    const quint8 msgType = useHybrid ? kHybridPreKeyMsg : kPreKeyMsg;
     quint32 msg1Len = static_cast<quint32>(noiseMsg1.size());
     quint32 msg1LenBE = qToBigEndian(msg1Len);
 
     QByteArray out;
     out.reserve(1 + 4 + noiseMsg1.size() + 32 + encPayload.size());
-    out.append(static_cast<char>(kPreKeyMsg));
+    out.append(static_cast<char>(msgType));
     out.append(reinterpret_cast<const char*>(&msg1LenBE), 4);
     out.append(noiseMsg1);
     out.append(ratchetDhPub);   // 32 bytes — responder uses this for initial ratchet DH
@@ -204,9 +212,10 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         return pt;
     }
 
-    if (msgType == kPreKeyMsg) {
+    if (msgType == kPreKeyMsg || msgType == kHybridPreKeyMsg) {
         // Pre-key message: Noise msg1 + encrypted payload
         // We are the responder
+        const bool hybrid = (msgType == kHybridPreKeyMsg);
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SessionManager] Received pre-key message from" << senderIdB64u.left(8) + "..."
                  << "| size:" << blob.size() << "B";
@@ -223,12 +232,17 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         QByteArray initiatorRatchetDhPub = blob.mid(5 + static_cast<int>(msg1Len), 32);
         QByteArray encPayload = blob.mid(5 + static_cast<int>(msg1Len) + 32);
 
-        // Create Noise responder
+        // Create Noise responder (hybrid or classical based on message type)
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Processing Noise IK handshake (responder) from" << senderIdB64u.left(8) + "...";
+        qDebug() << "[SessionManager] Processing" << (hybrid ? "HYBRID PQ" : "classical")
+                 << "Noise IK handshake (responder) from" << senderIdB64u.left(8) + "...";
 #endif
-        NoiseState noise = NoiseState::createResponder(
-            m_crypto.curvePub(), m_crypto.curvePriv());
+        NoiseState noise = (hybrid && m_crypto.hasPQKeys())
+            ? NoiseState::createHybridResponder(
+                  m_crypto.curvePub(), m_crypto.curvePriv(),
+                  m_crypto.kemPub(), m_crypto.kemPriv())
+            : NoiseState::createResponder(
+                  m_crypto.curvePub(), m_crypto.curvePriv());
 
         QByteArray handshakePayload;
         QByteArray noiseMsg2 = noise.readMessage1AndWriteMessage2(
@@ -278,9 +292,10 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
             quint32 msg2Len = static_cast<quint32>(noiseMsg2.size());
             quint32 msg2LenBE = qToBigEndian(msg2Len);
 
+            const quint8 respType = hybrid ? kHybridPreKeyResp : kPreKeyResponse;
             QByteArray response;
             response.reserve(1 + 4 + noiseMsg2.size());
-            response.append(static_cast<char>(kPreKeyResponse));
+            response.append(static_cast<char>(respType));
             response.append(reinterpret_cast<const char*>(&msg2LenBE), 4);
             response.append(noiseMsg2);
 
@@ -293,7 +308,7 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         return pt;
     }
 
-    if (msgType == kPreKeyResponse) {
+    if (msgType == kPreKeyResponse || msgType == kHybridPreKeyResp) {
         // Pre-key response: Noise msg2 from responder
         // We are the initiator — complete the handshake
 #ifndef QT_NO_DEBUG_OUTPUT
