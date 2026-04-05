@@ -239,7 +239,8 @@ void DatabaseManager::saveContact(const ChatData &chat)
         " VALUES (:peer_id,:name,:subtitle,:keys,:is_blocked,:is_group,:group_id,0,:avatar)"
         " ON CONFLICT(peer_id) DO UPDATE SET"
         "   name=excluded.name, subtitle=excluded.subtitle, keys=excluded.keys,"
-        "   is_blocked=excluded.is_blocked, is_group=excluded.is_group, group_id=excluded.group_id;"
+        "   is_blocked=excluded.is_blocked, is_group=excluded.is_group, group_id=excluded.group_id,"
+        "   avatar=excluded.avatar;"
         );
     q.bindValue(":peer_id",   key);
     q.bindValue(":name",      encryptField(chat.name));
