@@ -100,9 +100,10 @@ else()
 endif()
 
 # --- 5. Link Dependencies ---
-# Suppress qDebug output in non-Debug builds so sensitive debug info is not baked in
+# Suppress qDebug output only for explicit non-Debug configurations so
+# single-config generators with an unset CMAKE_BUILD_TYPE keep local debug output.
 target_compile_definitions(Peer2Pear_QtProj PRIVATE
-    $<$<NOT:$<CONFIG:Debug>>:QT_NO_DEBUG_OUTPUT>
+    $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>:QT_NO_DEBUG_OUTPUT>
 )
 
 target_link_libraries(Peer2Pear_QtProj PRIVATE
