@@ -47,7 +47,7 @@ void NiceConnection::initIce(bool controlling) {
             m_turnHost.toUtf8().constData(), m_turnPort,
             m_turnUser.toUtf8().constData(), m_turnPass.toUtf8().constData(),
             NICE_RELAY_TYPE_TURN_UDP);
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[ICE] TURN relay configured:" << m_turnHost << ":" << m_turnPort;
 #endif
     }
@@ -64,12 +64,12 @@ void NiceConnection::initIce(bool controlling) {
 void NiceConnection::setRemoteSdp(const QString& sdp) {
     if (m_agent) {
         int parsed = nice_agent_parse_remote_sdp(m_agent, sdp.toUtf8().constData());
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[ICE] setRemoteSdp: parsed" << parsed << "candidates"
                  << "| sdp length:" << sdp.size();
 #endif
     } else {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[ICE] setRemoteSdp: agent is null!";
 #endif
     }
@@ -93,7 +93,7 @@ void NiceConnection::cbCandidateGatheringDone(NiceAgent* agent, guint stream_id,
     NiceConnection* self = static_cast<NiceConnection*>(data);
     gchar* sdp = nice_agent_generate_local_sdp(agent);
     QString sdpStr = QString::fromUtf8(sdp);
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[ICE] Candidate gathering done | sdp length:" << sdpStr.size();
 #endif
     emit self->localSdpReady(sdpStr);
@@ -109,7 +109,7 @@ void NiceConnection::cbComponentStateChanged(NiceAgent* agent, guint stream_id, 
         "CONNECTED", "READY", "FAILED", "LAST"
     };
     const char* name = (state < 7) ? stateNames[state] : "UNKNOWN";
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[ICE] State changed:" << name << "(" << state << ")";
 #endif
 

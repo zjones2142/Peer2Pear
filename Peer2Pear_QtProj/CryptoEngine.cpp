@@ -205,7 +205,7 @@ bool CryptoEngine::loadIdentityFromDisk() {
     m_edPub = pub;
     m_edPriv = priv;
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[CryptoEngine] Identity loaded from:" << path;
 #endif
 
@@ -252,7 +252,7 @@ bool CryptoEngine::saveIdentityToDisk() const {
     f.close();
 
     // Print path to Qt console
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[CryptoEngine] Identity saved to:" << path;
 #endif
     return true;

@@ -111,7 +111,7 @@ RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
     s.m_sendChainKey = sendChain;
     // Receiving chain is empty until we get peer's first DH ratchet message
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Ratchet] initAsInitiator: session created";
 #endif
     return s;
@@ -156,7 +156,7 @@ RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
     s.m_rootKey      = rk2;
     s.m_sendChainKey = sendChain;
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Ratchet] initAsResponder: session created";
 #endif
     return s;
@@ -227,7 +227,7 @@ QByteArray RatchetSession::encrypt(const QByteArray& plaintext) {
     header.prevChainLen = m_prevChainLen;
     header.messageNum   = m_sendMsgNum++;
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Ratchet] encrypt: msgNum=" << header.messageNum;
 #endif
 
@@ -338,7 +338,7 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
     }
 
     QByteArray ciphertext = headerAndCiphertext.mid(headerLen);
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Ratchet] decrypt: msgNum=" << header.messageNum
              << "prevChain=" << header.prevChainLen;
 #endif
@@ -349,14 +349,14 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
 
     // If the DH key changed, perform a DH ratchet step
     if (header.dhPub != m_remoteDhPub) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[Ratchet] DH ratchet step";
 #endif
         // Skip any remaining messages in the current receiving chain
         if (!skipMessageKeys(m_remoteDhPub, header.prevChainLen))
             return {};
         dhRatchetStep(header.dhPub);
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[Ratchet] ratchet step complete";
 #endif
     }

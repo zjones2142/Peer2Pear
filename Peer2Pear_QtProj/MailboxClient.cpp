@@ -30,7 +30,7 @@ void MailboxClient::enqueue(const QString& toIdB64u,
     req.setRawHeader("X-TtlMs", QByteArray::number(ttlMs));
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Mailbox] Enqueue to" << toIdB64u.left(8) + "..."
              << "| size:" << envelopeBytes.size() << "B | ttl:" << ttlMs << "ms";
 #endif
@@ -43,7 +43,7 @@ void MailboxClient::enqueue(const QString& toIdB64u,
             QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
         if (rep->error() == QNetworkReply::NoError) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[Mailbox] Enqueue OK to" << toIdB64u.left(8) + "...";
 #endif
             rep->deleteLater();
@@ -192,7 +192,7 @@ void MailboxClient::fetch(const QString& myIdB64u)
                 const QString    envId = QString::fromUtf8(rep->rawHeader("X-EnvId"));
                 rep->deleteLater();
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[Mailbox] Fetched envelope | size:" << body.size() << "B | envId:" << envId.left(8);
 #endif
                 emit envelopeReceived(body, envId);

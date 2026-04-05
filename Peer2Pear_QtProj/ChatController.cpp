@@ -77,7 +77,7 @@ ChatController::ChatController(QObject* parent)
             }
         }
         for (const QString &key : toRemove) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[ICE] Cleaning up stale connection to" << key.left(8) + "...";
 #endif
             m_p2pConnections[key]->deleteLater();
@@ -139,7 +139,7 @@ void ChatController::setDatabase(QSqlDatabase db)
         QByteArray sealed = SealedEnvelope::seal(
             recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), blob);
         if (sealed.isEmpty()) return;
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "...";
 #endif
 
@@ -194,12 +194,12 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
 
     if (m_p2pConnections.contains(peerIdB64u) &&
         m_p2pConnections[peerIdB64u]->isReady()) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND P2P] sealed text to" << peerIdB64u.left(8) + "...";
 #endif
         m_p2pConnections[peerIdB64u]->sendData(sealedEnv);
     } else {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND MAILBOX] sealed text to" << peerIdB64u.left(8) + "...";
 #endif
         m_mbox.enqueue(peerIdB64u, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
@@ -255,7 +255,7 @@ QString ChatController::sendFile(const QString& peerIdB64u,
 
     // Extract the ratchet-derived key for chunk encryption
     QByteArray fileKey = m_sessionMgr->lastMessageKey();
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[FILE] file_key announced for" << transferId.left(8) + "..."
              << "to" << peerIdB64u.left(8) + "...";
 #endif
@@ -305,7 +305,7 @@ QString ChatController::sendGroupFile(const QString& groupId,
         m_mbox.enqueue(peerId, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
 
         QByteArray fileKey = m_sessionMgr->lastMessageKey();
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[FILE] file_key announced for" << transferId.left(8) + "..."
                  << "to" << peerId.left(8) + "...";
 #endif
@@ -354,7 +354,7 @@ void ChatController::setTurnServer(const QString& host, int port,
     m_turnPort = port;
     m_turnUser = username;
     m_turnPass = password;
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[ChatController] TURN server set:" << host << ":" << port;
 #endif
 }
@@ -402,7 +402,7 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         QByteArray env = sealForPeer(peerId, pt);
         if (!env.isEmpty()) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[SEND MAILBOX] sealed group_msg to" << peerId.left(8) + "...";
 #endif
             m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
@@ -439,7 +439,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         QByteArray env = sealForPeer(peerId, pt);
         if (!env.isEmpty()) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[SEND MAILBOX] sealed group_leave to" << peerId.left(8) + "...";
 #endif
             m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
@@ -535,7 +535,7 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
 
     QByteArray env = sealForPeer(peerIdB64u, pt);
     if (!env.isEmpty()) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND MAILBOX] sealed" << type << "to" << peerIdB64u.left(8) + "...";
 #endif
         m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
@@ -599,7 +599,7 @@ void ChatController::initiateP2PConnection(const QString& peerIdB64u)
 
 void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data)
 {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[ChatController] P2P data received from" << peerIdB64u.left(8) + "..."
              << "| size:" << data.size() << "B";
 #endif
@@ -609,7 +609,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
 
     // ── Sealed envelope over P2P ─────────────────────────────────────────────
     if (data.startsWith(kSealedPrefix) || data.startsWith(kSealedFCPrefix)) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV P2P] sealed envelope from" << peerIdB64u.left(8) + "...";
 #endif
         onEnvelope(data, QString());
@@ -618,7 +618,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
 
     // ── File chunk received over P2P (legacy) ────────────────────────────────
     if (data.startsWith(kFilePrefix)) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV P2P] file chunk from" << peerIdB64u.left(8) + "...";
 #endif
         onEnvelope(data, QString());
@@ -631,7 +631,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
         if (!pt.isEmpty()) {
             const auto o = QJsonDocument::fromJson(pt).object();
             if (o.value("type").toString() == "text") {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV P2P] ratchet text from" << peerIdB64u.left(8) + "...";
 #endif
                 const QString msgId = o.value("msgId").toString();
@@ -644,7 +644,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     }
 
     // ── Legacy encrypted JSON message ────────────────────────────────────────
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[RECV P2P] legacy text from" << peerIdB64u.left(8) + "...";
 #endif
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
@@ -680,7 +680,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
         const bool isFileChunk = header.startsWith(kSealedFCPrefix);
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV" << via << "] sealed envelope | size:" << rest.size() << "B"
                  << (isFileChunk ? "(file chunk)" : "");
 #endif
@@ -693,7 +693,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         }
 
         QString senderId = CryptoEngine::toBase64Url(unsealed.senderEdPub);
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV" << via << "] unsealed OK | sender:" << senderId.left(8) + "..."
                  << "| inner:" << unsealed.innerPayload.size() << "B";
 #endif
@@ -719,7 +719,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                 return;
             }
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[RECV" << via << "] sealed file chunk from" << senderId.left(8) + "...";
 #endif
             m_fileMgr.handleFileEnvelope(senderId, unsealed.innerPayload,
@@ -744,11 +744,11 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             // a ratchet session inside decryptFromPeer(), but returns no user payload.
             // This is expected — future messages will use the ratchet session.
             if (!unsealed.innerPayload.isEmpty() && static_cast<quint8>(unsealed.innerPayload[0]) == 0x02) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
 #endif
             } else {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";
 #endif
             }
@@ -764,7 +764,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         const QDateTime ts = tsFromSecs(tsSecs);
         const QString msgId = o.value("msgId").toString();
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV" << via << "] sealed type:" << type << "from" << senderId.left(8) + "...";
 #endif
 
@@ -808,13 +808,13 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         } else if (type == "group_avatar") {
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
         } else if (type == "ice_offer") {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
 #endif
             // Skip if we already have a working P2P connection
             if (m_p2pConnections.contains(senderId) &&
                 m_p2pConnections[senderId]->isReady()) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[ICE] Already connected to" << senderId.left(8) + "... — ignoring ice_offer";
 #endif
             } else {
@@ -823,7 +823,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
             }
         } else if (type == "ice_answer") {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[RECV" << via << "] ice_answer from" << senderId.left(8) + "...";
 #endif
             if (m_p2pConnections.contains(senderId) &&
@@ -839,7 +839,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                 m_fileKeys[compoundKey] = msgKey;  // M3+M4 fix
                 m_fileKeyTimes[compoundKey] = QDateTime::currentSecsSinceEpoch();  // M8 fix
                 sodium_memzero(msgKey.data(), msgKey.size());
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[FILE] stored ratchet key for transfer" << transferId.left(8) + "..."
                          << "from" << senderId.left(8) + "...";
 #endif
@@ -856,7 +856,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     // ── File chunk envelope ─────────────────────────────────────────────────
     if (header.startsWith(kFilePrefix)) {
         const QString fromId = QString::fromUtf8(header.mid(kFilePrefix.size())).trimmed();
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV" << via << "] file chunk from" << fromId.left(8) + "...";
 #endif
         m_fileMgr.handleFileEnvelope(fromId, rest,
@@ -888,7 +888,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         return;
     }
 
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[RECV" << via << "] legacy type:" << type << "from" << fromId.left(8) + "...";
 #endif
 
@@ -905,7 +905,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
     } else if (type == "ice_offer") {
         if (m_p2pConnections.contains(fromId) &&
             m_p2pConnections[fromId]->isReady()) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[ICE] Already connected to" << fromId.left(8) + "... — ignoring ice_offer";
 #endif
         } else {
@@ -951,7 +951,7 @@ void ChatController::resetSession(const QString& peerIdB64u)
 {
     if (m_sessionMgr) {
         m_sessionMgr->deleteSession(peerIdB64u);
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SESSION] Reset ratchet session for" << peerIdB64u.left(8) + "...";
 #endif
         emit status("Session reset — next message will establish a fresh handshake.");

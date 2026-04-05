@@ -212,7 +212,7 @@ void SessionStore::clearAll() {
     q.exec("DELETE FROM ratchet_sessions;");
     q.exec("DELETE FROM skipped_message_keys;");
     q.exec("DELETE FROM pending_handshakes;");
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[SessionStore] Cleared all sessions, skipped keys, and pending handshakes";
 #endif
 }
@@ -263,7 +263,7 @@ void SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
     q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
     q.bindValue(":cutoff", cutoff);
     if (q.exec() && q.numRowsAffected() > 0) {
-#ifndef QT_NO_DEBUG
+#ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SessionStore] Pruned" << q.numRowsAffected() << "stale pending handshakes";
 #endif
     }
