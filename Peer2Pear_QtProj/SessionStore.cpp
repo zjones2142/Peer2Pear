@@ -262,8 +262,9 @@ void SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
     QSqlQuery q(m_db);
     q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
     q.bindValue(":cutoff", cutoff);
-    if (q.exec() && q.numRowsAffected() > 0)
+    if (q.exec() && q.numRowsAffected() > 0) {
 #ifndef QT_NO_DEBUG
         qDebug() << "[SessionStore] Pruned" << q.numRowsAffected() << "stale pending handshakes";
 #endif
+    }
 }
