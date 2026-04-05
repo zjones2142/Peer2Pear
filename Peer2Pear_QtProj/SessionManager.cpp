@@ -264,12 +264,13 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         QByteArray prekeyKey = CryptoEngine::hkdf(
             noise.postMsg1ChainingKey(), QByteArray("prekey-salt"), QByteArray("prekey-payload"), 32);
         QByteArray pt = m_crypto.aeadDecrypt(prekeyKey, encPayload);
-        if (!pt.isEmpty())
+        if (!pt.isEmpty()) {
 #ifndef QT_NO_DEBUG
             qDebug() << "[SessionManager] Pre-key payload decrypted OK |" << pt.size() << "B";
 #endif
-        else
+        } else {
             qWarning() << "[SessionManager] Pre-key payload decryption FAILED";
+        }
 
         // Send back the Noise msg2 as a pre-key response
         if (m_sendResponse) {
