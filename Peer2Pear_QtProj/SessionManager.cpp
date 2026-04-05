@@ -265,7 +265,7 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         // Initialize ratchet with the initiator's fresh ratchet DH pub (from wire format)
         // This lets us derive both recv and send chains immediately — no LEGACY fallback
         RatchetSession ratchet = RatchetSession::initAsResponder(
-            hr.sendCipher.key, ephPub, ephPriv, initiatorRatchetDhPub);
+            hr.sendCipher.key, ephPub, ephPriv, initiatorRatchetDhPub, hybrid);
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);
@@ -356,7 +356,8 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         QByteArray responderEphPub = noiseMsg2.left(32);
 
         RatchetSession ratchet = RatchetSession::initAsInitiator(
-            hr.recvCipher.key, responderEphPub, ratchetDhPub, ratchetDhPriv);
+            hr.recvCipher.key, responderEphPub, ratchetDhPub, ratchetDhPriv,
+            noise.isHybrid());
         // L4 fix: zero extracted private key now that ratchet owns it
         sodium_memzero(ratchetDhPriv.data(), ratchetDhPriv.size());
         sodium_memzero(pendingBlob.data(), pendingBlob.size());

@@ -4,11 +4,13 @@
 #include <QPair>
 
 /*
- * Double Ratchet Algorithm (Signal-style)
+ * Double Ratchet Algorithm — hybrid X25519 + ML-KEM-768
  *
  * Initialized from the output of a Noise handshake (root key + DH keys).
  * Provides forward secrecy and post-compromise security via:
  *   - DH ratchet: new ephemeral X25519 keypair on each reply
+ *   - KEM ratchet (hybrid): ML-KEM-768 encaps/decaps mixed into root key,
+ *     runs one step behind the DH ratchet for PQ protection
  *   - Symmetric ratchet: KDF chain for per-message keys
  *
  * Skipped message keys are cached (bounded) for out-of-order delivery.
@@ -19,10 +21,15 @@ struct RatchetHeader {
     quint32    prevChainLen;   // number of messages in previous sending chain
     quint32    messageNum;     // index in current sending chain
 
+    // PQ hybrid fields (may be empty for classical sessions)
+    QByteArray kemPub;         // 1184 bytes — sender's current KEM ratchet public key
+    QByteArray kemCt;          // 1088 bytes — KEM ciphertext encapsulated to peer's last KEM pub
+                               //              (empty if we haven't received peer's KEM pub yet)
+
     QByteArray serialize() const;
     static RatchetHeader deserialize(const QByteArray& data, int& bytesRead);
 
-    static constexpr int kSerializedSize = 32 + 4 + 4; // 40 bytes
+    static constexpr int kClassicalSize = 32 + 4 + 4; // 40 bytes
 };
 
 class RatchetSession {
@@ -34,19 +41,23 @@ public:
     // rootKey = derived from Noise chaining key
     // remoteDhPub = responder's initial DH public key (from Noise ephemeral)
     // localDhPub/Priv = our initial DH keypair (Noise ephemeral, so responder knows it)
+    // hybrid = true if this session should use ML-KEM-768 ratchet augmentation
     static RatchetSession initAsInitiator(const QByteArray& rootKey,
                                           const QByteArray& remoteDhPub,
                                           const QByteArray& localDhPub,
-                                          const QByteArray& localDhPriv);
+                                          const QByteArray& localDhPriv,
+                                          bool hybrid = false);
 
     // Initialize as the responder after Noise handshake
     // rootKey = derived from Noise chaining key
     // localDhPub/Priv = our initial DH keypair (Noise ephemeral)
     // remoteDhPub = initiator's initial DH pub (Noise ephemeral from msg1)
+    // hybrid = true if this session should use ML-KEM-768 ratchet augmentation
     static RatchetSession initAsResponder(const QByteArray& rootKey,
                                           const QByteArray& localDhPub,
                                           const QByteArray& localDhPriv,
-                                          const QByteArray& remoteDhPub);
+                                          const QByteArray& remoteDhPub,
+                                          bool hybrid = false);
 
     // Encrypt a plaintext message
     // Returns serialized header + ciphertext
@@ -78,7 +89,9 @@ private:
     static QPair<QByteArray, QByteArray> kdfChainKey(const QByteArray& chainKey);
 
     // Perform a DH ratchet step when we receive a new remote DH key
-    void dhRatchetStep(const QByteArray& remoteDhPub);
+    // kemCt: KEM ciphertext from the peer (empty if peer hasn't sent one)
+    void dhRatchetStep(const QByteArray& remoteDhPub,
+                       const QByteArray& kemCt = {});
 
     // Try to decrypt using a skipped message key
     QByteArray trySkippedKeys(const RatchetHeader& header,
@@ -95,6 +108,14 @@ private:
     QByteArray m_dhPub;            // 32 bytes — our current DH ratchet pub
     QByteArray m_dhPriv;           // 32 bytes — our current DH ratchet priv
     QByteArray m_remoteDhPub;      // 32 bytes — peer's current DH ratchet pub
+
+    // ML-KEM-768 ratchet state (hybrid mode)
+    bool       m_hybrid = false;
+    QByteArray m_kemPub;           // 1184 — our current KEM ratchet pub
+    QByteArray m_kemPriv;          // 2400 — our current KEM ratchet priv
+    QByteArray m_remoteKemPub;     // 1184 — peer's current KEM ratchet pub (for encaps on next send)
+    QByteArray m_pendingKemCt;     // 1088 — KEM ciphertext to include in next message header
+                                   //         (produced during dhRatchetStep, consumed during encrypt)
 
     quint32 m_sendMsgNum = 0;      // messages sent in current chain
     quint32 m_recvMsgNum = 0;      // messages received in current chain
