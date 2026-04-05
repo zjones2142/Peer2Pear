@@ -58,7 +58,7 @@ void SessionStore::createTables() {
 // ---------------------------
 
 QByteArray SessionStore::encryptBlob(const QByteArray& plaintext) const {
-    if (m_storeKey.size() != 32) return {};
+    if (m_storeKey.size() != 32) return plaintext;
 
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
     randombytes_buf(nonce, sizeof(nonce));
