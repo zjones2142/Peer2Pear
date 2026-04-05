@@ -215,7 +215,10 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
     const QString transferId = meta.value("transferId").toString();
     const int chunkIndex     = meta.value("chunkIndex").toInt(-1);
     const int totalChunks    = meta.value("totalChunks").toInt(0);
-    if (transferId.isEmpty() || chunkIndex < 0 || totalChunks <= 0) return false;
+    if (transferId.isEmpty()
+        || totalChunks <= 0
+        || chunkIndex < 0
+        || chunkIndex >= totalChunks) return false;
 
     // ── Receive-side limits ──────────────────────────────────────────────────
     const qint64 claimedSize = meta.value("fileSize").toVariant().toLongLong();
