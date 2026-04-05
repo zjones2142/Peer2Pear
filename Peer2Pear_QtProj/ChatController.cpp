@@ -448,6 +448,9 @@ bool ChatController::markSeen(const QString& id)
 
 void ChatController::pollOnce()
 {
+    // H3 fix: reset per-sender rate limit counters each poll cycle
+    m_envelopeCount.clear();
+
     // fetchAll retrieves every pending envelope in one authenticated request.
     // Falls back to single fetch() automatically if the server doesn't yet
     // support /mbox/fetch_all (404/405 response).
@@ -458,6 +461,10 @@ void ChatController::pollOnce()
 
     // Purge stale incomplete transfers to bound memory usage
     m_fileMgr.purgeStaleTransfers();
+
+    // H2 fix: prune stuck pending handshakes (5 min timeout, checked every poll)
+    if (m_sessionStore)
+        m_sessionStore->pruneStaleHandshakes();
 
     // M8 fix: purge orphaned file keys older than 30 minutes.
     // If a file_key announcement arrives but chunks never follow (sender crash,
@@ -663,6 +670,15 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         QString senderId = CryptoEngine::toBase64Url(unsealed.senderEdPub);
         qDebug() << "[RECV" << via << "] unsealed OK | sender:" << senderId.left(8) + "..."
                  << "| inner:" << unsealed.innerPayload.size() << "B";
+
+        // H3 fix: rate limit per sender to prevent CPU exhaustion via envelope flooding
+        int& count = m_envelopeCount[senderId];
+        if (++count > kMaxEnvelopesPerSenderPerPoll) {
+            if (count == kMaxEnvelopesPerSenderPerPoll + 1)
+                qWarning() << "[RECV] rate limit hit for" << senderId.left(8) + "..."
+                           << "— dropping further envelopes this cycle";
+            return;
+        }
 
         // M2 fix: Sealed file chunk — pass directly to FileTransferManager.
         // The inner payload is already encrypted with the ratchet-derived file key;

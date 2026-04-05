@@ -88,11 +88,26 @@ UnsealResult SealedEnvelope::unseal(const QByteArray& recipientCurvePriv,
     QByteArray ephPub = sealedBytes.left(kPubLen);
     QByteArray aeadData = sealedBytes.mid(kPubLen);
 
+    // C2 fix: reject all-zeros or low-order ephemeral keys.
+    // crypto_scalarmult returns -1 for these, but we also explicitly check
+    // for an all-zeros key to fail fast before the scalar multiplication.
+    if (sodium_is_zero(reinterpret_cast<const unsigned char*>(ephPub.constData()),
+                       static_cast<size_t>(ephPub.size()))) {
+        return result;
+    }
+
     // 2. ECDH: recipientCurvePriv × ephPub → shared secret
     unsigned char shared[crypto_scalarmult_BYTES];
     if (crypto_scalarmult(shared,
                           reinterpret_cast<const unsigned char*>(recipientCurvePriv.constData()),
                           reinterpret_cast<const unsigned char*>(ephPub.constData())) != 0) {
+        return result;  // low-order point or invalid key rejected by libsodium
+    }
+
+    // C2 fix: verify the shared secret is contributory (not all-zeros).
+    // This catches small-subgroup attacks that crypto_scalarmult might not reject.
+    if (sodium_is_zero(shared, sizeof(shared))) {
+        sodium_memzero(shared, sizeof(shared));
         return result;
     }
 

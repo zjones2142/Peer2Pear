@@ -70,9 +70,15 @@ public:
     // Get the remote static public key (available after handshake)
     const QByteArray& remoteStaticPub() const { return m_rs; }
 
-    // Serialization for persisting mid-handshake state
+    // Serialization for persisting mid-handshake state.
+    // C3 fix: static private key (m_sk) is NOT serialized — it must be
+    // re-injected via setStaticPrivateKey() after deserialization.
     QByteArray serialize() const;
     static NoiseState deserialize(const QByteArray& data);
+
+    // Re-inject the static private key after deserialization (C3 fix).
+    // Must be called before readMessage2() if this is an initiator.
+    void setStaticPrivateKey(const QByteArray& curvePriv) { m_sk = curvePriv; }
 
     Role role() const { return m_role; }
     bool isComplete() const { return m_complete; }

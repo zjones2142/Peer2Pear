@@ -293,6 +293,8 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         QByteArray hsBlob        = pendingBlob.mid(64);
 
         NoiseState noise = NoiseState::deserialize(hsBlob);
+        // C3 fix: re-inject static private key (not persisted since v3)
+        noise.setStaticPrivateKey(m_crypto.curvePriv());
         QByteArray responsePayload;
         if (!noise.readMessage2(noiseMsg2, responsePayload)) {
             qWarning() << "[SessionManager] Failed to process Noise msg2 from" << senderIdB64u.left(8) + "...";
