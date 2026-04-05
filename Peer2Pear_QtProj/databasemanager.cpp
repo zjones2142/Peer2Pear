@@ -33,8 +33,10 @@ bool DatabaseManager::open()
     }
 
     QSqlQuery pragma(m_db);
-    pragma.exec("PRAGMA journal_mode=WAL;");
-    pragma.exec("PRAGMA foreign_keys=ON;");
+    if (!pragma.exec("PRAGMA journal_mode=WAL;"))
+        qWarning() << "DatabaseManager: PRAGMA journal_mode failed:" << pragma.lastError().text();
+    if (!pragma.exec("PRAGMA foreign_keys=ON;"))
+        qWarning() << "DatabaseManager: PRAGMA foreign_keys failed:" << pragma.lastError().text();
 
     createTables();
     qDebug() << "DatabaseManager: opened" << m_db.databaseName();
@@ -239,7 +241,8 @@ void DatabaseManager::saveContact(const ChatData &chat)
         " VALUES (:peer_id,:name,:subtitle,:keys,:is_blocked,:is_group,:group_id,0,:avatar)"
         " ON CONFLICT(peer_id) DO UPDATE SET"
         "   name=excluded.name, subtitle=excluded.subtitle, keys=excluded.keys,"
-        "   is_blocked=excluded.is_blocked, is_group=excluded.is_group, group_id=excluded.group_id;"
+        "   is_blocked=excluded.is_blocked, is_group=excluded.is_group, group_id=excluded.group_id,"
+        "   avatar=excluded.avatar;"
         );
     q.bindValue(":peer_id",   key);
     q.bindValue(":name",      encryptField(chat.name));

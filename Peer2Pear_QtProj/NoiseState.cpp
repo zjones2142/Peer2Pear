@@ -86,6 +86,9 @@ QByteArray NoiseState::decryptAndHash(const QByteArray& ciphertext) {
         nonce[i] = static_cast<unsigned char>((m_n >> (8 * i)) & 0xff);
     }
 
+    if (static_cast<size_t>(ciphertext.size()) < crypto_aead_xchacha20poly1305_ietf_ABYTES)
+        return {};
+
     QByteArray pt;
     pt.resize(ciphertext.size() - crypto_aead_xchacha20poly1305_ietf_ABYTES);
     unsigned long long plen = 0;
