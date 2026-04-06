@@ -72,7 +72,7 @@ ChatController::ChatController(QObject* parent)
     connect(iceCleanup, &QTimer::timeout, this, [this]() {
         QStringList toRemove;
         for (auto it = m_p2pConnections.begin(); it != m_p2pConnections.end(); ++it) {
-            if (!it.value()->isReady() && !it.value()->isRunning()) {
+            if (!it.value()->isReady()) {
                 toRemove << it.key();
             }
         }
@@ -172,6 +172,16 @@ void ChatController::setDatabase(QSqlDatabase db)
         if (sealed.isEmpty()) return {};
 
         return kSealedFCPrefix + "\n" + sealed;
+    });
+    // QUIC P2P file send callback: try sending file chunks directly via QUIC stream
+    m_fileMgr.setP2PFileSendFn([this](const QString& peerId, const QByteArray& data) -> bool {
+        if (m_p2pConnections.contains(peerId) &&
+            m_p2pConnections[peerId]->isReady() &&
+            m_p2pConnections[peerId]->quicActive()) {
+            m_p2pConnections[peerId]->sendFileData(data);
+            return true;
+        }
+        return false;  // fall back to mailbox
     });
 }
 
@@ -584,28 +594,41 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
                     .arg(type));
 }
 
-// ── L2 fix: shared ICE connection setup ──────────────────────────────────────
-NiceConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bool controlling)
+// ── QUIC + ICE connection setup ──────────────────────────────────────────────
+QuicConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bool controlling)
 {
-    NiceConnection* conn = new NiceConnection(this);
+    QuicConnection* conn = new QuicConnection(this);
     if (!m_turnHost.isEmpty())
         conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
     m_p2pConnections[peerIdB64u] = conn;
 
     const QString iceType = controlling ? "ice_offer" : "ice_answer";
-    connect(conn, &NiceConnection::localSdpReady, this, [this, peerIdB64u, iceType](const QString& sdp) {
+    connect(conn, &QuicConnection::localSdpReady, this, [this, peerIdB64u, iceType, conn](const QString& sdp) {
         QJsonObject p;
         p["type"] = iceType;
         p["from"] = myIdB64u();
         p["sdp"]  = sdp;
-        sendSealedPayload(peerIdB64u, p);   // S8 fix: use sealed path for ICE signaling
+        // Advertise QUIC capability + fingerprint
+        p["quic"] = true;
+        p["quic_fingerprint"] = conn->localQuicFingerprint();
+        sendSealedPayload(peerIdB64u, p);
     });
-    connect(conn, &NiceConnection::stateChanged, this, [this, peerIdB64u](int state) {
-        if      (state == NICE_COMPONENT_STATE_READY)  emit status("P2P ready with " + peerIdB64u);
-        else if (state == NICE_COMPONENT_STATE_FAILED) emit status("P2P failed for " + peerIdB64u);
+    connect(conn, &QuicConnection::stateChanged, this, [this, peerIdB64u, conn](int state) {
+        if (state == NICE_COMPONENT_STATE_READY) {
+            const QString mode = conn->quicActive() ? "QUIC" : "ICE";
+            emit status("P2P ready (" + mode + ") with " + peerIdB64u);
+        } else if (state == NICE_COMPONENT_STATE_FAILED) {
+            emit status("P2P failed for " + peerIdB64u);
+        }
     });
-    connect(conn, &NiceConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& d) {
+    connect(conn, &QuicConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& d) {
         onP2PDataReceived(peerIdB64u, d);
+    });
+    connect(conn, &QuicConnection::fileDataReceived, this, [this, peerIdB64u](const QByteArray& d) {
+        // File data received via QUIC file stream — route to FileTransferManager
+        m_fileMgr.handleFileEnvelope(peerIdB64u, d,
+            [this](const QString& id) { return markSeen(id); },
+            m_fileKeys);
     });
     conn->initIce(controlling);
     return conn;
@@ -852,7 +875,12 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 #endif
             } else {
                 if (!m_p2pConnections.contains(senderId))
-                    setupP2PConnection(senderId, false);  // L2 fix
+                    setupP2PConnection(senderId, false);
+                // Pass QUIC capability from signaling
+                if (o.value("quic").toBool()) {
+                    m_p2pConnections[senderId]->setPeerSupportsQuic(
+                        true, o.value("quic_fingerprint").toString());
+                }
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
             }
         } else if (type == "ice_answer") {
@@ -860,8 +888,13 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             qDebug() << "[RECV" << via << "] ice_answer from" << senderId.left(8) + "...";
 #endif
             if (m_p2pConnections.contains(senderId) &&
-                !m_p2pConnections[senderId]->isReady())
+                !m_p2pConnections[senderId]->isReady()) {
+                if (o.value("quic").toBool()) {
+                    m_p2pConnections[senderId]->setPeerSupportsQuic(
+                        true, o.value("quic_fingerprint").toString());
+                }
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
+            }
         } else if (type == "file_key") {
             // File key announcement: store the ratchet-derived key for chunk decryption.
             // M4 fix: key on senderId:transferId to avoid collisions when multiple
@@ -969,13 +1002,22 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 #endif
         } else {
             if (!m_p2pConnections.contains(fromId))
-                setupP2PConnection(fromId, false);  // L2 fix
+                setupP2PConnection(fromId, false);
+            if (o.value("quic").toBool()) {
+                m_p2pConnections[fromId]->setPeerSupportsQuic(
+                    true, o.value("quic_fingerprint").toString());
+            }
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
         }
     } else if (type == "ice_answer") {
         if (m_p2pConnections.contains(fromId) &&
-            !m_p2pConnections[fromId]->isReady())
+            !m_p2pConnections[fromId]->isReady()) {
+            if (o.value("quic").toBool()) {
+                m_p2pConnections[fromId]->setPeerSupportsQuic(
+                    true, o.value("quic_fingerprint").toString());
+            }
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "NiceConnection.hpp"
+#include "QuicConnection.hpp"
 #include <QObject>
 #include <QTimer>
 #include <QSet>
@@ -127,7 +127,7 @@ private slots:
 private:
     QByteArray sealForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
     void sendSealedPayload(const QString& peerIdB64u, const QJsonObject& payload);
-    NiceConnection* setupP2PConnection(const QString& peerIdB64u, bool controlling);
+    QuicConnection* setupP2PConnection(const QString& peerIdB64u, bool controlling);
     void initiateP2PConnection(const QString& peerIdB64u);
 
     // ── Deduplication ─────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ private:
     QTimer      m_pollTimer;
     QStringList m_selfKeys;
 
-    QMap<QString, NiceConnection*> m_p2pConnections;
+    QMap<QString, QuicConnection*> m_p2pConnections;
 
     // G5 fix: per-group outbound sequence counter (monotonic, not persisted)
     QMap<QString, qint64> m_groupSeqOut;

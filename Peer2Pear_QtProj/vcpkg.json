@@ -5,6 +5,7 @@
     "libsodium",
     "libnice",
     "glib",
-    "liboqs"
+    "liboqs",
+    "msquic"
   ]
 }

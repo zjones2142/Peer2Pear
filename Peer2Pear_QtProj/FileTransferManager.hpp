@@ -35,6 +35,11 @@ public:
     // Set the callback for sealing file chunk envelopes (M2 fix).
     void setSealFn(SealFn fn) { m_sealFn = std::move(fn); }
 
+    // Callback for sending file chunks via P2P QUIC stream.
+    // Returns true if sent successfully, false to fall back to mailbox.
+    using SendFileP2PFn = std::function<bool(const QString& peerIdB64u, const QByteArray& chunk)>;
+    void setP2PFileSendFn(SendFileP2PFn fn) { m_p2pFileSendFn = std::move(fn); }
+
     // The server enforces MAX_ENVELOPE_BYTES = 256 KB (262 144 bytes).
     //
     // Per-envelope overhead budget:
@@ -133,4 +138,5 @@ private:
     CryptoEngine& m_crypto;
     MailboxClient& m_mbox;
     SealFn m_sealFn;
+    SendFileP2PFn m_p2pFileSendFn;
 };

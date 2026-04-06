@@ -28,6 +28,13 @@ public:
     // Check if the ICE connection is established
     bool isReady() const;
 
+    // Get the selected peer's transport address after ICE completes.
+    // Returns true and populates host/port. Returns false if not ready.
+    bool getSelectedPeerAddress(QString& host, quint16& port) const;
+
+    // Check if the selected candidate pair uses a TURN relay.
+    bool isRelayed() const;
+
 signals:
     void localSdpReady(const QString& sdp);
     void stateChanged(int state); // Emits NiceComponentState
