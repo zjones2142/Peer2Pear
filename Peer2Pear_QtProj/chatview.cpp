@@ -2,6 +2,7 @@
 #include "ui_mainwindow.h"
 
 #include <algorithm>
+#include <memory>
 #include <utility>
 #include <QLabel>
 #include <QVBoxLayout>
@@ -2235,9 +2236,11 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
     auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
     if (!layout) return;
     layout->insertWidget(layout->count()-1, row);
-    QTimer::singleShot(5,[this](){
-        m_ui->messageScroll->verticalScrollBar()->setValue(
-            m_ui->messageScroll->verticalScrollBar()->maximum());
+    auto *sb1 = m_ui->messageScroll->verticalScrollBar();
+    auto conn1 = std::make_shared<QMetaObject::Connection>();
+    *conn1 = connect(sb1, &QScrollBar::rangeChanged, this, [sb1, conn1](int, int max){
+        sb1->setValue(max);
+        QObject::disconnect(*conn1);
     });
 }
 
@@ -2290,9 +2293,11 @@ void ChatView::addFileBubble(const QString &fileName, qint64 fileSize, bool sent
     }
 
     layout->insertWidget(layout->count() - 1, row);
-    QTimer::singleShot(5, [this]{
-        m_ui->messageScroll->verticalScrollBar()->setValue(
-            m_ui->messageScroll->verticalScrollBar()->maximum());
+    auto *sb2 = m_ui->messageScroll->verticalScrollBar();
+    auto conn2 = std::make_shared<QMetaObject::Connection>();
+    *conn2 = connect(sb2, &QScrollBar::rangeChanged, this, [sb2, conn2](int, int max){
+        sb2->setValue(max);
+        QObject::disconnect(*conn2);
     });
 }
 
