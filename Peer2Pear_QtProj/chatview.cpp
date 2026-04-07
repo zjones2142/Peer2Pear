@@ -853,11 +853,13 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         promoteChatToTop(idx);
         rebuildChatList();
     } else {
+        const QString chatName = chat.name;
+
         m_unread[idx] += 1;
         emit unreadChanged(totalUnread());
         promoteChatToTop(idx);
         rebuildChatList();
-        if (m_notifier) m_notifier->notify(chat.name, text);
+        if (m_notifier) m_notifier->notify(chatName, text);
     }
 }
 

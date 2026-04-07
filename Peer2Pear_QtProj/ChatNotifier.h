@@ -6,6 +6,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QStyle>
+#include <QTimer>
 
 // ── ChatNotifier ──────────────────────────────────────────────────────────────
 // Wraps QSystemTrayIcon to deliver chat message balloon notifications.
@@ -52,16 +53,15 @@ public slots:
     {
         if (!m_enabled || !m_trayIcon) return;
 
+        const QString title = senderName;
         const QString body = messageText.length() > 80
                                  ? messageText.left(77) + "…"
                                  : messageText;
 
-        m_trayIcon->showMessage(
-            senderName,
-            body,
-            QSystemTrayIcon::Information,
-            4000
-            );
+        QTimer::singleShot(0, this, [this, title, body]() {
+            if (m_trayIcon && m_trayIcon->isVisible())
+                m_trayIcon->showMessage(title, body, QSystemTrayIcon::Information, 4000);
+        });
     }
 
 private:
