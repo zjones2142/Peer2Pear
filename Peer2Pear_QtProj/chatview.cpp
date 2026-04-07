@@ -819,6 +819,12 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     }
     if (keysUpdated && m_db)
         m_db->saveContact(chat); // persist the updated key list
+
+    // If text is empty this was a member-update-only message (no chat bubble needed).
+    // Key merge above already ran, so just bail out.
+    if (text.isEmpty())
+        return;
+
     if (!msgId.isEmpty())
         for (const Message &m : std::as_const(chat.messages))
             if (m.msgId == msgId) return;
@@ -854,6 +860,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         if (m_notifier) m_notifier->notify(chat.name, text);
     }
 }
+
 void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
                                  const QString& groupId,
                                  const QString& groupName,
@@ -1669,6 +1676,7 @@ void ChatView::onEditContact(int index)
     const bool  wasGroup   = m_chats[index].isGroup;
     const QString oldName  = name;
     const QString oldAvatar = avatar;
+    const QStringList oldKeys = keys;
 
     const ContactEditorResult result =
         openContactEditor(m_ui->centralwidget,
@@ -1685,7 +1693,7 @@ void ChatView::onEditContact(int index)
                           wasGroup ? &avatar : nullptr);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
-        // Validate key format for 1:1 contacts
+        // Validate key format and prevent duplicate keys — 1:1 contacts only
         if (!wasGroup) {
             if (keys.isEmpty()) {
                 QMessageBox::warning(m_ui->centralwidget, "Missing Key",
@@ -1697,22 +1705,22 @@ void ChatView::onEditContact(int index)
                                      "Public key must be exactly 43 base64url characters.");
                 return;
             }
-        }
 
-        // Prevent duplicate keys: check if any new key collides with another contact
-        bool conflict = false;
-        for (const QString &k : std::as_const(keys)) {
-            for (int i = 0; i < m_chats.size(); ++i) {
-                if (i == index || m_chats[i].isGroup) continue;
-                if (m_chats[i].peerIdB64u == k || m_chats[i].keys.contains(k)) {
-                    QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
-                        QString("Key already belongs to contact \"%1\".").arg(m_chats[i].name));
-                    conflict = true; break;
+            // Prevent duplicate keys: check if any new key collides with another contact.
+            bool conflict = false;
+            for (const QString &k : std::as_const(keys)) {
+                for (int i = 0; i < m_chats.size(); ++i) {
+                    if (i == index || m_chats[i].isGroup) continue;
+                    if (m_chats[i].peerIdB64u == k || m_chats[i].keys.contains(k)) {
+                        QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
+                                             QString("Key already belongs to contact \"%1\".").arg(m_chats[i].name));
+                        conflict = true; break;
+                    }
                 }
+                if (conflict) break;
             }
-            if (conflict) break;
+            if (conflict) return;
         }
-        if (conflict) return;
 
         m_chats[index].name = name; m_chats[index].keys = keys;
         if (wasGroup) m_chats[index].avatarData = avatar;
@@ -1731,6 +1739,8 @@ void ChatView::onEditContact(int index)
                 m_controller->sendGroupRename(m_chats[index].groupId, name, keys);
             if (avatar != oldAvatar)
                 m_controller->sendGroupAvatar(m_chats[index].groupId, avatar, keys);
+            if (keys != oldKeys)
+                m_controller->sendGroupMemberUpdate(m_chats[index].groupId, m_chats[index].name, keys);
         }
     } else if (result == ContactEditorResult::Removed) {
         // Use the same key logic as saveContact

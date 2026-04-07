@@ -823,6 +823,22 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
         } else if (type == "group_avatar") {
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
+        } else if (type == "group_member_update") {
+            const QString gid       = o.value("groupId").toString();
+            const QString gname     = o.value("groupName").toString();
+            QStringList memberKeys;
+            for (const QJsonValue &v : o.value("members").toArray())
+                memberKeys << v.toString();
+
+            // Re-use the existing groupMessageReceived signal — the
+            // ChatView::onIncomingGroupMessage handler already merges new
+            // member keys into the group's key list.
+            // Empty text means no chat bubble appears, but the key merge still happens.
+            emit groupMessageReceived(senderId, gid, gname, memberKeys,
+                                      QString(),
+                                      QDateTime::fromSecsSinceEpoch(
+                                          o.value("ts").toVariant().toLongLong()),
+                                      QUuid::createUuid().toString(QUuid::WithoutBraces));
         } else if (type == "ice_offer") {
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
@@ -960,6 +976,36 @@ void ChatController::sendGroupAvatar(const QString& groupId,
     payload["avatar"]  = avatarB64;
     for (const QString &key : memberKeys)
         sendSealedPayload(key, payload);   // S7 fix
+}
+
+void ChatController::sendGroupMemberUpdate(const QString& groupId,
+                                           const QString& groupName,
+                                           const QStringList& memberKeys)
+{
+    const QString myId = myIdB64u();
+
+    // Build the member array (excluding self, matching group_msg format)
+    QJsonArray membersArray;
+    for (const QString &key : memberKeys) {
+        if (key.trimmed() == myId) continue;
+        membersArray.append(key);
+    }
+
+    // Send to ALL members (including newly added ones) so everyone gets
+    // the updated member list and new members discover the group.
+    for (const QString &peerId : memberKeys) {
+        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
+
+        QJsonObject payload;
+        payload["from"]      = myId;
+        payload["type"]      = "group_member_update";
+        payload["groupId"]   = groupId;
+        payload["groupName"] = groupName;
+        payload["members"]   = membersArray;
+        payload["ts"]        = QDateTime::currentSecsSinceEpoch();
+
+        sendSealedPayload(peerId, payload);
+    }
 }
 
 // ── G3: Reset encrypted session ──────────────────────────────────────────────
