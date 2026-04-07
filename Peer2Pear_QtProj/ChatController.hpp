@@ -73,6 +73,7 @@ public:
 
     void sendGroupRename(const QString& groupId, const QString& newName, const QStringList& memberKeys);
     void sendGroupAvatar(const QString& groupId, const QString& avatarB64, const QStringList& memberKeys);
+    void sendGroupMemberUpdate(const QString& groupId, const QString& groupName, const QStringList& memberKeys);
 
     // G3: Wipe ratchet session for a peer, forcing a fresh Noise IK handshake
     void resetSession(const QString& peerIdB64u);
