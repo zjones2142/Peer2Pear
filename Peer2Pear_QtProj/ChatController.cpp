@@ -823,8 +823,6 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
         } else if (type == "group_avatar") {
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
-        } else if (type == "group_avatar") {
-            emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
         } else if (type == "group_member_update") {
             const QString gid       = o.value("groupId").toString();
             const QString gname     = o.value("groupName").toString();
