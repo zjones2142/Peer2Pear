@@ -20,7 +20,7 @@ endif()
 
 # --- Build speed: Unity (jumbo) builds ---
 # Combines source files into fewer translation units for faster compilation.
-option(CMAKE_UNITY_BUILD "Enable unity (jumbo) builds" ON)
+set(CMAKE_UNITY_BUILD ON CACHE BOOL "Enable unity (jumbo) builds")
 
 # --- 1. Find Qt Packages ---
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Sql)
@@ -47,8 +47,8 @@ if(WIN32)
     find_package(unofficial-glib CONFIG REQUIRED)
 
     # libnice does not ship a CMake config in vcpkg; find it manually.
-    find_library(NICE_LIBRARY NAMES nice REQUIRED)
-    find_path(NICE_INCLUDE_DIR nice/agent.h REQUIRED)
+    find_library(NICE_LIBRARY NAMES nice)
+    find_path(NICE_INCLUDE_DIR nice/agent.h)
     if(NOT NICE_LIBRARY OR NOT NICE_INCLUDE_DIR)
         message(FATAL_ERROR
             "Could not find libnice. Make sure vcpkg dependencies are installed:\n"
