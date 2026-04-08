@@ -76,7 +76,7 @@ ChatController::ChatController(QObject* parent)
                 toRemove << it.key();
             }
         }
-        for (const QString &key : toRemove) {
+        for (const QString &key : std::as_const(toRemove)) {
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[ICE] Cleaning up stale connection to" << key.left(8) + "...";
 #endif
@@ -345,8 +345,6 @@ void ChatController::stopPolling()
     m_rvz.publish("", 0, 1);
 }
 
-void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
-
 void ChatController::setTurnServer(const QString& host, int port,
                                     const QString& username, const QString& password)
 {
@@ -559,8 +557,8 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
         if (key32.size() != 32) return;
         const QByteArray icePt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         const QByteArray ct     = m_crypto.aeadEncrypt(key32, icePt);
-        const QByteArray env    = kMsgPrefix + myIdB64u().toUtf8() + "\n" + ct;
-        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        const QByteArray envel    = kMsgPrefix + myIdB64u().toUtf8() + "\n" + ct;
+        m_mbox.enqueue(peerIdB64u, envel, 7LL * 24 * 60 * 60 * 1000);
         return;
     }
 

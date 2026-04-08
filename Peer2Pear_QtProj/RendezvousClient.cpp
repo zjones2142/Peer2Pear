@@ -37,25 +37,6 @@ void RendezvousClient::publish(const QString& host, int port, qint64 expiresMs) 
     });
 }
 
-void RendezvousClient::lookup(const QString& peerIdB64u) {
-    QJsonObject j;
-    j["id"] = peerIdB64u;
-
-    QNetworkRequest req(m_base.resolved(QUrl("/rvz/lookup")));
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-
-    auto* rep = m_nam.post(req, QJsonDocument(j).toJson(QJsonDocument::Compact));
-    connect(rep, &QNetworkReply::finished, this, [this, rep](){
-        if (rep->error() != QNetworkReply::NoError) {
-            emit status(QString("rvz lookup error: %1").arg(rep->errorString()));
-        } else {
-            const auto doc = QJsonDocument::fromJson(rep->readAll());
-            const auto o = doc.object();
-            emit lookupResult(o["host"].toString(), o["port"].toInt());
-        }
-        rep->deleteLater();
-    });
-}
 
 void RendezvousClient::checkPresence(const QString& peerIdB64u) {
     QJsonObject j;

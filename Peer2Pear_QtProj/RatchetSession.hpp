@@ -16,8 +16,8 @@
 
 struct RatchetHeader {
     QByteArray dhPub;          // 32 bytes — sender's current DH ratchet public key
-    quint32    prevChainLen;   // number of messages in previous sending chain
-    quint32    messageNum;     // index in current sending chain
+    quint32    prevChainLen =0;   // number of messages in previous sending chain
+    quint32    messageNum   =0;     // index in current sending chain
 
     QByteArray serialize() const;
     static RatchetHeader deserialize(const QByteArray& data, int& bytesRead);

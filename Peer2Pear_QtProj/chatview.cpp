@@ -304,7 +304,6 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
     // ── Keys / Members section ────────────────────────────────────────────────
     QListWidget *memberList = nullptr; // only used for groups
-    QListWidget *keyList    = nullptr; // only used for contacts
 
     if (isGroup && allContacts) {
         auto *membersLbl = new QLabel("Members", &dlg);
@@ -1339,7 +1338,7 @@ void ChatView::highlightSearchMatches()
 
         // Find the QLabel bubble inside this message row
         QList<QLabel*> labels = w->findChildren<QLabel*>();
-        for (QLabel *lbl : labels) {
+        for (QLabel *lbl : std::as_const(labels)) {
             // Bubbles have border-radius:14px in their style; sender name labels don't
             if (!lbl->styleSheet().contains("border-radius:14px")) continue;
 
@@ -2098,10 +2097,6 @@ void ChatView::loadChat(int index)
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor(0x2e, 0x8b, 0x3a), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
-        static const QList<QColor> kPalette = {
-            QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
-            QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
-        };
         const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
         const QColor bg = avatarColorForName(chat.name);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));

@@ -406,12 +406,12 @@ NoiseState NoiseState::deserialize(const QByteArray& data) {
     QDataStream ds(data);
     ds.setVersion(QDataStream::Qt_5_15);
 
-    quint8 version, role;
+    quint8 version, role1;
     ds >> version;
     if (version < 1 || version > 3) return ns;
 
-    ds >> role;
-    ns.m_role = static_cast<Role>(role);
+    ds >> role1;
+    ns.m_role = static_cast<Role>(role1);
     ds >> ns.m_complete;
     ds >> ns.m_ck >> ns.m_h >> ns.m_k >> ns.m_n;
 

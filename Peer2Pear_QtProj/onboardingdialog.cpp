@@ -458,7 +458,6 @@ void OnboardingDialog::onPickCustomColor()
         m_selectedSwatch = nullptr; // no swatch selected for custom
         // Deselect all swatches visually
         for (QPushButton *btn : std::as_const(m_swatchBtns)) {
-            QString hex = btn->styleSheet();
             // Extract background color from existing style and rebuild without selection
             // Simpler: just remove white border
             QString s = btn->styleSheet();

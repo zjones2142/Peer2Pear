@@ -143,59 +143,6 @@ void SessionStore::deleteSession(const QString& peerId) {
 // Skipped message keys
 // ---------------------------
 
-void SessionStore::saveSkippedKey(const QString& peerId, const QByteArray& dhPub,
-                                   quint32 msgNum, const QByteArray& messageKey) {
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    QSqlQuery q(m_db);
-    q.prepare(
-        "INSERT OR REPLACE INTO skipped_message_keys"
-        " (peer_id, dh_pub, msg_num, message_key, created_at)"
-        " VALUES (:pid, :dh, :mn, :mk, :now);"
-    );
-    q.bindValue(":pid", peerId);
-    q.bindValue(":dh", dhPub);
-    q.bindValue(":mn", msgNum);
-    q.bindValue(":mk", encryptBlob(messageKey));   // S2 fix: encrypt at rest
-    q.bindValue(":now", now);
-    if (!q.exec()) qWarning() << "SessionStore::saveSkippedKey:" << q.lastError().text();
-}
-
-QByteArray SessionStore::loadAndDeleteSkippedKey(const QString& peerId,
-                                                  const QByteArray& dhPub, quint32 msgNum) {
-    QSqlQuery q(m_db);
-    q.prepare(
-        "SELECT id, message_key FROM skipped_message_keys"
-        " WHERE peer_id=:pid AND dh_pub=:dh AND msg_num=:mn;"
-    );
-    q.bindValue(":pid", peerId);
-    q.bindValue(":dh", dhPub);
-    q.bindValue(":mn", msgNum);
-    if (!q.exec() || !q.next()) return {};
-
-    qint64 id = q.value(0).toLongLong();
-    QByteArray key = decryptBlob(q.value(1).toByteArray());  // S2 fix: decrypt
-
-    QSqlQuery del(m_db);
-    del.prepare("DELETE FROM skipped_message_keys WHERE id=:id;");
-    del.bindValue(":id", id);
-    del.exec();
-
-    return key;
-}
-
-void SessionStore::pruneSkippedKeys(const QString& peerId, int maxCount) {
-    QSqlQuery q(m_db);
-    q.prepare(
-        "DELETE FROM skipped_message_keys WHERE peer_id=:pid AND id NOT IN"
-        " (SELECT id FROM skipped_message_keys WHERE peer_id=:pid2"
-        "  ORDER BY created_at DESC LIMIT :lim);"
-    );
-    q.bindValue(":pid", peerId);
-    q.bindValue(":pid2", peerId);
-    q.bindValue(":lim", maxCount);
-    q.exec();
-}
-
 void SessionStore::deleteSkippedKeysForPeer(const QString& peerId) {
     QSqlQuery q(m_db);
     q.prepare("DELETE FROM skipped_message_keys WHERE peer_id=:pid;");

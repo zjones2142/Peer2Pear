@@ -291,33 +291,3 @@ void MailboxClient::fetchAll(const QString& myIdB64u)
                 }
             });
 }
-
-// ── ack ───────────────────────────────────────────────────────────────────────
-// The server already pops on fetch; ack is a no-op kept for forward
-// compatibility.  We keep the implementation so callers compile, but
-// ChatController no longer calls it.
-
-void MailboxClient::ack(const QString& myIdB64u, const QString& envId)
-{
-    const qint64   ts    = QDateTime::currentMSecsSinceEpoch();
-    const quint64  nonce = QRandomGenerator::global()->generate64();
-    const QString  msg   = QString("MBX1|%1|%2|%3|ack|%4")
-                            .arg(myIdB64u).arg(ts).arg(nonce).arg(envId);
-    const QString  sig   = m_crypto->signB64u(msg.toUtf8());
-
-    QNetworkRequest req(m_base.resolved(QUrl("/mbox/ack")));
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    req.setRawHeader("X-To",    myIdB64u.toUtf8());
-    req.setRawHeader("X-Ts",    QByteArray::number(ts));
-    req.setRawHeader("X-Nonce", QByteArray::number(nonce));
-    req.setRawHeader("X-Sig",   sig.toUtf8());
-
-    QJsonObject j;
-    j["env_id"] = envId;
-    auto* rep = m_nam.post(req, QJsonDocument(j).toJson(QJsonDocument::Compact));
-    connect(rep, &QNetworkReply::finished, this, [this, rep]() {
-        if (rep->error() != QNetworkReply::NoError)
-            emit status(QString("mbox ack error: %1").arg(rep->errorString()));
-        rep->deleteLater();
-    });
-}
