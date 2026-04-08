@@ -61,7 +61,7 @@ Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io
 - Qt 5 or Qt 6 (Widgets, Network, Sql modules)
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
-- **Windows only:** Visual Studio 2019+ or Build Tools with the "Desktop development with C++" workload, and [Ninja](https://ninja-build.org/) on PATH (or install via `winget install Ninja-build.Ninja`)
+- **Windows only:** Visual Studio 2019+ or Build Tools with the "Desktop development with C++" workload. [Ninja](https://ninja-build.org/) is recommended for faster builds (install via `winget install Ninja-build.Ninja`); the CMake presets default to Ninja, but you can override the generator if needed.
 
 #### Run the setup script before opening in Qt Creator (it clones vcpkg to the correct directory):
 

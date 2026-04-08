@@ -49,6 +49,11 @@ if(WIN32)
     # libnice does not ship a CMake config in vcpkg; find it manually.
     find_library(NICE_LIBRARY NAMES nice REQUIRED)
     find_path(NICE_INCLUDE_DIR nice/agent.h REQUIRED)
+    if(NOT NICE_LIBRARY OR NOT NICE_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "Could not find libnice. Make sure vcpkg dependencies are installed:\n"
+            "  .\\vcpkg\\vcpkg install --triplet x64-windows")
+    endif()
 
     add_library(libnice_imported INTERFACE IMPORTED)
     set_target_properties(libnice_imported PROPERTIES
