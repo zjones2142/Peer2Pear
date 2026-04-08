@@ -28,7 +28,7 @@ if not exist vcpkg\ (
     )
 ) else (
     echo vcpkg directory already exists. Pulling latest changes...
-    git -C vcpkg pull --ff-only 2>nul || echo [WARN] Could not update vcpkg (local changes or network issue), using existing version.
+    git -C vcpkg pull --ff-only 2>nul || echo [WARN] Could not update vcpkg ^(local changes or network issue^), using existing version.
 )
 
 REM --- Bootstrap vcpkg ---
