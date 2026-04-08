@@ -83,4 +83,3 @@ CMakeLists.txt.user*
 vcpkg/
 vcpkg_installed/
 .vcpkg/
-tests/
