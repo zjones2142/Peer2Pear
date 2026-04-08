@@ -61,6 +61,7 @@ Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io
 - Qt 5 or Qt 6 (Widgets, Network, Sql modules)
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
+- **Windows only:** Visual Studio 2019+ or Build Tools with the "Desktop development with C++" workload, and [Ninja](https://ninja-build.org/) on PATH (or install via `winget install Ninja-build.Ninja`)
 
 #### Run the setup script before opening in Qt Creator (it clones vcpkg to the correct directory):
 
@@ -77,6 +78,19 @@ cd Peer2Pear_QtProj
 cd Peer2Pear_QtProj
 winsetup.bat
 ```
+
+Then open the folder in Qt Creator and select the **win-msvc-debug** or **win-msvc-release** CMake preset. You can also build from a **Developer Command Prompt for VS**:
+
+```bat
+cd Peer2Pear_QtProj
+cmake --preset win-msvc-debug
+cmake --build build
+```
+
+> **Tip:** The first build compiles all vcpkg dependencies from source and may
+> take 10–20 minutes. Subsequent builds use binary caching and complete in
+> seconds. To share caches across machines or CI, set `VCPKG_DEFAULT_BINARY_CACHE`
+> to a shared directory before running the setup script.
 
 The setup scripts bootstrap vcpkg, install the required libraries, and configure the CMake build.
 

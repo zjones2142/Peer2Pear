@@ -13,6 +13,15 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# --- Build speed: MSVC parallel compilation ---
+if(MSVC)
+    add_compile_options(/MP)
+endif()
+
+# --- Build speed: Unity (jumbo) builds ---
+# Combines source files into fewer translation units for faster compilation.
+option(CMAKE_UNITY_BUILD "Enable unity (jumbo) builds" ON)
+
 # --- 1. Find Qt Packages ---
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Sql)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network Sql)
@@ -32,14 +41,36 @@ endif()
 # libsodium uses an unofficial wrapper name in vcpkg
 find_package(unofficial-sodium CONFIG REQUIRED)
 
-# libnice and glib use pkg-config instead of standard CMake configs
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
-pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0 gobject-2.0 gio-2.0)
+if(WIN32)
+    # On Windows, pkg-config is not reliably available. Use vcpkg's CMake
+    # config files and manual library discovery instead.
+    find_package(unofficial-glib CONFIG REQUIRED)
 
-if(APPLE)
-    set_property(TARGET PkgConfig::NICE PROPERTY INTERFACE_LINK_OPTIONS "")
-    set_property(TARGET PkgConfig::GLIB PROPERTY INTERFACE_LINK_OPTIONS "")
+    # libnice does not ship a CMake config in vcpkg; find it manually.
+    find_library(NICE_LIBRARY NAMES nice REQUIRED)
+    find_path(NICE_INCLUDE_DIR nice/agent.h REQUIRED)
+
+    add_library(libnice_imported INTERFACE IMPORTED)
+    set_target_properties(libnice_imported PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${NICE_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES "${NICE_LIBRARY}"
+    )
+
+    set(NICE_TARGET libnice_imported)
+    set(GLIB_TARGETS unofficial::glib::glib unofficial::glib::gobject unofficial::glib::gio)
+else()
+    # On macOS/Linux, pkg-config works reliably
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
+    pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0 gobject-2.0 gio-2.0)
+
+    if(APPLE)
+        set_property(TARGET PkgConfig::NICE PROPERTY INTERFACE_LINK_OPTIONS "")
+        set_property(TARGET PkgConfig::GLIB PROPERTY INTERFACE_LINK_OPTIONS "")
+    endif()
+
+    set(NICE_TARGET PkgConfig::NICE)
+    set(GLIB_TARGETS PkgConfig::GLIB)
 endif()
 
 # --- 3. Define Project Sources (Unified List) ---
@@ -111,8 +142,32 @@ target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Network
     Qt${QT_VERSION_MAJOR}::Sql
     unofficial-sodium::sodium
-    PkgConfig::NICE
-    PkgConfig::GLIB
+    ${NICE_TARGET}
+    ${GLIB_TARGETS}
+)
+
+# Windows needs Winsock and IP helper for libnice/glib networking
+if(WIN32)
+    target_link_libraries(Peer2Pear_QtProj PRIVATE ws2_32 iphlpapi)
+endif()
+
+# --- Build speed: Precompiled headers ---
+target_precompile_headers(Peer2Pear_QtProj PRIVATE
+    <QObject>
+    <QString>
+    <QByteArray>
+    <QDebug>
+    <QWidget>
+    <QJsonObject>
+    <QJsonDocument>
+    <QJsonArray>
+    <QNetworkAccessManager>
+    <QNetworkReply>
+    <QSqlDatabase>
+    <QSqlQuery>
+    <memory>
+    <vector>
+    <functional>
 )
 
 # --- 6. Bundle and Platform Properties ---
