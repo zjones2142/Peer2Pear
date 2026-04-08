@@ -17,6 +17,28 @@ if not exist "%VCPKG_DEFAULT_BINARY_CACHE%" (
 )
 echo [OK] Binary caching enabled: %VCPKG_DEFAULT_BINARY_CACHE%
 
+REM --- Check for Qt installation ---
+set "QT_DETECTED="
+if exist "C:\Qt" (
+    for /d %%Q in (C:\Qt\6.*) do (
+        if exist "%%Q\msvc2022_64\bin\qmake.exe" set "QT_DETECTED=%%Q\msvc2022_64"
+        if exist "%%Q\msvc2019_64\bin\qmake.exe" set "QT_DETECTED=%%Q\msvc2019_64"
+    )
+    if not defined QT_DETECTED (
+        for /d %%Q in (C:\Qt\5.*) do (
+            if exist "%%Q\msvc2019_64\bin\qmake.exe" set "QT_DETECTED=%%Q\msvc2019_64"
+            if exist "%%Q\msvc2017_64\bin\qmake.exe" set "QT_DETECTED=%%Q\msvc2017_64"
+        )
+    )
+)
+if defined QT_DETECTED (
+    echo [OK] Qt detected: %QT_DETECTED%
+) else (
+    echo [WARN] Qt not found at C:\Qt. Make sure Qt is installed.
+    echo        Download from: https://www.qt.io/download-qt-installer
+    echo        Install a Desktop MSVC kit ^(e.g. Qt 6.x / MSVC 2022 64-bit^).
+)
+
 REM --- Clone or update vcpkg ---
 if not exist vcpkg\ (
     echo Cloning vcpkg repository...

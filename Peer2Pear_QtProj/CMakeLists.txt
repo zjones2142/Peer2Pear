@@ -23,6 +23,48 @@ endif()
 set(CMAKE_UNITY_BUILD ON CACHE BOOL "Enable unity (jumbo) builds")
 
 # --- 1. Find Qt Packages ---
+# When using the vcpkg toolchain, CMAKE_PREFIX_PATH may not include the Qt
+# installation (Qt is not a vcpkg package).  Auto-detect Qt from standard
+# installer paths and common environment variables so the build works
+# out-of-the-box on Windows without manual PREFIX_PATH configuration.
+if(WIN32)
+    find_package(QT NAMES Qt6 Qt5 QUIET COMPONENTS Core)
+    if(NOT QT_FOUND)
+        message(STATUS "Qt not on CMAKE_PREFIX_PATH – attempting auto-detection...")
+
+        # Collect hints from environment variables that Qt tools may set.
+        set(_qt_hints "")
+        foreach(_env QT_DIR QTDIR QT_ROOT_DIR Qt6_DIR)
+            if(DEFINED ENV{${_env}} AND IS_DIRECTORY "$ENV{${_env}}")
+                list(APPEND _qt_hints "$ENV{${_env}}")
+            endif()
+        endforeach()
+
+        # Search the standard Qt installer location (C:/Qt).
+        file(GLOB _qt6_dirs "C:/Qt/6.*/msvc*_64")
+        file(GLOB _qt5_dirs "C:/Qt/5.*/msvc*_64")
+        list(APPEND _qt_hints ${_qt6_dirs} ${_qt5_dirs})
+
+        if(_qt_hints)
+            list(SORT _qt_hints ORDER DESCENDING)
+            list(GET _qt_hints 0 _qt_best)
+            message(STATUS "Auto-detected Qt installation: ${_qt_best}")
+            list(PREPEND CMAKE_PREFIX_PATH "${_qt_best}")
+        else()
+            message(WARNING
+                "Could not auto-detect a Qt installation.\n"
+                "Set CMAKE_PREFIX_PATH to your Qt directory, e.g.:\n"
+                "  cmake -DCMAKE_PREFIX_PATH=C:/Qt/6.8.0/msvc2022_64 ..\n"
+                "Or install Qt from https://www.qt.io/download-qt-installer")
+        endif()
+
+        unset(_qt_hints)
+        unset(_qt6_dirs)
+        unset(_qt5_dirs)
+        unset(_qt_best)
+    endif()
+endif()
+
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Sql)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network Sql)
 

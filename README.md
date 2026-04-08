@@ -87,6 +87,13 @@ cmake --preset win-msvc-debug
 cmake --build build
 ```
 
+> **Qt Creator kit setup:** If CMake reports *"Could not find a package
+> configuration file provided by QT"*, your kit's Qt version may not be set.
+> Go to **Edit → Preferences → Kits**, select the Desktop kit, and make sure
+> the **Qt version** drop-down points to your installed MSVC build of Qt
+> (e.g. `Qt 6.8.0 (msvc2022_64)`). CMake auto-detection will also try
+> `C:\Qt\6.*\msvc*_64` automatically.
+
 > **Tip:** The first build compiles all vcpkg dependencies from source and may
 > take 10–20 minutes. Subsequent builds use binary caching and complete in
 > seconds. To share caches across machines or CI, set `VCPKG_DEFAULT_BINARY_CACHE`
