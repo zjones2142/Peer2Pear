@@ -4,6 +4,12 @@ cmake_minimum_required(VERSION 3.16)
 # This must come BEFORE the project() command.
 set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 
+# Default to x64 on Windows so vcpkg installs 64-bit packages even when
+# cmake is invoked without a preset (e.g. from Qt Creator's default kit).
+if(WIN32 AND NOT DEFINED VCPKG_TARGET_TRIPLET)
+    set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "vcpkg target triplet")
+endif()
+
 project(Peer2Pear_QtProj VERSION 0.1 LANGUAGES CXX)
 
 set(CMAKE_AUTOUIC ON)
