@@ -1,13 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Find Qt Test module
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
-# ── Group chat unit tests ─────────────────────────────────────────────────────
-add_executable(tst_groupchat
-    tst_groupchat.cpp
-
-    # Pull in the minimal set of project sources needed to compile
+# ── Shared source list (everything the test binaries need to link against) ──
+set(APP_SOURCES
     ../chattypes.h
     ../ChatController.cpp
     ../ChatController.hpp
@@ -31,10 +27,9 @@ add_executable(tst_groupchat
     ../SealedEnvelope.hpp
     ../FileTransferManager.cpp
     ../FileTransferManager.hpp
-    README.md
 )
 
-target_link_libraries(tst_groupchat PRIVATE
+set(TEST_LINK_LIBS
     Qt${QT_VERSION_MAJOR}::Test
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
@@ -44,4 +39,28 @@ target_link_libraries(tst_groupchat PRIVATE
     PkgConfig::GLIB
 )
 
-add_test(NAME GroupChatTests COMMAND tst_groupchat)
+# ── Helper function so each test is one line ──────────────────────────────────
+function(add_p2p_test TEST_NAME TEST_SOURCE)
+    add_executable(${TEST_NAME} ${TEST_SOURCE} ${APP_SOURCES})
+    target_link_libraries(${TEST_NAME} PRIVATE ${TEST_LINK_LIBS})
+    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+endfunction()
+
+# ── Test targets ──────────────────────────────────────────────────────────────
+add_p2p_test(tst_groupchat       tst_groupchat.cpp)
+add_p2p_test(tst_cryptoengine    tst_cryptoengine.cpp)
+add_p2p_test(tst_ratchetsession  tst_ratchetsession.cpp)
+add_p2p_test(tst_noisestate      tst_noisestate.cpp)
+add_p2p_test(tst_sealedenvelope  tst_sealedenvelope.cpp)
+add_p2p_test(tst_sessionstore    tst_sessionstore.cpp)
+add_p2p_test(tst_filetransfer    tst_filetransfer.cpp)
+add_p2p_test(tst_chatcontroller  tst_chatcontroller.cpp)
+
+# DatabaseManager test needs databasemanager.cpp too
+add_executable(tst_databasemanager tst_databasemanager.cpp ${APP_SOURCES}
+    ../databasemanager.cpp
+    ../databasemanager.h
+    ../filetransfer.h
+)
+target_link_libraries(tst_databasemanager PRIVATE ${TEST_LINK_LIBS})
+add_test(NAME tst_databasemanager COMMAND tst_databasemanager)

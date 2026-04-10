@@ -35,11 +35,6 @@ public:
     void deleteSession(const QString& peerId);
 
     // Skipped message keys
-    void saveSkippedKey(const QString& peerId, const QByteArray& dhPub,
-                        quint32 msgNum, const QByteArray& messageKey);
-    QByteArray loadAndDeleteSkippedKey(const QString& peerId,
-                                       const QByteArray& dhPub, quint32 msgNum);
-    void pruneSkippedKeys(const QString& peerId, int maxCount);
     void deleteSkippedKeysForPeer(const QString& peerId);
 
     // Clear all sessions, skipped keys, and pending handshakes
