@@ -13,7 +13,7 @@
 #include "SealedEnvelope.hpp"
 #include "FileTransferManager.hpp"
 
-#include <QtSql/QSqlDatabase>
+#include "SqlCipherDb.hpp"
 #include <memory>
 
 
@@ -23,8 +23,10 @@ public:
     explicit ChatController(QObject* parent = nullptr);
 
     void setPassphrase(const QString& pass);
+    // Unified path: pass the pre-derived identity key from HKDF(masterKey, "identity-unlock")
+    void setPassphrase(const QString& pass, const QByteArray& identityKey);
     void setServerBaseUrl(const QUrl& base);
-    void setDatabase(QSqlDatabase db);
+    void setDatabase(SqlCipherDb& db);
     QString myIdB64u() const;
 
     // Send encrypted text to a peer
@@ -73,6 +75,7 @@ public:
 
     void sendGroupRename(const QString& groupId, const QString& newName, const QStringList& memberKeys);
     void sendGroupAvatar(const QString& groupId, const QString& avatarB64, const QStringList& memberKeys);
+    void sendGroupMemberUpdate(const QString& groupId, const QString& groupName, const QStringList& memberKeys);
 
     // G3: Wipe ratchet session for a peer, forcing a fresh Noise IK handshake
     void resetSession(const QString& peerIdB64u);
@@ -146,7 +149,7 @@ private:
     // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
     std::unique_ptr<SessionStore>   m_sessionStore;
     std::unique_ptr<SessionManager> m_sessionMgr;
-    QSqlDatabase m_db;  // stored for KEM pub lookups
+    SqlCipherDb* m_dbPtr = nullptr;  // stored for KEM pub lookups
 
     QTimer      m_pollTimer;
     QStringList m_selfKeys;

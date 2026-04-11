@@ -151,6 +151,12 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
         qWarning() << "[SessionManager] Pre-key payload encryption failed for" << peerIdB64u.left(8) + "...";
         return {};
     }
+
+    // B1 fix: expose the prekey-derived key so callers (e.g. sendFile) can use
+    // it as a file encryption key.  Both sides derive the same prekeyKey from
+    // the Noise chaining key, so the receiver's decryptFromPeer also has it.
+    m_lastMessageKey = QByteArray(prekeyKey.constData(), prekeyKey.size());
+    CryptoEngine::secureZero(prekeyKey);
 #ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[SessionManager] Encrypted pre-key message for" << peerIdB64u.left(8) + "..."
              << "| noiseMsg1:" << noiseMsg1.size() << "B | ratchetDhPub:" << ratchetDhPub.left(4).toHex()
@@ -279,12 +285,17 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
             noise.postMsg1ChainingKey(), QByteArray("prekey-salt"), QByteArray("prekey-payload"), 32);
         QByteArray pt = m_crypto.aeadDecrypt(prekeyKey, encPayload);
         if (!pt.isEmpty()) {
+            // B1 fix: expose prekey-derived key so file_key announcements work
+            m_lastMessageKey = QByteArray(prekeyKey.constData(), prekeyKey.size());
+            if (msgKeyOut)
+                *msgKeyOut = m_lastMessageKey;
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[SessionManager] Pre-key payload decrypted OK |" << pt.size() << "B";
 #endif
         } else {
             qWarning() << "[SessionManager] Pre-key payload decryption FAILED";
         }
+        CryptoEngine::secureZero(prekeyKey);
 
         // Send back the Noise msg2 as a pre-key response
         if (m_sendResponse) {

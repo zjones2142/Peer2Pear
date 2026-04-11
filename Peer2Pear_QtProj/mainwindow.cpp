@@ -16,6 +16,7 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QStandardPaths>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -23,14 +24,9 @@ MainWindow::MainWindow(QWidget *parent)
 {
     ui->setupUi(this);
 
-    // ── DB ────────────────────────────────────────────────────────────────────
-    if (!m_db.open()) {
-        QMessageBox::critical(this, "Database Error",
-                              "Could not open the local chat database.\n"
-                              "Chat history will not be saved this session.");
-    }
-
     // ── Identity unlock ───────────────────────────────────────────────────────
+    // Passphrase must be obtained BEFORE opening the DB so we can derive the
+    // SQLCipher page-level encryption key via Argon2id.
     while (true) {
         bool ok = false;
         QString pass = QInputDialog::getText(this, "Unlock Identity",
@@ -43,17 +39,67 @@ MainWindow::MainWindow(QWidget *parent)
             continue;
         }
         try {
-            m_controller.setPassphrase(pass);
-            // Derive a DB encryption key from the passphrase (secret) for at-rest protection.
-            // Also provide the old key (derived from public ID) so existing encrypted
-            // messages can still be read during migration.
-            QByteArray newKey = ChatController::blake2b256(
-                pass.toUtf8() + QByteArray("peer2pear-dbkey"));
-            QByteArray legacyKey = ChatController::blake2b256(
+            // ── Unified key derivation (single Argon2id call) ────────────────
+            const QString keysDir = QStandardPaths::writableLocation(
+                QStandardPaths::AppDataLocation) + "/keys";
+            QByteArray salt = CryptoEngine::loadOrCreateSalt(keysDir + "/db_salt.bin");
+            if (salt.isEmpty()) {
+                QMessageBox::critical(this, "Salt File Error",
+                    "The encryption salt file is corrupt and no backup exists.\n"
+                    "Your database cannot be decrypted.\n\n"
+                    "Contact support or delete the app data directory to start fresh.");
+                CryptoEngine::secureZero(pass);
+                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+                return;
+            }
+            QByteArray masterKey = CryptoEngine::deriveMasterKey(pass, salt);
+            if (masterKey.isEmpty()) {
+                QMessageBox::critical(this, "Key Derivation Failed",
+                                      "Could not derive encryption key from passphrase.");
+                CryptoEngine::secureZero(pass);
+                continue;
+            }
+
+            // Derive all purpose-specific subkeys from one master key
+            QByteArray identityKey = CryptoEngine::deriveSubkey(masterKey, "identity-unlock");
+            QByteArray dbKey       = CryptoEngine::deriveSubkey(masterKey, "sqlcipher-db-key");
+            QByteArray fieldKey    = CryptoEngine::deriveSubkey(masterKey, "field-encryption");
+            CryptoEngine::secureZero(masterKey);
+
+            // ── Identity unlock (uses identityKey instead of separate Argon2) ─
+            // setPassphrase(pass, identityKey) still needs pass for legacy v4
+            // migration (deriveKeyFromPassphrase inside loadIdentityFromDisk).
+            // Once migrated to v5, the passphrase is never used for identity.
+            m_controller.setPassphrase(pass, identityKey);
+            CryptoEngine::secureZero(identityKey);
+
+            // ── Open DB with SQLCipher encryption ────────────────────────────
+            if (!m_db.open(dbKey)) {
+                QMessageBox::critical(this, "Database Error",
+                                      "Could not open the local chat database.\n"
+                                      "The passphrase may be incorrect.");
+                CryptoEngine::secureZero(dbKey);
+                CryptoEngine::secureZero(fieldKey);
+                CryptoEngine::secureZero(pass);
+                continue;
+            }
+            CryptoEngine::secureZero(dbKey);
+
+            // Set per-field encryption key (backward compat with ENC: fields).
+            // Legacy keys cover all previous key derivation generations:
+            //   Gen 1: BLAKE2b(publicId + "peer2pear-dbkey")
+            //   Gen 2: BLAKE2b(passphrase + "peer2pear-dbkey")
+            // decryptField() tries the primary key first, then each legacy
+            // key in order until one succeeds.
+            QByteArray legacyGen1 = ChatController::blake2b256(
                 m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey"));
-            m_db.setEncryptionKey(newKey, legacyKey);
-            CryptoEngine::secureZero(newKey);
-            CryptoEngine::secureZero(legacyKey);
+            QByteArray legacyGen2 = ChatController::blake2b256(
+                pass.toUtf8() + QByteArray("peer2pear-dbkey"));
+            m_db.setEncryptionKey(fieldKey, {legacyGen2, legacyGen1});
+            CryptoEngine::secureZero(fieldKey);
+            CryptoEngine::secureZero(legacyGen1);
+            CryptoEngine::secureZero(legacyGen2);
+
             // Wire DB to ChatController for Noise/Ratchet session persistence
             m_controller.setDatabase(m_db.database());
             CryptoEngine::secureZero(pass);

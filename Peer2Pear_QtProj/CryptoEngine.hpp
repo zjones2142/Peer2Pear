@@ -20,6 +20,11 @@ public:
 
     void ensureIdentity();
 
+    // Unified path: caller supplies a pre-derived 32-byte key for identity
+    // file encryption (from HKDF(masterKey, "identity-unlock")).
+    // Falls back to legacy per-salt Argon2 for v4 files, then re-encrypts as v5.
+    void ensureIdentity(const QByteArray& identityKey);
+
     void setPassphrase(const QString& pass);
     bool hasPassphrase() const;
 
@@ -87,6 +92,17 @@ public:
     static bool dsaVerify(const QByteArray& sig, const QByteArray& message,
                           const QByteArray& dsaPub);
 
+    // Derive a master key from a passphrase using Argon2id.
+    // Salt must be 16 bytes (use loadOrCreateSalt() to manage it).
+    static QByteArray deriveMasterKey(const QString& passphrase, const QByteArray& salt);
+
+    // Derive a purpose-specific subkey from a master key via HKDF.
+    static QByteArray deriveSubkey(const QByteArray& masterKey,
+                                   const QByteArray& info, int len = 32);
+
+    // Load a salt file from disk, or create a new random 16-byte one.
+    static QByteArray loadOrCreateSalt(const QString& path);
+
     // Securely zero a QByteArray's backing buffer in-place.
     static void secureZero(QByteArray& buf);
 
@@ -96,11 +112,15 @@ public:
 private:
     // Encrypted persistence helpers
     bool loadIdentityFromDisk();
+    bool loadIdentityFromDisk(const QByteArray& identityKey);  // v5 unified key path
     bool saveIdentityToDisk() const;
+    bool saveIdentityToDisk(const QByteArray& identityKey) const;  // v5 unified key path
     void deriveCurveKeysFromEd();
     void ensurePQKeys();  // generate + persist ML-KEM/ML-DSA keys if missing
+    void ensurePQKeys(const QByteArray& identityKey);  // v5 unified key path
 
-    QString m_passphrase;   // zeroed after ensureIdentity() completes
+    QString m_passphrase;       // zeroed after ensureIdentity() completes
+    QByteArray m_identityKey;   // v5: 32-byte key from HKDF(masterKey, "identity-unlock")
 
     QByteArray m_edPub;     // 32  (public — not secret, but zeroed for hygiene)
     QByteArray m_edPriv;    // 64  (secret — zeroed in destructor)

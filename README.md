@@ -13,13 +13,13 @@ A hybrid peer-to-peer messaging and file sharing application built with Qt and C
 - **QUIC transport** — when both peers are online, messages and files flow over a QUIC connection (msquic) layered on ICE, providing reliable framing, multiplexing, and congestion control.
 - **Group chats** — create group conversations with encrypted broadcasts to all members, with per-group sequence numbering for gap detection.
 - **Hybrid P2P + relay networking** — direct peer-to-peer connections via ICE/NAT traversal (libnice) with QUIC upgrade, falling back to an HTTP mailbox relay for offline delivery.
-- **Encrypted storage** — chat history, contacts, and ratchet session state are stored in a local SQLite database with per-field XChaCha20-Poly1305 encryption at rest.
+- **Encrypted storage** — the entire local database is encrypted at the page level using SQLCipher (AES-256). Sensitive fields (message text, contact names, file paths) have an additional layer of XChaCha20-Poly1305 AEAD encryption. No plaintext SQLite databases exist on any device.
 - **Contact management** — add contacts by Peer ID, block unwanted contacts, import/export contact lists.
-- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 5 or Qt 6.
+- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 5 or Qt 6, with mobile (iOS/Android) portability in mind.
 
 ## How It Works
 
-Each user has an Ed25519 identity key pair generated locally, protected by a passphrase (Argon2id KDF). The public key serves as the user's **Peer ID** (base64url-encoded, 43 characters), shared with contacts out-of-band. ML-KEM-768 and ML-DSA-65 key pairs are generated alongside the identity and stored encrypted in the identity file.
+Each user has an Ed25519 identity key pair generated locally, along with ML-KEM-768 and ML-DSA-65 post-quantum key pairs, all protected by a passphrase via Argon2id key derivation (MODERATE: 3 iterations, 256 MB on desktop; INTERACTIVE: 2 iterations, 64 MB on mobile). A single Argon2id call produces a master key, from which purpose-specific subkeys are derived via HKDF: one for SQLCipher database encryption, one for per-field AEAD, and one for identity key unlock. The public key serves as the user's **Peer ID** (base64url-encoded, 43 characters), shared with contacts out-of-band.
 
 ### Session Establishment
 
@@ -49,8 +49,10 @@ Each user has an Ed25519 identity key pair generated locally, protected by a pas
 | X25519 | ECDH key agreement (Noise, Sealed Sender, Ratchet) | No (harvest-now risk) |
 | ML-KEM-768 (Kyber) | Hybrid KEM in sealed envelopes, Noise handshake, and ratchet | Yes |
 | XChaCha20-Poly1305 | AEAD encryption (messages, files, DB fields, session store) | Yes (128-bit PQ) |
+| AES-256-CBC | SQLCipher page-level database encryption | Yes (128-bit PQ) |
 | BLAKE2b | Hashing, KDF chains (root chain, message chain) | Yes |
-| Argon2id | Passphrase-based key derivation for identity encryption | Yes |
+| Argon2id | Passphrase-based master key derivation | Yes |
+| HKDF (BLAKE2b) | Deriving sub-keys (DB encryption, field encryption, identity unlock) | Yes |
 
 ### Transport Layers
 
@@ -70,14 +72,14 @@ MainWindow
   │   ├── SessionManager (Noise IK + Double Ratchet lifecycle)
   │   │   ├── NoiseState (hybrid Noise IK handshake)
   │   │   ├── RatchetSession (hybrid Double Ratchet with KEM augmentation)
-  │   │   └── SessionStore (encrypted SQLite persistence)
+  │   │   └── SessionStore (encrypted SQLCipher persistence)
   │   ├── SealedEnvelope (hybrid sealed sender with KEM + DSA)
   │   ├── FileTransferManager (chunked encrypted file transfers)
   │   ├── MailboxClient (HTTP relay with retry queue)
   │   ├── RendezvousClient (presence discovery)
   │   ├── QuicConnection (QUIC over ICE transport)
   │   │   └── NiceConnection (ICE/STUN/TURN NAT traversal)
-  │   └── DatabaseManager (encrypted SQLite storage)
+  │   └── DatabaseManager (SQLCipher-encrypted storage)
   ├── SettingsPanel (configuration UI)
   ├── ChatNotifier (system tray notifications)
   └── OnboardingDialog (first-run setup)
@@ -87,21 +89,23 @@ MainWindow
 
 | Dependency | Purpose |
 |---|---|
-| [Qt 5 / Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
+| [Qt 5 / Qt 6](https://www.qt.io/) | GUI, networking, and application framework |
+| [SQLCipher](https://www.zetetic.net/sqlcipher/) | AES-256 encrypted SQLite (hard requirement) |
 | [libsodium](https://libsodium.org/) | Classical cryptographic primitives (Ed25519, X25519, XChaCha20-Poly1305, BLAKE2b, Argon2) |
 | [liboqs](https://openquantumsafe.org/) | Post-quantum cryptography (ML-KEM-768, ML-DSA-65) |
 | [msquic](https://github.com/microsoft/msquic) | QUIC transport protocol for reliable P2P communication |
 | [libnice](https://libnice.freedesktop.org/) | ICE agent for P2P NAT traversal |
 | [GLib](https://docs.gtk.org/glib/) | Required by libnice |
 
-All native dependencies are managed via [vcpkg](https://vcpkg.io/).
+Dependencies (libsodium, liboqs, msquic, libnice, GLib) are managed via [vcpkg](https://vcpkg.io/). SQLCipher must be installed separately via your system package manager (e.g., `brew install sqlcipher` on macOS, `apt install sqlcipher libsqlcipher-dev` on Ubuntu).
 
 ## Building
 
 ### Prerequisites
 
 - CMake >= 3.16
-- Qt 5 or Qt 6 (Widgets, Network, Sql modules)
+- Qt 5 or Qt 6 (Widgets, Network modules)
+- SQLCipher (`brew install sqlcipher` / `apt install sqlcipher libsqlcipher-dev`)
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
 
@@ -133,7 +137,7 @@ The setup scripts bootstrap vcpkg, install the required libraries, and configure
 | **Sender anonymity** | Sealed Sender envelopes (hybrid X25519 + ML-KEM-768) |
 | **Authentication** | Ed25519 + ML-DSA-65 hybrid signatures |
 | **Quantum resistance** | Hybrid classical + PQ at every layer (envelopes, handshake, ratchet, signatures) |
-| **Data at rest** | Per-field DB encryption, encrypted session store, passphrase-protected identity |
+| **Data at rest** | SQLCipher full-DB encryption (AES-256) + per-field AEAD, encrypted session store, passphrase-protected identity |
 | **Integrity** | AEAD tags on all ciphertexts, BLAKE2b-256 file hashes |
 
 ## License

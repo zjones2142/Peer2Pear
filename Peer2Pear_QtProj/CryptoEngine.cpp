@@ -21,7 +21,7 @@ static QString identityPath() {
     return base + "/keys/identity.json";
 }
 
-static constexpr int kIdentityVersion = 4;  // v4 adds ML-DSA-65 signatures
+static constexpr int kIdentityVersion = 5;  // v5 unified key derivation (single Argon2 call)
 
 static constexpr int SALT_BYTES  = crypto_pwhash_SALTBYTES;        // 16
 static constexpr int KEY_BYTES   = crypto_secretbox_KEYBYTES;      // 32
@@ -103,6 +103,7 @@ CryptoEngine::CryptoEngine() {
 
 CryptoEngine::~CryptoEngine() {
     secureZero(m_passphrase);
+    secureZero(m_identityKey);
     secureZero(m_edPriv);
     secureZero(m_curvePriv);
     secureZero(m_kemPriv);
@@ -256,6 +257,77 @@ bool CryptoEngine::loadIdentityFromDisk() {
     return true;
 }
 
+// ── v5 unified-key load: single pre-derived 32-byte key for all private keys ──
+bool CryptoEngine::loadIdentityFromDisk(const QByteArray& identityKey) {
+    if (identityKey.size() != KEY_BYTES) return false;
+
+    const QString path = identityPath();
+    QFile f(path);
+    if (!f.exists() || !f.open(QIODevice::ReadOnly)) return false;
+
+    const auto doc = QJsonDocument::fromJson(f.readAll());
+    f.close();
+    if (!doc.isObject()) return false;
+
+    const auto o = doc.object();
+    const int version = o.value("v").toInt(1);
+
+    const QByteArray pub = fromBase64Url(o.value("ed_pub_b64u").toString());
+    if (pub.size() != crypto_sign_PUBLICKEYBYTES) return false;
+
+    // ── v5 file: all keys encrypted with the same identityKey ────────────
+    if (version >= 5) {
+        const auto enc = o.value("ed_priv_enc").toObject();
+        const QByteArray nonce = fromBase64Url(enc.value("nonce_b64u").toString());
+        const QByteArray ct    = fromBase64Url(enc.value("ct_b64u").toString());
+        const QByteArray priv  = secretboxDecrypt(identityKey, nonce, ct);
+        if (priv.size() != crypto_sign_SECRETKEYBYTES) return false;
+
+        m_edPub  = pub;
+        m_edPriv = priv;
+
+        // KEM
+        if (o.contains("kem_pub_b64u")) {
+            m_kemPub = fromBase64Url(o.value("kem_pub_b64u").toString());
+            const auto kemEnc = o.value("kem_priv_enc").toObject();
+            m_kemPriv = secretboxDecrypt(identityKey,
+                fromBase64Url(kemEnc.value("nonce_b64u").toString()),
+                fromBase64Url(kemEnc.value("ct_b64u").toString()));
+        }
+        // DSA
+        if (o.contains("dsa_pub_b64u")) {
+            m_dsaPub = fromBase64Url(o.value("dsa_pub_b64u").toString());
+            const auto dsaEnc = o.value("dsa_priv_enc").toObject();
+            m_dsaPriv = secretboxDecrypt(identityKey,
+                fromBase64Url(dsaEnc.value("nonce_b64u").toString()),
+                fromBase64Url(dsaEnc.value("ct_b64u").toString()));
+        }
+
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[CryptoEngine] Identity v5 loaded from:" << path
+                 << "| KEM:" << (hasPQKeys() ? "yes" : "no")
+                 << "| DSA:" << (hasDSAKeys() ? "yes" : "no");
+#endif
+        return true;
+    }
+
+    // ── v4 or earlier: legacy per-salt Argon2 derivation ─────────────────
+    // Fall back to passphrase-based derivation for migration.
+    if (!hasPassphrase()) return false;
+
+    // Delegate to the legacy loader (which uses m_passphrase internally)
+    if (!loadIdentityFromDisk()) return false;
+
+    // Re-encrypt and save as v5 using the unified key
+    if (saveIdentityToDisk(identityKey)) {
+        qDebug() << "[CryptoEngine] Migrated identity.json v" << version << "→ v5";
+    } else {
+        qWarning() << "[CryptoEngine] identity.json migration to v5 failed"
+                    << "— will retry next launch";
+    }
+    return true;
+}
+
 bool CryptoEngine::saveIdentityToDisk() const {
     if (m_edPub.size() != crypto_sign_PUBLICKEYBYTES) return false;
     if (m_edPriv.size() != crypto_sign_SECRETKEYBYTES) return false;
@@ -343,6 +415,62 @@ bool CryptoEngine::saveIdentityToDisk() const {
     return true;
 }
 
+// ── v5 unified-key save: one pre-derived key, random nonces per field ─────
+bool CryptoEngine::saveIdentityToDisk(const QByteArray& identityKey) const {
+    if (m_edPub.size()  != crypto_sign_PUBLICKEYBYTES)  return false;
+    if (m_edPriv.size() != crypto_sign_SECRETKEYBYTES)  return false;
+    if (identityKey.size() != KEY_BYTES) return false;
+
+    // Ed25519 private key
+    QByteArray edNonce, edCt, edDummy;
+    if (!secretboxEncrypt(identityKey, m_edPriv, edDummy, edNonce, edCt))
+        return false;
+
+    QJsonObject edEnc;
+    edEnc["nonce_b64u"] = toBase64Url(edNonce);
+    edEnc["ct_b64u"]    = toBase64Url(edCt);
+
+    QJsonObject j;
+    j["v"]             = kIdentityVersion;
+    j["ed_pub_b64u"]   = toBase64Url(m_edPub);
+    j["ed_priv_enc"]   = edEnc;
+
+    // ML-KEM-768
+    if (hasPQKeys()) {
+        j["kem_pub_b64u"] = toBase64Url(m_kemPub);
+        QByteArray kemNonce, kemCt, kemDummy;
+        if (secretboxEncrypt(identityKey, m_kemPriv, kemDummy, kemNonce, kemCt)) {
+            QJsonObject kemEnc;
+            kemEnc["nonce_b64u"] = toBase64Url(kemNonce);
+            kemEnc["ct_b64u"]    = toBase64Url(kemCt);
+            j["kem_priv_enc"] = kemEnc;
+        }
+    }
+
+    // ML-DSA-65
+    if (hasDSAKeys()) {
+        j["dsa_pub_b64u"] = toBase64Url(m_dsaPub);
+        QByteArray dsaNonce, dsaCt, dsaDummy;
+        if (secretboxEncrypt(identityKey, m_dsaPriv, dsaDummy, dsaNonce, dsaCt)) {
+            QJsonObject dsaEnc;
+            dsaEnc["nonce_b64u"] = toBase64Url(dsaNonce);
+            dsaEnc["ct_b64u"]    = toBase64Url(dsaCt);
+            j["dsa_priv_enc"] = dsaEnc;
+        }
+    }
+
+    const QString path = identityPath();
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    f.write(QJsonDocument(j).toJson(QJsonDocument::Compact));
+    f.close();
+
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[CryptoEngine] Identity v5 saved to:" << path;
+#endif
+    return true;
+}
+
 void CryptoEngine::deriveCurveKeysFromEd() {
     unsigned char cpk[crypto_box_PUBLICKEYBYTES];
     unsigned char csk[crypto_box_SECRETKEYBYTES];
@@ -415,6 +543,64 @@ void CryptoEngine::ensureIdentity() {
     }
 
     // Passphrase is no longer needed — identity keys are in memory
+    secureZero(m_passphrase);
+}
+
+// ── v5 unified ensureIdentity: caller passes pre-derived identityKey ─────
+void CryptoEngine::ensureIdentity(const QByteArray& identityKey) {
+    if (!m_edPub.isEmpty()) return;
+
+    m_identityKey = identityKey;
+
+    const QString path = identityPath();
+    const bool identityExists = QFileInfo::exists(path);
+
+    if (identityExists) {
+        // Try v5 loader first (which handles v4 migration internally)
+        if (!loadIdentityFromDisk(identityKey)) {
+            secureZero(m_identityKey);
+            secureZero(m_passphrase);
+            throw std::runtime_error("Failed to decrypt identity (wrong passphrase or corrupted file)");
+        }
+        deriveCurveKeysFromEd();
+        ensurePQKeys(identityKey);  // generate + persist PQ keys if missing
+        secureZero(m_identityKey);
+        secureZero(m_passphrase);
+        return;
+    }
+
+    // First-run: generate new keypair
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    unsigned char sk[crypto_sign_SECRETKEYBYTES];
+    (void)crypto_sign_keypair(pk, sk);
+
+    m_edPub  = QByteArray(reinterpret_cast<const char*>(pk), sizeof(pk));
+    m_edPriv = QByteArray(reinterpret_cast<const char*>(sk), sizeof(sk));
+    sodium_memzero(sk, sizeof(sk));
+
+    deriveCurveKeysFromEd();
+
+    // Generate PQ keypairs on first run
+    {
+        auto [kPub, kPriv] = generateKemKeypair();
+        m_kemPub  = kPub;
+        m_kemPriv = kPriv;
+        secureZero(kPriv);
+    }
+    {
+        auto [dPub, dPriv] = generateDsaKeypair();
+        m_dsaPub  = dPub;
+        m_dsaPriv = dPriv;
+        secureZero(dPriv);
+    }
+
+    if (!saveIdentityToDisk(identityKey)) {
+        secureZero(m_identityKey);
+        secureZero(m_passphrase);
+        throw std::runtime_error("Failed to save encrypted identity to disk");
+    }
+
+    secureZero(m_identityKey);
     secureZero(m_passphrase);
 }
 
@@ -530,6 +716,48 @@ void CryptoEngine::ensurePQKeys() {
 #endif
         } else {
             qWarning() << "[CryptoEngine] Failed to persist PQ keys";
+        }
+    }
+}
+
+// ── v5 unified ensurePQKeys: uses pre-derived identityKey ────────────────
+void CryptoEngine::ensurePQKeys(const QByteArray& identityKey) {
+    if (identityKey.size() != KEY_BYTES) return;
+
+    bool changed = false;
+
+    if (!hasPQKeys()) {
+        auto [pub, priv] = generateKemKeypair();
+        if (pub.isEmpty()) {
+            qWarning() << "[CryptoEngine] Failed to generate ML-KEM-768 keypair";
+            return;
+        }
+        m_kemPub  = pub;
+        m_kemPriv = priv;
+        secureZero(priv);
+        changed = true;
+    }
+
+    if (!hasDSAKeys()) {
+        auto [pub, priv] = generateDsaKeypair();
+        if (pub.isEmpty()) {
+            qWarning() << "[CryptoEngine] Failed to generate ML-DSA-65 keypair";
+        } else {
+            m_dsaPub  = pub;
+            m_dsaPriv = priv;
+            secureZero(priv);
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        if (saveIdentityToDisk(identityKey)) {
+#ifndef QT_NO_DEBUG_OUTPUT
+            qDebug() << "[CryptoEngine] PQ keys generated and persisted (v5)"
+                     << "| KEM:" << hasPQKeys() << "| DSA:" << hasDSAKeys();
+#endif
+        } else {
+            qWarning() << "[CryptoEngine] Failed to persist PQ keys (v5)";
         }
     }
 }
@@ -762,4 +990,123 @@ bool CryptoEngine::verifySignature(const QByteArray& sig, const QByteArray& mess
         reinterpret_cast<const unsigned char*>(message.constData()),
         static_cast<unsigned long long>(message.size()),
         reinterpret_cast<const unsigned char*>(edPub.constData())) == 0;
+}
+
+// ---------------------------
+// Master key derivation (Argon2id)
+// ---------------------------
+
+QByteArray CryptoEngine::deriveMasterKey(const QString& passphrase, const QByteArray& salt)
+{
+    if (salt.size() != crypto_pwhash_SALTBYTES) {
+        qWarning() << "deriveMasterKey: invalid salt size" << salt.size();
+        return {};
+    }
+
+    QByteArray passUtf8 = passphrase.toUtf8();
+    QByteArray masterKey(32, 0);
+
+    // Mobile devices have tight memory limits — use INTERACTIVE (64 MB).
+    // Desktop can afford MODERATE (256 MB) for stronger brute-force resistance.
+    // The salt is device-local so different params per platform is safe.
+#if defined(Q_OS_IOS) || defined(Q_OS_ANDROID)
+    constexpr auto opsLimit = crypto_pwhash_OPSLIMIT_INTERACTIVE;
+    constexpr auto memLimit = crypto_pwhash_MEMLIMIT_INTERACTIVE;
+#else
+    constexpr auto opsLimit = crypto_pwhash_OPSLIMIT_MODERATE;
+    constexpr auto memLimit = crypto_pwhash_MEMLIMIT_MODERATE;
+#endif
+
+    if (crypto_pwhash(
+            reinterpret_cast<unsigned char*>(masterKey.data()),
+            static_cast<unsigned long long>(masterKey.size()),
+            passUtf8.constData(),
+            static_cast<unsigned long long>(passUtf8.size()),
+            reinterpret_cast<const unsigned char*>(salt.constData()),
+            opsLimit,
+            memLimit,
+            crypto_pwhash_ALG_ARGON2ID13) != 0) {
+        secureZero(passUtf8);
+        qWarning() << "deriveMasterKey: Argon2id failed (out of memory?)";
+        return {};
+    }
+
+    secureZero(passUtf8);
+    return masterKey;
+}
+
+QByteArray CryptoEngine::deriveSubkey(const QByteArray& masterKey,
+                                       const QByteArray& info, int len)
+{
+    return hkdf(masterKey, {}, info, len);
+}
+
+QByteArray CryptoEngine::loadOrCreateSalt(const QString& path)
+{
+    const int expectedSize = static_cast<int>(crypto_pwhash_SALTBYTES);
+    const QString backupPath = path + ".bak";
+
+    // Try primary salt file
+    QFile f(path);
+    if (f.exists() && f.open(QIODevice::ReadOnly)) {
+        QByteArray salt = f.readAll();
+        f.close();
+        if (salt.size() == expectedSize)
+            return salt;
+        qWarning() << "loadOrCreateSalt: primary salt file corrupt (size"
+                    << salt.size() << "expected" << expectedSize << ")";
+    }
+
+    // Try backup salt file (recovery from corruption)
+    QFile backup(backupPath);
+    if (backup.exists() && backup.open(QIODevice::ReadOnly)) {
+        QByteArray salt = backup.readAll();
+        backup.close();
+        if (salt.size() == expectedSize) {
+            qWarning() << "loadOrCreateSalt: recovered salt from backup";
+            // Restore primary from backup
+            QFile restore(path);
+            if (restore.open(QIODevice::WriteOnly)) {
+                restore.write(salt);
+                restore.flush();
+                restore.close();
+            }
+            return salt;
+        }
+    }
+
+    // Generate new random salt (first run only — both files missing)
+    if (f.exists()) {
+        // Primary exists but is corrupt AND backup is missing/corrupt.
+        // This means data loss is imminent — refuse to silently regenerate.
+        qCritical() << "loadOrCreateSalt: salt file corrupt with no backup!"
+                     << "Cannot derive the correct encryption key."
+                     << "Delete" << path << "and the database to start fresh.";
+        return {};
+    }
+
+    QByteArray salt(expectedSize, 0);
+    randombytes_buf(reinterpret_cast<unsigned char*>(salt.data()),
+                    static_cast<size_t>(salt.size()));
+
+    // Ensure parent directory exists
+    QDir().mkpath(QFileInfo(path).absolutePath());
+
+    // Write primary + backup, flush both to disk
+    if (f.open(QIODevice::WriteOnly)) {
+        f.write(salt);
+        f.flush();
+        f.close();
+    } else {
+        qWarning() << "loadOrCreateSalt: failed to write salt file:" << path;
+    }
+
+    QFile bak(backupPath);
+    if (bak.open(QIODevice::WriteOnly)) {
+        bak.write(salt);
+        bak.flush();
+        bak.close();
+    }
+
+    return salt;
 }

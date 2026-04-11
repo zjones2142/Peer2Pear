@@ -5,7 +5,7 @@
 #include <QDateTime>
 #include <QTimeZone>
 #include <QUuid>
-#include <QtSql/QSqlQuery>
+// SqlCipherQuery is available via ChatController.hpp -> SqlCipherDb.hpp
 #include <sodium.h>
 
 // Envelope header prefixes (legacy + sealed)
@@ -93,18 +93,24 @@ void ChatController::setPassphrase(const QString& pass)
     m_crypto.ensureIdentity();
 }
 
+void ChatController::setPassphrase(const QString& pass, const QByteArray& identityKey)
+{
+    m_crypto.setPassphrase(pass);
+    m_crypto.ensureIdentity(identityKey);
+}
+
 void ChatController::setServerBaseUrl(const QUrl& base)
 {
     m_rvz.setBaseUrl(base);
     m_mbox.setBaseUrl(base);
 }
 
-void ChatController::setDatabase(QSqlDatabase db)
+void ChatController::setDatabase(SqlCipherDb& db)
 {
     // Guard against double-call: reset previous instances before reinitializing
     m_sessionMgr.reset();
     m_sessionStore.reset();
-    m_db = db;
+    m_dbPtr = &db;
 
     // Derive a 32-byte at-rest encryption key from the identity curve private key.
     // This key never leaves memory and is tied to the user's unlocked identity.
@@ -116,11 +122,11 @@ void ChatController::setDatabase(QSqlDatabase db)
     // One-time migration: clear sessions when serialization format changes.
     // v5: ratchet init fix.  v6: PQ hybrid (Noise v4 + RatchetSession v2).
     {
-        QSqlQuery q(db);
+        SqlCipherQuery q(db);
         q.prepare("SELECT value FROM settings WHERE key='ratchet_v6_cleared';");
         if (!q.exec() || !q.next()) {
             m_sessionStore->clearAll();
-            QSqlQuery ins(db);
+            SqlCipherQuery ins(db);
             ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v6_cleared','1');");
             ins.exec();
         }
@@ -435,6 +441,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
 {
     const QString myId = myIdB64u();
     const qint64 ts = QDateTime::currentSecsSinceEpoch();
+    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
     // Include member list so receivers can update their local group member list
     QJsonArray membersArray;
@@ -452,6 +459,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         payload["groupName"] = groupName;
         payload["members"]   = membersArray;
         payload["ts"]        = ts;
+        payload["msgId"]     = msgId;  // B2 fix: include msgId for dedup
 
         const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         QByteArray env = sealForPeer(peerId, pt);
@@ -687,9 +695,11 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     }
 
     // ── Legacy encrypted JSON message ────────────────────────────────────────
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[RECV P2P] legacy text from" << peerIdB64u.left(8) + "...";
-#endif
+    // SEC3: This path uses a static ECDH key with NO forward secrecy.
+    // It exists for backward compatibility but should be disabled once
+    // all peers support sealed/ratchet messaging.
+    qWarning() << "[RECV P2P] legacy path (no forward secrecy) from"
+               << peerIdB64u.left(8) + "... — peer should upgrade";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
     if (pt.isEmpty()) return;
@@ -852,6 +862,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                                        o.value("groupName").toString(),
                                        memberKeys, o.value("text").toString(), ts, msgId);
         } else if (type == "group_leave") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B2 fix: dedup
             QStringList memberKeys;
             for (const QJsonValue &v : o.value("members").toArray())
                 memberKeys << v.toString();
@@ -863,6 +874,21 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
         } else if (type == "group_avatar") {
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
+        } else if (type == "group_member_update") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B3 fix: dedup
+            const QString gid       = o.value("groupId").toString();
+            const QString gname     = o.value("groupName").toString();
+            QStringList memberKeys;
+            for (const QJsonValue &v : o.value("members").toArray())
+                memberKeys << v.toString();
+
+            // Re-use the existing groupMessageReceived signal — the
+            // ChatView::onIncomingGroupMessage handler already merges new
+            // member keys into the group's key list.
+            // Empty text means no chat bubble appears, but the key merge still happens.
+            emit groupMessageReceived(senderId, gid, gname, memberKeys,
+                                      QString(), ts,
+                                      msgId.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : msgId);
         } else if (type == "ice_offer") {
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
@@ -916,8 +942,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             if (kemPub.size() == 1184) {  // ML-KEM-768 pub key size
                 m_peerKemPubs[senderId] = kemPub;
                 // Persist to DB
-                if (m_db.isOpen()) {
-                    QSqlQuery q(m_db);
+                if (m_dbPtr && m_dbPtr->isOpen()) {
+                    SqlCipherQuery q(*m_dbPtr);
                     q.prepare("UPDATE contacts SET kem_pub=:kp WHERE peer_id=:pid;");
                     q.bindValue(":kp", kemPub);
                     q.bindValue(":pid", senderId);
@@ -1047,6 +1073,36 @@ void ChatController::sendGroupAvatar(const QString& groupId,
         sendSealedPayload(key, payload);   // S7 fix
 }
 
+void ChatController::sendGroupMemberUpdate(const QString& groupId,
+                                           const QString& groupName,
+                                           const QStringList& memberKeys)
+{
+    const QString myId = myIdB64u();
+
+    // Build the member array (excluding self, matching group_msg format)
+    QJsonArray membersArray;
+    for (const QString &key : memberKeys) {
+        if (key.trimmed() == myId) continue;
+        membersArray.append(key);
+    }
+
+    // Send to ALL members (including newly added ones) so everyone gets
+    // the updated member list and new members discover the group.
+    for (const QString &peerId : memberKeys) {
+        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
+
+        QJsonObject payload;
+        payload["from"]      = myId;
+        payload["type"]      = "group_member_update";
+        payload["groupId"]   = groupId;
+        payload["groupName"] = groupName;
+        payload["members"]   = membersArray;
+        payload["ts"]        = QDateTime::currentSecsSinceEpoch();
+
+        sendSealedPayload(peerId, payload);
+    }
+}
+
 // ── G3: Reset encrypted session ──────────────────────────────────────────────
 void ChatController::resetSession(const QString& peerIdB64u)
 {
@@ -1070,8 +1126,8 @@ QByteArray ChatController::lookupPeerKemPub(const QString& peerIdB64u)
     if (it != m_peerKemPubs.end()) return it.value();
 
     // Load from DB
-    if (!m_db.isOpen()) return {};
-    QSqlQuery q(m_db);
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return {};
+    SqlCipherQuery q(m_dbPtr->handle());
     q.prepare("SELECT kem_pub FROM contacts WHERE peer_id=:pid;");
     q.bindValue(":pid", peerIdB64u);
     if (q.exec() && q.next()) {
