@@ -506,8 +506,16 @@ void ChatController::pollOnce()
     m_fileMgr.purgeStaleTransfers();
 
     // H2 fix: prune stuck pending handshakes (5 min timeout, checked every poll)
-    if (m_sessionStore)
-        m_sessionStore->pruneStaleHandshakes();
+    // SEC9: track peers whose handshakes repeatedly time out — they likely
+    //        run a legacy client that doesn't understand hybrid PQ messages.
+    if (m_sessionStore) {
+        const QStringList pruned = m_sessionStore->pruneStaleHandshakes();
+        for (const QString &peerId : pruned) {
+            int count = ++m_handshakeFailCount[peerId];
+            if (count >= 2)   // two consecutive timeouts → likely incompatible
+                emit peerMayNeedUpgrade(peerId);
+        }
+    }
 
     // M8 fix: purge orphaned file keys older than 30 minutes.
     // If a file_key announcement arrives but chunks never follow (sender crash,
@@ -811,6 +819,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
 #endif
+                // SEC9: handshake succeeded — clear failure counter
+                m_handshakeFailCount.remove(senderId);
+
                 // Announce our PQ KEM pub now that we have an authenticated channel
                 announceKemPub(senderId);
             } else {
@@ -871,8 +882,10 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         } else if (type == "avatar") {
             emit avatarReceived(senderId, o.value("name").toString(), o.value("avatar").toString());
         } else if (type == "group_rename") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B5 fix: dedup
             emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
         } else if (type == "group_avatar") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B5 fix: dedup
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
         } else if (type == "group_member_update") {
             if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B3 fix: dedup
@@ -1051,11 +1064,14 @@ void ChatController::sendGroupRename(const QString& groupId,
                                      const QString& newName,
                                      const QStringList& memberKeys)
 {
+    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);  // B5 fix
     QJsonObject payload;
     payload["from"]    = myIdB64u();
     payload["type"]    = "group_rename";
     payload["groupId"] = groupId;
     payload["newName"] = newName;
+    payload["msgId"]   = msgId;                                   // B5 fix
+    payload["ts"]      = QDateTime::currentSecsSinceEpoch();      // B5 fix
     for (const QString &key : memberKeys)
         sendSealedPayload(key, payload);   // S7 fix
 }
@@ -1064,11 +1080,14 @@ void ChatController::sendGroupAvatar(const QString& groupId,
                                      const QString& avatarB64,
                                      const QStringList& memberKeys)
 {
+    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);  // B5 fix
     QJsonObject payload;
     payload["from"]    = myIdB64u();
     payload["type"]    = "group_avatar";
     payload["groupId"] = groupId;
     payload["avatar"]  = avatarB64;
+    payload["msgId"]   = msgId;                                   // B5 fix
+    payload["ts"]      = QDateTime::currentSecsSinceEpoch();      // B5 fix
     for (const QString &key : memberKeys)
         sendSealedPayload(key, payload);   // S7 fix
 }
@@ -1078,6 +1097,7 @@ void ChatController::sendGroupMemberUpdate(const QString& groupId,
                                            const QStringList& memberKeys)
 {
     const QString myId = myIdB64u();
+    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);  // B5 fix
 
     // Build the member array (excluding self, matching group_msg format)
     QJsonArray membersArray;
@@ -1097,6 +1117,7 @@ void ChatController::sendGroupMemberUpdate(const QString& groupId,
         payload["groupId"]   = groupId;
         payload["groupName"] = groupName;
         payload["members"]   = membersArray;
+        payload["msgId"]     = msgId;                              // B5 fix
         payload["ts"]        = QDateTime::currentSecsSinceEpoch();
 
         sendSealedPayload(peerId, payload);
@@ -1113,6 +1134,15 @@ void ChatController::resetSession(const QString& peerIdB64u)
 #endif
         emit status("Session reset — next message will establish a fresh handshake.");
     }
+}
+
+// ── GAP5: Group sequence counter persistence ────────────────────────────────
+
+void ChatController::setGroupSeqCounters(const QMap<QString, qint64>& seqOut,
+                                          const QMap<QString, qint64>& seqIn)
+{
+    m_groupSeqOut = seqOut;
+    m_groupSeqIn  = seqIn;
 }
 
 // ---------------------------

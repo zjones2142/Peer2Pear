@@ -3,6 +3,7 @@
 #include <QString>
 #include <QByteArray>
 #include <QVector>
+#include <QMap>
 #include <QDateTime>
 
 #include "SqlCipherDb.hpp"
@@ -43,6 +44,12 @@ public:
 
     void    saveSetting(const QString &key, const QString &value);
     QString loadSetting(const QString &key, const QString &defaultValue = {}) const;
+
+    // GAP5: Persistent group sequence counters (survive app restart)
+    void saveGroupSeqOut(const QMap<QString, qint64> &counters);
+    QMap<QString, qint64> loadGroupSeqOut() const;
+    void saveGroupSeqIn(const QMap<QString, qint64> &counters);
+    QMap<QString, qint64> loadGroupSeqIn() const;
 
     // Expose the underlying SqlCipherDb for shared use (e.g., SessionStore)
     SqlCipherDb& database() { return m_db; }

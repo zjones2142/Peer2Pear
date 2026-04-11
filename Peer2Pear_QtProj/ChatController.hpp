@@ -80,6 +80,12 @@ public:
     // G3: Wipe ratchet session for a peer, forcing a fresh Noise IK handshake
     void resetSession(const QString& peerIdB64u);
 
+    // GAP5: restore/persist group sequence counters across restarts
+    void setGroupSeqCounters(const QMap<QString, qint64>& seqOut,
+                             const QMap<QString, qint64>& seqIn);
+    const QMap<QString, qint64>& groupSeqOut() const { return m_groupSeqOut; }
+    const QMap<QString, qint64>& groupSeqIn()  const { return m_groupSeqIn;  }
+
 signals:
     void status(const QString& s);
     void presenceChanged(const QString& peerIdB64u, bool online);
@@ -106,6 +112,11 @@ signals:
     void avatarReceived(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
     void groupRenamed(const QString& groupId, const QString& newName);
     void groupAvatarReceived(const QString& groupId, const QString& avatarB64);
+
+    // SEC9: emitted when a handshake with a peer is pruned (timed out) more
+    // than once — likely means the peer is running an older client that
+    // doesn't understand hybrid PQ Noise messages.
+    void peerMayNeedUpgrade(const QString& peerIdB64u);
 
     // Emitted each time a chunk of an incoming transfer arrives.
     // chunksReceived == chunksTotal signals completion; fileData contains
@@ -160,6 +171,9 @@ private:
     QMap<QString, qint64> m_groupSeqOut;
     // G5 fix: per-(group,sender) last-seen sequence — detects gaps
     QMap<QString, qint64> m_groupSeqIn;  // key: "groupId:senderId"
+
+    // SEC9: count consecutive handshake timeouts per peer — 2+ suggests legacy client
+    QMap<QString, int> m_handshakeFailCount;
 
     // Peer ML-KEM-768 public keys: peerIdB64u -> 1184-byte KEM pub
     // Populated by kem_pub_announce messages, used by sealForPeer() for hybrid envelopes

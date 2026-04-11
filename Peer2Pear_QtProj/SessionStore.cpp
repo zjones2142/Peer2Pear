@@ -29,17 +29,10 @@ void SessionStore::createTables() {
         ");"
     );
 
-    q.exec(
-        "CREATE TABLE IF NOT EXISTS skipped_message_keys ("
-        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  peer_id     TEXT NOT NULL,"
-        "  dh_pub      BLOB NOT NULL,"
-        "  msg_num     INTEGER NOT NULL,"
-        "  message_key BLOB NOT NULL,"
-        "  created_at  INTEGER NOT NULL,"
-        "  UNIQUE(peer_id, dh_pub, msg_num)"
-        ");"
-    );
+    // B4 fix: skipped_message_keys table removed — RatchetSession manages
+    // skipped keys in its own serialized blob (in-memory map).
+    // Drop the unused table if it exists from prior versions.
+    q.exec("DROP TABLE IF EXISTS skipped_message_keys;");
 
     q.exec(
         "CREATE TABLE IF NOT EXISTS pending_handshakes ("
@@ -133,72 +126,7 @@ void SessionStore::deleteSession(const QString& peerId) {
     q.prepare("DELETE FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     q.exec();
-    deleteSkippedKeysForPeer(peerId);
     deletePendingHandshake(peerId);
-}
-
-// ---------------------------
-// Skipped message keys
-// ---------------------------
-
-void SessionStore::saveSkippedKey(const QString& peerId, const QByteArray& dhPub,
-                                   quint32 msgNum, const QByteArray& messageKey) {
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    SqlCipherQuery q(m_db);
-    q.prepare(
-        "INSERT OR REPLACE INTO skipped_message_keys"
-        " (peer_id, dh_pub, msg_num, message_key, created_at)"
-        " VALUES (:pid, :dh, :mn, :mk, :now);"
-    );
-    q.bindValue(":pid", peerId);
-    q.bindValue(":dh", dhPub);
-    q.bindValue(":mn", msgNum);
-    q.bindValue(":mk", encryptBlob(messageKey));   // S2 fix: encrypt at rest
-    q.bindValue(":now", now);
-    if (!q.exec()) qWarning() << "SessionStore::saveSkippedKey:" << q.lastError();
-}
-
-QByteArray SessionStore::loadAndDeleteSkippedKey(const QString& peerId,
-                                                  const QByteArray& dhPub, quint32 msgNum) {
-    SqlCipherQuery q(m_db);
-    q.prepare(
-        "SELECT id, message_key FROM skipped_message_keys"
-        " WHERE peer_id=:pid AND dh_pub=:dh AND msg_num=:mn;"
-    );
-    q.bindValue(":pid", peerId);
-    q.bindValue(":dh", dhPub);
-    q.bindValue(":mn", msgNum);
-    if (!q.exec() || !q.next()) return {};
-
-    qint64 id = q.value(0).toLongLong();
-    QByteArray key = decryptBlob(q.value(1).toByteArray());  // S2 fix: decrypt
-
-    SqlCipherQuery del(m_db);
-    del.prepare("DELETE FROM skipped_message_keys WHERE id=:id;");
-    del.bindValue(":id", id);
-    del.exec();
-
-    return key;
-}
-
-void SessionStore::pruneSkippedKeys(const QString& peerId, int maxCount) {
-    SqlCipherQuery q(m_db);
-    q.prepare(
-        "DELETE FROM skipped_message_keys WHERE peer_id=:pid AND id NOT IN"
-        " (SELECT id FROM skipped_message_keys WHERE peer_id=:pid2"
-        "  ORDER BY created_at DESC LIMIT :lim);"
-    );
-    q.bindValue(":pid", peerId);
-    q.bindValue(":pid2", peerId);
-    q.bindValue(":lim", maxCount);
-    q.exec();
-}
-
-void SessionStore::deleteSkippedKeysForPeer(const QString& peerId) {
-    SqlCipherQuery q(m_db);
-    q.prepare("DELETE FROM skipped_message_keys WHERE peer_id=:pid;");
-    q.bindValue(":pid", peerId);
-    q.exec();
 }
 
 // ---------------------------
@@ -208,7 +136,6 @@ void SessionStore::deleteSkippedKeysForPeer(const QString& peerId) {
 void SessionStore::clearAll() {
     SqlCipherQuery q(m_db);
     q.exec("DELETE FROM ratchet_sessions;");
-    q.exec("DELETE FROM skipped_message_keys;");
     q.exec("DELETE FROM pending_handshakes;");
 #ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[SessionStore] Cleared all sessions, skipped keys, and pending handshakes";
@@ -254,14 +181,29 @@ void SessionStore::deletePendingHandshake(const QString& peerId) {
     q.exec();
 }
 
-void SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
+QStringList SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
     const qint64 cutoff = QDateTime::currentSecsSinceEpoch() - maxAgeSecs;
-    SqlCipherQuery q(m_db);
-    q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
-    q.bindValue(":cutoff", cutoff);
-    if (q.exec() && q.numRowsAffected() > 0) {
+    QStringList pruned;
+
+    // SEC9: collect peer IDs before deleting so we can report them
+    {
+        SqlCipherQuery sel(m_db.handle());
+        sel.prepare("SELECT peer_id FROM pending_handshakes WHERE created_at < :cutoff;");
+        sel.bindValue(":cutoff", cutoff);
+        if (sel.exec()) {
+            while (sel.next())
+                pruned << sel.value(0).toString();
+        }
+    }
+
+    if (!pruned.isEmpty()) {
+        SqlCipherQuery q(m_db);
+        q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
+        q.bindValue(":cutoff", cutoff);
+        q.exec();
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionStore] Pruned" << q.numRowsAffected() << "stale pending handshakes";
+        qDebug() << "[SessionStore] Pruned" << pruned.size() << "stale pending handshakes";
 #endif
     }
+    return pruned;
 }

@@ -403,6 +403,15 @@ void DatabaseManager::createTables()
         ");"
         );
 
+    // GAP5 fix: persistent group sequence counters
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS group_seq_counters ("
+        "  seq_key    TEXT PRIMARY KEY,"
+        "  direction  INTEGER NOT NULL,"
+        "  counter    INTEGER NOT NULL"
+        ");"
+    );
+
     q.exec(
         "CREATE TABLE IF NOT EXISTS file_transfers ("
         "  transfer_id      TEXT PRIMARY KEY,"
@@ -656,3 +665,43 @@ QString DatabaseManager::loadSetting(const QString &key, const QString &def) con
     if (q.exec() && q.next()) return q.value(0).toString();
     return def;
 }
+
+// ── GAP5: Persistent group sequence counters ───────────────────────────────
+
+static void saveSeqMap(SqlCipherDb& db, int direction, const QMap<QString, qint64>& map)
+{
+    // Clear old entries for this direction, then bulk-insert
+    {
+        SqlCipherQuery del(db);
+        del.prepare("DELETE FROM group_seq_counters WHERE direction=:dir;");
+        del.bindValue(":dir", direction);
+        del.exec();
+    }
+    for (auto it = map.cbegin(); it != map.cend(); ++it) {
+        SqlCipherQuery q(db);
+        q.prepare("INSERT INTO group_seq_counters(seq_key,direction,counter)"
+                  " VALUES(:k,:d,:c);");
+        q.bindValue(":k", it.key());
+        q.bindValue(":d", direction);
+        q.bindValue(":c", it.value());
+        q.exec();
+    }
+}
+
+static QMap<QString, qint64> loadSeqMap(sqlite3* db, int direction)
+{
+    QMap<QString, qint64> result;
+    SqlCipherQuery q(db);
+    q.prepare("SELECT seq_key, counter FROM group_seq_counters WHERE direction=:dir;");
+    q.bindValue(":dir", direction);
+    if (q.exec()) {
+        while (q.next())
+            result[q.value(0).toString()] = q.value(1).toLongLong();
+    }
+    return result;
+}
+
+void DatabaseManager::saveGroupSeqOut(const QMap<QString, qint64>& counters) { saveSeqMap(m_db, 0, counters); }
+QMap<QString, qint64> DatabaseManager::loadGroupSeqOut() const { return loadSeqMap(m_db.handle(), 0); }
+void DatabaseManager::saveGroupSeqIn(const QMap<QString, qint64>& counters) { saveSeqMap(m_db, 1, counters); }
+QMap<QString, qint64> DatabaseManager::loadGroupSeqIn() const { return loadSeqMap(m_db.handle(), 1); }
