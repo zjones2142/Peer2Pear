@@ -479,3 +479,122 @@ bool CryptoEngine::verifySignature(const QByteArray& sig, const QByteArray& mess
         static_cast<unsigned long long>(message.size()),
         reinterpret_cast<const unsigned char*>(edPub.constData())) == 0;
 }
+
+// ---------------------------
+// Master key derivation (Argon2id)
+// ---------------------------
+
+QByteArray CryptoEngine::deriveMasterKey(const QString& passphrase, const QByteArray& salt)
+{
+    if (salt.size() != crypto_pwhash_SALTBYTES) {
+        qWarning() << "deriveMasterKey: invalid salt size" << salt.size();
+        return {};
+    }
+
+    QByteArray passUtf8 = passphrase.toUtf8();
+    QByteArray masterKey(32, 0);
+
+    // Mobile devices have tight memory limits — use INTERACTIVE (64 MB).
+    // Desktop can afford MODERATE (256 MB) for stronger brute-force resistance.
+    // The salt is device-local so different params per platform is safe.
+#if defined(Q_OS_IOS) || defined(Q_OS_ANDROID)
+    constexpr auto opsLimit = crypto_pwhash_OPSLIMIT_INTERACTIVE;
+    constexpr auto memLimit = crypto_pwhash_MEMLIMIT_INTERACTIVE;
+#else
+    constexpr auto opsLimit = crypto_pwhash_OPSLIMIT_MODERATE;
+    constexpr auto memLimit = crypto_pwhash_MEMLIMIT_MODERATE;
+#endif
+
+    if (crypto_pwhash(
+            reinterpret_cast<unsigned char*>(masterKey.data()),
+            static_cast<unsigned long long>(masterKey.size()),
+            passUtf8.constData(),
+            static_cast<unsigned long long>(passUtf8.size()),
+            reinterpret_cast<const unsigned char*>(salt.constData()),
+            opsLimit,
+            memLimit,
+            crypto_pwhash_ALG_ARGON2ID13) != 0) {
+        secureZero(passUtf8);
+        qWarning() << "deriveMasterKey: Argon2id failed (out of memory?)";
+        return {};
+    }
+
+    secureZero(passUtf8);
+    return masterKey;
+}
+
+QByteArray CryptoEngine::deriveSubkey(const QByteArray& masterKey,
+                                       const QByteArray& info, int len)
+{
+    return hkdf(masterKey, {}, info, len);
+}
+
+QByteArray CryptoEngine::loadOrCreateSalt(const QString& path)
+{
+    const int expectedSize = static_cast<int>(crypto_pwhash_SALTBYTES);
+    const QString backupPath = path + ".bak";
+
+    // Try primary salt file
+    QFile f(path);
+    if (f.exists() && f.open(QIODevice::ReadOnly)) {
+        QByteArray salt = f.readAll();
+        f.close();
+        if (salt.size() == expectedSize)
+            return salt;
+        qWarning() << "loadOrCreateSalt: primary salt file corrupt (size"
+                    << salt.size() << "expected" << expectedSize << ")";
+    }
+
+    // Try backup salt file (recovery from corruption)
+    QFile backup(backupPath);
+    if (backup.exists() && backup.open(QIODevice::ReadOnly)) {
+        QByteArray salt = backup.readAll();
+        backup.close();
+        if (salt.size() == expectedSize) {
+            qWarning() << "loadOrCreateSalt: recovered salt from backup";
+            // Restore primary from backup
+            QFile restore(path);
+            if (restore.open(QIODevice::WriteOnly)) {
+                restore.write(salt);
+                restore.flush();
+                restore.close();
+            }
+            return salt;
+        }
+    }
+
+    // Generate new random salt (first run only — both files missing)
+    if (f.exists()) {
+        // Primary exists but is corrupt AND backup is missing/corrupt.
+        // This means data loss is imminent — refuse to silently regenerate.
+        qCritical() << "loadOrCreateSalt: salt file corrupt with no backup!"
+                     << "Cannot derive the correct encryption key."
+                     << "Delete" << path << "and the database to start fresh.";
+        return {};
+    }
+
+    QByteArray salt(expectedSize, 0);
+    randombytes_buf(reinterpret_cast<unsigned char*>(salt.data()),
+                    static_cast<size_t>(salt.size()));
+
+    // Ensure parent directory exists
+    QDir().mkpath(QFileInfo(path).absolutePath());
+
+    // Write primary + backup, flush both to disk
+    if (f.open(QIODevice::WriteOnly)) {
+        f.write(salt);
+        f.flush();
+        f.close();
+    } else {
+        qWarning() << "loadOrCreateSalt: failed to write salt file:" << path;
+    }
+
+    QFile bak(backupPath);
+    if (bak.open(QIODevice::WriteOnly)) {
+        bak.write(salt);
+        bak.flush();
+        bak.close();
+    }
+
+    return salt;
+}

@@ -14,8 +14,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- 1. Find Qt Packages ---
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Sql)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network Sql)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network)
 
 # Fix Qt's malformed framework flags on macOS
 if(APPLE)
@@ -41,6 +41,29 @@ if(APPLE)
     set_property(TARGET PkgConfig::NICE PROPERTY INTERFACE_LINK_OPTIONS "")
     set_property(TARGET PkgConfig::GLIB PROPERTY INTERFACE_LINK_OPTIONS "")
 endif()
+
+# --- 2b. Find SQLCipher (REQUIRED — no unencrypted databases) ---
+# On macOS: brew install sqlcipher
+# On Linux: apt install libsqlcipher-dev
+# On Windows: vcpkg install sqlcipher (or build from source)
+#
+# Homebrew installs SQLCipher as keg-only, so its .pc file isn't on the
+# default pkg-config search path.  Append it when building on macOS.
+if(APPLE)
+    execute_process(
+        COMMAND brew --prefix sqlcipher
+        OUTPUT_VARIABLE _SQLCIPHER_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_SQLCIPHER_PREFIX)
+        set(ENV{PKG_CONFIG_PATH}
+            "$ENV{PKG_CONFIG_PATH}:${_SQLCIPHER_PREFIX}/lib/pkgconfig")
+    endif()
+endif()
+pkg_check_modules(SQLCIPHER REQUIRED IMPORTED_TARGET sqlcipher)
+message(STATUS "SQLCipher found: ${SQLCIPHER_VERSION}")
+set(SQLCIPHER_TARGET PkgConfig::SQLCIPHER)
 
 # --- 3. Define Project Sources (Unified List) ---
 set(PROJECT_SOURCES
@@ -82,6 +105,8 @@ set(PROJECT_SOURCES
     SealedEnvelope.cpp
     FileTransferManager.hpp
     FileTransferManager.cpp
+    SqlCipherDb.hpp
+    SqlCipherDb.cpp
     ${app_icon_resource}
 )
 
@@ -109,8 +134,8 @@ target_compile_definitions(Peer2Pear_QtProj PRIVATE
 target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
-    Qt${QT_VERSION_MAJOR}::Sql
     unofficial-sodium::sodium
+    ${SQLCIPHER_TARGET}
     PkgConfig::NICE
     PkgConfig::GLIB
 )

@@ -1,12 +1,10 @@
 #include "SessionStore.hpp"
-#include <QtSql/QSqlQuery>
-#include <QtSql/QSqlError>
 #include <QDateTime>
 #include <QDebug>
 #include <sodium.h>
 #include <cstring>
 
-SessionStore::SessionStore(QSqlDatabase db, QByteArray storeKey)
+SessionStore::SessionStore(SqlCipherDb& db, QByteArray storeKey)
     : m_db(db)
     , m_storeKey(std::move(storeKey))
 {
@@ -20,7 +18,7 @@ SessionStore::~SessionStore() {
 }
 
 void SessionStore::createTables() {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
 
     q.exec(
         "CREATE TABLE IF NOT EXISTS ratchet_sessions ("
@@ -58,7 +56,7 @@ void SessionStore::createTables() {
 // ---------------------------
 
 QByteArray SessionStore::encryptBlob(const QByteArray& plaintext) const {
-    if (m_storeKey.size() != 32) return plaintext;
+    if (m_storeKey.size() != 32) return {};  // no valid key — refuse to store plaintext
 
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
     randombytes_buf(nonce, sizeof(nonce));
@@ -110,7 +108,7 @@ QByteArray SessionStore::decryptBlob(const QByteArray& ciphertext) const {
 
 void SessionStore::saveSession(const QString& peerId, const QByteArray& stateBlob) {
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare(
         "INSERT INTO ratchet_sessions (peer_id, state_blob, created_at, updated_at)"
         " VALUES (:pid, :blob, :now, :now)"
@@ -119,11 +117,11 @@ void SessionStore::saveSession(const QString& peerId, const QByteArray& stateBlo
     q.bindValue(":pid", peerId);
     q.bindValue(":blob", encryptBlob(stateBlob));
     q.bindValue(":now", now);
-    if (!q.exec()) qWarning() << "SessionStore::saveSession:" << q.lastError().text();
+    if (!q.exec()) qWarning() << "SessionStore::saveSession:" << q.lastError();
 }
 
 QByteArray SessionStore::loadSession(const QString& peerId) const {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db.handle());
     q.prepare("SELECT state_blob FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     if (q.exec() && q.next()) return decryptBlob(q.value(0).toByteArray());
@@ -131,7 +129,7 @@ QByteArray SessionStore::loadSession(const QString& peerId) const {
 }
 
 void SessionStore::deleteSession(const QString& peerId) {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     q.exec();
@@ -146,7 +144,7 @@ void SessionStore::deleteSession(const QString& peerId) {
 void SessionStore::saveSkippedKey(const QString& peerId, const QByteArray& dhPub,
                                    quint32 msgNum, const QByteArray& messageKey) {
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare(
         "INSERT OR REPLACE INTO skipped_message_keys"
         " (peer_id, dh_pub, msg_num, message_key, created_at)"
@@ -157,12 +155,12 @@ void SessionStore::saveSkippedKey(const QString& peerId, const QByteArray& dhPub
     q.bindValue(":mn", msgNum);
     q.bindValue(":mk", encryptBlob(messageKey));   // S2 fix: encrypt at rest
     q.bindValue(":now", now);
-    if (!q.exec()) qWarning() << "SessionStore::saveSkippedKey:" << q.lastError().text();
+    if (!q.exec()) qWarning() << "SessionStore::saveSkippedKey:" << q.lastError();
 }
 
 QByteArray SessionStore::loadAndDeleteSkippedKey(const QString& peerId,
                                                   const QByteArray& dhPub, quint32 msgNum) {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare(
         "SELECT id, message_key FROM skipped_message_keys"
         " WHERE peer_id=:pid AND dh_pub=:dh AND msg_num=:mn;"
@@ -175,7 +173,7 @@ QByteArray SessionStore::loadAndDeleteSkippedKey(const QString& peerId,
     qint64 id = q.value(0).toLongLong();
     QByteArray key = decryptBlob(q.value(1).toByteArray());  // S2 fix: decrypt
 
-    QSqlQuery del(m_db);
+    SqlCipherQuery del(m_db);
     del.prepare("DELETE FROM skipped_message_keys WHERE id=:id;");
     del.bindValue(":id", id);
     del.exec();
@@ -184,7 +182,7 @@ QByteArray SessionStore::loadAndDeleteSkippedKey(const QString& peerId,
 }
 
 void SessionStore::pruneSkippedKeys(const QString& peerId, int maxCount) {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare(
         "DELETE FROM skipped_message_keys WHERE peer_id=:pid AND id NOT IN"
         " (SELECT id FROM skipped_message_keys WHERE peer_id=:pid2"
@@ -197,7 +195,7 @@ void SessionStore::pruneSkippedKeys(const QString& peerId, int maxCount) {
 }
 
 void SessionStore::deleteSkippedKeysForPeer(const QString& peerId) {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM skipped_message_keys WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     q.exec();
@@ -208,7 +206,7 @@ void SessionStore::deleteSkippedKeysForPeer(const QString& peerId) {
 // ---------------------------
 
 void SessionStore::clearAll() {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.exec("DELETE FROM ratchet_sessions;");
     q.exec("DELETE FROM skipped_message_keys;");
     q.exec("DELETE FROM pending_handshakes;");
@@ -224,7 +222,7 @@ void SessionStore::clearAll() {
 void SessionStore::savePendingHandshake(const QString& peerId, int role,
                                          const QByteArray& handshakeBlob) {
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare(
         "INSERT INTO pending_handshakes (peer_id, role, handshake_blob, created_at)"
         " VALUES (:pid, :role, :blob, :now)"
@@ -235,11 +233,11 @@ void SessionStore::savePendingHandshake(const QString& peerId, int role,
     q.bindValue(":role", role);
     q.bindValue(":blob", encryptBlob(handshakeBlob));
     q.bindValue(":now", now);
-    if (!q.exec()) qWarning() << "SessionStore::savePendingHandshake:" << q.lastError().text();
+    if (!q.exec()) qWarning() << "SessionStore::savePendingHandshake:" << q.lastError();
 }
 
 QByteArray SessionStore::loadPendingHandshake(const QString& peerId, int& roleOut) const {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db.handle());
     q.prepare("SELECT role, handshake_blob FROM pending_handshakes WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     if (q.exec() && q.next()) {
@@ -250,16 +248,15 @@ QByteArray SessionStore::loadPendingHandshake(const QString& peerId, int& roleOu
 }
 
 void SessionStore::deletePendingHandshake(const QString& peerId) {
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM pending_handshakes WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     q.exec();
 }
 
 void SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
-    // G2 fix: remove pending handshakes older than maxAgeSecs (default 24h)
     const qint64 cutoff = QDateTime::currentSecsSinceEpoch() - maxAgeSecs;
-    QSqlQuery q(m_db);
+    SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
     q.bindValue(":cutoff", cutoff);
     if (q.exec() && q.numRowsAffected() > 0) {

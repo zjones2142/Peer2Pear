@@ -52,6 +52,17 @@ public:
     static bool verifySignature(const QByteArray& sig, const QByteArray& message,
                                 const QByteArray& edPub);
 
+    // Derive a master key from a passphrase using Argon2id.
+    // Salt must be 16 bytes (use loadOrCreateSalt() to manage it).
+    static QByteArray deriveMasterKey(const QString& passphrase, const QByteArray& salt);
+
+    // Derive a purpose-specific subkey from a master key via HKDF.
+    static QByteArray deriveSubkey(const QByteArray& masterKey,
+                                   const QByteArray& info, int len = 32);
+
+    // Load a salt file from disk, or create a new random 16-byte one.
+    static QByteArray loadOrCreateSalt(const QString& path);
+
     // Securely zero a QByteArray's backing buffer in-place.
     static void secureZero(QByteArray& buf);
 

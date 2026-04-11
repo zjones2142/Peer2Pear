@@ -11,13 +11,13 @@ A hybrid peer-to-peer messaging and file sharing application built with Qt and C
 - **Encrypted file transfer** — send files up to 25 MB, automatically chunked (256 KB) and encrypted before transmission.
 - **Group chats** — create group conversations with encrypted broadcasts to all members.
 - **Hybrid P2P networking** — direct peer-to-peer connections via ICE/NAT traversal (libnice), falling back to an HTTP mailbox relay for offline delivery.
-- **Encrypted storage** — chat history and contacts are stored in a local SQLite database with per-field XChaCha20-Poly1305 encryption at rest.
+- **Encrypted storage** — the entire local database is encrypted at the page level using SQLCipher (AES-256). Sensitive fields (message text, contact names, file paths) have an additional layer of XChaCha20-Poly1305 AEAD encryption. No plaintext SQLite databases exist on any device.
 - **Contact management** — add contacts by Peer ID, block unwanted contacts, import/export contact lists.
-- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 5 or Qt 6.
+- **Cross-platform** — builds on Linux, macOS, and Windows using Qt 5 or Qt 6, with mobile (iOS/Android) portability in mind.
 
 ## How It Works
 
-Each user has an Ed25519 identity key pair generated locally, protected by a passphrase (Argon2id KDF). The public key serves as the user's **Peer ID** (base64url-encoded), shared with contacts out-of-band.
+Each user has an Ed25519 identity key pair generated locally, protected by a passphrase via Argon2id key derivation (MODERATE: 3 iterations, 256 MB on desktop; INTERACTIVE: 2 iterations, 64 MB on mobile). A single Argon2id call produces a master key, from which purpose-specific subkeys are derived via HKDF: one for SQLCipher database encryption, one for per-field AEAD, and one for identity key unlock. The public key serves as the user's **Peer ID** (base64url-encoded), shared with contacts out-of-band.
 
 ### Session Establishment
 
@@ -39,26 +39,29 @@ Each user has an Ed25519 identity key pair generated locally, protected by a pas
 | X25519 | ECDH key agreement (Noise, Sealed Sender) |
 | XChaCha20-Poly1305 | AEAD encryption (messages, files, DB fields) |
 | BLAKE2b | Hashing, KDF chains (root chain, message chain) |
-| Argon2id | Passphrase-based key derivation |
-| HKDF (BLAKE2b) | Deriving sub-keys (pre-key payloads, DB encryption) |
+| AES-256-CBC | SQLCipher page-level database encryption |
+| Argon2id | Passphrase-based master key derivation |
+| HKDF (BLAKE2b) | Deriving sub-keys (DB encryption, field encryption, identity unlock) |
 
 ## Dependencies
 
 | Dependency | Purpose |
 |---|---|
-| [Qt 5 / Qt 6](https://www.qt.io/) | GUI, networking, SQL, and application framework |
+| [Qt 5 / Qt 6](https://www.qt.io/) | GUI, networking, and application framework |
+| [SQLCipher](https://www.zetetic.net/sqlcipher/) | AES-256 encrypted SQLite (hard requirement) |
 | [libsodium](https://libsodium.org/) | Cryptographic primitives |
 | [libnice](https://libnice.freedesktop.org/) | ICE agent for P2P NAT traversal |
 | [GLib](https://docs.gtk.org/glib/) | Required by libnice |
 
-Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io/).
+Dependencies (libsodium, libnice, GLib) are managed via [vcpkg](https://vcpkg.io/). SQLCipher must be installed separately via your system package manager (e.g., `brew install sqlcipher` on macOS, `apt install sqlcipher libsqlcipher-dev` on Ubuntu).
 
 ## Building
 
 ### Prerequisites
 
 - CMake >= 3.16
-- Qt 5 or Qt 6 (Widgets, Network, Sql modules)
+- Qt 5 or Qt 6 (Widgets, Network modules)
+- SQLCipher (`brew install sqlcipher` / `apt install sqlcipher libsqlcipher-dev`)
 - A C++17-capable compiler
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically by the setup scripts)
 

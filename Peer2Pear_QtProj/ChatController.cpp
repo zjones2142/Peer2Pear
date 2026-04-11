@@ -5,7 +5,7 @@
 #include <QDateTime>
 #include <QTimeZone>
 #include <QUuid>
-#include <QtSql/QSqlQuery>
+// SqlCipherQuery is available via ChatController.hpp -> SqlCipherDb.hpp
 #include <sodium.h>
 
 // Envelope header prefixes (legacy + sealed)
@@ -99,7 +99,7 @@ void ChatController::setServerBaseUrl(const QUrl& base)
     m_mbox.setBaseUrl(base);
 }
 
-void ChatController::setDatabase(QSqlDatabase db)
+void ChatController::setDatabase(SqlCipherDb& db)
 {
     // Guard against double-call: reset previous instances before reinitializing
     m_sessionMgr.reset();
@@ -114,11 +114,11 @@ void ChatController::setDatabase(QSqlDatabase db)
 
     // One-time migration: clear sessions created with the buggy ratchet init
     {
-        QSqlQuery q(db);
+        SqlCipherQuery q(db);
         q.prepare("SELECT value FROM settings WHERE key='ratchet_v5_cleared';");
         if (!q.exec() || !q.next()) {
             m_sessionStore->clearAll();
-            QSqlQuery ins(db);
+            SqlCipherQuery ins(db);
             ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v5_cleared','1');");
             ins.exec();
         }
