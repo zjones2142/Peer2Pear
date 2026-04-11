@@ -72,7 +72,7 @@ ChatController::ChatController(QObject* parent)
     connect(iceCleanup, &QTimer::timeout, this, [this]() {
         QStringList toRemove;
         for (auto it = m_p2pConnections.begin(); it != m_p2pConnections.end(); ++it) {
-            if (!it.value()->isReady() && !it.value()->isRunning()) {
+            if (!it.value()->isReady()) {
                 toRemove << it.key();
             }
         }
@@ -93,6 +93,12 @@ void ChatController::setPassphrase(const QString& pass)
     m_crypto.ensureIdentity();
 }
 
+void ChatController::setPassphrase(const QString& pass, const QByteArray& identityKey)
+{
+    m_crypto.setPassphrase(pass);
+    m_crypto.ensureIdentity(identityKey);
+}
+
 void ChatController::setServerBaseUrl(const QUrl& base)
 {
     m_rvz.setBaseUrl(base);
@@ -104,6 +110,7 @@ void ChatController::setDatabase(SqlCipherDb& db)
     // Guard against double-call: reset previous instances before reinitializing
     m_sessionMgr.reset();
     m_sessionStore.reset();
+    m_dbPtr = &db;
 
     // Derive a 32-byte at-rest encryption key from the identity curve private key.
     // This key never leaves memory and is tied to the user's unlocked identity.
@@ -112,14 +119,15 @@ void ChatController::setDatabase(SqlCipherDb& db)
     m_sessionStore = std::make_unique<SessionStore>(db, storeKey);
     CryptoEngine::secureZero(storeKey);
 
-    // One-time migration: clear sessions created with the buggy ratchet init
+    // One-time migration: clear sessions when serialization format changes.
+    // v5: ratchet init fix.  v6: PQ hybrid (Noise v4 + RatchetSession v2).
     {
         SqlCipherQuery q(db);
-        q.prepare("SELECT value FROM settings WHERE key='ratchet_v5_cleared';");
+        q.prepare("SELECT value FROM settings WHERE key='ratchet_v6_cleared';");
         if (!q.exec() || !q.next()) {
             m_sessionStore->clearAll();
             SqlCipherQuery ins(db);
-            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v5_cleared','1');");
+            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v6_cleared','1');");
             ins.exec();
         }
     }
@@ -136,11 +144,14 @@ void ChatController::setDatabase(SqlCipherDb& db)
                 reinterpret_cast<const unsigned char*>(peerEdPub.constData())) != 0) return;
 
         QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+        QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
-            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), blob);
+            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+            blob, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.isEmpty()) return;
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "...";
+        qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "..."
+                 << (peerKemPub.isEmpty() ? "(classical)" : "(hybrid PQ)");
 #endif
 
         QByteArray env = kSealedPrefix + "\n" + sealed;
@@ -160,11 +171,23 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
         QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
         sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
+        QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
-            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), payload);
+            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+            payload, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.isEmpty()) return {};
 
         return kSealedFCPrefix + "\n" + sealed;
+    });
+    // QUIC P2P file send callback: try sending file chunks directly via QUIC stream
+    m_fileMgr.setP2PFileSendFn([this](const QString& peerId, const QByteArray& data) -> bool {
+        if (m_p2pConnections.contains(peerId) &&
+            m_p2pConnections[peerId]->isReady() &&
+            m_p2pConnections[peerId]->quicActive()) {
+            m_p2pConnections[peerId]->sendFileData(data);
+            return true;
+        }
+        return false;  // fall back to mailbox
     });
 }
 
@@ -418,6 +441,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
 {
     const QString myId = myIdB64u();
     const qint64 ts = QDateTime::currentSecsSinceEpoch();
+    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
     // Include member list so receivers can update their local group member list
     QJsonArray membersArray;
@@ -435,6 +459,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         payload["groupName"] = groupName;
         payload["members"]   = membersArray;
         payload["ts"]        = ts;
+        payload["msgId"]     = msgId;  // B2 fix: include msgId for dedup
 
         const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         QByteArray env = sealForPeer(peerId, pt);
@@ -514,7 +539,9 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
                                        const QByteArray& plaintext)
 {
     if (!m_sessionMgr) return {};
-    QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext);
+    // Pass peer's KEM pub so SessionManager can do hybrid Noise handshake if available
+    QByteArray peerKemPub = lookupPeerKemPub(peerIdB64u);
+    QByteArray sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext, peerKemPub);
     if (sessionBlob.isEmpty()) return {};
 
     QByteArray peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
@@ -526,8 +553,12 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
 
     QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
     sodium_memzero(peerCurvePub, sizeof(peerCurvePub));  // G11 fix
+
+    // Use hybrid seal if we know the peer's ML-KEM-768 public key (already looked up above)
+    // Include ML-DSA-65 signature if we have DSA keys
     QByteArray sealed = SealedEnvelope::seal(
-        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(), sessionBlob);
+        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+        sessionBlob, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
     if (sealed.isEmpty()) return {};
 
     return kSealedPrefix + "\n" + sealed;
@@ -571,28 +602,41 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
                     .arg(type));
 }
 
-// ── L2 fix: shared ICE connection setup ──────────────────────────────────────
-NiceConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bool controlling)
+// ── QUIC + ICE connection setup ──────────────────────────────────────────────
+QuicConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bool controlling)
 {
-    NiceConnection* conn = new NiceConnection(this);
+    QuicConnection* conn = new QuicConnection(this);
     if (!m_turnHost.isEmpty())
         conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
     m_p2pConnections[peerIdB64u] = conn;
 
     const QString iceType = controlling ? "ice_offer" : "ice_answer";
-    connect(conn, &NiceConnection::localSdpReady, this, [this, peerIdB64u, iceType](const QString& sdp) {
+    connect(conn, &QuicConnection::localSdpReady, this, [this, peerIdB64u, iceType, conn](const QString& sdp) {
         QJsonObject p;
         p["type"] = iceType;
         p["from"] = myIdB64u();
         p["sdp"]  = sdp;
-        sendSealedPayload(peerIdB64u, p);   // S8 fix: use sealed path for ICE signaling
+        // Advertise QUIC capability + fingerprint
+        p["quic"] = true;
+        p["quic_fingerprint"] = conn->localQuicFingerprint();
+        sendSealedPayload(peerIdB64u, p);
     });
-    connect(conn, &NiceConnection::stateChanged, this, [this, peerIdB64u](int state) {
-        if      (state == NICE_COMPONENT_STATE_READY)  emit status("P2P ready with " + peerIdB64u);
-        else if (state == NICE_COMPONENT_STATE_FAILED) emit status("P2P failed for " + peerIdB64u);
+    connect(conn, &QuicConnection::stateChanged, this, [this, peerIdB64u, conn](int state) {
+        if (state == NICE_COMPONENT_STATE_READY) {
+            const QString mode = conn->quicActive() ? "QUIC" : "ICE";
+            emit status("P2P ready (" + mode + ") with " + peerIdB64u);
+        } else if (state == NICE_COMPONENT_STATE_FAILED) {
+            emit status("P2P failed for " + peerIdB64u);
+        }
     });
-    connect(conn, &NiceConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& d) {
+    connect(conn, &QuicConnection::dataReceived, this, [this, peerIdB64u](const QByteArray& d) {
         onP2PDataReceived(peerIdB64u, d);
+    });
+    connect(conn, &QuicConnection::fileDataReceived, this, [this, peerIdB64u](const QByteArray& d) {
+        // File data received via QUIC file stream — route to FileTransferManager
+        m_fileMgr.handleFileEnvelope(peerIdB64u, d,
+            [this](const QString& id) { return markSeen(id); },
+            m_fileKeys);
     });
     conn->initIce(controlling);
     return conn;
@@ -651,9 +695,11 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     }
 
     // ── Legacy encrypted JSON message ────────────────────────────────────────
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[RECV P2P] legacy text from" << peerIdB64u.left(8) + "...";
-#endif
+    // SEC3: This path uses a static ECDH key with NO forward secrecy.
+    // It exists for backward compatibility but should be disabled once
+    // all peers support sealed/ratchet messaging.
+    qWarning() << "[RECV P2P] legacy path (no forward secrecy) from"
+               << peerIdB64u.left(8) + "... — peer should upgrade";
     const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
     const QByteArray pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
     if (pt.isEmpty()) return;
@@ -692,8 +738,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                  << (isFileChunk ? "(file chunk)" : "");
 #endif
 
-        // Unseal to learn sender identity
-        UnsealResult unsealed = SealedEnvelope::unseal(m_crypto.curvePriv(), rest);
+        // Unseal to learn sender identity (pass KEM priv for hybrid PQ envelopes)
+        UnsealResult unsealed = SealedEnvelope::unseal(
+            m_crypto.curvePriv(), rest, m_crypto.kemPriv());
         if (!unsealed.valid) {
             qWarning() << "[ChatController] Failed to unseal envelope";
             return;
@@ -759,10 +806,13 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             // Pre-key response (0x02) completes the Noise IK handshake and creates
             // a ratchet session inside decryptFromPeer(), but returns no user payload.
             // This is expected — future messages will use the ratchet session.
-            if (!unsealed.innerPayload.isEmpty() && static_cast<quint8>(unsealed.innerPayload[0]) == 0x02) {
+            const quint8 innerType = unsealed.innerPayload.isEmpty() ? 0 : static_cast<quint8>(unsealed.innerPayload[0]);
+            if (innerType == SessionManager::kPreKeyResponse || innerType == SessionManager::kHybridPreKeyResp) {
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
 #endif
+                // Announce our PQ KEM pub now that we have an authenticated channel
+                announceKemPub(senderId);
             } else {
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";
@@ -812,6 +862,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                                        o.value("groupName").toString(),
                                        memberKeys, o.value("text").toString(), ts, msgId);
         } else if (type == "group_leave") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B2 fix: dedup
             QStringList memberKeys;
             for (const QJsonValue &v : o.value("members").toArray())
                 memberKeys << v.toString();
@@ -824,6 +875,7 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
         } else if (type == "group_avatar") {
             emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
         } else if (type == "group_member_update") {
+            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B3 fix: dedup
             const QString gid       = o.value("groupId").toString();
             const QString gname     = o.value("groupName").toString();
             QStringList memberKeys;
@@ -835,10 +887,8 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             // member keys into the group's key list.
             // Empty text means no chat bubble appears, but the key merge still happens.
             emit groupMessageReceived(senderId, gid, gname, memberKeys,
-                                      QString(),
-                                      QDateTime::fromSecsSinceEpoch(
-                                          o.value("ts").toVariant().toLongLong()),
-                                      QUuid::createUuid().toString(QUuid::WithoutBraces));
+                                      QString(), ts,
+                                      msgId.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : msgId);
         } else if (type == "ice_offer") {
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
@@ -851,7 +901,12 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 #endif
             } else {
                 if (!m_p2pConnections.contains(senderId))
-                    setupP2PConnection(senderId, false);  // L2 fix
+                    setupP2PConnection(senderId, false);
+                // Pass QUIC capability from signaling
+                if (o.value("quic").toBool()) {
+                    m_p2pConnections[senderId]->setPeerSupportsQuic(
+                        true, o.value("quic_fingerprint").toString());
+                }
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
             }
         } else if (type == "ice_answer") {
@@ -859,8 +914,13 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
             qDebug() << "[RECV" << via << "] ice_answer from" << senderId.left(8) + "...";
 #endif
             if (m_p2pConnections.contains(senderId) &&
-                !m_p2pConnections[senderId]->isReady())
+                !m_p2pConnections[senderId]->isReady()) {
+                if (o.value("quic").toBool()) {
+                    m_p2pConnections[senderId]->setPeerSupportsQuic(
+                        true, o.value("quic_fingerprint").toString());
+                }
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
+            }
         } else if (type == "file_key") {
             // File key announcement: store the ratchet-derived key for chunk decryption.
             // M4 fix: key on senderId:transferId to avoid collisions when multiple
@@ -875,6 +935,32 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
                 qDebug() << "[FILE] stored ratchet key for transfer" << transferId.left(8) + "..."
                          << "from" << senderId.left(8) + "...";
 #endif
+            }
+        } else if (type == "kem_pub_announce") {
+            // Post-quantum KEM public key exchange — store the peer's ML-KEM-768 pub
+            QByteArray kemPub = CryptoEngine::fromBase64Url(o.value("kem_pub_b64u").toString());
+            if (kemPub.size() == 1184) {  // ML-KEM-768 pub key size
+                m_peerKemPubs[senderId] = kemPub;
+                // Persist to DB
+                if (m_dbPtr && m_dbPtr->isOpen()) {
+                    SqlCipherQuery q(*m_dbPtr);
+                    q.prepare("UPDATE contacts SET kem_pub=:kp WHERE peer_id=:pid;");
+                    q.bindValue(":kp", kemPub);
+                    q.bindValue(":pid", senderId);
+                    q.exec();
+                }
+#ifndef QT_NO_DEBUG_OUTPUT
+                qDebug() << "[PQ] Stored ML-KEM-768 pub from" << senderId.left(8) + "..."
+                         << "| hybrid sealing now active for this peer";
+#endif
+                // Reciprocate: send our KEM pub back if we haven't already
+                if (m_crypto.hasPQKeys() && !lookupPeerKemPub(senderId).isEmpty()) {
+                    // They sent theirs, we have theirs — send ours if they might not have it
+                    announceKemPub(senderId);
+                }
+            } else {
+                qWarning() << "[PQ] Invalid kem_pub_announce from" << senderId.left(8) + "..."
+                           << "| size:" << kemPub.size() << "(expected 1184)";
             }
         } else if (type == "file_chunk") {
             // Sealed file_chunk in JSON payload shouldn't happen — file chunks
@@ -942,13 +1028,22 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 #endif
         } else {
             if (!m_p2pConnections.contains(fromId))
-                setupP2PConnection(fromId, false);  // L2 fix
+                setupP2PConnection(fromId, false);
+            if (o.value("quic").toBool()) {
+                m_p2pConnections[fromId]->setPeerSupportsQuic(
+                    true, o.value("quic_fingerprint").toString());
+            }
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
         }
     } else if (type == "ice_answer") {
         if (m_p2pConnections.contains(fromId) &&
-            !m_p2pConnections[fromId]->isReady())
+            !m_p2pConnections[fromId]->isReady()) {
+            if (o.value("quic").toBool()) {
+                m_p2pConnections[fromId]->setPeerSupportsQuic(
+                    true, o.value("quic_fingerprint").toString());
+            }
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
+        }
     }
 }
 
@@ -1018,4 +1113,49 @@ void ChatController::resetSession(const QString& peerIdB64u)
 #endif
         emit status("Session reset — next message will establish a fresh handshake.");
     }
+}
+
+// ---------------------------
+// Post-Quantum KEM pub exchange
+// ---------------------------
+
+QByteArray ChatController::lookupPeerKemPub(const QString& peerIdB64u)
+{
+    // Check in-memory cache first
+    auto it = m_peerKemPubs.find(peerIdB64u);
+    if (it != m_peerKemPubs.end()) return it.value();
+
+    // Load from DB
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return {};
+    SqlCipherQuery q(m_dbPtr->handle());
+    q.prepare("SELECT kem_pub FROM contacts WHERE peer_id=:pid;");
+    q.bindValue(":pid", peerIdB64u);
+    if (q.exec() && q.next()) {
+        QByteArray pub = q.value(0).toByteArray();
+        if (!pub.isEmpty()) {
+            m_peerKemPubs[peerIdB64u] = pub;
+            return pub;
+        }
+    }
+    return {};
+}
+
+void ChatController::announceKemPub(const QString& peerIdB64u)
+{
+    if (!m_crypto.hasPQKeys()) return;
+    if (!m_sessionMgr) return;
+    if (m_kemPubAnnounced.contains(peerIdB64u)) return;  // already sent this session
+
+    m_kemPubAnnounced.insert(peerIdB64u);
+
+    QJsonObject payload;
+    payload["from"] = myIdB64u();
+    payload["type"] = "kem_pub_announce";
+    payload["kem_pub_b64u"] = CryptoEngine::toBase64Url(m_crypto.kemPub());
+    payload["ts"] = QDateTime::currentSecsSinceEpoch();
+
+    sendSealedPayload(peerIdB64u, payload);
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[PQ] Announced ML-KEM-768 pub to" << peerIdB64u.left(8) + "...";
+#endif
 }

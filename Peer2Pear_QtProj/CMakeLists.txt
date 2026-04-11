@@ -32,6 +32,12 @@ endif()
 # libsodium uses an unofficial wrapper name in vcpkg
 find_package(unofficial-sodium CONFIG REQUIRED)
 
+# liboqs for post-quantum KEM (ML-KEM-768) and signatures (ML-DSA-65)
+find_package(liboqs CONFIG REQUIRED)
+
+# msquic for QUIC transport over ICE (reliable P2P with framing + file streams)
+find_package(msquic CONFIG REQUIRED)
+
 # libnice and glib use pkg-config instead of standard CMake configs
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
@@ -105,6 +111,8 @@ set(PROJECT_SOURCES
     SealedEnvelope.cpp
     FileTransferManager.hpp
     FileTransferManager.cpp
+    QuicConnection.hpp
+    QuicConnection.cpp
     SqlCipherDb.hpp
     SqlCipherDb.cpp
     ${app_icon_resource}
@@ -135,6 +143,8 @@ target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
     unofficial-sodium::sodium
+    OQS::oqs
+    msquic
     ${SQLCIPHER_TARGET}
     PkgConfig::NICE
     PkgConfig::GLIB

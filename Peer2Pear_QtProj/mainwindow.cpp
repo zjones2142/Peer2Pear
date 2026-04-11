@@ -39,9 +39,7 @@ MainWindow::MainWindow(QWidget *parent)
             continue;
         }
         try {
-            m_controller.setPassphrase(pass);
-
-            // ── Unified key derivation ───────────────────────────────────────
+            // ── Unified key derivation (single Argon2id call) ────────────────
             const QString keysDir = QStandardPaths::writableLocation(
                 QStandardPaths::AppDataLocation) + "/keys";
             QByteArray salt = CryptoEngine::loadOrCreateSalt(keysDir + "/db_salt.bin");
@@ -62,10 +60,18 @@ MainWindow::MainWindow(QWidget *parent)
                 continue;
             }
 
-            // Derive purpose-specific subkeys
-            QByteArray dbKey    = CryptoEngine::deriveSubkey(masterKey, "sqlcipher-db-key");
-            QByteArray fieldKey = CryptoEngine::deriveSubkey(masterKey, "field-encryption");
+            // Derive all purpose-specific subkeys from one master key
+            QByteArray identityKey = CryptoEngine::deriveSubkey(masterKey, "identity-unlock");
+            QByteArray dbKey       = CryptoEngine::deriveSubkey(masterKey, "sqlcipher-db-key");
+            QByteArray fieldKey    = CryptoEngine::deriveSubkey(masterKey, "field-encryption");
             CryptoEngine::secureZero(masterKey);
+
+            // ── Identity unlock (uses identityKey instead of separate Argon2) ─
+            // setPassphrase(pass, identityKey) still needs pass for legacy v4
+            // migration (deriveKeyFromPassphrase inside loadIdentityFromDisk).
+            // Once migrated to v5, the passphrase is never used for identity.
+            m_controller.setPassphrase(pass, identityKey);
+            CryptoEngine::secureZero(identityKey);
 
             // ── Open DB with SQLCipher encryption ────────────────────────────
             if (!m_db.open(dbKey)) {

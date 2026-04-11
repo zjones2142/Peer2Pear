@@ -2,20 +2,26 @@
 #include <QByteArray>
 
 /*
- * Noise Protocol Framework — IK handshake pattern
+ * Noise Protocol Framework — IK handshake pattern (classical + hybrid PQ)
  *
- * IK:
+ * Classical IK:
  *   <- s                         (responder's static key is pre-known)
  *   ...
  *   -> e, es, s, ss              (initiator message 1)
  *   <- e, ee, se                 (responder message 2)
  *
- * After the handshake, both sides have two CipherState objects
- * (one for sending, one for receiving) plus a handshake hash for
- * channel binding.
+ * Hybrid IK (X25519 + ML-KEM-768):
+ *   <- s, s_kem                  (responder's static + KEM pub pre-known)
+ *   ...
+ *   -> e, es, KEM_es, s, ss      (msg1: adds KEM encaps to responder's KEM pub)
+ *   <- e, ee, KEM_ee, se         (msg2: adds KEM encaps to initiator's KEM pub)
  *
- * Crypto primitives (all libsodium):
+ * Each DH result is augmented: mixKey(dh_shared || kem_shared)
+ * If either classical or PQ holds, the derived keys remain safe.
+ *
+ * Crypto primitives:
  *   DH:   X25519 (crypto_scalarmult)
+ *   KEM:  ML-KEM-768 (liboqs)
  *   Hash: BLAKE2b-256 (crypto_generichash)
  *   AEAD: XChaCha20-Poly1305 (crypto_aead_xchacha20poly1305_ietf)
  */
@@ -37,18 +43,38 @@ class NoiseState {
 public:
     enum Role { Initiator, Responder };
 
-    // Create an initiator: we know the responder's static X25519 public key
+    // Create a classical initiator: we know the responder's static X25519 public key
     static NoiseState createInitiator(
         const QByteArray& localStaticPub,   // our X25519 pub (32)
         const QByteArray& localStaticPriv,  // our X25519 priv (32)
         const QByteArray& remoteStaticPub   // peer's X25519 pub (32)
     );
 
-    // Create a responder: we don't know the initiator's static key yet
+    // Create a hybrid PQ initiator: also knows responder's KEM pub
+    static NoiseState createHybridInitiator(
+        const QByteArray& localStaticPub,       // our X25519 pub (32)
+        const QByteArray& localStaticPriv,      // our X25519 priv (32)
+        const QByteArray& remoteStaticPub,      // peer's X25519 pub (32)
+        const QByteArray& localKemPub,          // our ML-KEM-768 pub (1184)
+        const QByteArray& localKemPriv,         // our ML-KEM-768 priv (2400)
+        const QByteArray& remoteKemPub          // peer's ML-KEM-768 pub (1184)
+    );
+
+    // Create a classical responder: we don't know the initiator's static key yet
     static NoiseState createResponder(
         const QByteArray& localStaticPub,   // our X25519 pub (32)
         const QByteArray& localStaticPriv   // our X25519 priv (32)
     );
+
+    // Create a hybrid PQ responder: has own KEM keypair
+    static NoiseState createHybridResponder(
+        const QByteArray& localStaticPub,       // our X25519 pub (32)
+        const QByteArray& localStaticPriv,      // our X25519 priv (32)
+        const QByteArray& localKemPub,          // our ML-KEM-768 pub (1184)
+        const QByteArray& localKemPriv          // our ML-KEM-768 priv (2400)
+    );
+
+    bool isHybrid() const { return m_hybrid; }
 
     // Initiator: produce handshake message 1
     // Returns the message bytes to send, or empty on error
@@ -108,6 +134,7 @@ private:
 
     Role m_role = Initiator;
     bool m_complete = false;
+    bool m_hybrid = false;  // true = hybrid X25519 + ML-KEM-768
 
     // Noise symmetric state
     QByteArray m_ck;          // chaining key (32)
@@ -116,15 +143,20 @@ private:
     QByteArray m_k;   // cipher key for handshake encryption (32, may be empty)
     quint64    m_n = 0; // nonce for handshake cipher
 
-    // Static keys
+    // Static keys (X25519)
     QByteArray m_s;   // local static X25519 pub (32)
     QByteArray m_sk;  // local static X25519 priv (32)
     QByteArray m_rs;  // remote static X25519 pub (32)
 
-    // Ephemeral keys
+    // Ephemeral keys (X25519)
     QByteArray m_e;   // local ephemeral X25519 pub (32)
     QByteArray m_ek;  // local ephemeral X25519 priv (32)
     QByteArray m_re;  // remote ephemeral X25519 pub (32)
+
+    // ML-KEM-768 keys (hybrid mode only)
+    QByteArray m_kemPub;      // local KEM pub (1184)
+    QByteArray m_kemPriv;     // local KEM priv (2400)
+    QByteArray m_rsKem;       // remote static KEM pub (1184)
 
     // Transport cipher states (populated on finish)
     CipherState m_c1, m_c2;

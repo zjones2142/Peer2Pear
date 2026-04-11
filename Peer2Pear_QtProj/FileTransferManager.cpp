@@ -110,6 +110,11 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
                                         + encMeta
                                         + encChunk;
 
+        // Try P2P QUIC file stream first (reliable, framed, congestion-controlled)
+        if (m_p2pFileSendFn && m_p2pFileSendFn(peerIdB64u, innerPayload)) {
+            continue;  // sent via QUIC — skip mailbox
+        }
+
         // M2 fix: seal file chunk envelopes to hide sender identity from relay
         if (m_sealFn) {
             QByteArray sealedEnv = m_sealFn(peerIdB64u, innerPayload);
@@ -128,7 +133,7 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
         m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
     }
 
-    // Kick off P2P for future text messages (files always go via mailbox)
+    // Kick off P2P for future messages
     emit wantP2PConnection(peerIdB64u);
 }
 

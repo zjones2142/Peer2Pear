@@ -1,6 +1,6 @@
 #pragma once
 
-#include "NiceConnection.hpp"
+#include "QuicConnection.hpp"
 #include <QObject>
 #include <QTimer>
 #include <QSet>
@@ -23,6 +23,8 @@ public:
     explicit ChatController(QObject* parent = nullptr);
 
     void setPassphrase(const QString& pass);
+    // Unified path: pass the pre-derived identity key from HKDF(masterKey, "identity-unlock")
+    void setPassphrase(const QString& pass, const QByteArray& identityKey);
     void setServerBaseUrl(const QUrl& base);
     void setDatabase(SqlCipherDb& db);
     QString myIdB64u() const;
@@ -128,7 +130,7 @@ private slots:
 private:
     QByteArray sealForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
     void sendSealedPayload(const QString& peerIdB64u, const QJsonObject& payload);
-    NiceConnection* setupP2PConnection(const QString& peerIdB64u, bool controlling);
+    QuicConnection* setupP2PConnection(const QString& peerIdB64u, bool controlling);
     void initiateP2PConnection(const QString& peerIdB64u);
 
     // ── Deduplication ─────────────────────────────────────────────────────────
@@ -147,16 +149,24 @@ private:
     // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
     std::unique_ptr<SessionStore>   m_sessionStore;
     std::unique_ptr<SessionManager> m_sessionMgr;
+    SqlCipherDb* m_dbPtr = nullptr;  // stored for KEM pub lookups
 
     QTimer      m_pollTimer;
     QStringList m_selfKeys;
 
-    QMap<QString, NiceConnection*> m_p2pConnections;
+    QMap<QString, QuicConnection*> m_p2pConnections;
 
     // G5 fix: per-group outbound sequence counter (monotonic, not persisted)
     QMap<QString, qint64> m_groupSeqOut;
     // G5 fix: per-(group,sender) last-seen sequence — detects gaps
     QMap<QString, qint64> m_groupSeqIn;  // key: "groupId:senderId"
+
+    // Peer ML-KEM-768 public keys: peerIdB64u -> 1184-byte KEM pub
+    // Populated by kem_pub_announce messages, used by sealForPeer() for hybrid envelopes
+    QMap<QString, QByteArray> m_peerKemPubs;
+    QSet<QString> m_kemPubAnnounced;  // peers we've already announced to this session
+    QByteArray lookupPeerKemPub(const QString& peerIdB64u);
+    void announceKemPub(const QString& peerIdB64u);
 
     // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
     // Populated by file_key announcements, consumed by handleFileEnvelope()

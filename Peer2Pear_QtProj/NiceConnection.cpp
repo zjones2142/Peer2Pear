@@ -85,6 +85,36 @@ bool NiceConnection::isReady() const {
     return m_state == NICE_COMPONENT_STATE_READY;
 }
 
+bool NiceConnection::getSelectedPeerAddress(QString& host, quint16& port) const {
+    if (!m_agent || !isReady()) return false;
+
+    NiceCandidate* local = nullptr;
+    NiceCandidate* remote = nullptr;
+    if (!nice_agent_get_selected_pair(m_agent, m_streamId, 1, &local, &remote))
+        return false;
+
+    if (!remote) return false;
+
+    gchar addrStr[NICE_ADDRESS_STRING_LEN];
+    nice_address_to_string(&remote->addr, addrStr);
+    host = QString::fromUtf8(addrStr);
+    port = static_cast<quint16>(nice_address_get_port(&remote->addr));
+    return true;
+}
+
+bool NiceConnection::isRelayed() const {
+    if (!m_agent || !isReady()) return false;
+
+    NiceCandidate* local = nullptr;
+    NiceCandidate* remote = nullptr;
+    if (!nice_agent_get_selected_pair(m_agent, m_streamId, 1, &local, &remote))
+        return false;
+
+    // If either candidate is RELAYED, we're going through TURN
+    return (local && local->type == NICE_CANDIDATE_TYPE_RELAYED) ||
+           (remote && remote->type == NICE_CANDIDATE_TYPE_RELAYED);
+}
+
 void NiceConnection::run() {
     g_main_loop_run(m_loop);
 }

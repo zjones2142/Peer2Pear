@@ -11,22 +11,37 @@
 // RatchetHeader
 // ---------------------------
 
+// ML-KEM-768 sizes
+static constexpr int kKemPubLen = 1184;
+static constexpr int kKemCtLen  = 1088;
+
 QByteArray RatchetHeader::serialize() const {
     QByteArray out;
-    out.reserve(kSerializedSize);
+
+    // Classical fields: dhPub(32) + prevChainLen(4) + messageNum(4)
     out.append(dhPub);
-    // Append prevChainLen and messageNum as big-endian 4 bytes each
     quint32 pcl = qToBigEndian(prevChainLen);
     quint32 mn  = qToBigEndian(messageNum);
     out.append(reinterpret_cast<const char*>(&pcl), 4);
     out.append(reinterpret_cast<const char*>(&mn), 4);
+
+    // Hybrid PQ fields: kemCtLen(2) + kemCt(0..1088) + kemPub(0..1184)
+    // kemCtLen = 0 means no KEM ciphertext; kemPub follows only if kemCtLen > 0 or kemPub is non-empty
+    if (!kemPub.isEmpty()) {
+        quint16 ctLen = qToBigEndian(static_cast<quint16>(kemCt.size()));
+        out.append(reinterpret_cast<const char*>(&ctLen), 2);
+        if (!kemCt.isEmpty())
+            out.append(kemCt);
+        out.append(kemPub);
+    }
+
     return out;
 }
 
 RatchetHeader RatchetHeader::deserialize(const QByteArray& data, int& bytesRead) {
     RatchetHeader h;
     bytesRead = 0;
-    if (data.size() < kSerializedSize) return h;
+    if (data.size() < kClassicalSize) return h;
 
     h.dhPub = data.left(32);
     quint32 pcl, mn;
@@ -34,7 +49,29 @@ RatchetHeader RatchetHeader::deserialize(const QByteArray& data, int& bytesRead)
     memcpy(&mn,  data.constData() + 36, 4);
     h.prevChainLen = qFromBigEndian(pcl);
     h.messageNum   = qFromBigEndian(mn);
-    bytesRead = kSerializedSize;
+    bytesRead = kClassicalSize;  // 40
+
+    // Check for hybrid PQ extension: kemCtLen(2) + kemCt + kemPub
+    if (data.size() >= bytesRead + 2) {
+        quint16 ctLenBE;
+        memcpy(&ctLenBE, data.constData() + bytesRead, 2);
+        quint16 ctLen = qFromBigEndian(ctLenBE);
+
+        // Validate KEM ciphertext size: must be 0 (no CT) or exactly 1088 (ML-KEM-768)
+        if (ctLen != 0 && ctLen != kKemCtLen) return h;  // reject malformed
+
+        const int pqSize = 2 + ctLen + kKemPubLen;
+        if (data.size() >= bytesRead + pqSize) {
+            bytesRead += 2;
+            if (ctLen > 0) {
+                h.kemCt = data.mid(bytesRead, ctLen);
+                bytesRead += ctLen;
+            }
+            h.kemPub = data.mid(bytesRead, kKemPubLen);
+            bytesRead += kKemPubLen;
+        }
+    }
+
     return h;
 }
 
@@ -87,13 +124,23 @@ QPair<QByteArray, QByteArray> RatchetSession::kdfChainKey(const QByteArray& chai
 RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
                                                 const QByteArray& remoteDhPub,
                                                 const QByteArray& localDhPub,
-                                                const QByteArray& localDhPriv) {
+                                                const QByteArray& localDhPriv,
+                                                bool hybrid) {
     RatchetSession s;
+    s.m_hybrid = hybrid;
     s.m_remoteDhPub = remoteDhPub;
 
     // Use the provided DH keypair (Noise ephemeral) so the responder already knows our pub
     s.m_dhPub  = localDhPub;
     s.m_dhPriv = localDhPriv;
+
+    // Hybrid: generate initial KEM keypair
+    if (hybrid) {
+        auto [kemPub, kemPriv] = CryptoEngine::generateKemKeypair();
+        s.m_kemPub  = kemPub;
+        s.m_kemPriv = kemPriv;
+        CryptoEngine::secureZero(kemPriv);
+    }
 
     // Perform initial DH and derive sending chain
     unsigned char shared[crypto_scalarmult_BYTES];
@@ -109,10 +156,9 @@ RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
     auto [newRoot, sendChain] = kdfRootKey(rootKey, dhOutput);
     s.m_rootKey      = newRoot;
     s.m_sendChainKey = sendChain;
-    // Receiving chain is empty until we get peer's first DH ratchet message
 
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Ratchet] initAsInitiator: session created";
+    qDebug() << "[Ratchet] initAsInitiator: session created" << (hybrid ? "(hybrid PQ)" : "");
 #endif
     return s;
 }
@@ -120,8 +166,10 @@ RatchetSession RatchetSession::initAsInitiator(const QByteArray& rootKey,
 RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
                                                 const QByteArray& localDhPub,
                                                 const QByteArray& localDhPriv,
-                                                const QByteArray& remoteDhPub) {
+                                                const QByteArray& remoteDhPub,
+                                                bool hybrid) {
     RatchetSession s;
+    s.m_hybrid = hybrid;
     s.m_remoteDhPub = remoteDhPub;
 
     // Step 1: Derive receiving chain from DH(our priv, initiator's pub)
@@ -144,6 +192,14 @@ RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
     s.m_dhPub  = pub;
     s.m_dhPriv = priv;
 
+    // Hybrid: generate initial KEM keypair for sending
+    if (hybrid) {
+        auto [kemPub, kemPriv] = CryptoEngine::generateKemKeypair();
+        s.m_kemPub  = kemPub;
+        s.m_kemPriv = kemPriv;
+        CryptoEngine::secureZero(kemPriv);
+    }
+
     if (crypto_scalarmult(shared,
                           reinterpret_cast<const unsigned char*>(priv.constData()),
                           reinterpret_cast<const unsigned char*>(remoteDhPub.constData())) != 0) {
@@ -157,7 +213,7 @@ RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
     s.m_sendChainKey = sendChain;
 
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Ratchet] initAsResponder: session created";
+    qDebug() << "[Ratchet] initAsResponder: session created" << (hybrid ? "(hybrid PQ)" : "");
 #endif
     return s;
 }
@@ -166,7 +222,8 @@ RatchetSession RatchetSession::initAsResponder(const QByteArray& rootKey,
 // DH ratchet step
 // ---------------------------
 
-void RatchetSession::dhRatchetStep(const QByteArray& remoteDhPub) {
+void RatchetSession::dhRatchetStep(const QByteArray& remoteDhPub,
+                                    const QByteArray& kemCt) {
     m_prevChainLen = m_sendMsgNum;
     m_sendMsgNum = 0;
     m_recvMsgNum = 0;
@@ -181,7 +238,17 @@ void RatchetSession::dhRatchetStep(const QByteArray& remoteDhPub) {
     QByteArray dhOutput(reinterpret_cast<const char*>(shared), sizeof(shared));
     sodium_memzero(shared, sizeof(shared));
 
+    // Hybrid: if the peer included a KEM ciphertext, decapsulate and combine with DH
+    if (m_hybrid && !kemCt.isEmpty() && !m_kemPriv.isEmpty()) {
+        QByteArray kemSS = CryptoEngine::kemDecaps(kemCt, m_kemPriv);
+        if (!kemSS.isEmpty()) {
+            dhOutput = dhOutput + kemSS;  // DH || KEM combined input
+            CryptoEngine::secureZero(kemSS);
+        }
+    }
+
     auto [rk1, recvChain] = kdfRootKey(m_rootKey, dhOutput);
+    CryptoEngine::secureZero(dhOutput);
     m_rootKey      = rk1;
     m_recvChainKey = recvChain;
 
@@ -189,6 +256,33 @@ void RatchetSession::dhRatchetStep(const QByteArray& remoteDhPub) {
     auto [pub, priv] = CryptoEngine::generateEphemeralX25519();
     m_dhPub  = pub;
     m_dhPriv = priv;
+
+    // Hybrid: generate new KEM keypair and encapsulate to peer's KEM pub
+    m_pendingKemCt.clear();
+    if (m_hybrid) {
+        CryptoEngine::secureZero(m_kemPriv);
+        auto [kemPub, kemPriv] = CryptoEngine::generateKemKeypair();
+        m_kemPub  = kemPub;
+        m_kemPriv = kemPriv;
+        CryptoEngine::secureZero(kemPriv);
+
+        // Encapsulate to the peer's KEM pub (received in their last header)
+        // Store the ciphertext — it will be included in our next message header
+        if (m_remoteKemPub.size() == kKemPubLen) {
+            KemEncapsResult kemResult = CryptoEngine::kemEncaps(m_remoteKemPub);
+            if (!kemResult.ciphertext.isEmpty()) {
+                m_pendingKemCt = kemResult.ciphertext;
+                // Mix KEM SS into root key (peer will decaps and do the same)
+                QByteArray kemIkm = kemResult.sharedSecret;
+                CryptoEngine::secureZero(kemResult.sharedSecret);
+                QByteArray augmented = CryptoEngine::hkdf(
+                    kemIkm, m_rootKey, QByteArray("ratchet-kem"), 32);
+                CryptoEngine::secureZero(kemIkm);
+                if (!augmented.isEmpty())
+                    m_rootKey = augmented;
+            }
+        }
+    }
 
     // DH with new private + remote public -> sending chain
     if (crypto_scalarmult(shared,
@@ -199,6 +293,7 @@ void RatchetSession::dhRatchetStep(const QByteArray& remoteDhPub) {
     sodium_memzero(shared, sizeof(shared));
 
     auto [rk2, sendChain] = kdfRootKey(m_rootKey, dhOutput);
+    CryptoEngine::secureZero(dhOutput);
     m_rootKey      = rk2;
     m_sendChainKey = sendChain;
 }
@@ -234,8 +329,18 @@ QByteArray RatchetSession::encrypt(const QByteArray& plaintext) {
     header.prevChainLen = m_prevChainLen;
     header.messageNum   = m_sendMsgNum++;
 
+    // Hybrid: include our KEM pub so the peer can encapsulate back on their next
+    // DH ratchet step. We do NOT encapsulate here — KEM encaps/decaps happens only
+    // during dhRatchetStep() to stay synchronized with the DH ratchet pace.
+    if (m_hybrid && !m_kemPub.isEmpty()) {
+        header.kemPub = m_kemPub;
+        header.kemCt  = m_pendingKemCt;  // set during our last dhRatchetStep, if any
+        m_pendingKemCt.clear();           // consume — don't send same ciphertext twice
+    }
+
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Ratchet] encrypt: msgNum=" << header.messageNum;
+    qDebug() << "[Ratchet] encrypt: msgNum=" << header.messageNum
+             << (m_hybrid ? "(hybrid PQ)" : "");
 #endif
 
     QByteArray headerBytes = header.serialize();
@@ -332,7 +437,7 @@ bool RatchetSession::skipMessageKeys(const QByteArray& dhPub, quint32 until) {
 }
 
 QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
-    if (headerAndCiphertext.size() < RatchetHeader::kSerializedSize) {
+    if (headerAndCiphertext.size() < RatchetHeader::kClassicalSize) {
         qWarning() << "[Ratchet] decrypt: too short" << headerAndCiphertext.size();
         return {};
     }
@@ -357,12 +462,19 @@ QByteArray RatchetSession::decrypt(const QByteArray& headerAndCiphertext) {
     // If the DH key changed, perform a DH ratchet step
     if (header.dhPub != m_remoteDhPub) {
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[Ratchet] DH ratchet step";
+        qDebug() << "[Ratchet] DH ratchet step" << (m_hybrid ? "(hybrid PQ)" : "");
 #endif
         // Skip any remaining messages in the current receiving chain
         if (!skipMessageKeys(m_remoteDhPub, header.prevChainLen))
             return {};
-        dhRatchetStep(header.dhPub);
+
+        // Hybrid: store the peer's KEM pub for our next dhRatchetStep to encaps to
+        if (m_hybrid && header.kemPub.size() == kKemPubLen) {
+            m_remoteKemPub = header.kemPub;
+        }
+
+        // Pass KEM ciphertext to dhRatchetStep — it handles decaps + root key mixing
+        dhRatchetStep(header.dhPub, header.kemCt);
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[Ratchet] ratchet step complete";
 #endif
@@ -419,7 +531,7 @@ QByteArray RatchetSession::serialize() const {
     QDataStream ds(&buf, QIODevice::WriteOnly);
     ds.setVersion(QDataStream::Qt_5_15);
 
-    ds << quint8(1); // version
+    ds << quint8(2); // v2: adds hybrid PQ fields
     ds << m_rootKey << m_sendChainKey << m_recvChainKey;
     ds << m_dhPub << m_dhPriv << m_remoteDhPub;
     ds << m_sendMsgNum << m_recvMsgNum << m_prevChainLen;
@@ -432,6 +544,10 @@ QByteArray RatchetSession::serialize() const {
         ds << it.value();      // messageKey
     }
 
+    // v2: hybrid PQ state
+    ds << m_hybrid;
+    ds << m_kemPub << m_kemPriv << m_remoteKemPub << m_pendingKemCt;
+
     return buf;
 }
 
@@ -442,7 +558,7 @@ RatchetSession RatchetSession::deserialize(const QByteArray& data) {
 
     quint8 version;
     ds >> version;
-    if (version != 1) return s;
+    if (version < 1 || version > 2) return s;
 
     ds >> s.m_rootKey >> s.m_sendChainKey >> s.m_recvChainKey;
     ds >> s.m_dhPub >> s.m_dhPriv >> s.m_remoteDhPub;
@@ -456,6 +572,22 @@ RatchetSession RatchetSession::deserialize(const QByteArray& data) {
         QByteArray key;
         ds >> dhPub >> msgNum >> key;
         s.m_skippedKeys.insert(qMakePair(dhPub, msgNum), key);
+    }
+
+    // v2: hybrid PQ state
+    if (version >= 2) {
+        ds >> s.m_hybrid;
+        ds >> s.m_kemPub >> s.m_kemPriv >> s.m_remoteKemPub >> s.m_pendingKemCt;
+
+        // Validate PQ key sizes — reject corrupted state
+        if (s.m_hybrid) {
+            if ((!s.m_kemPub.isEmpty() && s.m_kemPub.size() != kKemPubLen) ||
+                (!s.m_kemPriv.isEmpty() && s.m_kemPriv.size() != 2400) ||
+                (!s.m_remoteKemPub.isEmpty() && s.m_remoteKemPub.size() != kKemPubLen) ||
+                (!s.m_pendingKemCt.isEmpty() && s.m_pendingKemCt.size() != kKemCtLen)) {
+                return RatchetSession{};  // corrupted — return invalid
+            }
+        }
     }
 
     return s;

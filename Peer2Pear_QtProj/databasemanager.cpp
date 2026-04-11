@@ -378,6 +378,7 @@ void DatabaseManager::createTables()
     q.exec("ALTER TABLE contacts ADD COLUMN is_group    INTEGER DEFAULT 0;");
     q.exec("ALTER TABLE contacts ADD COLUMN group_id    TEXT    DEFAULT '';");
     q.exec("ALTER TABLE contacts ADD COLUMN avatar      TEXT    DEFAULT '';");
+    q.exec("ALTER TABLE contacts ADD COLUMN kem_pub     BLOB    DEFAULT NULL;");
 
     q.exec(
         "CREATE TABLE IF NOT EXISTS messages ("
@@ -496,6 +497,26 @@ void DatabaseManager::saveContactAvatar(const QString &peerIdB64u, const QString
     q.bindValue(":avatar",  encryptField(avatarB64));
     q.bindValue(":peer_id", peerIdB64u);
     if (!q.exec()) qWarning() << "saveContactAvatar:" << q.lastError();
+}
+
+void DatabaseManager::saveContactKemPub(const QString &peerIdB64u, const QByteArray &kemPub)
+{
+    if (peerIdB64u.isEmpty() || kemPub.isEmpty()) return;
+    SqlCipherQuery q(m_db);
+    q.prepare("UPDATE contacts SET kem_pub=:kp WHERE peer_id=:peer_id;");
+    q.bindValue(":kp",      kemPub);
+    q.bindValue(":peer_id", peerIdB64u);
+    if (!q.exec()) qWarning() << "saveContactKemPub:" << q.lastError();
+}
+
+QByteArray DatabaseManager::loadContactKemPub(const QString &peerIdB64u) const
+{
+    if (peerIdB64u.isEmpty()) return {};
+    SqlCipherQuery q(m_db.handle());
+    q.prepare("SELECT kem_pub FROM contacts WHERE peer_id=:peer_id;");
+    q.bindValue(":peer_id", peerIdB64u);
+    if (q.exec() && q.next()) return q.value(0).toByteArray();
+    return {};
 }
 
 void DatabaseManager::updateLastActive(const QString &key)

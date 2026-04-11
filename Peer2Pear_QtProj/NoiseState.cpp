@@ -9,6 +9,14 @@
 static const QByteArray kProtocolName =
     "Noise_IK_25519_XChaChaPoly_BLAKE2b";
 
+// Hybrid protocol name — distinct from classical so both sides agree on the pattern
+static const QByteArray kHybridProtocolName =
+    "Noise_IK_25519+MLKEM768_XChaChaPoly_BLAKE2b";
+
+// ML-KEM-768 sizes
+static constexpr int kKemPubLen = 1184;
+static constexpr int kKemCtLen  = 1088;
+
 // ---------------------------
 // Symmetric-state helpers
 // ---------------------------
@@ -144,6 +152,21 @@ void NoiseState::split(CipherState& c1, CipherState& c2) {
 // Factory methods
 // ---------------------------
 
+// Helper: initialize symmetric state from a protocol name
+static void initSymmetricState(const QByteArray& protoName, QByteArray& h, QByteArray& ck) {
+    if (protoName.size() <= 32) {
+        h = protoName + QByteArray(32 - protoName.size(), 0);
+    } else {
+        unsigned char hBuf[32];
+        (void)crypto_generichash(hBuf, 32,
+                                 reinterpret_cast<const unsigned char*>(protoName.constData()),
+                                 static_cast<size_t>(protoName.size()),
+                                 nullptr, 0);
+        h = QByteArray(reinterpret_cast<const char*>(hBuf), 32);
+    }
+    ck = h;
+}
+
 NoiseState NoiseState::createInitiator(const QByteArray& localStaticPub,
                                        const QByteArray& localStaticPriv,
                                        const QByteArray& remoteStaticPub) {
@@ -153,22 +176,33 @@ NoiseState NoiseState::createInitiator(const QByteArray& localStaticPub,
     ns.m_sk = localStaticPriv;
     ns.m_rs = remoteStaticPub;
 
-    // Initialize symmetric state with protocol name
-    // h = BLAKE2b-256(protocolName) if len <= 32, else hash it
-    if (kProtocolName.size() <= 32) {
-        ns.m_h = kProtocolName + QByteArray(32 - kProtocolName.size(), 0);
-    } else {
-        unsigned char h[32];
-        (void)crypto_generichash(h, 32,
-                                 reinterpret_cast<const unsigned char*>(kProtocolName.constData()),
-                                 static_cast<size_t>(kProtocolName.size()),
-                                 nullptr, 0);
-        ns.m_h = QByteArray(reinterpret_cast<const char*>(h), 32);
-    }
-    ns.m_ck = ns.m_h;
-
-    // IK prologue: mix in responder's static public key (pre-message pattern: <- s)
+    initSymmetricState(kProtocolName, ns.m_h, ns.m_ck);
     ns.mixHash(remoteStaticPub);
+
+    return ns;
+}
+
+NoiseState NoiseState::createHybridInitiator(const QByteArray& localStaticPub,
+                                              const QByteArray& localStaticPriv,
+                                              const QByteArray& remoteStaticPub,
+                                              const QByteArray& localKemPub,
+                                              const QByteArray& localKemPriv,
+                                              const QByteArray& remoteKemPub) {
+    NoiseState ns;
+    ns.m_role = Initiator;
+    ns.m_hybrid = true;
+    ns.m_s  = localStaticPub;
+    ns.m_sk = localStaticPriv;
+    ns.m_rs = remoteStaticPub;
+    ns.m_kemPub  = localKemPub;
+    ns.m_kemPriv = localKemPriv;
+    ns.m_rsKem   = remoteKemPub;
+
+    // Use distinct protocol name so both sides hash the same prologue
+    initSymmetricState(kHybridProtocolName, ns.m_h, ns.m_ck);
+    // IK prologue: mix in responder's static X25519 pub AND KEM pub
+    ns.mixHash(remoteStaticPub);
+    ns.mixHash(remoteKemPub);
 
     return ns;
 }
@@ -180,21 +214,28 @@ NoiseState NoiseState::createResponder(const QByteArray& localStaticPub,
     ns.m_s  = localStaticPub;
     ns.m_sk = localStaticPriv;
 
-    // Same initialization as initiator
-    if (kProtocolName.size() <= 32) {
-        ns.m_h = kProtocolName + QByteArray(32 - kProtocolName.size(), 0);
-    } else {
-        unsigned char h[32];
-        (void)crypto_generichash(h, 32,
-                                 reinterpret_cast<const unsigned char*>(kProtocolName.constData()),
-                                 static_cast<size_t>(kProtocolName.size()),
-                                 nullptr, 0);
-        ns.m_h = QByteArray(reinterpret_cast<const char*>(h), 32);
-    }
-    ns.m_ck = ns.m_h;
-
-    // IK prologue: mix in our static public key (pre-message pattern: <- s)
+    initSymmetricState(kProtocolName, ns.m_h, ns.m_ck);
     ns.mixHash(localStaticPub);
+
+    return ns;
+}
+
+NoiseState NoiseState::createHybridResponder(const QByteArray& localStaticPub,
+                                              const QByteArray& localStaticPriv,
+                                              const QByteArray& localKemPub,
+                                              const QByteArray& localKemPriv) {
+    NoiseState ns;
+    ns.m_role = Responder;
+    ns.m_hybrid = true;
+    ns.m_s  = localStaticPub;
+    ns.m_sk = localStaticPriv;
+    ns.m_kemPub  = localKemPub;
+    ns.m_kemPriv = localKemPriv;
+
+    // Same prologue: mix our static X25519 + KEM pub
+    initSymmetricState(kHybridProtocolName, ns.m_h, ns.m_ck);
+    ns.mixHash(localStaticPub);
+    ns.mixHash(localKemPub);
 
     return ns;
 }
@@ -220,11 +261,29 @@ QByteArray NoiseState::writeMessage1(const QByteArray& payload) {
     // es: DH(e, rs) — initiator's ephemeral with responder's static
     QByteArray dhResult = dh(m_ek, m_rs);
     if (dhResult.isEmpty()) return {};
-    mixKey(dhResult);
+
+    // Hybrid: also KEM_es — encapsulate to responder's static KEM pub
+    if (m_hybrid && m_rsKem.size() == kKemPubLen) {
+        KemEncapsResult kemEs = CryptoEngine::kemEncaps(m_rsKem);
+        if (kemEs.ciphertext.isEmpty()) { CryptoEngine::secureZero(dhResult); return {}; }
+        msg.append(kemEs.ciphertext);   // 1088 bytes
+        mixHash(kemEs.ciphertext);
+        mixKey(dhResult + kemEs.sharedSecret);  // hybrid: DH || KEM
+        CryptoEngine::secureZero(kemEs.sharedSecret);
+    } else {
+        mixKey(dhResult);
+    }
+    CryptoEngine::secureZero(dhResult);
 
     // s: encrypt and send initiator's static public key
     QByteArray encS = encryptAndHash(m_s);
     msg.append(encS);
+
+    // In hybrid mode, also encrypt and send our KEM public key
+    if (m_hybrid) {
+        QByteArray encKemPub = encryptAndHash(m_kemPub);
+        msg.append(encKemPub);
+    }
 
     // ss: DH(s, rs) — initiator's static with responder's static
     dhResult = dh(m_sk, m_rs);
@@ -263,13 +322,34 @@ QByteArray NoiseState::readMessage1AndWriteMessage2(const QByteArray& msg1,
     // es: DH(s, re) — responder's static with initiator's ephemeral
     QByteArray dhResult = dh(m_sk, m_re);
     if (dhResult.isEmpty()) return {};
-    mixKey(dhResult);
+
+    // Hybrid: also KEM_es — decapsulate the KEM ciphertext from initiator
+    if (m_hybrid) {
+        if (msg1.size() < offset + kKemCtLen) return {};
+        QByteArray kemEsCt = msg1.mid(offset, kKemCtLen);
+        offset += kKemCtLen;
+        QByteArray kemEsSS = CryptoEngine::kemDecaps(kemEsCt, m_kemPriv);
+        if (kemEsSS.isEmpty()) return {};
+        mixHash(kemEsCt);
+        mixKey(dhResult + kemEsSS);  // hybrid: DH || KEM
+        CryptoEngine::secureZero(kemEsSS);
+    } else {
+        mixKey(dhResult);
+    }
 
     // s: decrypt initiator's static public key
     QByteArray encS = msg1.mid(offset, kPubLen + kTagLen);
     offset += kPubLen + kTagLen;
     m_rs = decryptAndHash(encS);
     if (m_rs.size() != kPubLen) return {};
+
+    // Hybrid: also decrypt initiator's KEM public key
+    if (m_hybrid) {
+        QByteArray encKemPub = msg1.mid(offset, kKemPubLen + kTagLen);
+        offset += kKemPubLen + kTagLen;
+        m_rsKem = decryptAndHash(encKemPub);
+        if (m_rsKem.size() != kKemPubLen) return {};
+    }
 
     // ss: DH(s, rs) — responder's static with initiator's static
     dhResult = dh(m_sk, m_rs);
@@ -299,12 +379,20 @@ QByteArray NoiseState::readMessage1AndWriteMessage2(const QByteArray& msg1,
     // ee: DH(e, re)
     dhResult = dh(m_ek, m_re);
     if (dhResult.isEmpty()) return {};
-    mixKey(dhResult);
 
-    // se: DH(s, re) — wait, Noise IK is: se means DH(responder_e, initiator_s)
-    // Actually in the responder's perspective for "se" token:
-    // se means the responder uses e, the initiator uses s
-    // So: DH(e, rs) where rs is the initiator's static
+    // Hybrid: KEM_ee — encapsulate to initiator's KEM pub (learned from msg1)
+    if (m_hybrid && m_rsKem.size() == kKemPubLen) {
+        KemEncapsResult kemEe = CryptoEngine::kemEncaps(m_rsKem);
+        if (kemEe.ciphertext.isEmpty()) return {};
+        msg2.append(kemEe.ciphertext);  // 1088 bytes
+        mixHash(kemEe.ciphertext);
+        mixKey(dhResult + kemEe.sharedSecret);  // hybrid: DH || KEM
+        CryptoEngine::secureZero(kemEe.sharedSecret);
+    } else {
+        mixKey(dhResult);
+    }
+
+    // se: DH(e, rs) where rs is the initiator's static
     dhResult = dh(m_ek, m_rs);
     if (dhResult.isEmpty()) return {};
     mixKey(dhResult);
@@ -335,15 +423,22 @@ bool NoiseState::readMessage2(const QByteArray& msg2, QByteArray& payloadOut) {
     // ee: DH(e, re) — our ephemeral with their ephemeral
     QByteArray dhResult = dh(m_ek, m_re);
     if (dhResult.isEmpty()) return false;
-    mixKey(dhResult);
 
-    // se: DH(s, re) — for initiator, se means DH with our static and their ephemeral
-    // Wait — in the initiator's view of the "se" token:
-    // "se" means (the s of the sender of this message = responder_s) with
-    // (the e of the other side = initiator_e)
-    // But the sender of msg2 is the responder, so:
-    // se = DH(responder_e, initiator_s) from responder's view
-    // From initiator's view: DH(initiator_s, responder_e) = DH(sk, re)
+    // Hybrid: KEM_ee — decapsulate the KEM ciphertext from responder
+    if (m_hybrid) {
+        if (msg2.size() < offset + kKemCtLen) return false;
+        QByteArray kemEeCt = msg2.mid(offset, kKemCtLen);
+        offset += kKemCtLen;
+        QByteArray kemEeSS = CryptoEngine::kemDecaps(kemEeCt, m_kemPriv);
+        if (kemEeSS.isEmpty()) return false;
+        mixHash(kemEeCt);
+        mixKey(dhResult + kemEeSS);  // hybrid: DH || KEM
+        CryptoEngine::secureZero(kemEeSS);
+    } else {
+        mixKey(dhResult);
+    }
+
+    // se: From initiator's view: DH(initiator_s, responder_e) = DH(sk, re)
     dhResult = dh(m_sk, m_re);
     if (dhResult.isEmpty()) return false;
     mixKey(dhResult);
@@ -375,6 +470,8 @@ HandshakeResult NoiseState::finish() {
     sodium_memzero(m_sk.data(), m_sk.size());
     sodium_memzero(m_ck.data(), m_ck.size());
     sodium_memzero(m_k.data(), m_k.size());
+    if (!m_kemPriv.isEmpty())
+        CryptoEngine::secureZero(m_kemPriv);
 
     return result;
 }
@@ -388,15 +485,17 @@ QByteArray NoiseState::serialize() const {
     QDataStream ds(&buf, QIODevice::WriteOnly);
     ds.setVersion(QDataStream::Qt_5_15);
 
-    // C3 fix: version 3 — m_sk (static private key) is NOT persisted.
-    // Caller must re-inject via setStaticPrivateKey() after deserialization.
-    ds << quint8(3); // version
+    // v4: adds hybrid PQ fields. m_sk and m_kemPriv NOT persisted (C3 fix).
+    ds << quint8(4); // version
     ds << quint8(m_role);
     ds << m_complete;
+    ds << m_hybrid;
     ds << m_ck << m_h << m_k << m_n;
-    ds << m_s << m_rs;         // no m_sk — re-derived from identity
+    ds << m_s << m_rs;
     ds << m_e << m_ek << m_re;
     ds << m_ckAfterMsg1;
+    // v4 PQ fields (may be empty for classical handshakes)
+    ds << m_kemPub << m_rsKem;
 
     return buf;
 }
@@ -408,24 +507,32 @@ NoiseState NoiseState::deserialize(const QByteArray& data) {
 
     quint8 version, role;
     ds >> version;
-    if (version < 1 || version > 3) return ns;
+    if (version < 1 || version > 4) return ns;
 
     ds >> role;
     ns.m_role = static_cast<Role>(role);
     ds >> ns.m_complete;
+
+    if (version >= 4)
+        ds >> ns.m_hybrid;
+
     ds >> ns.m_ck >> ns.m_h >> ns.m_k >> ns.m_n;
 
     if (version <= 2) {
         // Legacy: m_sk was serialized between m_s and m_rs
         ds >> ns.m_s >> ns.m_sk >> ns.m_rs;
     } else {
-        // C3 fix (v3): m_sk not persisted — caller must re-inject
+        // v3+: m_sk not persisted — caller must re-inject
         ds >> ns.m_s >> ns.m_rs;
     }
 
     ds >> ns.m_e >> ns.m_ek >> ns.m_re;
     if (version >= 2)
         ds >> ns.m_ckAfterMsg1;
+
+    // v4: PQ fields
+    if (version >= 4)
+        ds >> ns.m_kemPub >> ns.m_rsKem;
 
     return ns;
 }
