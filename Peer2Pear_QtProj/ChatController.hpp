@@ -13,7 +13,7 @@
 #include "SealedEnvelope.hpp"
 #include "FileTransferManager.hpp"
 
-#include <QtSql/QSqlDatabase>
+#include "SqlCipherDb.hpp"
 #include <memory>
 
 
@@ -24,7 +24,7 @@ public:
 
     void setPassphrase(const QString& pass);
     void setServerBaseUrl(const QUrl& base);
-    void setDatabase(QSqlDatabase db);
+    void setDatabase(SqlCipherDb& db);
     QString myIdB64u() const;
 
     // Send encrypted text to a peer

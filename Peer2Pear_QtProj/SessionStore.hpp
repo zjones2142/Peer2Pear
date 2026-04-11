@@ -1,12 +1,13 @@
 #pragma once
 #include <QByteArray>
 #include <QString>
-#include <QtSql/QSqlDatabase>
+
+#include "SqlCipherDb.hpp"
 
 /*
  * SessionStore — persistent storage for ratchet session state.
  *
- * Uses the same SQLite database as DatabaseManager.
+ * Uses the same SQLCipher database as DatabaseManager.
  * Tables:
  *   ratchet_sessions       — serialized RatchetSession per peer
  *   skipped_message_keys   — cached keys for out-of-order messages
@@ -14,17 +15,14 @@
  *
  * When a 32-byte storeKey is provided all BLOBs (session state and
  * handshake state) are authenticated-encrypted at rest using
- * XChaCha20-Poly1305 before being written to SQLite.
+ * XChaCha20-Poly1305 before being written to the database.
  */
 
 class SessionStore {
 public:
+    // db must outlive this SessionStore.
     // storeKey must be exactly 32 bytes to enable at-rest encryption.
-    // If storeKey is not 32 bytes, encryptBlob/decryptBlob return {} (fail-safe):
-    // save operations will be no-ops and load operations will return nothing,
-    // so sessions will simply be re-established. In practice ChatController
-    // always derives and passes a valid 32-byte key.
-    explicit SessionStore(QSqlDatabase db, QByteArray storeKey = {});
+    explicit SessionStore(SqlCipherDb& db, QByteArray storeKey = {});
     ~SessionStore();
 
     void createTables();
@@ -55,11 +53,9 @@ public:
 
 private:
     // Encrypt/decrypt a BLOB using XChaCha20-Poly1305 and m_storeKey.
-    // Returns the input unchanged when m_storeKey is not 32 bytes.
-    // decryptBlob() returns {} on authentication failure.
     QByteArray encryptBlob(const QByteArray& plaintext) const;
     QByteArray decryptBlob(const QByteArray& ciphertext) const;
 
-    QSqlDatabase m_db;
+    SqlCipherDb& m_db;
     QByteArray   m_storeKey; // 32-byte at-rest encryption key; zeroed in destructor
 };
