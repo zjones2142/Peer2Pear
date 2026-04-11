@@ -21,7 +21,7 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
                              nullptr);
     if (rc != SQLITE_OK) {
         m_lastError = QString::fromUtf8(sqlite3_errmsg(m_db));
-        qWarning() << "SqlCipherDb::open failed:" << m_lastError;
+        qWarning() << "SqlCipherDb::open failed";
         sqlite3_close_v2(m_db);
         m_db = nullptr;
         return false;
@@ -50,7 +50,7 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
         if (rc != SQLITE_OK) {
             m_lastError = err ? QString::fromUtf8(err) : QStringLiteral("PRAGMA key failed");
             sqlite3_free(err);
-            qWarning() << "PRAGMA key failed:" << m_lastError;
+            qWarning() << "SqlCipherDb: PRAGMA key failed";
             close();
             return false;
         }
@@ -63,7 +63,7 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
             m_lastError = verifyErr ? QString::fromUtf8(verifyErr)
                                     : QStringLiteral("Key verification failed");
             sqlite3_free(verifyErr);
-            qWarning() << "SqlCipherDb: wrong key or unencrypted database:" << m_lastError;
+            qWarning() << "SqlCipherDb: wrong key or unencrypted database";
             close();
             return false;
         }
@@ -88,7 +88,7 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
         m_lastError = QStringLiteral(
             "SQLCipher is required but the linked sqlite library is plain sqlite3. "
             "Install SQLCipher and rebuild.");
-        qCritical() << "SqlCipherDb:" << m_lastError;
+        qCritical() << "SqlCipherDb: SQLCipher required but not available";
         close();
         return false;
     }
@@ -98,7 +98,9 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
     sqlite3_exec(m_db, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
     sqlite3_exec(m_db, "PRAGMA cipher_memory_security=ON;", nullptr, nullptr, nullptr);
 
+#ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "SqlCipherDb: opened" << path << "(encrypted)";
+#endif
     return true;
 }
 

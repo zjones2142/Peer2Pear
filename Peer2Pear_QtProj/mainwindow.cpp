@@ -102,6 +102,11 @@ MainWindow::MainWindow(QWidget *parent)
 
             // Wire DB to ChatController for Noise/Ratchet session persistence
             m_controller.setDatabase(m_db.database());
+
+            // GAP5: restore persisted group sequence counters
+            m_controller.setGroupSeqCounters(m_db.loadGroupSeqOut(),
+                                              m_db.loadGroupSeqIn());
+
             CryptoEngine::secureZero(pass);
             break;
         } catch (const std::exception &e) {
@@ -254,6 +259,11 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow() {
     m_controller.stopPolling();   // unpublish presence so peers see us offline
+
+    // GAP5: persist group sequence counters before shutdown
+    m_db.saveGroupSeqOut(m_controller.groupSeqOut());
+    m_db.saveGroupSeqIn(m_controller.groupSeqIn());
+
     delete ui;
 }
 

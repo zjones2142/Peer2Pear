@@ -293,6 +293,10 @@ bool CryptoEngine::loadIdentityFromDisk(const QByteArray& identityKey) {
             m_kemPriv = secretboxDecrypt(identityKey,
                 fromBase64Url(kemEnc.value("nonce_b64u").toString()),
                 fromBase64Url(kemEnc.value("ct_b64u").toString()));
+            // M2 fix: warn if KEM private key decryption failed (unexpected in v5)
+            if (m_kemPriv.isEmpty() && !m_kemPub.isEmpty())
+                qWarning() << "[CryptoEngine] v5 ML-KEM-768 private key decryption failed"
+                           << "— falling back to classical-only crypto";
         }
         // DSA
         if (o.contains("dsa_pub_b64u")) {
@@ -301,6 +305,10 @@ bool CryptoEngine::loadIdentityFromDisk(const QByteArray& identityKey) {
             m_dsaPriv = secretboxDecrypt(identityKey,
                 fromBase64Url(dsaEnc.value("nonce_b64u").toString()),
                 fromBase64Url(dsaEnc.value("ct_b64u").toString()));
+            // M2 fix: warn if DSA private key decryption failed (unexpected in v5)
+            if (m_dsaPriv.isEmpty() && !m_dsaPub.isEmpty())
+                qWarning() << "[CryptoEngine] v5 ML-DSA-65 private key decryption failed"
+                           << "— signatures will use Ed25519 only";
         }
 
 #ifndef QT_NO_DEBUG_OUTPUT
@@ -317,6 +325,9 @@ bool CryptoEngine::loadIdentityFromDisk(const QByteArray& identityKey) {
 
     // Delegate to the legacy loader (which uses m_passphrase internally)
     if (!loadIdentityFromDisk()) return false;
+
+    // M1 fix: passphrase no longer needed after legacy decrypt — zero early
+    secureZero(m_passphrase);
 
     // Re-encrypt and save as v5 using the unified key
     if (saveIdentityToDisk(identityKey)) {
@@ -415,15 +426,36 @@ bool CryptoEngine::saveIdentityToDisk() const {
     return true;
 }
 
-// ── v5 unified-key save: one pre-derived key, random nonces per field ─────
+// ── v5 unified-key save: one pre-derived key, domain-tagged nonces ────────
+//
+// H1 defense-in-depth: all three private keys share the same identityKey.
+// Security depends on nonce uniqueness (24-byte random, collision at ~2^96).
+// As extra protection against OS RNG failure or VM snapshot rollback, we
+// XOR a 1-byte key-index tag into the first byte of each random nonce.
+// This guarantees Ed/KEM/DSA nonces differ even if randombytes_buf
+// returns identical output for all three calls.
+static void tagNonce(QByteArray& nonce, uint8_t keyIndex) {
+    if (nonce.size() >= 1)
+        nonce[0] = static_cast<char>(static_cast<uint8_t>(nonce[0]) ^ keyIndex);
+}
+
 bool CryptoEngine::saveIdentityToDisk(const QByteArray& identityKey) const {
     if (m_edPub.size()  != crypto_sign_PUBLICKEYBYTES)  return false;
     if (m_edPriv.size() != crypto_sign_SECRETKEYBYTES)  return false;
     if (identityKey.size() != KEY_BYTES) return false;
 
-    // Ed25519 private key
+    // Ed25519 private key (tag 0x01)
     QByteArray edNonce, edCt, edDummy;
     if (!secretboxEncrypt(identityKey, m_edPriv, edDummy, edNonce, edCt))
+        return false;
+    tagNonce(edNonce, 0x01);
+    // Re-encrypt with tagged nonce
+    edCt.resize(m_edPriv.size() + crypto_secretbox_MACBYTES);
+    if (crypto_secretbox_easy(reinterpret_cast<unsigned char*>(edCt.data()),
+                              reinterpret_cast<const unsigned char*>(m_edPriv.constData()),
+                              static_cast<unsigned long long>(m_edPriv.size()),
+                              reinterpret_cast<const unsigned char*>(edNonce.constData()),
+                              reinterpret_cast<const unsigned char*>(identityKey.constData())) != 0)
         return false;
 
     QJsonObject edEnc;
@@ -435,11 +467,18 @@ bool CryptoEngine::saveIdentityToDisk(const QByteArray& identityKey) const {
     j["ed_pub_b64u"]   = toBase64Url(m_edPub);
     j["ed_priv_enc"]   = edEnc;
 
-    // ML-KEM-768
+    // ML-KEM-768 (tag 0x02)
     if (hasPQKeys()) {
         j["kem_pub_b64u"] = toBase64Url(m_kemPub);
         QByteArray kemNonce, kemCt, kemDummy;
         if (secretboxEncrypt(identityKey, m_kemPriv, kemDummy, kemNonce, kemCt)) {
+            tagNonce(kemNonce, 0x02);
+            kemCt.resize(m_kemPriv.size() + crypto_secretbox_MACBYTES);
+            crypto_secretbox_easy(reinterpret_cast<unsigned char*>(kemCt.data()),
+                                  reinterpret_cast<const unsigned char*>(m_kemPriv.constData()),
+                                  static_cast<unsigned long long>(m_kemPriv.size()),
+                                  reinterpret_cast<const unsigned char*>(kemNonce.constData()),
+                                  reinterpret_cast<const unsigned char*>(identityKey.constData()));
             QJsonObject kemEnc;
             kemEnc["nonce_b64u"] = toBase64Url(kemNonce);
             kemEnc["ct_b64u"]    = toBase64Url(kemCt);
@@ -447,11 +486,18 @@ bool CryptoEngine::saveIdentityToDisk(const QByteArray& identityKey) const {
         }
     }
 
-    // ML-DSA-65
+    // ML-DSA-65 (tag 0x03)
     if (hasDSAKeys()) {
         j["dsa_pub_b64u"] = toBase64Url(m_dsaPub);
         QByteArray dsaNonce, dsaCt, dsaDummy;
         if (secretboxEncrypt(identityKey, m_dsaPriv, dsaDummy, dsaNonce, dsaCt)) {
+            tagNonce(dsaNonce, 0x03);
+            dsaCt.resize(m_dsaPriv.size() + crypto_secretbox_MACBYTES);
+            crypto_secretbox_easy(reinterpret_cast<unsigned char*>(dsaCt.data()),
+                                  reinterpret_cast<const unsigned char*>(m_dsaPriv.constData()),
+                                  static_cast<unsigned long long>(m_dsaPriv.size()),
+                                  reinterpret_cast<const unsigned char*>(dsaNonce.constData()),
+                                  reinterpret_cast<const unsigned char*>(identityKey.constData()));
             QJsonObject dsaEnc;
             dsaEnc["nonce_b64u"] = toBase64Url(dsaNonce);
             dsaEnc["ct_b64u"]    = toBase64Url(dsaCt);
@@ -1027,6 +1073,7 @@ QByteArray CryptoEngine::deriveMasterKey(const QString& passphrase, const QByteA
             memLimit,
             crypto_pwhash_ALG_ARGON2ID13) != 0) {
         secureZero(passUtf8);
+        secureZero(masterKey);  // L1 fix: zero pre-allocated buffer on failure
         qWarning() << "deriveMasterKey: Argon2id failed (out of memory?)";
         return {};
     }

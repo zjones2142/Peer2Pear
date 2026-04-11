@@ -1,6 +1,7 @@
 #pragma once
 #include <QByteArray>
 #include <QString>
+#include <QStringList>
 
 #include "SqlCipherDb.hpp"
 
@@ -10,8 +11,10 @@
  * Uses the same SQLCipher database as DatabaseManager.
  * Tables:
  *   ratchet_sessions       — serialized RatchetSession per peer
- *   skipped_message_keys   — cached keys for out-of-order messages
  *   pending_handshakes     — in-progress Noise handshakes
+ *
+ * Note: skipped message keys are managed inside RatchetSession's own
+ * serialized blob (in-memory map), not in a separate SQL table.
  *
  * When a 32-byte storeKey is provided all BLOBs (session state and
  * handshake state) are authenticated-encrypted at rest using
@@ -32,15 +35,7 @@ public:
     QByteArray loadSession(const QString& peerId) const;
     void deleteSession(const QString& peerId);
 
-    // Skipped message keys
-    void saveSkippedKey(const QString& peerId, const QByteArray& dhPub,
-                        quint32 msgNum, const QByteArray& messageKey);
-    QByteArray loadAndDeleteSkippedKey(const QString& peerId,
-                                       const QByteArray& dhPub, quint32 msgNum);
-    void pruneSkippedKeys(const QString& peerId, int maxCount);
-    void deleteSkippedKeysForPeer(const QString& peerId);
-
-    // Clear all sessions, skipped keys, and pending handshakes
+    // Clear all sessions and pending handshakes
     void clearAll();
 
     // Pending handshakes (survive app restart)
@@ -49,7 +44,8 @@ public:
     QByteArray loadPendingHandshake(const QString& peerId, int& roleOut) const;
     void deletePendingHandshake(const QString& peerId);
     // H2 fix: reduced from 24h to 5 min — stuck handshakes block messaging
-    void pruneStaleHandshakes(int maxAgeSecs = 300);
+    // SEC9: returns peer IDs whose handshakes were pruned (for upgrade detection)
+    QStringList pruneStaleHandshakes(int maxAgeSecs = 300);
 
 private:
     // Encrypt/decrypt a BLOB using XChaCha20-Poly1305 and m_storeKey.
