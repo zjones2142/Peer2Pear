@@ -28,6 +28,7 @@ public:
     void setServerBaseUrl(const QUrl& base);
     void setDatabase(SqlCipherDb& db);
     QString myIdB64u() const;
+    const QByteArray& identityPub() const { return m_crypto.identityPub(); }
 
     // Send encrypted text to a peer
     void sendText(const QString& peerIdB64u, const QString& text);

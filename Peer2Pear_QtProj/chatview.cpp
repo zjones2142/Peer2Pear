@@ -639,25 +639,32 @@ bool ChatView::eventFilter(QObject *obj, QEvent *event)
 
 void ChatView::startPresencePolling(int intervalMs)
 {
-    connect(&m_presenceTimer, &QTimer::timeout, this, [this]() {
+    // Collect all unique peer keys from DMs and groups for presence checks
+    auto collectAllPeerIds = [this]() {
+        QSet<QString> seen;
         QStringList peerIds;
+        const QString myKey = m_controller->myIdB64u();
         for (const ChatData &c : std::as_const(m_chats)) {
-            if (c.isGroup) continue;
-            for (const QString &k : c.keys)
-                if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
+            for (const QString &k : c.keys) {
+                const QString trimmed = k.trimmed();
+                if (!trimmed.isEmpty() && trimmed != myKey && !seen.contains(trimmed)) {
+                    seen.insert(trimmed);
+                    peerIds << trimmed;
+                }
+            }
         }
+        return peerIds;
+    };
+
+    connect(&m_presenceTimer, &QTimer::timeout, this, [this, collectAllPeerIds]() {
+        const QStringList peerIds = collectAllPeerIds();
         if (!peerIds.isEmpty())
             m_controller->checkPresence(peerIds);
     });
     m_presenceTimer.start(intervalMs);
     // Immediate first check on startup (500ms delay to let connections settle)
-    QTimer::singleShot(500, this, [this]() {
-        QStringList peerIds;
-        for (const ChatData &c : std::as_const(m_chats)) {
-            if (c.isGroup) continue;
-            for (const QString &k : c.keys)
-                if (!k.trimmed().isEmpty()) peerIds << k.trimmed();
-        }
+    QTimer::singleShot(500, this, [this, collectAllPeerIds]() {
+        const QStringList peerIds = collectAllPeerIds();
         if (!peerIds.isEmpty())
             m_controller->checkPresence(peerIds);
     });
@@ -665,9 +672,41 @@ void ChatView::startPresencePolling(int intervalMs)
 
 void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 {
-    for (int i = 0; i < m_chats.size(); ++i) {
-        if (m_chats[i].isGroup) continue;
+    // Update global member-online map
+    m_memberOnline[peerIdB64u] = online;
 
+    for (int i = 0; i < m_chats.size(); ++i) {
+        if (m_chats[i].isGroup) {
+            // Check if this peer is a member of the group
+            bool isMember = false;
+            for (const QString &k : std::as_const(m_chats[i].keys))
+                if (k.trimmed() == peerIdB64u) { isMember = true; break; }
+            if (!isMember) continue;
+
+            // Update group header if this is the currently selected chat
+            if (i == m_currentChat) {
+                const QString myKey = m_controller->myIdB64u();
+                int onlineCount = 0, totalMembers = 0;
+                for (const QString &k : std::as_const(m_chats[i].keys)) {
+                    const QString trimmed = k.trimmed();
+                    if (trimmed.isEmpty() || trimmed == myKey) continue;
+                    ++totalMembers;
+                    if (m_memberOnline.value(trimmed, false))
+                        ++onlineCount;
+                }
+                const QString statusText = (totalMembers == 0)
+                    ? m_chats[i].subtitle
+                    : QString("%1 of %2 members online").arg(onlineCount).arg(totalMembers);
+                m_ui->chatSubLabel->setText(statusText);
+                m_ui->chatSubLabel->setStyleSheet(
+                    onlineCount > 0
+                        ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
+                        : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+            }
+            continue;  // don't return — this peer may be in multiple groups
+        }
+
+        // 1:1 DM chat
         bool match = (m_chats[i].peerIdB64u.trimmed() == peerIdB64u);
         if (!match) {
             for (const QString &k : std::as_const(m_chats[i].keys))
@@ -698,7 +737,6 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
                            : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
             }
         }
-        return;
     }
 }
 
@@ -1765,6 +1803,8 @@ void ChatView::onEditContact(int index)
         const QString peerId = m_chats[index].peerIdB64u;
         if (!peerId.isEmpty())
             m_controller->resetSession(peerId);
+        if (m_db) m_db->saveContact(m_chats[index]);
+        rebuildChatList();
     } else if (result == ContactEditorResult::Left) {
         // Notify all members you're leaving
         const QString groupId = m_chats[index].groupId;
@@ -1786,6 +1826,7 @@ void ChatView::onEditContact(int index)
         if (!m_chats.isEmpty())
             m_ui->chatList->setCurrentRow(0);
     }
+
 }
 
 void ChatView::onAddContact()
@@ -1982,6 +2023,22 @@ void ChatView::initChats()
 
 void ChatView::rebuildChatList()
 {
+    // Prune m_memberOnline: drop keys that no longer belong to any contact/group
+    {
+        QSet<QString> activeKeys;
+        for (const ChatData &c : std::as_const(m_chats))
+            for (const QString &k : c.keys) {
+                const QString t = k.trimmed();
+                if (!t.isEmpty()) activeKeys.insert(t);
+            }
+        for (auto it = m_memberOnline.begin(); it != m_memberOnline.end(); ) {
+            if (!activeKeys.contains(it.key()))
+                it = m_memberOnline.erase(it);
+            else
+                ++it;
+        }
+    }
+
     disconnect(m_ui->chatList, &QListWidget::currentRowChanged,
                this, &ChatView::onChatSelected);
     m_ui->chatList->clear();
@@ -2081,9 +2138,35 @@ void ChatView::loadChat(int index)
                 ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
                 : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
     } else {
-        m_ui->chatSubLabel->setText("● " + chat.subtitle);
-        m_ui->chatSubLabel->setStyleSheet(
-            "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+        // Show per-member presence summary for groups, but only after
+        // at least one member's presence has been resolved — avoids a
+        // misleading "0 of N online" flash before the first poll returns.
+        const QString myKey = m_controller->myIdB64u();
+        int onlineCount = 0, totalMembers = 0;
+        bool anyResolved = false;
+        for (const QString &k : std::as_const(chat.keys)) {
+            const QString trimmed = k.trimmed();
+            if (trimmed.isEmpty() || trimmed == myKey) continue;
+            ++totalMembers;
+            if (m_memberOnline.contains(trimmed)) {
+                anyResolved = true;
+                if (m_memberOnline.value(trimmed))
+                    ++onlineCount;
+            }
+        }
+        if (!anyResolved || totalMembers == 0) {
+            // No presence data yet — show the original subtitle
+            m_ui->chatSubLabel->setText(chat.subtitle);
+            m_ui->chatSubLabel->setStyleSheet(
+                "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+        } else {
+            m_ui->chatSubLabel->setText(
+                QString("%1 of %2 members online").arg(onlineCount).arg(totalMembers));
+            m_ui->chatSubLabel->setStyleSheet(
+                onlineCount > 0
+                    ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
+                    : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+        }
     }
 
     if (!chat.avatarData.isEmpty()) {
