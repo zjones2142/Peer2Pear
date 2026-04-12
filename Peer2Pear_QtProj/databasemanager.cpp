@@ -479,14 +479,14 @@ void DatabaseManager::saveContact(const ChatData &chat)
         "   is_blocked=excluded.is_blocked, is_group=excluded.is_group, group_id=excluded.group_id,"
         "   avatar=excluded.avatar;"
         );
-    q.bindValue(":peer_id",   key);
-    q.bindValue(":name",      encryptField(chat.name));
-    q.bindValue(":subtitle",  encryptField(chat.subtitle));
-    q.bindValue(":keys",      encryptField(chat.keys.join('|')));
-    q.bindValue(":is_blocked",chat.isBlocked ? 1 : 0);
-    q.bindValue(":is_group",  chat.isGroup   ? 1 : 0);
-    q.bindValue(":group_id",  chat.groupId);
-    q.bindValue(":avatar",    encryptField(chat.avatarData));
+    q.bindValue(":peer_id",     key);
+    q.bindValue(":name",        encryptField(chat.name));
+    q.bindValue(":subtitle",    encryptField(chat.subtitle));
+    q.bindValue(":keys",        encryptField(chat.keys.join('|')));
+    q.bindValue(":is_blocked",  chat.isBlocked  ? 1 : 0);
+    q.bindValue(":is_group",    chat.isGroup    ? 1 : 0);
+    q.bindValue(":group_id",    chat.groupId);
+    q.bindValue(":avatar",      encryptField(chat.avatarData));
     if (!q.exec()) qWarning() << "saveContact:" << q.lastError();
 }
 

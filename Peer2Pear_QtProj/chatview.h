@@ -126,6 +126,9 @@ private:
     QVector<int> m_unread;
     QTimer       m_presenceTimer;
 
+    // Per-member online status (peerIdB64u → online); shared across DM and group chats
+    QMap<QString, bool> m_memberOnline;
+
     // File records keyed by stable chatKey() — never needs index remapping
     QMap<QString, QVector<FileTransferRecord>> m_filesByKey;
 
