@@ -7,7 +7,6 @@
 #include <functional>
 
 class CryptoEngine;
-class MailboxClient;
 
 /*
  * FileTransferManager — handles chunked, encrypted file transfers.
@@ -29,8 +28,11 @@ public:
     // Takes (peerIdB64u, innerPayload) and returns sealed envelope bytes, or empty on failure.
     using SealFn = std::function<QByteArray(const QString& peerIdB64u, const QByteArray& payload)>;
 
-    explicit FileTransferManager(CryptoEngine& crypto, MailboxClient& mbox,
-                                 QObject* parent = nullptr);
+    // SendFn: takes (recipientIdB64u, envelopeBytes) — sends via relay
+    using SendFn = std::function<void(const QString&, const QByteArray&)>;
+
+    explicit FileTransferManager(CryptoEngine& crypto, QObject* parent = nullptr);
+    void setSendFn(SendFn fn) { m_sendFn = std::move(fn); }
 
     // Set the callback for sealing file chunk envelopes (M2 fix).
     void setSealFn(SealFn fn) { m_sealFn = std::move(fn); }
@@ -136,7 +138,7 @@ private:
     static constexpr int kMaxConcurrentTransfers = 50;
 
     CryptoEngine& m_crypto;
-    MailboxClient& m_mbox;
+    SendFn m_sendFn;
     SealFn m_sealFn;
     SendFileP2PFn m_p2pFileSendFn;
 };

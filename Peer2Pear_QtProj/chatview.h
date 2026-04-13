@@ -36,6 +36,7 @@ public:
     void setNotifier(ChatNotifier *notifier)         { m_notifier = notifier; }
 
     void startPresencePolling(int intervalMs = 30000);
+    void subscribeAllPresence();
 
 public slots:
     void onPresenceChanged(const QString &peerIdB64u, bool online);

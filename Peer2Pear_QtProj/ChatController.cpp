@@ -27,15 +27,19 @@ static QDateTime tsFromSecs(qint64 secs)
 
 ChatController::ChatController(QObject* parent)
     : QObject(parent)
-    , m_rvz(&m_crypto, this)
-    , m_mbox(&m_crypto, this)
-    , m_fileMgr(m_crypto, m_mbox, this)
+    , m_relay(&m_crypto, this)
+    , m_fileMgr(m_crypto, this)
 {
-    connect(&m_mbox, &MailboxClient::status,           this, &ChatController::status);
-    connect(&m_rvz,  &RendezvousClient::status,        this, &ChatController::status);
-    connect(&m_mbox, &MailboxClient::envelopeReceived, this, &ChatController::onEnvelope);
-    connect(&m_pollTimer, &QTimer::timeout,            this, &ChatController::pollOnce);
-    connect(&m_rvz,  &RendezvousClient::presenceResult, this, &ChatController::presenceChanged);
+    // Relay signals
+    connect(&m_relay, &RelayClient::status,           this, &ChatController::status);
+    connect(&m_relay, &RelayClient::envelopeReceived, this, &ChatController::onEnvelope);
+    connect(&m_relay, &RelayClient::presenceChanged,  this, &ChatController::presenceChanged);
+    connect(&m_relay, &RelayClient::connected,        this, &ChatController::onRelayConnected);
+
+    // FileTransferManager: provide send callback instead of MailboxClient ref
+    m_fileMgr.setSendFn([this](const QString& peerId, const QByteArray& env) {
+        m_relay.sendEnvelope(env);
+    });
 
     // Forward FileTransferManager signals
     connect(&m_fileMgr, &FileTransferManager::status, this, &ChatController::status);
@@ -60,21 +64,48 @@ ChatController::ChatController(QObject* parent)
         }
     });
 
-    // Refresh rendezvous registration every 50 seconds (TTL is 60s).
-    // Short TTL means peers detect offline status within ~60s of app close.
-    connect(&m_rvzRefreshTimer, &QTimer::timeout, this, [this]() {
-        m_rvz.publish("present", 0, 60LL * 1000);
-    });
-    m_rvzRefreshTimer.setInterval(50 * 1000);
+    // Periodic maintenance: handshake pruning, file key cleanup, ICE cleanup
+    connect(&m_maintenanceTimer, &QTimer::timeout, this, [this]() {
+        // H3 fix: reset per-sender rate limit counters
+        m_envelopeCount.clear();
 
-    // G4 fix: periodically clean up failed ICE connections (not READY after 60s)
-    auto *iceCleanup = new QTimer(this);
-    connect(iceCleanup, &QTimer::timeout, this, [this]() {
+        // Purge stale incomplete transfers
+        m_fileMgr.purgeStaleTransfers();
+
+        // H2/SEC9: prune stuck handshakes
+        if (m_sessionStore) {
+            const QStringList pruned = m_sessionStore->pruneStaleHandshakes();
+            for (const QString &peerId : pruned) {
+                int count = ++m_handshakeFailCount[peerId];
+                if (count >= 2)
+                    emit peerMayNeedUpgrade(peerId);
+            }
+        }
+
+        // M8 fix: purge orphaned file keys older than 30 minutes
+        {
+            static constexpr qint64 kFileKeyMaxAgeSecs = 30 * 60;
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            auto it = m_fileKeyTimes.begin();
+            while (it != m_fileKeyTimes.end()) {
+                if ((now - it.value()) > kFileKeyMaxAgeSecs) {
+                    auto keyIt = m_fileKeys.find(it.key());
+                    if (keyIt != m_fileKeys.end()) {
+                        sodium_memzero(keyIt.value().data(), keyIt.value().size());
+                        m_fileKeys.erase(keyIt);
+                    }
+                    it = m_fileKeyTimes.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // G4 fix: clean up failed ICE connections
         QStringList toRemove;
         for (auto it = m_p2pConnections.begin(); it != m_p2pConnections.end(); ++it) {
-            if (!it.value()->isReady()) {
+            if (!it.value()->isReady())
                 toRemove << it.key();
-            }
         }
         for (const QString &key : toRemove) {
 #ifndef QT_NO_DEBUG_OUTPUT
@@ -84,7 +115,7 @@ ChatController::ChatController(QObject* parent)
             m_p2pConnections.remove(key);
         }
     });
-    iceCleanup->start(60 * 1000);
+    m_maintenanceTimer.start(30 * 1000); // every 30 seconds
 }
 
 void ChatController::setPassphrase(const QString& pass)
@@ -99,10 +130,9 @@ void ChatController::setPassphrase(const QString& pass, const QByteArray& identi
     m_crypto.ensureIdentity(identityKey);
 }
 
-void ChatController::setServerBaseUrl(const QUrl& base)
+void ChatController::setRelayUrl(const QUrl& url)
 {
-    m_rvz.setBaseUrl(base);
-    m_mbox.setBaseUrl(base);
+    m_relay.setRelayUrl(url);
 }
 
 void ChatController::setDatabase(SqlCipherDb& db)
@@ -154,8 +184,9 @@ void ChatController::setDatabase(SqlCipherDb& db)
                  << (peerKemPub.isEmpty() ? "(classical)" : "(hybrid PQ)");
 #endif
 
-        QByteArray env = kSealedPrefix + "\n" + sealed;
-        m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+        QByteArray inner = kSealedPrefix + "\n" + sealed;
+        QByteArray env = SealedEnvelope::wrapForRelay(peerEdPub, inner);
+        m_relay.sendEnvelope(env);
     });
 
     // M2 fix: Set seal callback on FileTransferManager so file chunks get sealed envelopes.
@@ -177,7 +208,8 @@ void ChatController::setDatabase(SqlCipherDb& db)
             payload, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.isEmpty()) return {};
 
-        return kSealedFCPrefix + "\n" + sealed;
+        QByteArray inner = kSealedFCPrefix + "\n" + sealed;
+        return SealedEnvelope::wrapForRelay(peerEdPub, inner);
     });
     // QUIC P2P file send callback: try sending file chunks directly via QUIC stream
     m_fileMgr.setP2PFileSendFn([this](const QString& peerId, const QByteArray& data) -> bool {
@@ -210,8 +242,13 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
     // ── Sealed path (always required for text) ──────────────────────────────
     QByteArray sealedEnv = sealForPeer(peerIdB64u, pt);
     if (sealedEnv.isEmpty()) {
-        qWarning() << "[SEND] BLOCKED — cannot seal text to" << peerIdB64u.left(8) + "...";
-        emit status("Message not sent — encrypted session unavailable. Try again shortly.");
+        // Handshake in-flight — queue the message for delivery once the session
+        // is established. The user sees the message in the UI immediately.
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[SEND] Queued text for" << peerIdB64u.left(8) + "..."
+                 << "(handshake pending," << m_pendingMessages[peerIdB64u].size() + 1 << "queued)";
+#endif
+        m_pendingMessages[peerIdB64u].append({ peerIdB64u, pt });
         return;
     }
 
@@ -225,7 +262,7 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND MAILBOX] sealed text to" << peerIdB64u.left(8) + "...";
 #endif
-        m_mbox.enqueue(peerIdB64u, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
+        m_relay.sendEnvelope(sealedEnv);
         initiateP2PConnection(peerIdB64u);
     }
 }
@@ -274,7 +311,7 @@ QString ChatController::sendFile(const QString& peerIdB64u,
     }
 
     // Send the announcement (always via mailbox for reliability)
-    m_mbox.enqueue(peerIdB64u, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
+    m_relay.sendEnvelope(sealedEnv);
 
     // Extract the ratchet-derived key for chunk encryption
     QByteArray fileKey = m_sessionMgr->lastMessageKey();
@@ -325,7 +362,7 @@ QString ChatController::sendGroupFile(const QString& groupId,
             continue;
         }
 
-        m_mbox.enqueue(peerId, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
+        m_relay.sendEnvelope(sealedEnv);
 
         QByteArray fileKey = m_sessionMgr->lastMessageKey();
 #ifndef QT_NO_DEBUG_OUTPUT
@@ -346,26 +383,29 @@ QString ChatController::sendGroupFile(const QString& groupId,
     return transferId;
 }
 
-void ChatController::startPolling(int intervalMs)
+void ChatController::connectToRelay()
 {
-    if (!m_pollTimer.isActive()) {
-        m_pollTimer.start(intervalMs);
-        // Publish our identity to the rendezvous server so peers can discover us.
-        // host="present" is a non-empty marker — the lookup check treats any non-empty,
-        // non-"0.0.0.0" host as "online".  TTL of 60s; we refresh every 50s.
-        m_rvz.publish("present", 0, 60LL * 1000);
-        m_rvzRefreshTimer.start();
-        // Immediately drain the mailbox on startup rather than waiting for first tick
-        pollOnce();
-    }
+    m_relay.connectToRelay();
 }
 
-void ChatController::stopPolling()
+void ChatController::disconnectFromRelay()
 {
-    m_pollTimer.stop();
-    m_rvzRefreshTimer.stop();
-    // Immediately expire our presence so peers see us as offline
-    m_rvz.publish("", 0, 1);
+    m_relay.disconnectFromRelay();
+}
+
+void ChatController::onRelayConnected()
+{
+    // The relay delivers stored mailbox envelopes on WS connect automatically.
+    // No need to poll — envelopes arrive via push.
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[ChatController] Relay connected, envelopes will be pushed.";
+#endif
+    emit relayConnected();
+}
+
+void ChatController::subscribePresence(const QStringList& peerIds)
+{
+    m_relay.subscribePresence(peerIds);
 }
 
 void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
@@ -384,10 +424,7 @@ void ChatController::setTurnServer(const QString& host, int port,
 
 void ChatController::checkPresence(const QStringList& peerIds)
 {
-    for (const QString& id : peerIds) {
-        if (!id.trimmed().isEmpty())
-            m_rvz.checkPresence(id.trimmed());
-    }
+    m_relay.queryPresence(peerIds);
 }
 
 void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
@@ -428,7 +465,7 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[SEND MAILBOX] sealed group_msg to" << peerId.left(8) + "...";
 #endif
-            m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+            m_relay.sendEnvelope(env);
         } else {
             qWarning() << "[SEND] BLOCKED — cannot seal group_msg to" << peerId.left(8) + "...";
         }
@@ -467,7 +504,7 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[SEND MAILBOX] sealed group_leave to" << peerId.left(8) + "...";
 #endif
-            m_mbox.enqueue(peerId, env, 7LL * 24 * 60 * 60 * 1000);
+            m_relay.sendEnvelope(env);
         } else {
             qWarning() << "[SEND] BLOCKED — cannot seal group_leave to" << peerId.left(8) + "...";
         }
@@ -489,55 +526,8 @@ bool ChatController::markSeen(const QString& id)
     return true;
 }
 
-void ChatController::pollOnce()
-{
-    // H3 fix: reset per-sender rate limit counters each poll cycle
-    m_envelopeCount.clear();
-
-    // fetchAll retrieves every pending envelope in one authenticated request.
-    // Falls back to single fetch() automatically if the server doesn't yet
-    // support /mbox/fetch_all (404/405 response).
-    m_mbox.fetchAll(myIdB64u());
-    for (const QString &key : std::as_const(m_selfKeys)) {
-        if (!key.trimmed().isEmpty() && key.trimmed() != myIdB64u()) m_mbox.fetchAll(key.trimmed());
-    }
-
-    // Purge stale incomplete transfers to bound memory usage
-    m_fileMgr.purgeStaleTransfers();
-
-    // H2 fix: prune stuck pending handshakes (5 min timeout, checked every poll)
-    // SEC9: track peers whose handshakes repeatedly time out — they likely
-    //        run a legacy client that doesn't understand hybrid PQ messages.
-    if (m_sessionStore) {
-        const QStringList pruned = m_sessionStore->pruneStaleHandshakes();
-        for (const QString &peerId : pruned) {
-            int count = ++m_handshakeFailCount[peerId];
-            if (count >= 2)   // two consecutive timeouts → likely incompatible
-                emit peerMayNeedUpgrade(peerId);
-        }
-    }
-
-    // M8 fix: purge orphaned file keys older than 30 minutes.
-    // If a file_key announcement arrives but chunks never follow (sender crash,
-    // network issue), the key would sit in memory indefinitely without this.
-    {
-        static constexpr qint64 kFileKeyMaxAgeSecs = 30 * 60;
-        const qint64 now = QDateTime::currentSecsSinceEpoch();
-        auto it = m_fileKeyTimes.begin();
-        while (it != m_fileKeyTimes.end()) {
-            if ((now - it.value()) > kFileKeyMaxAgeSecs) {
-                auto keyIt = m_fileKeys.find(it.key());
-                if (keyIt != m_fileKeys.end()) {
-                    sodium_memzero(keyIt.value().data(), keyIt.value().size());
-                    m_fileKeys.erase(keyIt);
-                }
-                it = m_fileKeyTimes.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-}
+// pollOnce removed — relay pushes envelopes via WebSocket.
+// Maintenance tasks (handshake pruning, file key cleanup) moved to m_maintenanceTimer.
 
 // ── Core sealing primitive ────────────────────────────────────────────────────
 // Returns the sealed envelope bytes (SEALED:<version>\n<ciphertext>), or empty
@@ -569,7 +559,10 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
         sessionBlob, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
     if (sealed.isEmpty()) return {};
 
-    return kSealedPrefix + "\n" + sealed;
+    QByteArray inner = kSealedPrefix + "\n" + sealed;
+
+    // Wrap with relay routing header so /v1/send can route anonymously
+    return SealedEnvelope::wrapForRelay(peerEdPub, inner);
 }
 
 // ── S3/S7/S8 fix: Sealed payload via mailbox, fail-closed ───────────────────
@@ -584,7 +577,7 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND MAILBOX] sealed" << type << "to" << peerIdB64u.left(8) + "...";
 #endif
-        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        m_relay.sendEnvelope(env);
         return;
     }
 
@@ -599,15 +592,43 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
         const QByteArray icePt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
         const QByteArray ct     = m_crypto.aeadEncrypt(key32, icePt);
         const QByteArray env    = kMsgPrefix + myIdB64u().toUtf8() + "\n" + ct;
-        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        m_relay.sendEnvelopeTo(peerIdB64u, env);
         return;
     }
 
-    qWarning() << "[SEND] BLOCKED — cannot seal" << type
-               << "to" << peerIdB64u.left(8) + "...";
-    emit status(QString("Could not send %1 — encrypted session unavailable. "
-                        "Try sending a text message first to establish the session.")
-                    .arg(type));
+    // Queue for delivery once the handshake completes
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[SEND] Queued" << type << "for" << peerIdB64u.left(8) + "..."
+             << "(handshake pending)";
+#endif
+    m_pendingMessages[peerIdB64u].append({ peerIdB64u, pt });
+}
+
+// ── Pending message flush ─────────────────────────────────────────────────────
+// Called when a handshake completes — encrypts and sends all queued messages.
+
+void ChatController::flushPendingMessages(const QString& peerIdB64u)
+{
+    auto it = m_pendingMessages.find(peerIdB64u);
+    if (it == m_pendingMessages.end() || it->isEmpty()) return;
+
+    const QVector<PendingMessage> msgs = *it;
+    m_pendingMessages.erase(it);
+
+#ifndef QT_NO_DEBUG_OUTPUT
+    qDebug() << "[SEND] Flushing" << msgs.size() << "queued message(s) to"
+             << peerIdB64u.left(8) + "...";
+#endif
+
+    for (const PendingMessage& pm : msgs) {
+        QByteArray sealedEnv = sealForPeer(pm.peerIdB64u, pm.plaintext);
+        if (sealedEnv.isEmpty()) {
+            qWarning() << "[SEND] Failed to seal queued message to"
+                       << pm.peerIdB64u.left(8) + "... — dropping";
+            continue;
+        }
+        m_relay.sendEnvelope(sealedEnv);
+    }
 }
 
 // ── QUIC + ICE connection setup ──────────────────────────────────────────────
@@ -671,7 +692,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV P2P] sealed envelope from" << peerIdB64u.left(8) + "...";
 #endif
-        onEnvelope(data, QString());
+        onEnvelope(data);
         return;
     }
 
@@ -680,7 +701,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[RECV P2P] file chunk from" << peerIdB64u.left(8) + "...";
 #endif
-        onEnvelope(data, QString());
+        onEnvelope(data);
         return;
     }
 
@@ -722,20 +743,26 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
                          tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
 }
 
-void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
+void ChatController::onEnvelope(const QByteArray& body)
 {
-    // NOTE: The server pops the envelope on fetch — ACK is a no-op kept only for
-    // forward compatibility.  We do NOT call ack here to avoid the extra HTTP round-trip.
-    Q_UNUSED(envId)
+    // Envelopes arrive via WebSocket push — no ACK needed, the relay
+    // deletes stored envelopes on delivery.
+    const QString via = QStringLiteral("RELAY");
 
-    // Determine transport: P2P forwards call us with empty envId
-    const QString via = envId.isEmpty() ? "P2P" : "MAILBOX";
+    // Strip relay routing header if present (0x01 || recipientEdPub(32) || inner)
+    const QByteArray data = [&]() -> QByteArray {
+        if (!body.isEmpty() && static_cast<quint8>(body[0]) == 0x01 && body.size() > 33) {
+            QByteArray inner = SealedEnvelope::unwrapFromRelay(body);
+            if (!inner.isEmpty()) return inner;
+        }
+        return body;
+    }();
 
-    const int nl = body.indexOf('\n');
+    const int nl = data.indexOf('\n');
     if (nl < 0) return;
 
-    const QByteArray header = body.left(nl);
-    const QByteArray rest   = body.mid(nl + 1);
+    const QByteArray header = data.left(nl);
+    const QByteArray rest   = data.mid(nl + 1);
 
     // ── Sealed sender envelope ───────────────────────────────────────────────
     if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
@@ -824,6 +851,9 @@ void ChatController::onEnvelope(const QByteArray& body, const QString& envId)
 
                 // Announce our PQ KEM pub now that we have an authenticated channel
                 announceKemPub(senderId);
+
+                // Flush any messages queued while the handshake was in-flight
+                flushPendingMessages(senderId);
             } else {
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";

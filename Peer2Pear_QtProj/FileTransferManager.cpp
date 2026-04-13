@@ -1,6 +1,5 @@
 #include "FileTransferManager.hpp"
 #include "CryptoEngine.hpp"
-#include "MailboxClient.hpp"
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDateTime>
@@ -41,11 +40,9 @@ static QDateTime tsFromSecs(qint64 secs)
 
 // ── FileTransferManager ──────────────────────────────────────────────────────
 
-FileTransferManager::FileTransferManager(CryptoEngine& crypto, MailboxClient& mbox,
-                                         QObject* parent)
+FileTransferManager::FileTransferManager(CryptoEngine& crypto, QObject* parent)
     : QObject(parent)
     , m_crypto(crypto)
-    , m_mbox(mbox)
 {}
 
 QByteArray FileTransferManager::blake2b256(const QByteArray& data)
@@ -119,7 +116,7 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
         if (m_sealFn) {
             QByteArray sealedEnv = m_sealFn(peerIdB64u, innerPayload);
             if (!sealedEnv.isEmpty()) {
-                m_mbox.enqueue(peerIdB64u, sealedEnv, 7LL * 24 * 60 * 60 * 1000);
+                if (m_sendFn) m_sendFn(peerIdB64u, sealedEnv);
                 continue;
             }
             qWarning() << "[FileTransfer] Seal failed for chunk" << i
@@ -130,7 +127,7 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
         // Legacy fallback (no seal callback set)
         const QByteArray env = kFilePrefix + senderIdB64u.toUtf8() + "\n"
                                + innerPayload;
-        m_mbox.enqueue(peerIdB64u, env, 7LL * 24 * 60 * 60 * 1000);
+        if (m_sendFn) m_sendFn(peerIdB64u, env);
     }
 
     // Kick off P2P for future messages

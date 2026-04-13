@@ -152,18 +152,19 @@ MainWindow::MainWindow(QWidget *parent)
         welcome.exec();
     }
 
-    // ── Server + polling ──────────────────────────────────────────────────────
+    // ── Relay connection ─────────────────────────────────────────────────────
     // One-time migration: move existing users from the old HTTP IP to the new HTTPS domain
     {
-        const QString old = m_db.loadSetting("serverUrl");
+        const QString old = m_db.loadSetting("relayUrl",
+                                m_db.loadSetting("serverUrl")); // fallback to old key
         if (old == "http://3.141.14.234" || old == "http://3.141.14.234/") {
-            m_db.saveSetting("serverUrl", "https://peer2pear.com");
+            m_db.saveSetting("relayUrl", "https://peer2pear.com");
         }
     }
-    const QString serverUrl = m_db.loadSetting("serverUrl", "https://peer2pear.com");
-    m_controller.setServerBaseUrl(QUrl(serverUrl));
+    const QString relayUrl = m_db.loadSetting("relayUrl", "http://localhost:8443");
+    m_controller.setRelayUrl(QUrl(relayUrl));
 
-    // TURN relay for symmetric NAT fallback — configure before polling starts
+    // TURN relay for symmetric NAT fallback
     const QString turnHost = m_db.loadSetting("turnHost", "peer2pear.com");
     const int     turnPort = m_db.loadSetting("turnPort", "3478").toInt();
     const QString turnUser = m_db.loadSetting("turnUser", "peer2pear");
@@ -171,7 +172,7 @@ MainWindow::MainWindow(QWidget *parent)
     if (!turnHost.isEmpty())
         m_controller.setTurnServer(turnHost, turnPort, turnUser, turnPass);
 
-    m_controller.startPolling(2000);
+    m_controller.connectToRelay();
 
     // ── Profile handle: first 8 chars of public key ───────────────────────────
     const QString fullKey = m_controller.myIdB64u();
@@ -258,7 +259,7 @@ MainWindow::MainWindow(QWidget *parent)
 }
 
 MainWindow::~MainWindow() {
-    m_controller.stopPolling();   // unpublish presence so peers see us offline
+    m_controller.disconnectFromRelay();
 
     // GAP5: persist group sequence counters before shutdown
     m_db.saveGroupSeqOut(m_controller.groupSeqOut());

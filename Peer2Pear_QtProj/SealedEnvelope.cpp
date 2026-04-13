@@ -143,6 +143,38 @@ QByteArray SealedEnvelope::seal(const QByteArray& recipientCurvePub,
     return out;
 }
 
+// ── Relay routing header ─────────────────────────────────────────────────────
+// The relay reads bytes 0-32 to determine the recipient.
+// This is a transport concern, not a crypto concern — the sealed envelope
+// inside is unchanged.
+
+static constexpr quint8 kRoutingVersion = 0x01;
+
+QByteArray SealedEnvelope::wrapForRelay(const QByteArray& recipientEdPub,
+                                         const QByteArray& sealedBytes)
+{
+    if (recipientEdPub.size() != 32 || sealedBytes.isEmpty()) return {};
+
+    QByteArray out;
+    out.reserve(1 + 32 + sealedBytes.size());
+    out.append(static_cast<char>(kRoutingVersion));
+    out.append(recipientEdPub);
+    out.append(sealedBytes);
+    return out;
+}
+
+QByteArray SealedEnvelope::unwrapFromRelay(const QByteArray& relayEnvelope,
+                                            QByteArray* recipientEdPub)
+{
+    if (relayEnvelope.size() < 33) return {};
+    if (static_cast<quint8>(relayEnvelope[0]) != kRoutingVersion) return {};
+
+    if (recipientEdPub)
+        *recipientEdPub = relayEnvelope.mid(1, 32);
+
+    return relayEnvelope.mid(33);
+}
+
 UnsealResult SealedEnvelope::unseal(const QByteArray& recipientCurvePriv,
                                      const QByteArray& sealedBytes,
                                      const QByteArray& recipientKemPriv) {

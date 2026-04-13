@@ -50,6 +50,18 @@ public:
                            const QByteArray& senderDsaPub = {},
                            const QByteArray& senderDsaPriv = {});
 
+    // Wrap a sealed envelope with a routing header for relay transport.
+    // Format: 0x01 || recipientEdPub(32) || sealedBytes
+    // The relay reads bytes 0-32 to route; everything else is opaque.
+    static QByteArray wrapForRelay(const QByteArray& recipientEdPub,
+                                    const QByteArray& sealedBytes);
+
+    // Strip the routing header, returning the inner sealed envelope.
+    // Also extracts the recipientEdPub if non-null.
+    // Returns empty if the header is malformed.
+    static QByteArray unwrapFromRelay(const QByteArray& relayEnvelope,
+                                      QByteArray* recipientEdPub = nullptr);
+
     // Unseal an envelope using the recipient's keys.
     //
     // recipientCurvePriv: recipient's X25519 private key (32)

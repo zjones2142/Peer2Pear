@@ -14,8 +14,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- 1. Find Qt Packages ---
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network WebSockets)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network WebSockets)
 
 # Fix Qt's malformed framework flags on macOS
 if(APPLE)
@@ -91,10 +91,8 @@ set(PROJECT_SOURCES
     ChatController.hpp
     CryptoEngine.cpp
     CryptoEngine.hpp
-    MailboxClient.cpp
-    MailboxClient.hpp
-    RendezvousClient.cpp
-    RendezvousClient.hpp
+    RelayClient.cpp
+    RelayClient.hpp
     NiceConnection.cpp
     NiceConnection.hpp
     onboardingdialog.h
@@ -142,6 +140,7 @@ target_compile_definitions(Peer2Pear_QtProj PRIVATE
 target_link_libraries(Peer2Pear_QtProj PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
+    Qt${QT_VERSION_MAJOR}::WebSockets
     unofficial-sodium::sodium
     OQS::oqs
     msquic

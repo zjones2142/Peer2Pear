@@ -7,8 +7,7 @@
 #include <QMap>
 
 #include "CryptoEngine.hpp"
-#include "MailboxClient.hpp"
-#include "RendezvousClient.hpp"
+#include "RelayClient.hpp"
 #include "SessionManager.hpp"
 #include "SealedEnvelope.hpp"
 #include "FileTransferManager.hpp"
@@ -25,7 +24,7 @@ public:
     void setPassphrase(const QString& pass);
     // Unified path: pass the pre-derived identity key from HKDF(masterKey, "identity-unlock")
     void setPassphrase(const QString& pass, const QByteArray& identityKey);
-    void setServerBaseUrl(const QUrl& base);
+    void setRelayUrl(const QUrl& url);
     void setDatabase(SqlCipherDb& db);
     QString myIdB64u() const;
     const QByteArray& identityPub() const { return m_crypto.identityPub(); }
@@ -54,8 +53,8 @@ public:
 
     FileTransferManager& fileTransferMgr() { return m_fileMgr; }
 
-    void startPolling(int intervalMs = 2000);
-    void stopPolling();
+    void connectToRelay();
+    void disconnectFromRelay();
 
     void setSelfKeys(const QStringList& keys);
 
@@ -68,6 +67,7 @@ public:
                                     const QStringList& memberPeerIds);
 
     void checkPresence(const QStringList& peerIds);
+    void subscribePresence(const QStringList& peerIds);
 
     void setTurnServer(const QString& host, int port,
                        const QString& username, const QString& password);
@@ -89,6 +89,7 @@ public:
 
 signals:
     void status(const QString& s);
+    void relayConnected();
     void presenceChanged(const QString& peerIdB64u, bool online);
 
     void messageReceived(const QString& fromPeerIdB64u,
@@ -135,9 +136,9 @@ signals:
                            const QString& groupName = {});
 
 private slots:
-    void pollOnce();
-    void onEnvelope(const QByteArray& body, const QString& envId);
+    void onEnvelope(const QByteArray& body);
     void onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data);
+    void onRelayConnected();
 
 private:
     QByteArray sealForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
@@ -154,8 +155,7 @@ private:
     bool markSeen(const QString& id); // true = first time; false = duplicate
 
     CryptoEngine         m_crypto;
-    RendezvousClient     m_rvz;
-    MailboxClient        m_mbox;
+    RelayClient          m_relay;
     FileTransferManager  m_fileMgr;
 
     // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
@@ -163,7 +163,6 @@ private:
     std::unique_ptr<SessionManager> m_sessionMgr;
     SqlCipherDb* m_dbPtr = nullptr;  // stored for KEM pub lookups
 
-    QTimer      m_pollTimer;
     QStringList m_selfKeys;
 
     QMap<QString, QuicConnection*> m_p2pConnections;
@@ -175,6 +174,16 @@ private:
 
     // SEC9: count consecutive handshake timeouts per peer — 2+ suggests legacy client
     QMap<QString, int> m_handshakeFailCount;
+
+    // Outbound message queue for peers with pending handshakes.
+    // Messages are queued when sealForPeer() fails (handshake in-flight)
+    // and flushed when the handshake completes.
+    struct PendingMessage {
+        QString peerIdB64u;
+        QByteArray plaintext;  // pre-serialized JSON payload
+    };
+    QMap<QString, QVector<PendingMessage>> m_pendingMessages;
+    void flushPendingMessages(const QString& peerIdB64u);
 
     // Peer ML-KEM-768 public keys: peerIdB64u -> 1184-byte KEM pub
     // Populated by kem_pub_announce messages, used by sealForPeer() for hybrid envelopes
@@ -200,6 +209,6 @@ private:
     QString m_turnUser;
     QString m_turnPass;
 
-    // Refreshes rendezvous presence every 50 seconds (just under the 60-s TTL)
-    QTimer m_rvzRefreshTimer;
+    // Periodic maintenance (handshake pruning, file key cleanup)
+    QTimer m_maintenanceTimer;
 };

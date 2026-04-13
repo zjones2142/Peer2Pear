@@ -637,37 +637,36 @@ bool ChatView::eventFilter(QObject *obj, QEvent *event)
     return QObject::eventFilter(obj, event);
 }
 
-void ChatView::startPresencePolling(int intervalMs)
+void ChatView::startPresencePolling(int /*intervalMs*/)
 {
-    // Collect all unique peer keys from DMs and groups for presence checks
-    auto collectAllPeerIds = [this]() {
-        QSet<QString> seen;
-        QStringList peerIds;
-        const QString myKey = m_controller->myIdB64u();
-        for (const ChatData &c : std::as_const(m_chats)) {
-            for (const QString &k : c.keys) {
-                const QString trimmed = k.trimmed();
-                if (!trimmed.isEmpty() && trimmed != myKey && !seen.contains(trimmed)) {
-                    seen.insert(trimmed);
-                    peerIds << trimmed;
-                }
+    // Subscribe to presence updates via the relay (push-based, not polling).
+    // Re-subscribe on every relay reconnect since subscriptions are per-session.
+    connect(m_controller, &ChatController::relayConnected, this, [this]() {
+        subscribeAllPresence();
+    });
+
+    // Initial subscription (if relay is already connected)
+    QTimer::singleShot(500, this, [this]() {
+        subscribeAllPresence();
+    });
+}
+
+void ChatView::subscribeAllPresence()
+{
+    QSet<QString> seen;
+    QStringList peerIds;
+    const QString myKey = m_controller->myIdB64u();
+    for (const ChatData &c : std::as_const(m_chats)) {
+        for (const QString &k : c.keys) {
+            const QString trimmed = k.trimmed();
+            if (!trimmed.isEmpty() && trimmed != myKey && !seen.contains(trimmed)) {
+                seen.insert(trimmed);
+                peerIds << trimmed;
             }
         }
-        return peerIds;
-    };
-
-    connect(&m_presenceTimer, &QTimer::timeout, this, [this, collectAllPeerIds]() {
-        const QStringList peerIds = collectAllPeerIds();
-        if (!peerIds.isEmpty())
-            m_controller->checkPresence(peerIds);
-    });
-    m_presenceTimer.start(intervalMs);
-    // Immediate first check on startup (500ms delay to let connections settle)
-    QTimer::singleShot(500, this, [this, collectAllPeerIds]() {
-        const QStringList peerIds = collectAllPeerIds();
-        if (!peerIds.isEmpty())
-            m_controller->checkPresence(peerIds);
-    });
+    }
+    if (!peerIds.isEmpty())
+        m_controller->subscribePresence(peerIds);
 }
 
 void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
@@ -2023,6 +2022,9 @@ void ChatView::initChats()
 
 void ChatView::rebuildChatList()
 {
+    // Re-subscribe presence when contact list changes
+    subscribeAllPresence();
+
     // Prune m_memberOnline: drop keys that no longer belong to any contact/group
     {
         QSet<QString> activeKeys;
