@@ -1,0 +1,136 @@
+#pragma once
+#include <QByteArray>
+#include <QString>
+#include <utility>
+
+// ML-KEM-768 encapsulation result
+struct KemEncapsResult {
+    QByteArray ciphertext;   // KEM ciphertext (1088 bytes for ML-KEM-768)
+    QByteArray sharedSecret; // 32-byte shared secret
+};
+
+class CryptoEngine {
+public:
+    CryptoEngine();
+    ~CryptoEngine();
+
+    // Non-copyable — prevent accidental duplication of key material
+    CryptoEngine(const CryptoEngine&) = delete;
+    CryptoEngine& operator=(const CryptoEngine&) = delete;
+
+    void ensureIdentity();
+
+    // Unified path: caller supplies a pre-derived 32-byte key for identity
+    // file encryption (from HKDF(masterKey, "identity-unlock")).
+    // Falls back to legacy per-salt Argon2 for v4 files, then re-encrypts as v5.
+    void ensureIdentity(const QByteArray& identityKey);
+
+    void setPassphrase(const QString& pass);
+    bool hasPassphrase() const;
+
+    const QByteArray& identityPub() const { return m_edPub; }
+    const QByteArray& identityPriv() const { return m_edPriv; }
+
+    // base64url helpers (no padding)
+    static QString toBase64Url(const QByteArray& data);
+    static QByteArray fromBase64Url(const QString& s);
+
+    // mailbox auth signing
+    QString signB64u(const QByteArray& msgUtf8) const;
+
+    // X25519 key accessors (derived from Ed25519 identity)
+    const QByteArray& curvePub()  const { return m_curvePub;  }
+    const QByteArray& curvePriv() const { return m_curvePriv; }
+
+    // ML-KEM-768 key accessors (generated alongside Ed25519 identity)
+    // Empty if PQ keys haven't been generated yet (legacy identity file)
+    const QByteArray& kemPub()  const { return m_kemPub;  }
+    const QByteArray& kemPriv() const { return m_kemPriv; }
+    bool hasPQKeys() const { return !m_kemPub.isEmpty(); }
+
+    // ML-DSA-65 signature key accessors (generated alongside identity)
+    const QByteArray& dsaPub()  const { return m_dsaPub;  }
+    const QByteArray& dsaPriv() const { return m_dsaPriv; }
+    bool hasDSAKeys() const { return !m_dsaPub.isEmpty(); }
+
+    // ML-KEM-768 operations (static — work with any keys, not just ours)
+    // Returns (pub, priv) keypair. pub=1184 bytes, priv=2400 bytes.
+    static std::pair<QByteArray, QByteArray> generateKemKeypair();
+
+    // Encapsulate: generate shared secret and ciphertext for a recipient's KEM pub.
+    // Returns empty on failure.
+    static KemEncapsResult kemEncaps(const QByteArray& recipientKemPub);
+
+    // Decapsulate: recover shared secret from ciphertext using our KEM private key.
+    // Returns empty 0-byte array on failure.
+    static QByteArray kemDecaps(const QByteArray& ciphertext, const QByteArray& kemPriv);
+
+    // Generate a fresh ephemeral X25519 keypair (pub, priv)
+    static std::pair<QByteArray, QByteArray> generateEphemeralX25519();
+
+    // HKDF using BLAKE2b: derive outputLen bytes from input key material
+    static QByteArray hkdf(const QByteArray& ikm, const QByteArray& salt,
+                           const QByteArray& info, int outputLen = 32);
+
+    // derive per-peer shared 32-byte key using X25519 from Ed25519 keys
+    QByteArray deriveSharedKey32(const QByteArray& peerEd25519Pub) const;
+
+    // AEAD (XChaCha20-Poly1305). Output = nonce(24) || ciphertext
+    QByteArray aeadEncrypt(const QByteArray& key32, const QByteArray& plaintext,
+                           const QByteArray& aad = {}) const;
+
+    QByteArray aeadDecrypt(const QByteArray& key32, const QByteArray& nonceAndCiphertext,
+                           const QByteArray& aad = {}) const;
+
+    // Ed25519 signature verification (static — any key, not just ours)
+    static bool verifySignature(const QByteArray& sig, const QByteArray& message,
+                                const QByteArray& edPub);
+
+    // ML-DSA-65 operations (static)
+    static std::pair<QByteArray, QByteArray> generateDsaKeypair();  // (pub, priv)
+    static QByteArray dsaSign(const QByteArray& message, const QByteArray& dsaPriv);
+    static bool dsaVerify(const QByteArray& sig, const QByteArray& message,
+                          const QByteArray& dsaPub);
+
+    // Derive a master key from a passphrase using Argon2id.
+    // Salt must be 16 bytes (use loadOrCreateSalt() to manage it).
+    static QByteArray deriveMasterKey(const QString& passphrase, const QByteArray& salt);
+
+    // Derive a purpose-specific subkey from a master key via HKDF.
+    static QByteArray deriveSubkey(const QByteArray& masterKey,
+                                   const QByteArray& info, int len = 32);
+
+    // Load a salt file from disk, or create a new random 16-byte one.
+    static QByteArray loadOrCreateSalt(const QString& path);
+
+    // Securely zero a QByteArray's backing buffer in-place.
+    static void secureZero(QByteArray& buf);
+
+    // Securely zero a QString's UTF-16 backing buffer in-place.
+    static void secureZero(QString& str);
+
+private:
+    // Encrypted persistence helpers
+    bool loadIdentityFromDisk();
+    bool loadIdentityFromDisk(const QByteArray& identityKey);  // v5 unified key path
+    bool saveIdentityToDisk() const;
+    bool saveIdentityToDisk(const QByteArray& identityKey) const;  // v5 unified key path
+    void deriveCurveKeysFromEd();
+    void ensurePQKeys();  // generate + persist ML-KEM/ML-DSA keys if missing
+    void ensurePQKeys(const QByteArray& identityKey);  // v5 unified key path
+
+    QString m_passphrase;       // zeroed after ensureIdentity() completes
+    QByteArray m_identityKey;   // v5: 32-byte key from HKDF(masterKey, "identity-unlock")
+
+    QByteArray m_edPub;     // 32  (public — not secret, but zeroed for hygiene)
+    QByteArray m_edPriv;    // 64  (secret — zeroed in destructor)
+
+    QByteArray m_curvePub;  // 32
+    QByteArray m_curvePriv; // 32  (secret — zeroed in destructor)
+
+    QByteArray m_kemPub;    // 1184 (ML-KEM-768 public key)
+    QByteArray m_kemPriv;   // 2400 (ML-KEM-768 secret key — zeroed in destructor)
+
+    QByteArray m_dsaPub;    // 1952 (ML-DSA-65 public key)
+    QByteArray m_dsaPriv;   // 4032 (ML-DSA-65 secret key — zeroed in destructor)
+};
