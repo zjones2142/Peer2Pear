@@ -705,3 +705,4 @@ void DatabaseManager::saveGroupSeqOut(const QMap<QString, qint64>& counters) { s
 QMap<QString, qint64> DatabaseManager::loadGroupSeqOut() const { return loadSeqMap(m_db.handle(), 0); }
 void DatabaseManager::saveGroupSeqIn(const QMap<QString, qint64>& counters) { saveSeqMap(m_db, 1, counters); }
 QMap<QString, qint64> DatabaseManager::loadGroupSeqIn() const { return loadSeqMap(m_db.handle(), 1); }
+

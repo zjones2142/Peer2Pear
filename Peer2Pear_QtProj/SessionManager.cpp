@@ -75,17 +75,52 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
     }
 
     // No session — check if we already have a pending handshake in-flight.
-    // If so, DON'T start a new one (that would overwrite the pending state
-    // and cause a cryptographic mismatch when the response to the first arrives).
-    // The caller will fall back to legacy encryption for this message.
+    // If so, derive an additional pre-key message key from the Noise chaining
+    // key and encrypt.  This lets Alice send multiple messages to Bob while
+    // the handshake is pending — they'll all be decryptable once Bob processes
+    // the handshake init.
     {
         int pendingRole = 0;
         QByteArray existing = m_store.loadPendingHandshake(peerIdB64u, pendingRole);
-        if (!existing.isEmpty()) {
+        if (!existing.isEmpty() && pendingRole == NoiseState::Initiator) {
+            // Pending blob: [ratchetDhPub(32)][ratchetDhPriv(32)][ck(32)][counter(4 BE)][noiseBlob]
+            if (existing.size() < 100) return {};  // sanity check
+
+            QByteArray ck = existing.mid(64, 32);
+            quint32 counterBE;
+            memcpy(&counterBE, existing.constData() + 96, 4);
+            quint32 counter = qFromBigEndian(counterBE) + 1;  // increment for this message
+
+            // Derive key_n = HKDF(ck, "prekey-salt", "prekey-additional-N", 32)
+            const QByteArray info = QByteArray("prekey-additional-") + QByteArray::number(counter);
+            QByteArray prekeyKey = CryptoEngine::hkdf(ck, QByteArray("prekey-salt"), info, 32);
+            QByteArray encPayload = m_crypto.aeadEncrypt(prekeyKey, plaintext);
+
+            m_lastMessageKey = QByteArray(prekeyKey.constData(), prekeyKey.size());
+            CryptoEngine::secureZero(prekeyKey);
+
+            if (encPayload.isEmpty()) return {};
+
+            // Update counter in the pending blob and re-save
+            quint32 newCounterBE = qToBigEndian(counter);
+            existing.replace(96, 4, reinterpret_cast<const char*>(&newCounterBE), 4);
+            m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, existing);
+
 #ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[SessionManager] Handshake already in-flight for"
-                     << peerIdB64u.left(8) + "... — skipping, caller uses legacy path";
+            qDebug() << "[SessionManager] Additional pre-key message #" << counter
+                     << "for" << peerIdB64u.left(8) + "..."
+                     << "| payload:" << encPayload.size() << "B";
 #endif
+
+            // Wire: [0x06][counter(4 BE)][encPayload]
+            QByteArray out;
+            out.reserve(1 + 4 + encPayload.size());
+            out.append(static_cast<char>(kAdditionalPreKey));
+            out.append(reinterpret_cast<const char*>(&newCounterBE), 4);
+            out.append(encPayload);
+            return out;
+        } else if (!existing.isEmpty()) {
+            // We're the responder with a pending handshake — can't send yet
             return {};
         }
     }
@@ -129,11 +164,16 @@ QByteArray SessionManager::encryptForPeer(const QString& peerIdB64u,
     // Generate a fresh ratchet DH keypair (independent of Noise ephemeral — key separation)
     auto [ratchetDhPub, ratchetDhPriv] = CryptoEngine::generateEphemeralX25519();
 
-    // Save both the Noise state AND the ratchet DH keypair for when the response arrives
-    // Format: [32-byte ratchetDhPub][32-byte ratchetDhPriv][noiseBlob...]
+    // Save the Noise state, ratchet DH keypair, chaining key, and prekey counter.
+    // Format: [ratchetDhPub(32)][ratchetDhPriv(32)][ckAfterMsg1(32)][prekeyCounter(4 BE)][noiseBlob]
+    // The first pre-key message uses counter=0; additional messages increment it.
     QByteArray pendingBlob;
     pendingBlob.append(ratchetDhPub);
     pendingBlob.append(ratchetDhPriv);
+    pendingBlob.append(noise.postMsg1ChainingKey());  // 32 bytes
+    quint32 initialCounter = 0;
+    quint32 counterBE = qToBigEndian(initialCounter);
+    pendingBlob.append(reinterpret_cast<const char*>(&counterBE), 4);
     pendingBlob.append(noise.serialize());
     m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, pendingBlob);
     // L4 fix: zero the local private key copy now that it's persisted (encrypted)
@@ -279,6 +319,9 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         qDebug() << "[SessionManager] Double Ratchet session initialized (responder) for" << senderIdB64u.left(8) + "...";
 #endif
 
+        // Store the chaining key so we can decrypt additional pre-key messages (type 0x06)
+        m_pendingCk[senderIdB64u] = noise.postMsg1ChainingKey();
+
         // Decrypt the pre-key payload using the Noise chaining key after msg1 (secret)
         // Both sides snapshot m_ck after the same 4 DH ops (e, es, s, ss)
         QByteArray prekeyKey = CryptoEngine::hkdf(
@@ -343,9 +386,11 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         }
 
         // Extract saved ratchet DH keypair (fresh, independent of Noise ephemeral)
+        // Pending blob: [ratchetDhPub(32)][ratchetDhPriv(32)][ck(32)][counter(4)][noiseBlob]
         QByteArray ratchetDhPub  = pendingBlob.left(32);
         QByteArray ratchetDhPriv = pendingBlob.mid(32, 32);
-        QByteArray hsBlob        = pendingBlob.mid(64);
+        // ck(32) and counter(4) at offsets 64-99 — not needed here
+        QByteArray hsBlob        = pendingBlob.mid(100);
 
         NoiseState noise = NoiseState::deserialize(hsBlob);
         // C3 fix: re-inject static private key (not persisted since v3)
@@ -358,6 +403,7 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
 
         HandshakeResult hr = noise.finish();
         m_store.deletePendingHandshake(senderIdB64u);
+        m_pendingCk.remove(senderIdB64u);  // clean up chaining key (no longer needed)
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SessionManager] Noise IK handshake complete (initiator) for" << senderIdB64u.left(8) + "...";
 #endif
@@ -382,6 +428,45 @@ QByteArray SessionManager::decryptFromPeer(const QString& senderIdB64u,
         // The pre-key response may not carry user payload (it's a handshake completion)
         // Return the response payload if present
         return responsePayload;
+    }
+
+    if (msgType == kAdditionalPreKey) {
+        // Additional pre-key message: encrypted with a key derived from the
+        // Noise chaining key + counter.  We must have already processed the
+        // initial pre-key message (type 0x01/0x04) to have the chaining key.
+        if (blob.size() < 5) return {};
+
+        quint32 counterBE;
+        memcpy(&counterBE, blob.constData() + 1, 4);
+        quint32 counter = qFromBigEndian(counterBE);
+
+        QByteArray ck = m_pendingCk.value(senderIdB64u);
+        if (ck.isEmpty()) {
+            qWarning() << "[SessionManager] Additional pre-key msg from" << senderIdB64u.left(8) + "..."
+                       << "but no chaining key on record (initial handshake not yet received?)";
+            return {};
+        }
+
+        QByteArray encPayload = blob.mid(5);
+        const QByteArray info = QByteArray("prekey-additional-") + QByteArray::number(counter);
+        QByteArray prekeyKey = CryptoEngine::hkdf(ck, QByteArray("prekey-salt"), info, 32);
+        QByteArray pt = m_crypto.aeadDecrypt(prekeyKey, encPayload);
+
+        if (!pt.isEmpty()) {
+            m_lastMessageKey = QByteArray(prekeyKey.constData(), prekeyKey.size());
+            if (msgKeyOut)
+                *msgKeyOut = m_lastMessageKey;
+#ifndef QT_NO_DEBUG_OUTPUT
+            qDebug() << "[SessionManager] Additional pre-key #" << counter
+                     << "decrypted OK from" << senderIdB64u.left(8) + "..."
+                     << "|" << pt.size() << "B";
+#endif
+        } else {
+            qWarning() << "[SessionManager] Additional pre-key #" << counter
+                       << "decrypt FAILED from" << senderIdB64u.left(8) + "...";
+        }
+        CryptoEngine::secureZero(prekeyKey);
+        return pt;
     }
 
     qWarning() << "[SessionManager] Unknown message type" << msgType;

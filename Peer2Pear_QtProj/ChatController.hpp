@@ -175,16 +175,6 @@ private:
     // SEC9: count consecutive handshake timeouts per peer — 2+ suggests legacy client
     QMap<QString, int> m_handshakeFailCount;
 
-    // Outbound message queue for peers with pending handshakes.
-    // Messages are queued when sealForPeer() fails (handshake in-flight)
-    // and flushed when the handshake completes.
-    struct PendingMessage {
-        QString peerIdB64u;
-        QByteArray plaintext;  // pre-serialized JSON payload
-    };
-    QMap<QString, QVector<PendingMessage>> m_pendingMessages;
-    void flushPendingMessages(const QString& peerIdB64u);
-
     // Peer ML-KEM-768 public keys: peerIdB64u -> 1184-byte KEM pub
     // Populated by kem_pub_announce messages, used by sealForPeer() for hybrid envelopes
     QMap<QString, QByteArray> m_peerKemPubs;

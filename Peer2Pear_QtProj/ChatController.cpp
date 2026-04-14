@@ -221,6 +221,7 @@ void ChatController::setDatabase(SqlCipherDb& db)
         }
         return false;  // fall back to mailbox
     });
+
 }
 
 QString ChatController::myIdB64u() const
@@ -242,13 +243,8 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
     // ── Sealed path (always required for text) ──────────────────────────────
     QByteArray sealedEnv = sealForPeer(peerIdB64u, pt);
     if (sealedEnv.isEmpty()) {
-        // Handshake in-flight — queue the message for delivery once the session
-        // is established. The user sees the message in the UI immediately.
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND] Queued text for" << peerIdB64u.left(8) + "..."
-                 << "(handshake pending," << m_pendingMessages[peerIdB64u].size() + 1 << "queued)";
-#endif
-        m_pendingMessages[peerIdB64u].append({ peerIdB64u, pt });
+        qWarning() << "[SEND] BLOCKED — cannot seal text to" << peerIdB64u.left(8) + "...";
+        emit status("Message not sent — encrypted session unavailable. Try again shortly.");
         return;
     }
 
@@ -596,39 +592,8 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
         return;
     }
 
-    // Queue for delivery once the handshake completes
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[SEND] Queued" << type << "for" << peerIdB64u.left(8) + "..."
-             << "(handshake pending)";
-#endif
-    m_pendingMessages[peerIdB64u].append({ peerIdB64u, pt });
-}
-
-// ── Pending message flush ─────────────────────────────────────────────────────
-// Called when a handshake completes — encrypts and sends all queued messages.
-
-void ChatController::flushPendingMessages(const QString& peerIdB64u)
-{
-    auto it = m_pendingMessages.find(peerIdB64u);
-    if (it == m_pendingMessages.end() || it->isEmpty()) return;
-
-    const QVector<PendingMessage> msgs = *it;
-    m_pendingMessages.erase(it);
-
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[SEND] Flushing" << msgs.size() << "queued message(s) to"
-             << peerIdB64u.left(8) + "...";
-#endif
-
-    for (const PendingMessage& pm : msgs) {
-        QByteArray sealedEnv = sealForPeer(pm.peerIdB64u, pm.plaintext);
-        if (sealedEnv.isEmpty()) {
-            qWarning() << "[SEND] Failed to seal queued message to"
-                       << pm.peerIdB64u.left(8) + "... — dropping";
-            continue;
-        }
-        m_relay.sendEnvelope(sealedEnv);
-    }
+    qWarning() << "[SEND] BLOCKED — cannot seal" << type
+               << "to" << peerIdB64u.left(8) + "...";
 }
 
 // ── QUIC + ICE connection setup ──────────────────────────────────────────────
@@ -852,8 +817,6 @@ void ChatController::onEnvelope(const QByteArray& body)
                 // Announce our PQ KEM pub now that we have an authenticated channel
                 announceKemPub(senderId);
 
-                // Flush any messages queued while the handshake was in-flight
-                flushPendingMessages(senderId);
             } else {
 #ifndef QT_NO_DEBUG_OUTPUT
                 qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";

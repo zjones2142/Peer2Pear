@@ -32,6 +32,7 @@ public:
     static constexpr quint8 kRatchetMsg         = 0x03;
     static constexpr quint8 kHybridPreKeyMsg    = 0x04;  // Phase 2: hybrid PQ handshake
     static constexpr quint8 kHybridPreKeyResp   = 0x05;  // Phase 2: hybrid PQ response
+    static constexpr quint8 kAdditionalPreKey   = 0x06;  // Additional msg during pending handshake
 
     // Callback for sending handshake responses back to peers
     // Called with (peerId, sessionBlob) when a handshake response needs to be sent
@@ -79,6 +80,11 @@ private:
 
     QMap<QString, RatchetSession> m_sessions;
     QByteArray m_lastMessageKey;
+
+    // Chaining keys from completed handshakes — used to decrypt additional
+    // pre-key messages (type 0x06) that arrived while the handshake was pending.
+    // Cleared when the ratchet session receives a normal ratchet message.
+    QMap<QString, QByteArray> m_pendingCk;
 
     SendResponseFn m_sendResponse;
 };
