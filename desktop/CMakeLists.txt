@@ -10,6 +10,8 @@ set(DESKTOP_SOURCES
     settingspanel.cpp    settingspanel.h
     onboardingdialog.cpp onboardingdialog.h
     ChatNotifier.h
+    QtWebSocket.hpp
+    QtHttpClient.hpp
     databasemanager.cpp  databasemanager.h
     NiceConnection.cpp   NiceConnection.hpp
     QuicConnection.cpp   QuicConnection.hpp
@@ -33,9 +35,25 @@ else()
     endif()
 endif()
 
+# Enable P2P transport in the core library for this build.
+# Core's ChatController.cpp conditionally includes QuicConnection.hpp when
+# PEER2PEAR_P2P is defined, which pulls in NiceConnection.hpp → nice/agent.h
+# → glib-object.h and msquic.h. Core needs these include paths but does NOT
+# link the libraries (QuicConnection/NiceConnection are compiled by desktop).
+target_compile_definitions(peer2pear-core PUBLIC PEER2PEAR_P2P)
+target_include_directories(peer2pear-core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    $<TARGET_PROPERTY:PkgConfig::NICE,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:PkgConfig::GLIB,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:msquic,INTERFACE_INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:Qt${QT_VERSION_MAJOR}::Network,INTERFACE_INCLUDE_DIRECTORIES>
+)
+
 target_link_libraries(Peer2Pear PRIVATE
     peer2pear-core
     Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Network
+    Qt${QT_VERSION_MAJOR}::WebSockets
     msquic
     PkgConfig::NICE
     PkgConfig::GLIB

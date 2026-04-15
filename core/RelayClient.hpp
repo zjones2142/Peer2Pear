@@ -1,8 +1,8 @@
 #pragma once
 
+#include "IWebSocket.hpp"
+#include "IHttpClient.hpp"
 #include <QObject>
-#include <QWebSocket>
-#include <QNetworkAccessManager>
 #include <QUrl>
 #include <QTimer>
 #include <QMap>
@@ -23,11 +23,15 @@ class CryptoEngine;
  *
  * The relay never sees plaintext. It reads only the 'to' field
  * (bytes 1-32 of the envelope) for routing.
+ *
+ * Takes an IWebSocket& for platform portability — desktop provides
+ * QtWebSocket, iOS provides URLSessionWebSocket, Android provides
+ * OkHttpWebSocket. Each is ~50-80 lines of glue code.
  */
 class RelayClient : public QObject {
     Q_OBJECT
 public:
-    explicit RelayClient(CryptoEngine* crypto, QObject* parent = nullptr);
+    explicit RelayClient(IWebSocket& ws, IHttpClient& http, CryptoEngine* crypto, QObject* parent = nullptr);
     ~RelayClient() override;
 
     // Set the relay server URL (e.g., "wss://relay.peer2pear.org:8443")
@@ -77,8 +81,8 @@ private:
     void processRetryQueue();
 
     CryptoEngine*         m_crypto = nullptr;
-    QWebSocket            m_ws;
-    QNetworkAccessManager m_nam;
+    IWebSocket&           m_ws;
+    IHttpClient&          m_http;
     QUrl                  m_relayUrl;     // base URL (https/wss)
     bool                  m_authenticated = false;
     bool                  m_intentionalDisconnect = false;

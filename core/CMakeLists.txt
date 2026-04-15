@@ -23,11 +23,16 @@ set(CORE_SOURCES
     ChatController.cpp      ChatController.hpp
     RelayClient.cpp         RelayClient.hpp
     FileTransferManager.cpp FileTransferManager.hpp
+    IWebSocket.hpp
+    IHttpClient.hpp
     chattypes.h
     filetransfer.h
 )
 
 add_library(peer2pear-core STATIC ${CORE_SOURCES})
+
+# Optional P2P transport (ICE/QUIC). OFF by default — desktop/ enables it.
+option(PEER2PEAR_P2P "Enable P2P transport (ICE/QUIC)" OFF)
 
 # Public include directory so desktop/ (and future mobile/) can
 # #include "ChatController.hpp" etc. without path prefixes.
@@ -37,12 +42,12 @@ target_compile_features(peer2pear-core PUBLIC cxx_std_17)
 
 target_link_libraries(peer2pear-core PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
-    Qt${QT_VERSION_MAJOR}::Network
-    Qt${QT_VERSION_MAJOR}::WebSockets
     unofficial-sodium::sodium
     OQS::oqs
     ${SQLCIPHER_TARGET}
 )
+# NOTE: Qt::Network and Qt::WebSockets removed from core — abstracted behind
+# IHttpClient and IWebSocket interfaces. Desktop provides Qt implementations.
 
 # Suppress qDebug in release builds
 target_compile_definitions(peer2pear-core PRIVATE

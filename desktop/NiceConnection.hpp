@@ -1,5 +1,9 @@
 #pragma once
+// nice/agent.h pulls in GLib's gio headers which use a struct member named
+// 'signals' — this clashes with Qt5's 'signals' macro. Disable it for GLib.
+#undef signals
 #include <nice/agent.h>
+#define signals Q_SIGNALS
 
 #include <QObject>
 #include <QThread>
@@ -35,7 +39,7 @@ public:
     // Check if the selected candidate pair uses a TURN relay.
     bool isRelayed() const;
 
-signals:
+Q_SIGNALS:  // Q_SIGNALS avoids conflict with GLib's gio 'signals' struct member
     void localSdpReady(const QString& sdp);
     void stateChanged(int state); // Emits NiceComponentState
     void dataReceived(const QByteArray& data);

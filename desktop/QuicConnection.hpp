@@ -58,7 +58,7 @@ public:
     static const QUIC_API_TABLE* s_msquic;
     static HQUIC s_registration;
 
-signals:
+Q_SIGNALS:  // Q_SIGNALS avoids conflict with GLib's gio 'signals' struct member
     void localSdpReady(const QString& sdp);
     void stateChanged(int state);
     void dataReceived(const QByteArray& data);       // message stream

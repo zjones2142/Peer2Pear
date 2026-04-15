@@ -1,6 +1,8 @@
 #pragma once
 
-#include "QuicConnection.hpp"
+#ifdef PEER2PEAR_P2P
+class QuicConnection;  // forward declaration — full include in .cpp
+#endif
 #include <QObject>
 #include <QTimer>
 #include <QSet>
@@ -19,7 +21,7 @@
 class ChatController : public QObject {
     Q_OBJECT
 public:
-    explicit ChatController(QObject* parent = nullptr);
+    explicit ChatController(IWebSocket& ws, IHttpClient& http, QObject* parent = nullptr);
 
     void setPassphrase(const QString& pass);
     // Unified path: pass the pre-derived identity key from HKDF(masterKey, "identity-unlock")
@@ -69,8 +71,10 @@ public:
     void checkPresence(const QStringList& peerIds);
     void subscribePresence(const QStringList& peerIds);
 
+#ifdef PEER2PEAR_P2P
     void setTurnServer(const QString& host, int port,
                        const QString& username, const QString& password);
+#endif
 
     void sendAvatar(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
 
@@ -137,14 +141,18 @@ signals:
 
 private slots:
     void onEnvelope(const QByteArray& body);
+#ifdef PEER2PEAR_P2P
     void onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data);
+#endif
     void onRelayConnected();
 
 private:
     QByteArray sealForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
     void sendSealedPayload(const QString& peerIdB64u, const QJsonObject& payload);
+#ifdef PEER2PEAR_P2P
     QuicConnection* setupP2PConnection(const QString& peerIdB64u, bool controlling);
     void initiateP2PConnection(const QString& peerIdB64u);
+#endif
 
     // ── Deduplication ─────────────────────────────────────────────────────────
     // Bounded set (capped at 2 000 entries); used for msgId and transferId.
@@ -165,7 +173,9 @@ private:
 
     QStringList m_selfKeys;
 
+#ifdef PEER2PEAR_P2P
     QMap<QString, QuicConnection*> m_p2pConnections;
+#endif
 
     // G5 fix: per-group outbound sequence counter (monotonic, not persisted)
     QMap<QString, qint64> m_groupSeqOut;
@@ -193,11 +203,13 @@ private:
     QMap<QString, int> m_envelopeCount;
     static constexpr int kMaxEnvelopesPerSenderPerPoll = 200;
 
+#ifdef PEER2PEAR_P2P
     // TURN relay config for symmetric NAT fallback
     QString m_turnHost;
     int     m_turnPort = 0;
     QString m_turnUser;
     QString m_turnPass;
+#endif
 
     // Periodic maintenance (handshake pruning, file key cleanup)
     QTimer m_maintenanceTimer;

@@ -164,7 +164,7 @@ void QuicConnection::onIceStateChanged(int state) {
 
         // Find a free UDP port for QUIC
         QUdpSocket probe;
-        probe.bind(QHostAddress::AnyIPv4, 0);
+        probe.bind(QHostAddress::AnyIPv4, quint16(0));
         m_localQuicPort = probe.localPort();
         probe.close();
 

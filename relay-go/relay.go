@@ -33,7 +33,62 @@ const (
 	wsPingInterval     = 30 * time.Second
 	wsAuthTimeout      = 10 * time.Second
 	forwardTimeout     = 10 * time.Second
+
+	// Rate limiting for /v1/send (per IP)
+	rateLimitPerMin    = 60   // max envelopes per IP per minute
+	rateLimitWindow    = 60   // window in seconds
 )
+
+// ── Per-IP rate limiter ─────────────────────────────────────────────────────
+
+type ipRateEntry struct {
+	count   int
+	resetAt int64 // unix seconds
+}
+
+type rateLimiter struct {
+	mu      sync.Mutex
+	entries map[string]*ipRateEntry
+}
+
+func newRateLimiter() *rateLimiter {
+	rl := &rateLimiter{entries: make(map[string]*ipRateEntry)}
+	// Purge stale entries every 5 minutes
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			rl.purge()
+		}
+	}()
+	return rl
+}
+
+// allow returns true if the IP is within its rate limit.
+func (rl *rateLimiter) allow(ip string) bool {
+	now := time.Now().Unix()
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	e, ok := rl.entries[ip]
+	if !ok || now >= e.resetAt {
+		rl.entries[ip] = &ipRateEntry{count: 1, resetAt: now + rateLimitWindow}
+		return true
+	}
+	e.count++
+	return e.count <= rateLimitPerMin
+}
+
+func (rl *rateLimiter) purge() {
+	now := time.Now().Unix()
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for ip, e := range rl.entries {
+		if now >= e.resetAt {
+			delete(rl.entries, ip)
+		}
+	}
+}
 
 // ── Peer connection ──────────────────────────────────────────────────────────
 
@@ -50,6 +105,7 @@ type Hub struct {
 	peers map[string]*Peer // peer_id → *Peer
 	subs  map[string]map[string]bool // subscriber_id → set of watched peer_ids
 	mbox  *Mailbox
+	rl    *rateLimiter
 
 	upgrader websocket.Upgrader
 }
@@ -59,6 +115,7 @@ func NewHub(mbox *Mailbox) *Hub {
 		peers: make(map[string]*Peer),
 		subs:  make(map[string]map[string]bool),
 		mbox:  mbox,
+		rl:    newRateLimiter(),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  maxEnvelopeBytes,
 			WriteBufferSize: maxEnvelopeBytes,
@@ -168,6 +225,17 @@ func (h *Hub) notifyPresence(peerID string, online bool) {
 // ── POST /v1/send — Anonymous envelope submission ────────────────────────────
 
 func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
+	// Rate limit by IP before reading the body
+	ip := r.RemoteAddr
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		ip = strings.SplitN(fwd, ",", 2)[0]
+		ip = strings.TrimSpace(ip)
+	}
+	if !h.rl.allow(ip) {
+		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxEnvelopeBytes)+1))
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "read error")
@@ -361,25 +429,19 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── GET /v1/peers — List connected peers ─────────────────────────────────────
-
-func (h *Hub) HandlePeers(w http.ResponseWriter, r *http.Request) {
-	h.mu.RLock()
-	ids := make([]string, 0, len(h.peers))
-	for id := range h.peers {
-		ids = append(ids, id)
-	}
-	h.mu.RUnlock()
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"peers": ids,
-		"count": len(ids),
-	})
-}
-
 // ── POST /v1/forward — Multi-hop relay forwarding ────────────────────────────
 
 func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
+	// Rate limit (shares the same per-IP bucket as /v1/send)
+	ip := r.RemoteAddr
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		ip = strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])
+	}
+	if !h.rl.allow(ip) {
+		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
 	forwardTo := r.Header.Get("X-Forward-To")
 	if forwardTo == "" {
 		httpError(w, http.StatusBadRequest, "missing X-Forward-To header")

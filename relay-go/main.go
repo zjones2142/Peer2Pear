@@ -3,7 +3,7 @@
 // A minimal, untrusted relay that provides:
 //   - Anonymous envelope sending      (POST /v1/send)
 //   - Authenticated WebSocket receive (WS   /v1/receive)
-//   - Presence discovery              (GET  /v1/peers)
+//   - Per-IP rate limiting on sends
 //   - Store-and-forward mailbox for offline peers
 //   - Multi-hop forwarding            (POST /v1/forward)
 //
@@ -60,8 +60,8 @@ func main() {
 	// ── New protocol (/v1/*) ─────────────────────────────────────────
 	mux.HandleFunc("POST /v1/send", hub.HandleSend)
 	mux.HandleFunc("/v1/receive", hub.HandleReceive) // WebSocket — no method restriction
-	mux.HandleFunc("GET /v1/peers", hub.HandlePeers)
 	mux.HandleFunc("POST /v1/forward", hub.HandleForward)
+	// NOTE: /v1/peers removed — exposing connected peer IDs is a privacy leak.
 
 	// ── Legacy endpoints (backward compatibility) ────────────────────
 	mux.HandleFunc("POST /mbox/enqueue", hub.LegacyEnqueue)
@@ -73,13 +73,9 @@ func main() {
 
 	// ── Health ───────────────────────────────────────────────────────
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		count := mbox.Count()
-		peers := hub.PeerCount()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":               true,
-			"envelopes_queued": count,
-			"peers_connected":  peers,
-			"version":          "2.0.0-go",
+			"ok":      true,
+			"version": "2.0.0-go",
 		})
 	})
 

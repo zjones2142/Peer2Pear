@@ -54,6 +54,37 @@ FORWARD_TIMEOUT_S  = 10                            # timeout for relay-to-relay 
 
 DB_PATH = os.environ.get("DB_PATH", "/tmp/peer2pear_relay.db")
 
+RATE_LIMIT_PER_MIN = 60   # max envelopes per IP per minute
+RATE_LIMIT_WINDOW  = 60   # seconds
+
+# ── Per-IP rate limiter ──────────────────────────────────────────────────────
+
+class _RateLimiter:
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[int, float]] = {}  # ip → (count, reset_at)
+
+    def allow(self, ip: str) -> bool:
+        now = time.time()
+        entry = self._entries.get(ip)
+        if entry is None or now >= entry[1]:
+            self._entries[ip] = (1, now + RATE_LIMIT_WINDOW)
+            return True
+        count = entry[0] + 1
+        self._entries[ip] = (count, entry[1])
+        return count <= RATE_LIMIT_PER_MIN
+
+    def purge(self) -> None:
+        now = time.time()
+        self._entries = {ip: e for ip, e in self._entries.items() if now < e[1]}
+
+_rate_limiter = _RateLimiter()
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 # ── In-memory presence ────────────────────────────────────────────────────────
 
 # peer_id (base64url) → WebSocket connection
@@ -113,6 +144,7 @@ async def background_purge():
                 removed = before - after
                 if removed > 0:
                     log.info(f"purge: removed {removed} expired envelopes, {after} remaining")
+            _rate_limiter.purge()
         except Exception as e:
             log.error(f"purge error: {e}")
 
@@ -192,6 +224,8 @@ async def notify_presence(peer_id: str, online: bool):
 
 @app.post("/v1/send")
 async def v1_send(request: Request):
+    if not _rate_limiter.allow(_get_client_ip(request)):
+        raise HTTPException(429, "rate limit exceeded")
     body = await request.body()
     if len(body) > MAX_ENVELOPE_BYTES:
         raise HTTPException(413, f"envelope too large: {len(body)} > {MAX_ENVELOPE_BYTES}")
@@ -349,14 +383,8 @@ async def v1_receive(ws: WebSocket):
             await notify_presence(peer_id, online=False)
 
 
-# ── GET /v1/peers — List connected peers ──────────────────────────────────────
-#
-# Returns all currently connected peer IDs. This is the presence system.
-# No authentication required — peer IDs are public keys, already public.
-
-@app.get("/v1/peers")
-def v1_peers():
-    return {"peers": list(connected_peers.keys()), "count": len(connected_peers)}
+# NOTE: /v1/peers endpoint removed — exposing connected peer IDs is a privacy leak.
+# Presence is handled via authenticated WebSocket subscriptions in /v1/receive.
 
 
 # ── POST /v1/forward — Multi-hop relay forwarding ─────────────────────────────
@@ -372,6 +400,8 @@ async def v1_forward(
     request: Request,
     x_forward_to: str = Header(..., alias="X-Forward-To"),
 ):
+    if not _rate_limiter.allow(_get_client_ip(request)):
+        raise HTTPException(429, "rate limit exceeded")
     body = await request.body()
     if len(body) > MAX_ENVELOPE_BYTES:
         raise HTTPException(413, "envelope too large")
@@ -577,12 +607,8 @@ def mbox_ack(
 
 @app.get("/healthz")
 def healthz():
-    with db_conn() as conn:
-        env_count = conn.execute("SELECT COUNT(*) FROM envelopes;").fetchone()[0]
     return {
         "ok": True,
-        "envelopes_queued": env_count,
-        "peers_connected": len(connected_peers),
         "version": "2.0.0",
     }
 

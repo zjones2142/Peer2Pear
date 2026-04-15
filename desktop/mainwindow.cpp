@@ -21,6 +21,7 @@
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
+    , m_controller(m_webSocket, m_httpClient)
 {
     ui->setupUi(this);
 

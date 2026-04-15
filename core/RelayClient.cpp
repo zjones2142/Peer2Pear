@@ -5,18 +5,16 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QDateTime>
-#include <QNetworkRequest>
-#include <QNetworkReply>
 #include <QDebug>
 
-RelayClient::RelayClient(CryptoEngine* crypto, QObject* parent)
-    : QObject(parent), m_crypto(crypto)
+RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http, CryptoEngine* crypto, QObject* parent)
+    : QObject(parent), m_crypto(crypto), m_ws(ws), m_http(http)
 {
-    // WebSocket signals
-    connect(&m_ws, &QWebSocket::connected, this, &RelayClient::onWsConnected);
-    connect(&m_ws, &QWebSocket::disconnected, this, &RelayClient::onWsDisconnected);
-    connect(&m_ws, &QWebSocket::binaryMessageReceived, this, &RelayClient::onWsBinaryMessage);
-    connect(&m_ws, &QWebSocket::textMessageReceived, this, &RelayClient::onWsTextMessage);
+    // IWebSocket callbacks
+    m_ws.onConnected     = [this]()                    { onWsConnected(); };
+    m_ws.onDisconnected  = [this]()                    { onWsDisconnected(); };
+    m_ws.onBinaryMessage = [this](const QByteArray& d) { onWsBinaryMessage(d); };
+    m_ws.onTextMessage   = [this](const QString& m)    { onWsTextMessage(m); };
 
     // Reconnect timer
     m_reconnectTimer.setSingleShot(true);
@@ -40,14 +38,14 @@ void RelayClient::setRelayUrl(const QUrl& url)
 
 bool RelayClient::isConnected() const
 {
-    return m_ws.state() == QAbstractSocket::ConnectedState && m_authenticated;
+    return m_ws.isConnected() && m_authenticated;
 }
 
 // ── WebSocket receive channel ────────────────────────────────────────────────
 
 void RelayClient::connectToRelay()
 {
-    if (m_ws.state() != QAbstractSocket::UnconnectedState) return;
+    if (!m_ws.isIdle()) return;
 
     m_intentionalDisconnect = false;
     m_authenticated = false;
@@ -185,24 +183,12 @@ void RelayClient::sendEnvelope(const QByteArray& sealedEnvelope)
     QUrl sendUrl = m_relayUrl;
     sendUrl.setPath("/v1/send");
 
-    QNetworkRequest req(sendUrl);
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
-
-    auto* reply = m_nam.post(req, sealedEnvelope);
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, sealedEnvelope]() {
-        const int http = reply->attribute(
-            QNetworkRequest::HttpStatusCodeAttribute).toInt();
-
-        if (reply->error() == QNetworkReply::NoError) {
-            reply->deleteLater();
-            return;
-        }
+    m_http.post(sendUrl, sealedEnvelope, {}, [this, sealedEnvelope](const IHttpClient::Response& r) {
+        if (r.error.isEmpty()) return;  // success
 
         // Permanent failure — don't retry
-        if (http == 413) {
+        if (r.status == 413) {
             emit status("Envelope too large for relay — rejected.");
-            reply->deleteLater();
             return;
         }
 
@@ -211,10 +197,8 @@ void RelayClient::sendEnvelope(const QByteArray& sealedEnvelope)
         if (!m_retryTimer.isActive())
             scheduleRetry();
 
-        if (http != 429)
-            emit status(QString("relay send error: %1 — will retry").arg(reply->errorString()));
-
-        reply->deleteLater();
+        if (r.status != 429)
+            emit status(QString("relay send error: %1 — will retry").arg(r.error));
     });
 }
 
@@ -226,32 +210,21 @@ void RelayClient::sendEnvelopeTo(const QString& recipientIdB64u,
     QUrl sendUrl = m_relayUrl;
     sendUrl.setPath("/mbox/enqueue");
 
-    QNetworkRequest req(sendUrl);
-    req.setRawHeader("X-To", recipientIdB64u.toUtf8());
-    req.setRawHeader("X-TtlMs", QByteArray::number(7LL * 24 * 60 * 60 * 1000));
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+    QMap<QString, QString> headers;
+    headers["X-To"]    = recipientIdB64u;
+    headers["X-TtlMs"] = QString::number(7LL * 24 * 60 * 60 * 1000);
 
-    auto* reply = m_nam.post(req, envelopeBytes);
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, envelopeBytes]() {
-        if (reply->error() == QNetworkReply::NoError) {
-            reply->deleteLater();
-            return;
-        }
+    m_http.post(sendUrl, envelopeBytes, headers, [this, envelopeBytes](const IHttpClient::Response& r) {
+        if (r.error.isEmpty()) return;  // success
 
-        const int http = reply->attribute(
-            QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        if (http == 413) {
+        if (r.status == 413) {
             emit status("Envelope too large — rejected.");
-            reply->deleteLater();
             return;
         }
 
         m_retryQueue.append({ envelopeBytes, 0 });
         if (!m_retryTimer.isActive())
             scheduleRetry();
-
-        reply->deleteLater();
     });
 }
 
@@ -309,24 +282,15 @@ void RelayClient::processRetryQueue()
     QUrl sendUrl = m_relayUrl;
     sendUrl.setPath("/v1/send");
 
-    QNetworkRequest req(sendUrl);
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
-
-    auto* reply = m_nam.post(req, pe.data);
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, pe]() {
+    m_http.post(sendUrl, pe.data, {}, [this, pe](const IHttpClient::Response& r) {
         m_retryInFlight = false;
-        const int http = reply->attribute(
-            QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
-        if (reply->error() == QNetworkReply::NoError) {
-            reply->deleteLater();
+        if (r.error.isEmpty()) {
             if (!m_retryQueue.isEmpty()) scheduleRetry();
             return;
         }
 
-        if (http == 413) {
-            reply->deleteLater();
+        if (r.status == 413) {
             if (!m_retryQueue.isEmpty()) scheduleRetry();
             return;
         }
@@ -339,7 +303,5 @@ void RelayClient::processRetryQueue()
         } else {
             emit status("Gave up delivering envelope after max retries.");
         }
-
-        reply->deleteLater();
     });
 }

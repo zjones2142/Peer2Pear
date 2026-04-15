@@ -1,4 +1,15 @@
 #include "ChatController.hpp"
+#ifdef PEER2PEAR_P2P
+// GLib's gio headers use a struct member named 'signals' which clashes
+// with Qt5's 'signals' macro. Include GLib first with the macro disabled,
+// then restore it before pulling in the Qt-based QuicConnection header.
+#undef signals
+#include <glib.h>
+#include <gio/gio.h>
+#include <nice/agent.h>
+#define signals Q_SIGNALS
+#include "QuicConnection.hpp"
+#endif
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -25,9 +36,9 @@ static QDateTime tsFromSecs(qint64 secs)
 
 // ── ChatController ────────────────────────────────────────────────────────────
 
-ChatController::ChatController(QObject* parent)
+ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* parent)
     : QObject(parent)
-    , m_relay(&m_crypto, this)
+    , m_relay(ws, http, &m_crypto, this)
     , m_fileMgr(m_crypto, this)
 {
     // Relay signals
@@ -45,8 +56,10 @@ ChatController::ChatController(QObject* parent)
     connect(&m_fileMgr, &FileTransferManager::status, this, &ChatController::status);
     connect(&m_fileMgr, &FileTransferManager::fileChunkReceived,
             this, &ChatController::fileChunkReceived);
+#ifdef PEER2PEAR_P2P
     connect(&m_fileMgr, &FileTransferManager::wantP2PConnection,
             this, &ChatController::initiateP2PConnection);
+#endif
     // M1 fix: remove ratchet-derived file key when transfer completes.
     // M4 fix: keys are stored as "senderId:transferId" — match on suffix.
     connect(&m_fileMgr, &FileTransferManager::transferCompleted,
@@ -101,6 +114,7 @@ ChatController::ChatController(QObject* parent)
             }
         }
 
+#ifdef PEER2PEAR_P2P
         // G4 fix: clean up failed ICE connections
         QStringList toRemove;
         for (auto it = m_p2pConnections.begin(); it != m_p2pConnections.end(); ++it) {
@@ -114,6 +128,7 @@ ChatController::ChatController(QObject* parent)
             m_p2pConnections[key]->deleteLater();
             m_p2pConnections.remove(key);
         }
+#endif
     });
     m_maintenanceTimer.start(30 * 1000); // every 30 seconds
 }
@@ -211,6 +226,7 @@ void ChatController::setDatabase(SqlCipherDb& db)
         QByteArray inner = kSealedFCPrefix + "\n" + sealed;
         return SealedEnvelope::wrapForRelay(peerEdPub, inner);
     });
+#ifdef PEER2PEAR_P2P
     // QUIC P2P file send callback: try sending file chunks directly via QUIC stream
     m_fileMgr.setP2PFileSendFn([this](const QString& peerId, const QByteArray& data) -> bool {
         if (m_p2pConnections.contains(peerId) &&
@@ -221,6 +237,7 @@ void ChatController::setDatabase(SqlCipherDb& db)
         }
         return false;  // fall back to mailbox
     });
+#endif
 
 }
 
@@ -248,18 +265,23 @@ void ChatController::sendText(const QString& peerIdB64u, const QString& text)
         return;
     }
 
+#ifdef PEER2PEAR_P2P
     if (m_p2pConnections.contains(peerIdB64u) &&
         m_p2pConnections[peerIdB64u]->isReady()) {
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[SEND P2P] sealed text to" << peerIdB64u.left(8) + "...";
 #endif
         m_p2pConnections[peerIdB64u]->sendData(sealedEnv);
-    } else {
+    } else
+#endif
+    {
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND MAILBOX] sealed text to" << peerIdB64u.left(8) + "...";
+        qDebug() << "[SEND RELAY] sealed text to" << peerIdB64u.left(8) + "...";
 #endif
         m_relay.sendEnvelope(sealedEnv);
+#ifdef PEER2PEAR_P2P
         initiateP2PConnection(peerIdB64u);
+#endif
     }
 }
 
@@ -406,6 +428,7 @@ void ChatController::subscribePresence(const QStringList& peerIds)
 
 void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
 
+#ifdef PEER2PEAR_P2P
 void ChatController::setTurnServer(const QString& host, int port,
                                     const QString& username, const QString& password)
 {
@@ -417,6 +440,7 @@ void ChatController::setTurnServer(const QString& host, int port,
     qDebug() << "[ChatController] TURN server set:" << host << ":" << port;
 #endif
 }
+#endif
 
 void ChatController::checkPresence(const QStringList& peerIds)
 {
@@ -596,6 +620,7 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
                << "to" << peerIdB64u.left(8) + "...";
 }
 
+#ifdef PEER2PEAR_P2P
 // ── QUIC + ICE connection setup ──────────────────────────────────────────────
 QuicConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bool controlling)
 {
@@ -707,6 +732,7 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     emit messageReceived(peerIdB64u, o.value("text").toString(),
                          tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
 }
+#endif // PEER2PEAR_P2P
 
 void ChatController::onEnvelope(const QByteArray& body)
 {
@@ -895,6 +921,7 @@ void ChatController::onEnvelope(const QByteArray& body)
             emit groupMessageReceived(senderId, gid, gname, memberKeys,
                                       QString(), ts,
                                       msgId.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : msgId);
+#ifdef PEER2PEAR_P2P
         } else if (type == "ice_offer") {
 #ifndef QT_NO_DEBUG_OUTPUT
             qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
@@ -927,6 +954,7 @@ void ChatController::onEnvelope(const QByteArray& body)
                 }
                 m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
             }
+#endif // PEER2PEAR_P2P
         } else if (type == "file_key") {
             // File key announcement: store the ratchet-derived key for chunk decryption.
             // M4 fix: key on senderId:transferId to avoid collisions when multiple
@@ -1005,7 +1033,11 @@ void ChatController::onEnvelope(const QByteArray& body)
     // Text is accepted (with warning) for backward compat with older peers.
     // All other types (group_msg, avatar, group_rename, etc.) are rejected —
     // they must come through the sealed path where sender identity is verified.
+#ifdef PEER2PEAR_P2P
     if (type != "ice_offer" && type != "ice_answer" && type != "text") {
+#else
+    if (type != "text") {
+#endif
         qWarning() << "[RECV" << via << "] REJECTED legacy" << type
                    << "from" << fromId.left(8) + "..."
                    << "— must use sealed path";
@@ -1026,7 +1058,9 @@ void ChatController::onEnvelope(const QByteArray& body)
         if (!msgId.isEmpty() && !markSeen(msgId)) return;
         emit messageReceived(fromId, o.value("text").toString(),
                              tsFromSecs(tsSecs), msgId);
-    } else if (type == "ice_offer") {
+    }
+#ifdef PEER2PEAR_P2P
+    else if (type == "ice_offer") {
         if (m_p2pConnections.contains(fromId) &&
             m_p2pConnections[fromId]->isReady()) {
 #ifndef QT_NO_DEBUG_OUTPUT
@@ -1051,6 +1085,7 @@ void ChatController::onEnvelope(const QByteArray& body)
             m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
         }
     }
+#endif // PEER2PEAR_P2P
 }
 
 void ChatController::sendGroupRename(const QString& groupId,
