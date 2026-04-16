@@ -294,6 +294,7 @@ void RatchetSession::dhRatchetStep(const QByteArray& remoteDhPub,
 
     auto [rk2, sendChain] = kdfRootKey(m_rootKey, dhOutput);
     CryptoEngine::secureZero(dhOutput);
+    CryptoEngine::secureZero(priv);  // H1 fix: zero ephemeral DH priv after use
     m_rootKey      = rk2;
     m_sendChainKey = sendChain;
 }

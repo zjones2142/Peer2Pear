@@ -25,6 +25,8 @@ set(CORE_SOURCES
     FileTransferManager.cpp FileTransferManager.hpp
     IWebSocket.hpp
     IHttpClient.hpp
+    peer2pear.h
+    peer2pear_api.cpp
     chattypes.h
     filetransfer.h
 )

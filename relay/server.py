@@ -46,6 +46,7 @@ app = FastAPI(title="Peer2Pear Relay")
 
 MAX_ENVELOPE_BYTES = 256 * 1024                   # 262 144 B
 MAX_QUEUE_ITEMS    = 5_000                         # per recipient
+MAX_GLOBAL_ENVELOPES = 500_000                     # M5: total across all recipients
 DEFAULT_TTL_MS     = 7 * 24 * 60 * 60 * 1_000     # 7 days
 MAX_TTL_MS         = 7 * 24 * 60 * 60 * 1_000     # hard cap
 REPLAY_WINDOW_MS   = 5 * 60 * 1_000               # 5 min auth window
@@ -79,10 +80,30 @@ class _RateLimiter:
 
 _rate_limiter = _RateLimiter()
 
+# H3 fix: track seen auth nonces to prevent replay within the 5-min window
+_seen_auth: dict[str, float] = {}  # "peer_id|ts" → expiry_time
+
+def _check_auth_nonce(peer_id: str, ts: int) -> bool:
+    """Returns True if nonce is fresh, False if replayed."""
+    key = f"{peer_id}|{ts}"
+    now = time.time()
+    # Purge expired
+    expired = [k for k, exp in _seen_auth.items() if now > exp]
+    for k in expired:
+        del _seen_auth[k]
+    if key in _seen_auth:
+        return False
+    _seen_auth[key] = now + REPLAY_WINDOW_MS / 1000
+    return True
+
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "") != ""
+
 def _get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    # H2 fix: only trust X-Forwarded-For when behind a known reverse proxy
+    if TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 # ── In-memory presence ────────────────────────────────────────────────────────
@@ -256,6 +277,10 @@ async def v1_send(request: Request):
         ).fetchone()[0]
         if count >= MAX_QUEUE_ITEMS:
             raise HTTPException(429, "mailbox full")
+        # M5 fix: check global capacity to prevent disk exhaustion
+        global_count = conn.execute("SELECT COUNT(*) FROM envelopes;").fetchone()[0]
+        if global_count >= MAX_GLOBAL_ENVELOPES:
+            raise HTTPException(429, "relay storage full")
         conn.execute(
             "INSERT OR IGNORE INTO envelopes (env_id, recipient_id, payload, created_ms, expiry_ms) "
             "VALUES (?, ?, ?, ?, ?);",
@@ -310,6 +335,11 @@ async def v1_receive(ws: WebSocket):
             await ws.close(code=4004, reason="auth failed")
             return
 
+        # H3 fix: reject replayed auth messages
+        if not _check_auth_nonce(peer_id, ts):
+            await ws.close(code=4005, reason="auth replay")
+            return
+
         # ── Step 2: Register presence ────────────────────────────────────
         old_ws = connected_peers.get(peer_id)
         if old_ws:
@@ -362,7 +392,7 @@ async def v1_receive(ws: WebSocket):
 
             elif msg_type == "presence_subscribe":
                 # Client wants push notifications when these peers come online/offline
-                peer_ids = msg.get("peer_ids", [])
+                peer_ids = msg.get("peer_ids", [])[:200]  # H4 fix: cap at 200
                 presence_subscriptions[peer_id] = set(peer_ids)
                 # Send current state immediately
                 results = {pid: (pid in connected_peers) for pid in peer_ids}
@@ -411,6 +441,13 @@ async def v1_forward(
     # Validate the target looks like a hostname (basic sanity)
     if "/" in x_forward_to or " " in x_forward_to:
         raise HTTPException(400, "invalid relay address")
+
+    # M4 fix: block forwarding to private/loopback addresses (SSRF prevention)
+    host = x_forward_to.split(":")[0].lower()
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or \
+       host.startswith("10.") or host.startswith("192.168.") or \
+       host.startswith("172.") or host.startswith("169.254."):
+        raise HTTPException(403, "forwarding to private addresses not allowed")
 
     try:
         async with httpx.AsyncClient() as client:

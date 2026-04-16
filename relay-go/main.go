@@ -30,6 +30,7 @@ import (
 func main() {
 	port := flag.String("port", envOr("PORT", "8443"), "listen port")
 	dbPath := flag.String("db", envOr("DB_PATH", "peer2pear_relay.db"), "SQLite database path")
+	trustProxy := flag.Bool("trust-proxy", envOr("TRUST_PROXY", "") != "", "trust X-Forwarded-For header (set when behind a reverse proxy)")
 	flag.Parse()
 
 	// Initialize storage
@@ -40,7 +41,7 @@ func main() {
 	defer mbox.Close()
 
 	// Initialize relay hub
-	hub := NewHub(mbox)
+	hub := NewHub(mbox, *trustProxy)
 
 	// Background purge of expired envelopes
 	go func() {

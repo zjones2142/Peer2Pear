@@ -193,7 +193,8 @@ void RelayClient::sendEnvelope(const QByteArray& sealedEnvelope)
         }
 
         // Transient failure — queue for retry
-        m_retryQueue.append({ sealedEnvelope, 0 });
+        if (m_retryQueue.size() < kMaxRetryQueue)
+            m_retryQueue.append({ sealedEnvelope, 0 });
         if (!m_retryTimer.isActive())
             scheduleRetry();
 
@@ -222,7 +223,8 @@ void RelayClient::sendEnvelopeTo(const QString& recipientIdB64u,
             return;
         }
 
-        m_retryQueue.append({ envelopeBytes, 0 });
+        if (m_retryQueue.size() < kMaxRetryQueue)
+            m_retryQueue.append({ envelopeBytes, 0 });
         if (!m_retryTimer.isActive())
             scheduleRetry();
     });

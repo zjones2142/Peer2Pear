@@ -94,6 +94,7 @@ private:
 
     // Retry queue for failed sends
     static constexpr int kMaxRetries = 5;
+    static constexpr int kMaxRetryQueue = 100; // M1 fix: prevent OOM
     struct PendingEnvelope {
         QByteArray data;
         int        retryCount = 0;

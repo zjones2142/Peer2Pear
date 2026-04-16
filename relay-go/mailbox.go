@@ -69,12 +69,19 @@ func (m *Mailbox) Store(recipientID string, payload []byte) error {
 	// Purge expired before checking capacity
 	m.db.Exec("DELETE FROM envelopes WHERE expiry_ms < ?", now)
 
-	// Check capacity
+	// Check per-recipient capacity
 	var count int
 	m.db.QueryRow("SELECT COUNT(*) FROM envelopes WHERE recipient_id=?",
 		recipientID).Scan(&count)
 	if count >= maxQueueItems {
 		return fmt.Errorf("mailbox full")
+	}
+
+	// M5 fix: check global capacity to prevent disk exhaustion
+	var globalCount int
+	m.db.QueryRow("SELECT COUNT(*) FROM envelopes").Scan(&globalCount)
+	if globalCount >= maxGlobalEnvelopes {
+		return fmt.Errorf("relay storage full")
 	}
 
 	envID := fmt.Sprintf("%d-%s", now, randomHex(8))
@@ -123,13 +130,19 @@ func (m *Mailbox) FetchAll(recipientID string) [][]byte {
 		return nil
 	}
 
-	// Delete all fetched envelopes in one transaction
+	// H5 fix: delete in a transaction, only return payloads if commit succeeds
 	tx, err := m.db.Begin()
-	if err == nil {
-		for _, id := range envIDs {
-			tx.Exec("DELETE FROM envelopes WHERE env_id=?", id)
-		}
-		tx.Commit()
+	if err != nil {
+		log.Printf("fetchAll tx begin error: %v", err)
+		return nil
+	}
+	for _, id := range envIDs {
+		tx.Exec("DELETE FROM envelopes WHERE env_id=?", id)
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("fetchAll tx commit error: %v", err)
+		tx.Rollback()
+		return nil // don't deliver if we can't confirm deletion
 	}
 
 	return payloads

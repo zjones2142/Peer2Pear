@@ -37,6 +37,12 @@ const (
 	// Rate limiting for /v1/send (per IP)
 	rateLimitPerMin    = 60   // max envelopes per IP per minute
 	rateLimitWindow    = 60   // window in seconds
+
+	// H4: max peer IDs a single peer can subscribe to for presence
+	maxPresenceSubs    = 200
+
+	// M5: global max envelopes stored in mailbox
+	maxGlobalEnvelopes = 500_000
 )
 
 // ── Per-IP rate limiter ─────────────────────────────────────────────────────
@@ -101,33 +107,50 @@ type Peer struct {
 // ── Hub: manages all connected peers ─────────────────────────────────────────
 
 type Hub struct {
-	mu    sync.RWMutex
-	peers map[string]*Peer // peer_id → *Peer
-	subs  map[string]map[string]bool // subscriber_id → set of watched peer_ids
-	mbox  *Mailbox
-	rl    *rateLimiter
+	mu         sync.RWMutex
+	peers      map[string]*Peer // peer_id → *Peer
+	subs       map[string]map[string]bool // subscriber_id → set of watched peer_ids
+	mbox       *Mailbox
+	rl         *rateLimiter
+	trustProxy bool // H2 fix: only trust X-Forwarded-For when behind a reverse proxy
+
+	// H3 fix: track seen auth nonces to prevent replay within the 5-min window
+	authMu    sync.Mutex
+	seenAuth  map[string]int64 // "peer_id|ts" → expiry unix ms
 
 	upgrader websocket.Upgrader
 }
 
-func NewHub(mbox *Mailbox) *Hub {
-	return &Hub{
-		peers: make(map[string]*Peer),
-		subs:  make(map[string]map[string]bool),
-		mbox:  mbox,
-		rl:    newRateLimiter(),
+func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
+	h := &Hub{
+		peers:      make(map[string]*Peer),
+		subs:       make(map[string]map[string]bool),
+		mbox:       mbox,
+		rl:         newRateLimiter(),
+		trustProxy: trustProxy,
+		seenAuth:   make(map[string]int64),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  maxEnvelopeBytes,
 			WriteBufferSize: maxEnvelopeBytes,
 			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
 	}
-}
-
-func (h *Hub) PeerCount() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.peers)
+	// H3 fix: periodically purge expired auth nonces
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now().UnixMilli()
+			h.authMu.Lock()
+			for k, exp := range h.seenAuth {
+				if now > exp {
+					delete(h.seenAuth, k)
+				}
+			}
+			h.authMu.Unlock()
+		}
+	}()
+	return h
 }
 
 func (h *Hub) CloseAll() {
@@ -224,14 +247,17 @@ func (h *Hub) notifyPresence(peerID string, online bool) {
 
 // ── POST /v1/send — Anonymous envelope submission ────────────────────────────
 
-func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
-	// Rate limit by IP before reading the body
-	ip := r.RemoteAddr
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		ip = strings.SplitN(fwd, ",", 2)[0]
-		ip = strings.TrimSpace(ip)
+func (h *Hub) clientIP(r *http.Request) string {
+	if h.trustProxy {
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			return strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])
+		}
 	}
-	if !h.rl.allow(ip) {
+	return r.RemoteAddr
+}
+
+func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
+	if !h.rl.allow(h.clientIP(r)) {
 		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
@@ -304,6 +330,18 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
+
+	// H3 fix: reject replayed auth messages
+	authNonce := fmt.Sprintf("%s|%d", auth.PeerID, auth.Ts)
+	h.authMu.Lock()
+	if _, seen := h.seenAuth[authNonce]; seen {
+		h.authMu.Unlock()
+		conn.WriteJSON(map[string]string{"error": "auth replay"})
+		conn.Close()
+		return
+	}
+	h.seenAuth[authNonce] = nowMs + replayWindowMs
+	h.authMu.Unlock()
 
 	// Step 2: Register peer
 	peer := &Peer{
@@ -401,6 +439,10 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 
 		case "presence_subscribe":
 			peerIDs := toStringSlice(msg["peer_ids"])
+			// H4 fix: cap subscription size to prevent social graph enumeration
+			if len(peerIDs) > maxPresenceSubs {
+				peerIDs = peerIDs[:maxPresenceSubs]
+			}
 			h.mu.Lock()
 			subs := make(map[string]bool, len(peerIDs))
 			for _, pid := range peerIDs {
@@ -432,12 +474,7 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/forward — Multi-hop relay forwarding ────────────────────────────
 
 func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
-	// Rate limit (shares the same per-IP bucket as /v1/send)
-	ip := r.RemoteAddr
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		ip = strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])
-	}
-	if !h.rl.allow(ip) {
+	if !h.rl.allow(h.clientIP(r)) {
 		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
@@ -449,6 +486,15 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.ContainsAny(forwardTo, "/ ") {
 		httpError(w, http.StatusBadRequest, "invalid relay address")
+		return
+	}
+	// M4 fix: block forwarding to private/loopback addresses (SSRF prevention)
+	host := strings.Split(forwardTo, ":")[0]
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" ||
+		host == "0.0.0.0" || strings.HasPrefix(host, "10.") ||
+		strings.HasPrefix(host, "192.168.") || strings.HasPrefix(host, "172.") ||
+		strings.HasPrefix(host, "169.254.") {
+		httpError(w, http.StatusForbidden, "forwarding to private addresses not allowed")
 		return
 	}
 
