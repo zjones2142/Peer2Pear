@@ -40,6 +40,27 @@ public:
         });
     }
 
+    void get(const QUrl& url,
+             const QMap<QString, QString>& headers,
+             Callback cb) override
+    {
+        QNetworkRequest req(url);
+        for (auto it = headers.cbegin(); it != headers.cend(); ++it)
+            req.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
+
+        auto* reply = m_nam.get(req);
+        connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
+            Response resp;
+            resp.status = reply->attribute(
+                QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            resp.body = reply->readAll();
+            if (reply->error() != QNetworkReply::NoError)
+                resp.error = reply->errorString();
+            reply->deleteLater();
+            if (cb) cb(resp);
+        });
+    }
+
 private:
     QNetworkAccessManager m_nam;
 };

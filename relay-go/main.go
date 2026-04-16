@@ -43,6 +43,14 @@ func main() {
 	// Initialize relay hub
 	hub := NewHub(mbox, *trustProxy)
 
+	// Fix #7: load or generate the relay's X25519 keypair for onion routing.
+	pub, priv, err := loadOrCreateRelayKey()
+	if err != nil {
+		log.Fatalf("init relay onion key: %v", err)
+	}
+	hub.relayX25519Pub = pub
+	hub.relayX25519Priv = priv
+
 	// Background purge of expired envelopes
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
@@ -58,25 +66,26 @@ func main() {
 	// Routes
 	mux := http.NewServeMux()
 
-	// ── New protocol (/v1/*) ─────────────────────────────────────────
+	// ── Protocol (/v1/*) ─────────────────────────────────────────────
 	mux.HandleFunc("POST /v1/send", hub.HandleSend)
 	mux.HandleFunc("/v1/receive", hub.HandleReceive) // WebSocket — no method restriction
 	mux.HandleFunc("POST /v1/forward", hub.HandleForward)
+	// Fix #7: onion routing endpoints.
+	mux.HandleFunc("GET  /v1/relay_info", hub.HandleRelayInfo)
+	mux.HandleFunc("POST /v1/forward-onion", hub.HandleForwardOnion)
 	// NOTE: /v1/peers removed — exposing connected peer IDs is a privacy leak.
-
-	// ── Legacy endpoints (backward compatibility) ────────────────────
-	mux.HandleFunc("POST /mbox/enqueue", hub.LegacyEnqueue)
-	mux.HandleFunc("GET /mbox/fetch", hub.LegacyFetch)
-	mux.HandleFunc("GET /mbox/fetch_all", hub.LegacyFetchAll)
-	mux.HandleFunc("POST /mbox/ack", hub.LegacyAck)
-	mux.HandleFunc("POST /rvz/publish", hub.LegacyRvzPublish)
-	mux.HandleFunc("POST /rvz/lookup", hub.LegacyRvzLookup)
+	// NOTE: Legacy /mbox/* and /rvz/* endpoints removed.  The Qt client uses
+	// /v1/send exclusively; rendezvous is replaced by WS presence + P2P ICE.
 
 	// ── Health ───────────────────────────────────────────────────────
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Parity fix: expose PROTOCOL version (identical across impls) as
+		// `version`, and the implementation flavour as `impl`.  Clients can
+		// gate on `version` for compat, operators inspect `impl`.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":      true,
-			"version": "2.0.0-go",
+			"version": "2.0.0",
+			"impl":    "go",
 		})
 	})
 

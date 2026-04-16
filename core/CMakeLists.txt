@@ -17,6 +17,7 @@ set(CORE_SOURCES
     NoiseState.cpp          NoiseState.hpp
     RatchetSession.cpp      RatchetSession.hpp
     SealedEnvelope.cpp      SealedEnvelope.hpp
+    OnionWrap.cpp           OnionWrap.hpp
     SessionManager.cpp      SessionManager.hpp
     SessionStore.cpp        SessionStore.hpp
     SqlCipherDb.cpp         SqlCipherDb.hpp

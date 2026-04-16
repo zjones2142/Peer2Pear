@@ -46,11 +46,6 @@ public:
     // The recipient is parsed from the envelope header (bytes 1-32).
     void sendEnvelope(const QByteArray& sealedEnvelope);
 
-    // Send with explicit recipient (for legacy envelope format that doesn't
-    // have the recipient embedded in the binary header).
-    void sendEnvelopeTo(const QString& recipientIdB64u,
-                        const QByteArray& envelopeBytes);
-
     // Presence: subscribe to online/offline updates for a set of peers.
     // Results are pushed via presenceChanged signal.
     void subscribePresence(const QStringList& peerIds);
@@ -80,7 +75,17 @@ public:
     /// Enable multi-hop forwarding. When enabled, sendEnvelope() routes through
     /// a random intermediate relay via /v1/forward before reaching the
     /// recipient's relay. Cover traffic also uses multi-hop.
+    ///
+    /// Fix #7: multi-hop now uses onion layering when it has an entry-hop's
+    /// X25519 pubkey cached (fetched from /v1/relay_info).  If no pubkey is
+    /// cached, falls back to the single-layer /v1/forward path (still
+    /// functional but the entry hop can see the final recipient).
     void setMultiHopEnabled(bool enabled);
+
+    /// Fix #7: fetch `/v1/relay_info` from each configured relay and cache
+    /// the returned X25519 pubkey.  Called automatically on successful WS
+    /// connect; can also be called explicitly if the relay pool changes.
+    void refreshRelayInfo();
 
     /// Set the privacy level (convenience wrapper):
     ///   0 = Standard:  padding only (default)
@@ -147,11 +152,20 @@ private:
 
     // Known peers for realistic cover traffic
     QStringList m_knownPeers;
+    // Fix #14: currently-online subset, updated from presence pushes.
+    // Cover traffic is only sent to peers in this set to avoid filling
+    // offline contacts' mailboxes and to match real-traffic distribution.
+    QSet<QString> m_onlinePeers;
 
     // Multi-relay routing
     QVector<QUrl> m_sendRelays;     // pool of relays for send rotation
     int           m_sendRelayIdx = 0;
     bool          m_multiHop = false;
+
+    // Fix #7: per-relay X25519 pubkey cache for onion layering.
+    // Key: relay base URL string (e.g. "https://relay.example:8443")
+    // Val: 32-byte X25519 pub, empty if not yet fetched.
+    QMap<QString, QByteArray> m_relayX25519Pubs;
 
     QUrl pickSendRelay();           // round-robin through send relay pool
     int  pickJitterMs() const;      // Fix #9: random delay in [min,max]

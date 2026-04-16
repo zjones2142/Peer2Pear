@@ -92,6 +92,16 @@ public:
     const QMap<QString, qint64>& groupSeqOut() const { return m_groupSeqOut; }
     const QMap<QString, qint64>& groupSeqIn()  const { return m_groupSeqIn;  }
 
+    /// Fix #20: populate known-group-members state on startup from the UI's
+    /// persisted group rosters.  ChatController rejects group_rename,
+    /// group_avatar, group_member_update, and group_leave from peers who
+    /// aren't currently members of the named group, defeating the spoof
+    /// where a prior / evicted member (or anyone who learned the groupId)
+    /// pushes updates with an attacker-chosen member list.
+    ///
+    /// Should be called once per known group after loading state at startup.
+    void setKnownGroupMembers(const QString& groupId, const QStringList& members);
+
     // ── Phase 2: file-transfer consent ──────────────────────────────────────
 
     /// Accept a pending incoming file transfer. Installs the ratchet-derived
@@ -112,7 +122,12 @@ public:
     /// Global consent settings (persisted by the caller via DatabaseManager).
     void setFileAutoAcceptMaxMB(int mb) { m_fileAutoAcceptMaxMB = mb; }
     void setFileHardMaxMB(int mb)       { m_fileHardMaxMB       = mb; }
-    void setFileRequireP2P(bool on)     { m_fileRequireP2P      = on; }
+    void setFileRequireP2P(bool on)     {
+        m_fileRequireP2P = on;
+        // Fix #16: propagate live so in-flight streams upgrade to P2P-only
+        // on the next chunk rather than finishing under the old policy.
+        m_fileMgr.setSenderRequiresP2P(on);
+    }
     int  fileAutoAcceptMaxMB() const    { return m_fileAutoAcceptMaxMB; }
     int  fileHardMaxMB() const          { return m_fileHardMaxMB; }
     bool fileRequireP2P() const         { return m_fileRequireP2P; }
@@ -200,6 +215,11 @@ private slots:
 private:
     QByteArray sealForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
     void sendSealedPayload(const QString& peerIdB64u, const QJsonObject& payload);
+
+    // Fix #20: is `peerId` currently a known member of group `gid`?
+    // Returns true (permissively) only for groups we've never seen before;
+    // otherwise false unless peerId is in our roster.
+    bool isAuthorizedGroupSender(const QString& gid, const QString& peerId) const;
 #ifdef PEER2PEAR_P2P
     QuicConnection* setupP2PConnection(const QString& peerIdB64u, bool controlling);
     void initiateP2PConnection(const QString& peerIdB64u);
@@ -232,6 +252,15 @@ private:
     QMap<QString, qint64> m_groupSeqOut;
     // G5 fix: per-(group,sender) last-seen sequence — detects gaps
     QMap<QString, qint64> m_groupSeqIn;  // key: "groupId:senderId"
+
+    // Fix #20: known members per group, bootstrapped by setKnownGroupMembers
+    // from persisted UI state and updated as trusted group messages arrive.
+    // Used to authorize group_member_update / group_leave / group_rename /
+    // group_avatar — messages from peers not in this set are dropped.
+    QMap<QString, QSet<QString>> m_groupMembers;
+    // True for groups we have no prior knowledge of — the first sender of a
+    // group_msg bootstraps the roster.  Once populated, entry is removed.
+    QSet<QString> m_groupBootstrapNeeded;
 
     // SEC9: count consecutive handshake timeouts per peer — 2+ suggests legacy client
     QMap<QString, int> m_handshakeFailCount;

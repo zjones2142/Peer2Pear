@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -13,9 +14,9 @@ import (
 )
 
 const (
-	defaultTTLMs   = 7 * 24 * 60 * 60 * 1000 // 7 days
-	maxTTLMs       = 7 * 24 * 60 * 60 * 1000
-	maxQueueItems  = 5000
+	defaultTTLMs  = 7 * 24 * 60 * 60 * 1000 // 7 days
+	maxTTLMs      = 7 * 24 * 60 * 60 * 1000
+	maxQueueItems = 5000
 )
 
 // Mailbox provides store-and-forward storage for sealed envelopes.
@@ -145,7 +146,41 @@ func (m *Mailbox) FetchAll(recipientID string) [][]byte {
 		return nil // don't deliver if we can't confirm deletion
 	}
 
+	// Fix #18: shuffle delivery order so the relay operator can't correlate
+	// sender-enqueue-time with recipient-fetch-time by matching ordinals.
+	// Uses crypto/rand (Fisher–Yates with rejection sampling).
+	secureShuffle(payloads)
+
 	return payloads
+}
+
+// secureShuffle does a Fisher–Yates shuffle with crypto/rand so the permutation
+// isn't predictable from past samples.
+func secureShuffle(xs [][]byte) {
+	for i := len(xs) - 1; i > 0; i-- {
+		j := cryptoRandIntn(i + 1)
+		xs[i], xs[j] = xs[j], xs[i]
+	}
+}
+
+// cryptoRandIntn returns a uniform int in [0, n) using crypto/rand.
+// Rejection-samples to avoid modulo bias.
+func cryptoRandIntn(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	// 8 bytes of entropy, reject values that would bias the modulo.
+	max := ^uint64(0) - (^uint64(0) % uint64(n))
+	for {
+		var buf [8]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			return 0 // extremely unlikely; fall back to deterministic 0
+		}
+		v := binary.BigEndian.Uint64(buf[:])
+		if v < max {
+			return int(v % uint64(n))
+		}
+	}
 }
 
 // FetchOne retrieves and deletes the oldest envelope for a recipient.
@@ -186,6 +221,15 @@ func (m *Mailbox) StoreWithTTL(recipientID string, payload []byte, ttlMs int64) 
 		recipientID).Scan(&count)
 	if count >= maxQueueItems {
 		return "", fmt.Errorf("mailbox full")
+	}
+
+	// Parity fix: the legacy path skipped the global-envelope cap that /v1/send
+	// enforces. A client hammering /mbox/enqueue could exhaust the 500k
+	// ceiling.  Align with Store().
+	var globalCount int
+	m.db.QueryRow("SELECT COUNT(*) FROM envelopes").Scan(&globalCount)
+	if globalCount >= maxGlobalEnvelopes {
+		return "", fmt.Errorf("relay storage full")
 	}
 
 	envID := fmt.Sprintf("%d-%s", now, randomHex(8))

@@ -148,6 +148,10 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* paren
         m_fileMgr.purgeStaleTransfers();
         // Phase 2: drop outbound transfers that never got a file_accept in 10 minutes
         m_fileMgr.purgeStaleOutbound();
+        // Fix #21: don't rely on app restart to age out partial files / sent
+        // records.  A long-running desktop session could accumulate stale
+        // rows for weeks otherwise.  Cheap — just a few DB deletes by age.
+        m_fileMgr.purgeStalePartialFiles();
 
         // H2/SEC9: prune stuck handshakes
         if (m_sessionStore) {
@@ -831,27 +835,18 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
     QByteArray env = sealForPeer(peerIdB64u, pt);
     if (!env.isEmpty()) {
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND MAILBOX] sealed" << type << "to" << peerIdB64u.left(8) + "...";
+        qDebug() << "[SEND MAILBOX]" << type << "to" << peerIdB64u.left(8) + "...";
 #endif
         m_relay.sendEnvelope(env);
         return;
     }
 
-    // ── Fail closed: only ICE signaling may fall back to legacy ─────────────
-    // S10 fix: inlined legacy send — sendSignalingMessage() removed as standalone method
-    if (type == "ice_offer" || type == "ice_answer") {
-        qWarning() << "[SEND MAILBOX] legacy fallback for" << type
-                    << "to" << peerIdB64u.left(8) + "..." << "(ICE signaling)";
-        const QByteArray peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-        const QByteArray key32  = m_crypto.deriveSharedKey32(peerPub);
-        if (key32.size() != 32) return;
-        const QByteArray icePt  = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-        const QByteArray ct     = m_crypto.aeadEncrypt(key32, icePt);
-        const QByteArray env    = kMsgPrefix + myIdB64u().toUtf8() + "\n" + ct;
-        m_relay.sendEnvelopeTo(peerIdB64u, env);
-        return;
-    }
-
+    // Fail closed.  The old ICE-signaling fallback used the legacy
+    // /mbox/enqueue endpoint with a plain-text ICE message wrapped only by
+    // an AEAD keyed on a static DH secret — that endpoint is being removed
+    // and the plaintext leak was always a privacy concern.  ICE messages
+    // now go through the same sealed path as everything else; if the ratchet
+    // can't seal, we defer the handshake instead of leaking SDP/IP candidates.
     qWarning() << "[SEND] BLOCKED — cannot seal" << type
                << "to" << peerIdB64u.left(8) + "...";
 }
@@ -1144,31 +1139,103 @@ void ChatController::onEnvelope(const QByteArray& body)
             QStringList memberKeys;
             for (const QJsonValue &v : o.value("members").toArray())
                 memberKeys << v.toString();
+
+            // Fix #20: a valid sealed group_msg from X about group G adds X
+            // (and the declared members) to our roster — this is ground
+            // truth because the message is already authenticated.  We still
+            // require sender ∈ members to avoid rogue "I'm messaging this
+            // group but I'm not in it" bootstraps.
+            if (!gid.isEmpty() && !senderId.isEmpty()) {
+                if (!m_groupMembers.contains(gid)) {
+                    // Bootstrap: accept only if sender includes themselves.
+                    if (memberKeys.contains(senderId)) {
+                        m_groupMembers[gid] =
+                            QSet<QString>(memberKeys.begin(), memberKeys.end());
+                    }
+                } else {
+                    m_groupMembers[gid].insert(senderId);
+                }
+            }
+
             emit groupMessageReceived(senderId, gid,
                                        o.value("groupName").toString(),
                                        memberKeys, o.value("text").toString(), ts, msgId);
         } else if (type == "group_leave") {
             if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B2 fix: dedup
+            const QString gid = o.value("groupId").toString();
+            // Fix #20: a leave message may ONLY be self-leave — senders can't
+            // announce that OTHER members left.  And the sender must have been
+            // a known member of the group.
+            if (!gid.isEmpty() && !isAuthorizedGroupSender(gid, senderId)) {
+                qWarning() << "[GROUP] dropping group_leave from non-member"
+                           << senderId.left(8) + "... for" << gid.left(8);
+                return;
+            }
             QStringList memberKeys;
             for (const QJsonValue &v : o.value("members").toArray())
                 memberKeys << v.toString();
-            emit groupMemberLeft(senderId, o.value("groupId").toString(),
+            // The sender left — strike them from our roster so they can't push
+            // further member-update / rename / avatar messages afterwards.
+            if (m_groupMembers.contains(gid))
+                m_groupMembers[gid].remove(senderId);
+            emit groupMemberLeft(senderId, gid,
                                   o.value("groupName").toString(), memberKeys, ts, msgId);
         } else if (type == "avatar") {
             emit avatarReceived(senderId, o.value("name").toString(), o.value("avatar").toString());
         } else if (type == "group_rename") {
             if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B5 fix: dedup
-            emit groupRenamed(o.value("groupId").toString(), o.value("newName").toString());
+            const QString gid = o.value("groupId").toString();
+            if (!gid.isEmpty() && !isAuthorizedGroupSender(gid, senderId)) {
+                qWarning() << "[GROUP] dropping group_rename from non-member"
+                           << senderId.left(8) + "... for" << gid.left(8);
+                return;
+            }
+            emit groupRenamed(gid, o.value("newName").toString());
         } else if (type == "group_avatar") {
             if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B5 fix: dedup
-            emit groupAvatarReceived(o.value("groupId").toString(), o.value("avatar").toString());
+            const QString gid = o.value("groupId").toString();
+            if (!gid.isEmpty() && !isAuthorizedGroupSender(gid, senderId)) {
+                qWarning() << "[GROUP] dropping group_avatar from non-member"
+                           << senderId.left(8) + "... for" << gid.left(8);
+                return;
+            }
+            emit groupAvatarReceived(gid, o.value("avatar").toString());
         } else if (type == "group_member_update") {
             if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B3 fix: dedup
             const QString gid       = o.value("groupId").toString();
             const QString gname     = o.value("groupName").toString();
+            // Fix #20: reject member-list updates from peers that aren't
+            // currently in our roster.  First-sight of a new group bootstraps
+            // from the sender's proposed list only if the sender names
+            // themselves as a member.
             QStringList memberKeys;
             for (const QJsonValue &v : o.value("members").toArray())
                 memberKeys << v.toString();
+
+            if (!gid.isEmpty()) {
+                const bool bootstrap = m_groupBootstrapNeeded.contains(gid)
+                                       || !m_groupMembers.contains(gid);
+                if (bootstrap) {
+                    // Sender must include themselves in the proposed list.
+                    if (!memberKeys.contains(senderId)) {
+                        qWarning() << "[GROUP] rejecting bootstrap group_member_update"
+                                   << "from" << senderId.left(8) + "..."
+                                   << "— sender not in proposed member list";
+                        return;
+                    }
+                    m_groupMembers[gid] = QSet<QString>(memberKeys.begin(), memberKeys.end());
+                    m_groupBootstrapNeeded.remove(gid);
+                } else if (!m_groupMembers[gid].contains(senderId)) {
+                    qWarning() << "[GROUP] dropping group_member_update from non-member"
+                               << senderId.left(8) + "... for" << gid.left(8);
+                    return;
+                } else {
+                    // Authorized update: merge in new members (conservative —
+                    // we don't accept REMOVALS via this message type, only adds).
+                    for (const QString& m : memberKeys)
+                        m_groupMembers[gid].insert(m);
+                }
+            }
 
             // Re-use the existing groupMessageReceived signal — the
             // ChatView::onIncomingGroupMessage handler already merges new
@@ -1626,6 +1693,32 @@ void ChatController::setGroupSeqCounters(const QMap<QString, qint64>& seqOut,
 {
     m_groupSeqOut = seqOut;
     m_groupSeqIn  = seqIn;
+}
+
+// ── Fix #20: group-membership authorization ──────────────────────────────────
+
+void ChatController::setKnownGroupMembers(const QString& groupId,
+                                           const QStringList& members)
+{
+    if (groupId.isEmpty()) return;
+    m_groupMembers[groupId] = QSet<QString>(members.begin(), members.end());
+    m_groupBootstrapNeeded.remove(groupId);
+}
+
+bool ChatController::isAuthorizedGroupSender(const QString& gid,
+                                              const QString& peerId) const
+{
+    if (gid.isEmpty() || peerId.isEmpty()) return false;
+    auto it = m_groupMembers.find(gid);
+    if (it == m_groupMembers.end()) {
+        // First time we've seen this group — no persisted roster from the
+        // UI yet.  Permissive bootstrap: the next group_msg (which carries
+        // a members list) will populate m_groupMembers.  If we reject
+        // pre-bootstrap control messages here, a legit member whose
+        // group_msg races behind a group_rename will be silently dropped.
+        return true;
+    }
+    return it->contains(peerId);
 }
 
 // ---------------------------

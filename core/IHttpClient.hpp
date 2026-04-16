@@ -33,4 +33,10 @@ public:
                       const QByteArray& body,
                       const QMap<QString, QString>& headers,
                       Callback cb) = 0;
+
+    /// GET a URL. Used by RelayClient to fetch /v1/relay_info (Fix #7 —
+    /// onion routing needs the relay's X25519 pubkey).
+    virtual void get(const QUrl& url,
+                     const QMap<QString, QString>& headers,
+                     Callback cb) = 0;
 };

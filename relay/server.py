@@ -35,10 +35,10 @@ from contextlib import contextmanager
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from nacl.exceptions import BadSignatureError
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from nacl.exceptions import BadSignatureError, CryptoError
+from nacl.public import PrivateKey, PublicKey, Box
 from nacl.signing import VerifyKey
-from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -53,7 +53,7 @@ MAX_QUEUE_ITEMS    = 5_000                         # per recipient
 MAX_GLOBAL_ENVELOPES = 500_000                     # M5: total across all recipients
 DEFAULT_TTL_MS     = 7 * 24 * 60 * 60 * 1_000     # 7 days
 MAX_TTL_MS         = 7 * 24 * 60 * 60 * 1_000     # hard cap
-REPLAY_WINDOW_MS   = 5 * 60 * 1_000               # 5 min auth window
+REPLAY_WINDOW_MS   = 30 * 1_000                    # Fix #19: 30 s auth window (was 5 min; too long given in-memory nonce store)
 CLEANUP_INTERVAL_S = 60 * 60                       # purge every hour
 FORWARD_TIMEOUT_S  = 10                            # timeout for relay-to-relay forward
 
@@ -64,6 +64,35 @@ DELIVERY_JITTER_MS    = 200 # max random delivery delay (ms)
 DUMMY_VERSION         = 0x00 # version byte for dummy envelopes (client discards)
 
 DB_PATH = os.environ.get("DB_PATH", "/tmp/peer2pear_relay.db")
+# Parity fix: Go relay defaults to /data/... which lives on the persistent
+# container volume.  Previously Python defaulted to /tmp/... which is
+# ephemeral — the onion pubkey churned on every container restart,
+# invalidating every client's cached relay_info.  Matching Go's path now.
+RELAY_KEY_PATH = os.environ.get("RELAY_KEY_PATH", "/data/peer2pear_relay_x25519.key")
+
+# Fix #7: onion routing — load or generate this relay's persistent X25519
+# keypair.  The pubkey is advertised via /v1/relay_info so clients can build
+# onion layers addressed to us.  The privkey peels one layer on /v1/forward-onion.
+def _load_or_create_relay_key() -> PrivateKey:
+    try:
+        with open(RELAY_KEY_PATH, "rb") as f:
+            raw = f.read()
+        if len(raw) == 32:
+            return PrivateKey(raw)
+    except FileNotFoundError:
+        pass
+    key = PrivateKey.generate()
+    try:
+        os.makedirs(os.path.dirname(RELAY_KEY_PATH), exist_ok=True)
+        with open(RELAY_KEY_PATH, "wb") as f:
+            f.write(bytes(key))
+        os.chmod(RELAY_KEY_PATH, 0o600)
+    except OSError as e:
+        log.warning("could not persist relay key: %s (using in-memory only)", e)
+    return key
+
+_relay_priv: PrivateKey  # initialised in startup event
+_relay_pub_b64u: str     = ""
 
 RATE_LIMIT_PER_MIN = 60   # max envelopes per IP per minute
 RATE_LIMIT_WINDOW  = 60   # seconds
@@ -128,22 +157,43 @@ def _hash_ip(ip: str) -> str:
     return hashlib.sha256(ip.encode()).hexdigest()[:32]
 
 
+def _secure_shuffle(xs: list) -> None:
+    """Fix #18: Fisher–Yates shuffle using secrets (CSPRNG) so delivery order
+    on reconnect can't be correlated back to send order by a malicious relay
+    observer who recorded enqueue timings."""
+    for i in range(len(xs) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        xs[i], xs[j] = xs[j], xs[i]
+
+
 # Fix #11: SSRF guard — parse host[:port], resolve DNS, reject any IP that
 # lands in loopback / private / link-local / ULA / CGNAT / multicast /
 # unspecified.  Returns None if safe, else a human-readable reason.
+#
+# Parity fix: match Go's net.SplitHostPort semantics exactly — the original
+# `host.count(":") == 1` guard left unbracketed IPv6 literals (`::1:443`)
+# as a full host string and diverged from the Go relay.
 def _forward_host_reason(forward_to: str) -> Optional[str]:
     host = forward_to
-    # Strip optional [brackets] before splitting off port (IPv6 literals).
     if host.startswith("["):
         close = host.find("]")
         if close <= 0:
             return "malformed IPv6 literal"
         host = host[1:close]
     else:
-        # Only split on the LAST colon — IPv6 has many colons, hostnames have none.
-        last_colon = host.rfind(":")
-        if last_colon > 0 and host.count(":") == 1:
-            host = host[:last_colon]
+        # Two rules to match net.SplitHostPort:
+        #   - Exactly one colon → split off port.
+        #   - Zero or >=2 colons (unbracketed IPv6) → treat entire string
+        #     as host (and let ipaddress / getaddrinfo validate).
+        if host.count(":") == 1:
+            host = host[:host.rfind(":")]
+        else:
+            # Try parsing as a bare IPv6 first — if it parses, use as-is.
+            # Otherwise leave the string and let getaddrinfo reject it.
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                pass
 
     if not host:
         return "empty host"
@@ -398,6 +448,14 @@ async def v1_send(request: Request):
 
 @app.websocket("/v1/receive")
 async def v1_receive(ws: WebSocket):
+    # Fix #22: rate-limit ws auth attempts per IP.  The per-identity presence
+    # sub cap (200) is bypassed by keypair rotation; capping auth attempts
+    # bounds how fast an attacker can enumerate through many identities.
+    client_ip = ws.client.host if ws.client else "unknown"
+    if not _rate_limiter.allow(_hash_ip(client_ip)):
+        await ws.close(code=4006, reason="rate limit exceeded")
+        return
+
     await ws.accept()
     peer_id: Optional[str] = None
 
@@ -463,8 +521,13 @@ async def v1_receive(ws: WebSocket):
             ).fetchall()
             if rows:
                 env_ids = [r["env_id"] for r in rows]
-                for r in rows:
-                    await ws.send_bytes(bytes(r["payload"]))
+                # Fix #18: shuffle delivery order using secrets (CSPRNG) so the
+                # relay operator can't correlate sender-enqueue-time with
+                # recipient-fetch-time by matching ordinals.
+                payloads = [bytes(r["payload"]) for r in rows]
+                _secure_shuffle(payloads)
+                for p in payloads:
+                    await ws.send_bytes(p)
                 placeholders = ",".join("?" * len(env_ids))
                 conn.execute(
                     f"DELETE FROM envelopes WHERE env_id IN ({placeholders});",
@@ -574,198 +637,138 @@ async def v1_forward(
         raise HTTPException(502, f"cannot reach relay {x_forward_to}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LEGACY ENDPOINTS — backward compatibility during client transition
-# Remove these once all clients have migrated to /v1/* endpoints.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def check_recipient_sig(to_id: str, ts: int, nonce: str,
-                        sig: str, action: str, env_id: str = "") -> None:
-    n = now_ms()
-    if ts + REPLAY_WINDOW_MS < n or ts > n + REPLAY_WINDOW_MS:
-        raise HTTPException(status_code=401, detail="timestamp outside window")
-    verify_ed25519(to_id, sig, f"MBX1|{to_id}|{ts}|{nonce}|{action}|{env_id}")
-
-
-# ── Legacy: Rendezvous ────────────────────────────────────────────────────────
-# These will be removed. Presence is now handled by WS connections.
-
-# In-memory rendezvous store (was SQLite, simplified for transition)
-_rvz_store: dict[str, dict] = {}
-
-class PublishReq(BaseModel):
-    id:         str = Field(..., description="base64url Ed25519 public key")
-    host:       str
-    port:       int
-    expires_ms: int = Field(600_000)
-    sig:        str
-
-class LookupReq(BaseModel):
-    id: str
-
-@app.post("/rvz/publish")
-def rvz_publish(req: PublishReq):
-    verify_ed25519(req.id, req.sig,
-                   f"RVZ1|{req.id}|{req.host}|{req.port}|{req.expires_ms}")
-    exp = now_ms() + min(req.expires_ms, 15 * 60 * 1_000)
-    _rvz_store[req.id] = {"host": req.host, "port": req.port, "expiry_ms": exp}
-    return {"ok": True, "expires_at_ms": exp}
-
-@app.post("/rvz/lookup")
-def rvz_lookup(req: LookupReq):
-    entry = _rvz_store.get(req.id)
-    if not entry or now_ms() > entry["expiry_ms"]:
-        _rvz_store.pop(req.id, None)
-        raise HTTPException(status_code=404, detail="not found")
-    return {"host": entry["host"], "port": entry["port"],
-            "expires_at_ms": entry["expiry_ms"]}
-
-
-# ── Legacy: Mailbox enqueue ───────────────────────────────────────────────────
-# Old clients send via this authenticated endpoint. New clients use /v1/send.
-
-@app.post("/mbox/enqueue")
-async def mbox_enqueue(
-    request:  Request,
-    x_to:     str           = Header(..., alias="X-To"),
-    x_ttl_ms: Optional[int] = Header(None,  alias="X-TtlMs"),
-    x_env_id: Optional[str] = Header(None,  alias="X-EnvId"),
-):
-    # Fix #8: legacy enqueue previously skipped rate limiting, which let any
-    # attacker flood a victim's mailbox via this endpoint while /v1/send was
-    # throttled.  Apply the same per-IP and per-recipient caps.
-    if not _rate_limiter.allow(_hash_ip(_get_client_ip(request))):
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
-    if not _recip_limiter.allow(x_to, RECIPIENT_RATE_LIMIT_PER_MIN):
-        raise HTTPException(status_code=429, detail="recipient rate limit exceeded")
-
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="empty body")
-    if len(body) > MAX_ENVELOPE_BYTES:
-        raise HTTPException(status_code=413, detail="envelope too large")
-
-    ttl    = DEFAULT_TTL_MS if x_ttl_ms is None else min(int(x_ttl_ms), MAX_TTL_MS)
-    env_id = x_env_id or f"{now_ms()}-{secrets.token_hex(8)}"
-    exp    = now_ms() + ttl
-
-    # Try WebSocket push first (bridge old clients to new receive path)
-    ws = connected_peers.get(x_to)
-    if ws:
-        try:
-            await ws.send_bytes(body)
-            log.info(f"legacy enqueue→ws push: to={x_to[:8]}… size={len(body)}B")
-            return {"accepted": True, "env_id": env_id}
-        except Exception:
-            connected_peers.pop(x_to, None)
-
-    with db_conn() as conn:
-        purge_expired(conn)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM envelopes WHERE recipient_id=?;", (x_to,)
-        ).fetchone()[0]
-        if count >= MAX_QUEUE_ITEMS:
-            raise HTTPException(status_code=429, detail="mailbox full")
-        conn.execute(
-            "INSERT OR IGNORE INTO envelopes "
-            "(env_id, recipient_id, payload, created_ms, expiry_ms) "
-            "VALUES (?, ?, ?, ?, ?);",
-            (env_id, x_to, body, now_ms(), exp),
-        )
-
-    log.info(f"legacy enqueue: to={x_to[:8]}… size={len(body)}B ttl={ttl // 1000}s")
-    return {"accepted": True, "env_id": env_id}
-
-
-# ── Legacy: Mailbox fetch ─────────────────────────────────────────────────────
-# Old clients poll this. New clients receive via WebSocket push.
-
-@app.get("/mbox/fetch")
-def mbox_fetch(
-    x_to:    str = Header(..., alias="X-To"),
-    x_ts:    int = Header(..., alias="X-Ts"),
-    x_nonce: str = Header(..., alias="X-Nonce"),
-    x_sig:   str = Header(..., alias="X-Sig"),
-):
-    check_recipient_sig(x_to, int(x_ts), x_nonce, x_sig, "fetch")
-
-    with db_conn() as conn:
-        purge_expired(conn)
-        row = conn.execute(
-            "SELECT env_id, payload, created_ms, expiry_ms FROM envelopes "
-            "WHERE recipient_id=? ORDER BY created_ms ASC LIMIT 1;",
-            (x_to,),
-        ).fetchone()
-
-        if not row:
-            return Response(status_code=204)
-
-        conn.execute("DELETE FROM envelopes WHERE env_id=?;", (row["env_id"],))
-
-    resp = Response(content=bytes(row["payload"]),
-                    media_type="application/octet-stream")
-    resp.headers["X-EnvId"]       = row["env_id"]
-    resp.headers["X-CreatedAtMs"] = str(row["created_ms"])
-    resp.headers["X-ExpiryAtMs"]  = str(row["expiry_ms"])
-    return resp
-
-@app.get("/mbox/fetch_all")
-def mbox_fetch_all(
-    x_to:    str = Header(..., alias="X-To"),
-    x_ts:    int = Header(..., alias="X-Ts"),
-    x_nonce: str = Header(..., alias="X-Nonce"),
-    x_sig:   str = Header(..., alias="X-Sig"),
-):
-    check_recipient_sig(x_to, int(x_ts), x_nonce, x_sig, "fetch_all")
-
-    with db_conn() as conn:
-        purge_expired(conn)
-        rows = conn.execute(
-            "SELECT env_id, payload FROM envelopes "
-            "WHERE recipient_id=? ORDER BY created_ms ASC;",
-            (x_to,),
-        ).fetchall()
-
-        if not rows:
-            return Response(status_code=204)
-
-        env_ids      = [r["env_id"] for r in rows]
-        placeholders = ",".join("?" * len(env_ids))
-        conn.execute(
-            f"DELETE FROM envelopes WHERE env_id IN ({placeholders});",
-            env_ids,
-        )
-
-    log.info(f"legacy fetch_all: to={x_to[:8]}… delivered {len(rows)} envelope(s)")
-    return [
-        {"env_id": r["env_id"], "payload_b64": b64url_encode(bytes(r["payload"]))}
-        for r in rows
-    ]
-
-
-class AckReq(BaseModel):
-    env_id: str
-
-@app.post("/mbox/ack")
-def mbox_ack(
-    req:     AckReq,
-    x_to:    str = Header(..., alias="X-To"),
-    x_ts:    int = Header(..., alias="X-Ts"),
-    x_nonce: str = Header(..., alias="X-Nonce"),
-    x_sig:   str = Header(..., alias="X-Sig"),
-):
-    check_recipient_sig(x_to, int(x_ts), x_nonce, x_sig, "ack", req.env_id)
-    return {"ok": True}
+# Legacy /mbox/* and /rvz/* endpoints were removed.  The Qt client now uses
+# /v1/send exclusively; peer discovery is replaced by WS presence + P2P ICE.
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/healthz")
 def healthz():
+    # Parity fix: `version` is the PROTOCOL version (identical across impls)
+    # so clients can gate compatibility; `impl` distinguishes flavours.
     return {
         "ok": True,
         "version": "2.0.0",
+        "impl": "python",
     }
+
+
+# ── /v1/relay_info ───────────────────────────────────────────────────────────
+# Fix #7: advertise this relay's X25519 pubkey so clients can build onion
+# layers addressed to us.  Clients fetch this on connect and cache the result.
+
+@app.get("/v1/relay_info")
+def v1_relay_info():
+    return {
+        "x25519_pub": _relay_pub_b64u,
+        "impl": "python",
+    }
+
+
+# ── /v1/forward-onion ────────────────────────────────────────────────────────
+# Fix #7: real onion peel — decrypt ONE layer and forward the inner blob to
+# the next hop.  Intermediate relays see only (ephPub, encrypted_next_hop_url)
+# and never learn the final recipient pubkey.  Only the exit relay's /v1/send
+# sees the recipient in the envelope header.
+#
+# Wire format (must match core/OnionWrap.cpp):
+#   [version(1)=0x01][ephPub(32)][nonce(24)][Box ciphertext]
+#   Box plaintext = [nextHopUrlLen(2 BE)][nextHopUrl][innerBlob]
+
+@app.post("/v1/forward-onion")
+async def v1_forward_onion(request: Request):
+    if not _rate_limiter.allow(_hash_ip(_get_client_ip(request))):
+        raise HTTPException(429, "rate limit exceeded")
+
+    body = await request.body()
+    # Minimum: version(1) + ephPub(32) + nonce(24) + Box tag(16) + at least 3
+    # plaintext bytes (urlLen(2) + innerBlob(>=1)).
+    if len(body) < 1 + 32 + 24 + 16 + 3:
+        raise HTTPException(400, "onion envelope too small")
+    if body[0] != 0x01:
+        raise HTTPException(400, "unsupported onion version")
+
+    eph_pub_raw = body[1:33]
+    nonce       = body[33:57]
+    ct          = body[57:]
+
+    try:
+        eph_pub = PublicKey(eph_pub_raw)
+        box     = Box(_relay_priv, eph_pub)
+        plain   = box.decrypt(ct, nonce)
+    except (CryptoError, ValueError):
+        # Fail-closed: drop silently with a generic 400 so the attacker
+        # can't distinguish bad key vs bad ciphertext vs bad nonce.
+        raise HTTPException(400, "onion decrypt failed")
+
+    if len(plain) < 3:
+        raise HTTPException(400, "onion plaintext too small")
+    url_len = int.from_bytes(plain[:2], "big")
+    if url_len == 0 or url_len > len(plain) - 2:
+        raise HTTPException(400, "invalid next-hop url length")
+    try:
+        next_hop_url = plain[2:2 + url_len].decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "invalid next-hop url encoding")
+    inner_blob = plain[2 + url_len:]
+    if not inner_blob:
+        raise HTTPException(400, "empty inner blob")
+
+    # SSRF guard — parse the URL and run the same reachability check as
+    # /v1/forward so a peeled hop can't be redirected to internal infra.
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(next_hop_url)
+    except Exception:
+        raise HTTPException(400, "invalid next-hop url")
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(400, "invalid next-hop scheme")
+    if parsed.path not in ("/v1/send", "/v1/forward-onion"):
+        raise HTTPException(400, "invalid next-hop path")
+
+    # Parity fix: pass `hostname` (not `netloc`) so userinfo like
+    # `user:pass@host` can't sneak past the SSRF check — aligns with Go's
+    # `url.URL.Host` which also excludes userinfo.
+    ssrf_host = parsed.hostname
+    if parsed.port:
+        ssrf_host = f"{ssrf_host}:{parsed.port}"
+    if not ssrf_host:
+        raise HTTPException(400, "invalid next-hop host")
+    ssrf_reason = _forward_host_reason(ssrf_host)
+    if ssrf_reason is not None:
+        raise HTTPException(403, f"forwarding not allowed: {ssrf_reason}")
+
+    # Inner-blob size cap — an onion layer carrying a giant inner blob
+    # (beyond what a normal envelope or onion layer would be) is suspicious.
+    if len(inner_blob) > MAX_ENVELOPE_BYTES + 1024:
+        raise HTTPException(413, "inner blob exceeds ceiling")
+
+    # Forward as raw bytes to the next hop.
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                next_hop_url,
+                content=inner_blob,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=FORWARD_TIMEOUT_S,
+            )
+        return {"forwarded": True, "status": resp.status_code}
+    except httpx.TimeoutException:
+        raise HTTPException(504, "next-hop timed out")
+    except httpx.ConnectError:
+        raise HTTPException(502, "cannot reach next hop")
+
+
+# ── Startup: initialise relay keypair for onion routing ─────────────────────
+
+@app.on_event("startup")
+def _init_relay_key() -> None:
+    global _relay_priv, _relay_pub_b64u
+    _relay_priv = _load_or_create_relay_key()
+    _relay_pub_b64u = base64.urlsafe_b64encode(
+        bytes(_relay_priv.public_key)).decode().rstrip("=")
+    log.info("onion routing enabled: x25519_pub=%s", _relay_pub_b64u[:12] + "…")
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────

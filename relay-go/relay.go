@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"math/big"
-	mrand "math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -33,12 +32,16 @@ const (
 	envelopeVersion  = 0x01
 	envelopeMinSize  = 33        // version + 32-byte pubkey
 	maxEnvelopeBytes = 256 << 10 // 256 KiB
-	replayWindowMs   = 5 * 60 * 1000
-	wsWriteTimeout   = 10 * time.Second
-	wsReadTimeout    = 60 * time.Second
-	wsPingInterval   = 30 * time.Second
-	wsAuthTimeout    = 10 * time.Second
-	forwardTimeout   = 10 * time.Second
+	// Fix #19: auth nonces are in-memory only, so a relay restart within the
+	// replay window lets an attacker replay a captured auth tuple and drain
+	// a victim's mailbox.  A 30-second window is long enough for clock skew
+	// but short enough that a crash-restart race is minimal.
+	replayWindowMs = 30 * 1000
+	wsWriteTimeout = 10 * time.Second
+	wsReadTimeout  = 60 * time.Second
+	wsPingInterval = 30 * time.Second
+	wsAuthTimeout  = 10 * time.Second
+	forwardTimeout = 10 * time.Second
 
 	// Rate limiting for /v1/send (per IP)
 	rateLimitPerMin = 60 // max envelopes per IP per minute
@@ -145,6 +148,11 @@ type Hub struct {
 	authMu   sync.Mutex
 	seenAuth map[string]int64 // "peer_id|ts" → expiry unix ms
 
+	// Fix #7: persistent X25519 keypair for onion routing.
+	// Advertised via GET /v1/relay_info; used to peel POST /v1/forward-onion.
+	relayX25519Pub  *[32]byte
+	relayX25519Priv *[32]byte
+
 	upgrader websocket.Upgrader
 }
 
@@ -235,9 +243,13 @@ func (h *Hub) deliverOrStore(recipientID string, envelope []byte) (delivered boo
 	h.mu.RUnlock()
 
 	if online {
-		// DAITA: random delivery jitter (0-200ms)
+		// DAITA: random delivery jitter (0-200ms).
+		// Fix #17: use crypto/rand so the jitter can't be predicted from
+		// observing past samples — delivery-jitter is a timing defense and
+		// math/rand's state can be inferred after a few dozen observations.
 		if deliveryJitterMs > 0 {
-			jitter := time.Duration(mrand.Intn(deliveryJitterMs)) * time.Millisecond
+			jn, _ := rand.Int(rand.Reader, big.NewInt(int64(deliveryJitterMs)))
+			jitter := time.Duration(jn.Int64()) * time.Millisecond
 			time.Sleep(jitter)
 		}
 		select {
@@ -286,9 +298,11 @@ func (h *Hub) notifyPresence(peerID string, online bool) {
 
 // generateDummyEnvelope creates a random-looking envelope with version byte 0x00
 // that the client recognizes and discards. Uses standard bucket sizes.
+// Fix #17: crypto/rand for bucket selection too — observable from the wire.
 func generateDummyEnvelope() []byte {
 	buckets := []int{2048, 16384, 262144}
-	size := buckets[mrand.Intn(len(buckets))]
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(buckets))))
+	size := buckets[n.Int64()]
 	buf := make([]byte, size)
 	rand.Read(buf)
 	buf[0] = dummyVersion // client checks this byte and discards
@@ -367,6 +381,15 @@ func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
 // ── WS /v1/receive — Authenticated receive channel ──────────────────────────
 
 func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
+	// Fix #22: rate-limit ws auth attempts per IP.  Without this, the
+	// per-identity presence-sub cap (200) can be bypassed by rotating
+	// keypairs: auth → subscribe 200 → disconnect → new keypair → repeat.
+	// Capping auth attempts bounds how fast an attacker can enumerate.
+	if !h.rl.allow(hashIP(h.clientIP(r))) {
+		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade error: %v", err)

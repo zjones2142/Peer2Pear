@@ -1,0 +1,40 @@
+# Peer2Pear — unified compose for A/B testing both relay implementations.
+#
+# Run one of:
+#   docker compose up relay-go        # Go implementation only
+#   docker compose up relay-py        # Python implementation only
+#   docker compose --profile ab up    # both side-by-side on different ports
+#
+# The Go relay listens on 8443 by default; the Python relay is exposed on
+# 8444 in AB mode so you can hit either from a test client.  Clients rotating
+# through both flavours should observe identical protocol behaviour — any
+# drift is a bug.
+#
+# Data persists in separate named volumes so A/B runs don't share mailbox
+# state.
+
+services:
+  relay-go:
+    build: ./relay-go
+    ports:
+      - "8443:8443"
+    volumes:
+      - relay-go-data:/data
+    environment:
+      - DB_PATH=/data/peer2pear_relay.db
+    restart: unless-stopped
+
+  relay-py:
+    build: ./relay
+    profiles: ["ab", "python"]
+    ports:
+      - "8444:8443"
+    volumes:
+      - relay-py-data:/data
+    environment:
+      - DB_PATH=/data/peer2pear_relay.db
+    restart: unless-stopped
+
+volumes:
+  relay-go-data:
+  relay-py-data:

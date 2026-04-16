@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QMap>
+#include <QSet>
 #include <QByteArray>
 #include <QBitArray>
 #include <QDateTime>
@@ -96,20 +97,52 @@ public:
     /// than kPartialFileMaxAgeSecs on disk (7 days). Also removes their DB rows.
     void purgeStalePartialFiles();
 
-    // Chunk size (240 KB fits in 256 KiB relay envelope with overhead).
-    static constexpr qint64 kChunkBytes  = 240LL * 1024;
-    // 100 MB file limit. With streaming I/O we can raise this later.
-    static constexpr qint64 kMaxFileBytes = 100LL * 1024 * 1024;
+    /// Fix #16: toggle live sender-side privacy.  When true, in-flight
+    /// transfers currently streaming via Auto routing will refuse relay
+    /// fallback from the next chunk onward (P2P-only).  When P2P isn't
+    /// available, the stream aborts cleanly rather than leaking via relay.
+    void setSenderRequiresP2P(bool require);
 
-    // Phase 3: files above this size prefer P2P streaming.
-    // Below this threshold, the existing "P2P if ready, sealed relay otherwise"
-    // routing still applies (chunks dispatch immediately).
+    // ── Size knobs ──────────────────────────────────────────────────────────
+    // Chunk size (240 KB fits in 256 KiB relay envelope with overhead).
+    static constexpr qint64 kChunkBytes   = 240LL * 1024;
+    // Hard ceiling per file.  Streaming I/O means we can raise this later.
+    static constexpr qint64 kMaxFileBytes = 100LL * 1024 * 1024;
+    // Above this size, prefer P2P streaming and gate on file_accept consent.
     static constexpr qint64 kLargeFileBytes = 5LL * 1024 * 1024;
 
-    // Phase 3: after file_accept arrives, wait up to this long for P2P
-    // to establish before either streaming via relay (if permitted) or
-    // aborting the transfer.
-    static constexpr int kP2PReadyWaitSecs = 10;
+    // ── Lifecycle timing ────────────────────────────────────────────────────
+    //
+    // Each constant controls one stage of the file-transfer state machine.
+    // They're intentionally different because they defend different things:
+    //
+    //   kP2PReadyWaitSecs        10 s   — after file_accept, how long we park
+    //                                      the stream waiting for P2P to come
+    //                                      up before relay-falling-back or
+    //                                      aborting (when requireP2P).
+    //   kOutboundPendingTimeoutSecs  10 min — how long a sender waits for
+    //                                      file_accept/decline before giving
+    //                                      up on a queued send.
+    //   kMaxTransferAgeSecs          30 min — how long an in-memory incoming
+    //                                      transfer survives without progress
+    //                                      before its partial file is purged
+    //                                      and the transfer key cleared.
+    //   kSentTransferMaxAgeSecs      24 h   — how long the SENDER keeps a
+    //                                      plaintext fileKey in DB so it can
+    //                                      answer file_request resumptions.
+    //                                      Short because the row leaks keys
+    //                                      to a compromised device.
+    //   kPartialFileMaxAgeSecs       7 d    — how long the RECEIVER keeps a
+    //                                      partial file on disk for
+    //                                      resumption after extended offline
+    //                                      gaps.  Partials are plaintext
+    //                                      file data, purged aggressively.
+    //
+    static constexpr int    kP2PReadyWaitSecs           = 10;
+    static constexpr qint64 kOutboundPendingTimeoutSecs = 10LL * 60;
+    static constexpr qint64 kMaxTransferAgeSecs         = 30LL * 60;
+    static constexpr qint64 kSentTransferMaxAgeSecs     = 24LL * 60 * 60;
+    static constexpr qint64 kPartialFileMaxAgeSecs      = 7LL * 24 * 60 * 60;
 
     /// Send a file to a single peer using a pre-derived per-file ratchet key.
     /// Streams from disk — the full file is NEVER loaded into RAM.
@@ -378,9 +411,17 @@ private:
     };
     QMap<QString, OutboundTransfer> m_outboundPending;
 
-    /// Sender gives up on a queued file if no accept/decline arrives within
-    /// this window. User can re-initiate the send.
-    static constexpr qint64 kOutboundPendingTimeoutSecs = 10 * 60;  // 10 minutes
+    /// Fix #12: transferIds the sender aborted mid-stream.  sendChunkEnvelopes
+    /// checks this set each chunk and exits early — previously a cancel while
+    /// streaming did nothing because the streaming loop is synchronous.
+    /// Cleared when the sent-transfer record is purged or forgotten.
+    QSet<QString> m_abortedTransfers;
+
+    /// Fix #16: live mirror of the user's "require direct connection" setting
+    /// so mid-stream privacy changes upgrade in-flight transfers from Auto
+    /// to P2POnly routing.  ChatController writes this via
+    /// setSenderRequiresP2P() when the privacy level / toggle flips.
+    bool m_senderRequiresP2PLive = false;
 
     /// Phase 4: sender-side record of an in-flight / delivered transfer kept
     /// so we can answer file_request calls for resumption. Lives in DB.
@@ -397,9 +438,6 @@ private:
         qint64     createdSecs = 0;
     };
     QMap<QString, SentTransfer> m_sentTransfers;
-
-    /// Phase 4: max age of partial files / sent-transfer records before purge.
-    static constexpr qint64 kPartialFileMaxAgeSecs = 7LL * 24 * 60 * 60;
 
     SqlCipherDb* m_dbPtr = nullptr;  // Phase 4: shared DB for persistence
 

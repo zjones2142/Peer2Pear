@@ -186,6 +186,28 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
     chunk.reserve(int(kChunkBytes));
 
     for (int i = 0; i < totalChunks; ++i) {
+        // Fix #12: sender-side cancel check.  forgetSentTransfer() / cancel
+        // inserts transferId into m_abortedTransfers — without this the
+        // synchronous loop just keeps streaming to a peer who no longer wants
+        // the file.
+        if (m_abortedTransfers.contains(transferId)) {
+            qDebug() << "[FileTransfer] aborted mid-stream at chunk" << i
+                     << "of" << transferId.left(8);
+            src.close();
+            m_abortedTransfers.remove(transferId);
+            return;
+        }
+
+        // Fix #16: live privacy-level upgrade.  If the user flipped the
+        // "require direct connection" toggle mid-stream, every subsequent
+        // chunk falls under P2POnly routing.  If P2P isn't available, the
+        // next dispatchChunk() drops the chunk and aborts the transfer
+        // rather than leaking via relay.
+        const RoutingMode effectiveMode =
+            (mode == RoutingMode::P2POnly || m_senderRequiresP2PLive)
+                ? RoutingMode::P2POnly
+                : mode;
+
         const qint64 offset = qint64(i) * kChunkBytes;
         const qint64 remaining = fileSize - offset;
         const qint64 toRead = qMin<qint64>(kChunkBytes, remaining);
@@ -224,7 +246,7 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
                                         + encMeta
                                         + encChunk;
 
-        if (!dispatchChunk(senderIdB64u, peerIdB64u, innerPayload, mode)) {
+        if (!dispatchChunk(senderIdB64u, peerIdB64u, innerPayload, effectiveMode)) {
             // P2POnly mode and P2P went away mid-stream. Abandon the transfer —
             // partial delivery with missing chunks would be confusing.
             qWarning() << "[FileTransfer] P2P lost mid-stream at chunk" << i
@@ -544,7 +566,8 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
 
 void FileTransferManager::purgeStaleTransfers()
 {
-    static constexpr qint64 kMaxTransferAgeSecs = 30 * 60;  // 30 minutes
+    // kMaxTransferAgeSecs now lives in the header next to the other lifecycle
+    // constants.  See the "Lifecycle timing" block at the top of the class.
     const qint64 now = QDateTime::currentSecsSinceEpoch();
     auto it = m_incomingTransfers.begin();
     while (it != m_incomingTransfers.end()) {
@@ -765,11 +788,15 @@ QList<QString> FileTransferManager::notifyP2PReady(const QString& peerIdB64u)
 void FileTransferManager::abandonOutboundTransfer(const QString& transferId)
 {
     auto it = m_outboundPending.find(transferId);
-    if (it == m_outboundPending.end()) return;
-    const QString peerId = it->peerId;
-    sodium_memzero(it->fileKey.data(), it->fileKey.size());
-    m_outboundPending.erase(it);
-    emit outboundAbandoned(transferId, peerId);
+    if (it != m_outboundPending.end()) {
+        const QString peerId = it->peerId;
+        sodium_memzero(it->fileKey.data(), it->fileKey.size());
+        m_outboundPending.erase(it);
+        emit outboundAbandoned(transferId, peerId);
+    }
+    // Fix #12: also signal any in-flight stream to stop, even if the
+    // pre-stream state was already erased.
+    m_abortedTransfers.insert(transferId);
 }
 
 void FileTransferManager::cancelInboundTransfer(const QString& transferId)
@@ -1030,6 +1057,14 @@ void FileTransferManager::forgetSentTransfer(const QString& transferId)
         m_sentTransfers.erase(it);
     }
     deleteSentRow(transferId);
+
+    // Fix #12: if a stream is still flying, tell it to stop at the next chunk.
+    m_abortedTransfers.insert(transferId);
+}
+
+void FileTransferManager::setSenderRequiresP2P(bool require)
+{
+    m_senderRequiresP2PLive = require;
 }
 
 void FileTransferManager::registerSentTransfer(const QString& senderIdB64u,
@@ -1279,14 +1314,15 @@ void FileTransferManager::purgeStalePartialFiles()
 {
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
     const qint64 now = QDateTime::currentSecsSinceEpoch();
-    const qint64 cutoff = now - kPartialFileMaxAgeSecs;
+    const qint64 cutoffIn  = now - kPartialFileMaxAgeSecs;   // 7 days for receiver
+    const qint64 cutoffOut = now - kSentTransferMaxAgeSecs;  // Fix #15: 24h for sender
 
     SqlCipherQuery qSel(*m_dbPtr);
     QStringList toDelete;
     QStringList pathsToRemove;
     if (qSel.prepare("SELECT transfer_id, partial_path, created_secs "
                       "FROM file_transfers_in WHERE created_secs < :cutoff;")) {
-        qSel.bindValue(":cutoff", cutoff);
+        qSel.bindValue(":cutoff", cutoffIn);
         if (qSel.exec()) {
             while (qSel.next()) {
                 toDelete << qSel.value(0).toString();
@@ -1299,11 +1335,25 @@ void FileTransferManager::purgeStalePartialFiles()
         deleteIncomingRow(toDelete[i]);
     }
 
-    // Also purge stale sent-transfer records (source file kept by user, but
-    // our record of the file key shouldn't live forever).
+    // Fix #15: sender-side records containing a plaintext fileKey get a much
+    // shorter window.  SQLCipher encrypts them at rest, but a device
+    // compromise still leaks in-flight file keys — so we don't keep them
+    // around past a typical reconnect gap.
     SqlCipherQuery qDel(*m_dbPtr);
     if (qDel.prepare("DELETE FROM file_transfers_out WHERE created_secs < :cutoff;")) {
-        qDel.bindValue(":cutoff", cutoff);
+        qDel.bindValue(":cutoff", cutoffOut);
         qDel.exec();
+    }
+    // Also drop in-memory sent-transfer records that got purged from DB.
+    const qint64 memCutoff = cutoffOut;
+    auto it = m_sentTransfers.begin();
+    while (it != m_sentTransfers.end()) {
+        if (it->createdSecs > 0 && it->createdSecs < memCutoff) {
+            if (!it->fileKey.isEmpty())
+                sodium_memzero(it->fileKey.data(), it->fileKey.size());
+            it = m_sentTransfers.erase(it);
+        } else {
+            ++it;
+        }
     }
 }

@@ -105,6 +105,46 @@ public:
         m_pending[reqId] = std::move(cb);
     }
 
+    void get(const QUrl& url,
+             const QMap<QString, QString>& headers,
+             Callback cb) override
+    {
+        // Mobile FFI doesn't carry a dedicated http_get function pointer yet.
+        // Reuse http_post with an empty body — the platform adapter on the
+        // other side can issue a GET when body size is 0, or explicitly handle
+        // "GET" via a header the onion code sets.  For now, if the platform
+        // sets http_post, we route the GET through it; otherwise fail.
+        if (!m_p.http_post) {
+            if (cb) cb({ 0, {}, "http_get not implemented" });
+            return;
+        }
+
+        // Convert headers and add a X-HTTP-Method override so the platform
+        // adapter can distinguish GET from POST without new FFI surface.
+        QMap<QString, QString> hdrs = headers;
+        hdrs["X-HTTP-Method"] = "GET";
+
+        std::vector<std::string> keyStore, valStore;
+        std::vector<const char*> keys, vals;
+        for (auto it = hdrs.cbegin(); it != hdrs.cend(); ++it) {
+            keyStore.push_back(it.key().toStdString());
+            valStore.push_back(it.value().toStdString());
+            keys.push_back(keyStore.back().c_str());
+            vals.push_back(valStore.back().c_str());
+        }
+
+        int reqId = m_p.http_post(
+            url.toString().toUtf8().constData(),
+            nullptr, 0,  // empty body signals GET (in combination with X-HTTP-Method)
+            keys.empty() ? nullptr : keys.data(),
+            vals.empty() ? nullptr : vals.data(),
+            static_cast<int>(keys.size()),
+            m_p.platform_ctx);
+
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_pending[reqId] = std::move(cb);
+    }
+
     // Called by p2p_http_response() when platform delivers the result
     void onResponse(int requestId, int status,
                     const uint8_t* body, int bodyLen,
