@@ -70,7 +70,6 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* paren
         while (it != m_fileKeys.end()) {
             if (it.key().endsWith(suffix) || it.key() == transferId) {
                 sodium_memzero(it.value().data(), it.value().size());
-                m_fileKeyTimes.remove(it.key());  // M8 fix
                 it = m_fileKeys.erase(it);
             } else {
                 ++it;
@@ -100,6 +99,22 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* paren
     connect(&m_fileMgr, &FileTransferManager::outboundBlockedByPolicy,
             this, [this](const QString& transferId, const QString& /*peerId*/, bool byReceiver) {
         emit fileTransferBlocked(transferId, byReceiver);
+    });
+
+    // Fix #5: rehydrate file keys from DB after loadPersistedTransfers().
+    // The receiver's partial-file bitmap is restored in FileTransferManager;
+    // the fileKey that decrypts chunks lives here, so we restore it in sync.
+    connect(&m_fileMgr, &FileTransferManager::incomingFileKeyRestored,
+            this, [this](const QString& fromPeerId,
+                         const QString& transferId,
+                         const QByteArray& fileKey) {
+        if (fileKey.size() != 32) return;
+        const QString compound = fromPeerId + ":" + transferId;
+        m_fileKeys[compound] = fileKey;
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[FILE] restored file key for" << transferId.left(8)
+                 << "from" << fromPeerId.left(8) + "...";
+#endif
     });
 
     // Phase 3: receiver finished writing and verified — send file_ack.
@@ -144,24 +159,10 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* paren
             }
         }
 
-        // M8 fix: purge orphaned file keys older than 30 minutes
-        {
-            static constexpr qint64 kFileKeyMaxAgeSecs = 30 * 60;
-            const qint64 now = QDateTime::currentSecsSinceEpoch();
-            auto it = m_fileKeyTimes.begin();
-            while (it != m_fileKeyTimes.end()) {
-                if ((now - it.value()) > kFileKeyMaxAgeSecs) {
-                    auto keyIt = m_fileKeys.find(it.key());
-                    if (keyIt != m_fileKeys.end()) {
-                        sodium_memzero(keyIt.value().data(), keyIt.value().size());
-                        m_fileKeys.erase(keyIt);
-                    }
-                    it = m_fileKeyTimes.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
+        // Fix #4: the old 30-min m_fileKeys TTL was removed.  File keys now
+        // live as long as the FileTransferManager's DB-backed partial-transfer
+        // row (7-day max).  When that purges, transferCompleted fires and the
+        // key gets zeroed via the connect() in the constructor.
 
 #ifdef PEER2PEAR_P2P
         // G4 fix: clean up failed ICE connections
@@ -215,13 +216,14 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
     // One-time migration: clear sessions when serialization format changes.
     // v5: ratchet init fix.  v6: PQ hybrid (Noise v4 + RatchetSession v2).
+    // v7: sealed envelope v2 (recipient-bound AAD + envelope-id).
     {
         SqlCipherQuery q(db);
-        q.prepare("SELECT value FROM settings WHERE key='ratchet_v6_cleared';");
+        q.prepare("SELECT value FROM settings WHERE key='ratchet_v7_cleared';");
         if (!q.exec() || !q.next()) {
             m_sessionStore->clearAll();
             SqlCipherQuery ins(db);
-            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v6_cleared','1');");
+            ins.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('ratchet_v7_cleared','1');");
             ins.exec();
         }
     }
@@ -245,7 +247,8 @@ void ChatController::setDatabase(SqlCipherDb& db)
         QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
         QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
-            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+            recipientCurvePub, peerEdPub,
+            m_crypto.identityPub(), m_crypto.identityPriv(),
             blob, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.isEmpty()) return;
 #ifndef QT_NO_DEBUG_OUTPUT
@@ -273,7 +276,8 @@ void ChatController::setDatabase(SqlCipherDb& db)
         sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
         QByteArray peerKemPub = lookupPeerKemPub(peerId);
         QByteArray sealed = SealedEnvelope::seal(
-            recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+            recipientCurvePub, peerEdPub,
+            m_crypto.identityPub(), m_crypto.identityPriv(),
             payload, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.isEmpty()) return {};
 
@@ -588,11 +592,24 @@ void ChatController::acceptFileTransfer(const QString& transferId, bool requireP
         return;
     }
 
-    // Move the stashed key into the active file-keys map so chunks decrypt.
     const QString peerId   = it->peerId;
     const QString compound = peerId + ":" + transferId;
-    m_fileKeys[compound]     = it->fileKey;           // copy
-    m_fileKeyTimes[compound] = QDateTime::currentSecsSinceEpoch();
+
+    // Fix #3: announce with the metadata locked from file_key time — NOT from
+    // whatever the sender might put in later chunks.
+    if (!m_fileMgr.announceIncoming(peerId, transferId, it->fileName,
+                                      it->fileSize, it->totalChunks,
+                                      it->fileHash, it->fileKey, it->announcedTs,
+                                      it->groupId, it->groupName)) {
+        qWarning() << "[FILE] acceptFileTransfer: announceIncoming failed for"
+                   << transferId.left(8);
+        sodium_memzero(it->fileKey.data(), it->fileKey.size());
+        m_pendingIncomingFiles.erase(it);
+        return;
+    }
+
+    // Move the stashed key into the active file-keys map so chunks decrypt.
+    m_fileKeys[compound] = it->fileKey;           // copy
 
     sodium_memzero(it->fileKey.data(), it->fileKey.size());
     m_pendingIncomingFiles.erase(it);
@@ -793,7 +810,8 @@ QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
     // Use hybrid seal if we know the peer's ML-KEM-768 public key (already looked up above)
     // Include ML-DSA-65 signature if we have DSA keys
     QByteArray sealed = SealedEnvelope::seal(
-        recipientCurvePub, m_crypto.identityPub(), m_crypto.identityPriv(),
+        recipientCurvePub, peerEdPub,
+        m_crypto.identityPub(), m_crypto.identityPriv(),
         sessionBlob, peerKemPub, m_crypto.dsaPub(), m_crypto.dsaPriv());
     if (sealed.isEmpty()) return {};
 
@@ -984,12 +1002,30 @@ void ChatController::onEnvelope(const QByteArray& body)
                  << (isFileChunk ? "(file chunk)" : "");
 #endif
 
-        // Unseal to learn sender identity (pass KEM priv for hybrid PQ envelopes)
+        // Unseal to learn sender identity (pass KEM priv for hybrid PQ envelopes).
+        // Binding recipientEdPub (our own identity) into AEAD AAD — if a relay
+        // rewrote the outer routing pubkey, AEAD fails.
         UnsealResult unsealed = SealedEnvelope::unseal(
-            m_crypto.curvePriv(), rest, m_crypto.kemPriv());
+            m_crypto.curvePriv(), m_crypto.identityPub(), rest, m_crypto.kemPriv());
         if (!unsealed.valid) {
             qWarning() << "[ChatController] Failed to unseal envelope";
             return;
+        }
+
+        // Envelope-level replay protection (Fix #2): dedup on envelopeId.
+        // The ratchet dedups its own chain messages, but control messages
+        // outside the ratchet (file_accept, file_cancel, etc.) don't have that
+        // protection. A malicious relay could redeliver the same sealed blob
+        // and the receiver would happily reprocess it.
+        if (unsealed.envelopeId.size() == 16) {
+            const QString envKey = "env:" + CryptoEngine::toBase64Url(unsealed.envelopeId);
+            if (!markSeen(envKey)) {
+#ifndef QT_NO_DEBUG_OUTPUT
+                qDebug() << "[RECV" << via << "] dropping replayed envelope"
+                         << envKey.mid(4, 8) + "...";
+#endif
+                return;
+            }
         }
 
         QString senderId = CryptoEngine::toBase64Url(unsealed.senderEdPub);
@@ -1192,7 +1228,10 @@ void ChatController::onEnvelope(const QByteArray& body)
 
             const QString compoundKey = senderId + ":" + transferId;
 
-            // Evaluate global size policy.
+            // Evaluate global size policy.  Fix #6: the same thresholds apply
+            // whether the file is 1:1 or group-scoped — previously group files
+            // auto-accepted regardless, which let any group member push up to
+            // the hard-max bytes to disk without the user's consent.
             // (Per-contact policy will be layered on top in a follow-up.)
             const qint64 fileSizeMB = fileSize / (1024 * 1024);
             bool autoAccept = false;
@@ -1202,8 +1241,6 @@ void ChatController::onEnvelope(const QByteArray& body)
             } else if (fileSize <= qint64(m_fileAutoAcceptMaxMB) * 1024 * 1024) {
                 autoAccept = true;
             }
-            // Group files: always auto-accept (Phase 2 defers group consent).
-            if (!gId.isEmpty() && !autoDecline) autoAccept = true;
 
             if (autoDecline) {
 #ifndef QT_NO_DEBUG_OUTPUT
@@ -1216,9 +1253,31 @@ void ChatController::onEnvelope(const QByteArray& body)
                 sendFileControlMessage(senderId, declineMsg);
                 sodium_memzero(msgKey.data(), msgKey.size());
             } else if (autoAccept) {
-                // Install key immediately so arriving chunks decrypt.
+                // Fix #3: announce the transfer to FileTransferManager FIRST so
+                // it locks the announced fileSize/totalChunks/fileHash. Chunks
+                // with mismatched metadata will be dropped.
+                const QByteArray announcedHash =
+                    CryptoEngine::fromBase64Url(o.value("fileHash").toString());
+                const int announcedChunkCount = o.value("chunkCount").toInt(0);
+                const qint64 announcedTs      = o.value("ts").toVariant().toLongLong();
+
+                if (announcedHash.size() != 32 || announcedChunkCount <= 0) {
+                    qWarning() << "[FILE] missing fileHash/chunkCount on file_key for"
+                               << transferId.left(8) << "— dropping";
+                    sodium_memzero(msgKey.data(), msgKey.size());
+                    return;
+                }
+
+                if (!m_fileMgr.announceIncoming(senderId, transferId, fileName,
+                                                  fileSize, announcedChunkCount,
+                                                  announcedHash, msgKey, announcedTs,
+                                                  gId, gName)) {
+                    sodium_memzero(msgKey.data(), msgKey.size());
+                    return;
+                }
+
+                // Install key so chunks can decrypt.
                 m_fileKeys[compoundKey] = msgKey;  // M3+M4 fix
-                m_fileKeyTimes[compoundKey] = QDateTime::currentSecsSinceEpoch();  // M8 fix
                 sodium_memzero(msgKey.data(), msgKey.size());
 
                 QJsonObject acceptMsg;
@@ -1233,11 +1292,27 @@ void ChatController::onEnvelope(const QByteArray& body)
 #endif
             } else {
                 // Stash in pending — don't install key yet. User will accept/decline.
+                // Fix #3: lock announced hash/chunkCount/ts now so acceptFileTransfer
+                // can pass them to announceIncoming() unchanged.
+                const QByteArray announcedHash =
+                    CryptoEngine::fromBase64Url(o.value("fileHash").toString());
+                const int announcedChunkCount = o.value("chunkCount").toInt(0);
+                const qint64 announcedTs      = o.value("ts").toVariant().toLongLong();
+                if (announcedHash.size() != 32 || announcedChunkCount <= 0) {
+                    qWarning() << "[FILE] missing fileHash/chunkCount on file_key for"
+                               << transferId.left(8) << "— dropping";
+                    sodium_memzero(msgKey.data(), msgKey.size());
+                    return;
+                }
+
                 PendingIncoming p;
                 p.peerId         = senderId;
                 p.fileName       = fileName;
                 p.fileSize       = fileSize;
                 p.fileKey        = QByteArray(msgKey.constData(), msgKey.size());
+                p.fileHash       = announcedHash;
+                p.totalChunks    = announcedChunkCount;
+                p.announcedTs    = announcedTs;
                 p.groupId        = gId;
                 p.groupName      = gName;
                 p.announcedSecs  = QDateTime::currentSecsSinceEpoch();

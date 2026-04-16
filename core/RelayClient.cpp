@@ -493,12 +493,39 @@ QUrl RelayClient::pickSendRelay()
     return m_sendRelays[m_sendRelayIdx];
 }
 
+// Fix #9: honor the jitter range set by setPrivacyLevel.  Previously
+// m_jitterMinMs/m_jitterMaxMs were stored but never read — every send went
+// out the instant the caller invoked it, turning "Enhanced/Maximum privacy"
+// timing protection into a no-op that a relay operator could trivially
+// correlate to user typing.
+//
+// Random jitter ∈ [m_jitterMinMs, m_jitterMaxMs] is scheduled per-send via
+// QTimer::singleShot.  When both bounds are 0 (Privacy Level 0), we skip
+// the timer and post synchronously to preserve ordering invariants.
+int RelayClient::pickJitterMs() const
+{
+    if (m_jitterMaxMs <= 0) return 0;
+    const int span = m_jitterMaxMs - m_jitterMinMs;
+    if (span <= 0) return m_jitterMinMs;
+    return m_jitterMinMs + int(QRandomGenerator::global()->bounded(span + 1));
+}
+
 void RelayClient::postEnvelope(const QUrl& relayUrl, const QByteArray& envelope,
                                 IHttpClient::Callback cb)
 {
     QUrl sendUrl = relayUrl;
     sendUrl.setPath("/v1/send");
-    m_http.post(sendUrl, envelope, {}, std::move(cb));
+
+    const int jitterMs = pickJitterMs();
+    if (jitterMs <= 0) {
+        m_http.post(sendUrl, envelope, {}, std::move(cb));
+        return;
+    }
+
+    QTimer::singleShot(jitterMs, this,
+        [this, sendUrl, envelope, cb = std::move(cb)]() mutable {
+            m_http.post(sendUrl, envelope, {}, std::move(cb));
+        });
 }
 
 void RelayClient::forwardEnvelope(const QUrl& viaRelay, const QUrl& toRelay,
@@ -510,7 +537,17 @@ void RelayClient::forwardEnvelope(const QUrl& viaRelay, const QUrl& toRelay,
     QMap<QString, QString> headers;
     headers["X-Forward-To"] = toRelay.host()
         + (toRelay.port() > 0 ? ":" + QString::number(toRelay.port()) : "");
-    m_http.post(fwdUrl, envelope, headers, std::move(cb));
+
+    const int jitterMs = pickJitterMs();
+    if (jitterMs <= 0) {
+        m_http.post(fwdUrl, envelope, headers, std::move(cb));
+        return;
+    }
+
+    QTimer::singleShot(jitterMs, this,
+        [this, fwdUrl, envelope, headers, cb = std::move(cb)]() mutable {
+            m_http.post(fwdUrl, envelope, headers, std::move(cb));
+        });
 }
 
 void RelayClient::setPrivacyLevel(int level)

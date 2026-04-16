@@ -288,6 +288,83 @@ QString FileTransferManager::sendFileWithKey(const QString& senderIdB64u,
     return transferId;
 }
 
+// ── Announce-first: lock metadata at file_key time (Fix #3) ─────────────────
+
+bool FileTransferManager::announceIncoming(const QString& fromId,
+                                            const QString& transferId,
+                                            const QString& fileName,
+                                            qint64 fileSize,
+                                            int totalChunks,
+                                            const QByteArray& fileHash,
+                                            const QByteArray& fileKey,
+                                            qint64 announcedTsSecs,
+                                            const QString& groupId,
+                                            const QString& groupName)
+{
+    // Reject obviously-bad inputs up front.
+    if (transferId.isEmpty() || totalChunks <= 0 ||
+        fileSize <= 0 || fileSize > kMaxFileBytes ||
+        fileHash.size() != 32 || fileKey.size() != 32) {
+        qWarning() << "[FileTransfer] announceIncoming: invalid args for"
+                   << transferId.left(8);
+        return false;
+    }
+
+    // Cross-check fileSize against totalChunks.
+    const int expectedChunks = int((fileSize + kChunkBytes - 1) / kChunkBytes);
+    if (totalChunks != expectedChunks) {
+        qWarning() << "[FileTransfer] announceIncoming: totalChunks"
+                   << totalChunks << "doesn't match fileSize"
+                   << fileSize << "(expected" << expectedChunks << ")";
+        return false;
+    }
+
+    // Idempotent: if already announced (e.g., duplicate file_key delivery),
+    // leave the existing record alone.
+    if (m_incomingTransfers.contains(transferId)) {
+        return true;
+    }
+
+    // Enforce concurrent-transfer cap.
+    if (m_incomingTransfers.size() >= kMaxConcurrentTransfers) {
+        emit status("Too many concurrent incoming transfers — dropping announce.");
+        return false;
+    }
+
+    auto xferPtr = std::make_shared<IncomingTransfer>();
+    IncomingTransfer& xfer = *xferPtr;
+    // Strip path separators defensively even though it came from a trusted path.
+    QString safeName = QFileInfo(fileName).fileName();
+    if (safeName.isEmpty()) safeName = "file";
+
+    xfer.fromId       = fromId;
+    xfer.fileName     = safeName;
+    xfer.fileSize     = fileSize;
+    xfer.totalChunks  = totalChunks;
+    xfer.ts           = tsFromSecs(announcedTsSecs);
+    xfer.fileHash     = fileHash;
+    xfer.groupId      = groupId;
+    xfer.groupName    = groupName;
+    xfer.createdSecs  = QDateTime::currentSecsSinceEpoch();
+    xfer.partialPath  = partialPathFor(transferId);
+    xfer.finalPath    = finalPathFor(xfer.fileName, transferId);
+    xfer.receivedChunks = QBitArray(totalChunks);  // all false
+
+    xfer.partialFile = std::make_unique<QFile>(xfer.partialPath);
+    if (!xfer.partialFile->open(QIODevice::ReadWrite | QIODevice::Truncate)) {
+        qWarning() << "[FileTransfer] announceIncoming: cannot open partial file"
+                   << xfer.partialPath << "—" << xfer.partialFile->errorString();
+        emit status(QString("Cannot write to disk: %1").arg(xfer.fileName));
+        return false;
+    }
+
+    m_incomingTransfers.insert(transferId, xferPtr);
+
+    // Phase 4: persist so we can resume after a crash before any chunk arrives.
+    persistIncomingFull(transferId, xfer, fileKey);
+    return true;
+}
+
 // ── Handle incoming file chunk ───────────────────────────────────────────────
 
 bool FileTransferManager::handleFileEnvelope(const QString& fromId,
@@ -324,21 +401,35 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
     const QJsonObject meta   = QJsonDocument::fromJson(metaJson).object();
     const QString transferId = meta.value("transferId").toString();
     const int chunkIndex     = meta.value("chunkIndex").toInt(-1);
-    const int totalChunks    = meta.value("totalChunks").toInt(0);
+    const int claimedTotal   = meta.value("totalChunks").toInt(0);
     if (transferId.isEmpty()
-        || totalChunks <= 0
+        || claimedTotal <= 0
         || chunkIndex < 0
-        || chunkIndex >= totalChunks) return false;
+        || chunkIndex >= claimedTotal) return false;
 
-    const qint64 claimedSize = meta.value("fileSize").toVariant().toLongLong();
-    if (claimedSize > kMaxFileBytes || totalChunks > (kMaxFileBytes / kChunkBytes + 1)) {
-        emit status(QString("Rejected incoming file: claimed size %1 exceeds limit.")
-                        .arg(claimedSize));
+    // Fix #3: require a prior announceIncoming() for this transferId. Chunks
+    // arriving without announce are dropped — no more silent lazy-create that
+    // trusted the chunk's own metadata. And every arriving chunk's metadata
+    // must agree with what was announced.
+    auto itXfer = m_incomingTransfers.find(transferId);
+    if (itXfer == m_incomingTransfers.end() || !itXfer.value()) {
+        qWarning() << "[FileTransfer] chunk for unannounced transfer"
+                   << transferId.left(8) << "from" << fromId.left(8) + "... — dropped";
         return true;
     }
-    if (!m_incomingTransfers.contains(transferId)
-        && m_incomingTransfers.size() >= kMaxConcurrentTransfers) {
-        emit status("Too many concurrent incoming transfers — dropping chunk.");
+
+    IncomingTransfer& xfer = *itXfer.value();
+
+    // Metadata must match the locked announcement.
+    const qint64 claimedSize   = meta.value("fileSize").toVariant().toLongLong();
+    const QByteArray claimedHash = CryptoEngine::fromBase64Url(meta.value("fileHash").toString());
+    if (claimedTotal != xfer.totalChunks ||
+        claimedSize  != xfer.fileSize ||
+        (xfer.fileHash.size() == 32 && !claimedHash.isEmpty() && claimedHash != xfer.fileHash)) {
+        qWarning() << "[FileTransfer] chunk metadata disagrees with announce for"
+                   << transferId.left(8) << "— dropped."
+                   << "claimed(size/chunks)=" << claimedSize << "/" << claimedTotal
+                   << "vs announced=" << xfer.fileSize << "/" << xfer.totalChunks;
         return true;
     }
 
@@ -348,43 +439,23 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
     const QByteArray chunkData = m_crypto.aeadDecrypt(key32, encChunk);
     if (chunkData.isEmpty()) return true;
 
-    // ── Disk-backed assembly ────────────────────────────────────────────────
-    auto& xferPtr = m_incomingTransfers[transferId];
-    if (!xferPtr) {
-        // First chunk of this transfer — create and initialize.
-        xferPtr = std::make_shared<IncomingTransfer>();
-        IncomingTransfer& xfer = *xferPtr;
-        xfer.fromId      = fromId;
-        QString rawName  = meta.value("fileName").toString("file");
-        rawName          = rawName.section('/', -1).section('\\', -1);
-        xfer.fileName    = rawName.isEmpty() ? "file" : rawName;
-        xfer.fileSize    = meta.value("fileSize").toVariant().toLongLong();
-        xfer.totalChunks = totalChunks;
-        xfer.ts          = tsFromSecs(meta.value("ts").toVariant().toLongLong());
-        xfer.fileHash    = CryptoEngine::fromBase64Url(meta.value("fileHash").toString());
-        xfer.groupId     = meta.value("groupId").toString();
-        xfer.groupName   = meta.value("groupName").toString();
-        xfer.createdSecs = QDateTime::currentSecsSinceEpoch();
-        xfer.partialPath = partialPathFor(transferId);
-        xfer.finalPath   = finalPathFor(xfer.fileName, transferId);
-        xfer.receivedChunks = QBitArray(totalChunks);  // all false
-
-        // Open partial file for read/write (truncate any stale content).
-        xfer.partialFile = std::make_unique<QFile>(xfer.partialPath);
-        if (!xfer.partialFile->open(QIODevice::ReadWrite | QIODevice::Truncate)) {
-            qWarning() << "[FileTransfer] Cannot open partial file"
-                       << xfer.partialPath << "—" << xfer.partialFile->errorString();
-            const QString fname = xfer.fileName;
-            m_incomingTransfers.remove(transferId);
-            emit status(QString("Cannot write to disk: %1").arg(fname));
-            return true;
-        }
-
-        // Phase 4: persist the initial row so a crash before any chunk writes
-        // still leaves us a record to resume from. No bits set yet.
-        persistIncomingFull(transferId, xfer, key32);
+    // Each plaintext chunk except possibly the last must equal kChunkBytes.
+    const qint64 expectedLen =
+        (chunkIndex == xfer.totalChunks - 1)
+            ? (xfer.fileSize - qint64(chunkIndex) * kChunkBytes)
+            : kChunkBytes;
+    if (chunkData.size() != expectedLen) {
+        qWarning() << "[FileTransfer] chunk" << chunkIndex << "has wrong plaintext size"
+                   << chunkData.size() << "(expected" << expectedLen << ")";
+        return true;
     }
-    IncomingTransfer& xfer = *xferPtr;
+
+    // Guard against the partial file being closed (e.g., after completion).
+    if (!xfer.partialFile || !xfer.partialFile->isOpen()) {
+        qWarning() << "[FileTransfer] chunk for closed partial file"
+                   << transferId.left(8) << "— dropped";
+        return true;
+    }
 
     // Already received this chunk? (dedup above should have caught it, but
     // double-check the bitmap in case of an out-of-band retry.)
@@ -408,11 +479,12 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
     // after a crash with at worst one chunk of lost work.
     persistIncomingFull(transferId, xfer, key32);
 
-    const int received = xfer.chunksReceivedCount;
+    const int received      = xfer.chunksReceivedCount;
+    const int totalOfXfer   = xfer.totalChunks;
 
-    if (received < totalChunks) {
+    if (received < totalOfXfer) {
         emit fileChunkReceived(fromId, transferId, xfer.fileName,
-                               xfer.fileSize, received, totalChunks,
+                               xfer.fileSize, received, totalOfXfer,
                                QString{}, xfer.ts,
                                xfer.groupId, xfer.groupName);
         return true;
@@ -444,7 +516,7 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
             deleteIncomingRow(transferId);
             emit status(QString("File '%1' integrity check FAILED — discarded.").arg(fileName));
             emit fileChunkReceived(fromId, transferId, fileName,
-                                   fileSize, totalChunks, totalChunks,
+                                   fileSize, totalOfXfer, totalOfXfer,
                                    QString{}, tsCopy, groupId, groupName);
             return true;
         }
@@ -463,7 +535,7 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
     deleteIncomingRow(transferId);
 
     emit fileChunkReceived(fromId, transferId, fileName,
-                           fileSize, totalChunks, totalChunks,
+                           fileSize, totalOfXfer, totalOfXfer,
                            finalPath, tsCopy, groupId, groupName);
     return true;
 }
@@ -1016,8 +1088,8 @@ void FileTransferManager::loadPersistedTransfers()
     {
         SqlCipherQuery q(*m_dbPtr);
         if (q.prepare("SELECT transfer_id, peer_id, file_name, file_size, total_chunks, "
-                      "       file_hash, group_id, group_name, partial_path, final_path, "
-                      "       received_bitmap, created_secs, ts_secs "
+                      "       file_hash, file_key, group_id, group_name, partial_path, "
+                      "       final_path, received_bitmap, created_secs, ts_secs "
                       "FROM file_transfers_in;") && q.exec()) {
             while (q.next()) {
                 const QString tid      = q.value(0).toString();
@@ -1026,13 +1098,14 @@ void FileTransferManager::loadPersistedTransfers()
                 const qint64  fsize    = q.value(3).toLongLong();
                 const int     chunks   = q.value(4).toInt();
                 const QByteArray fhash = q.value(5).toByteArray();
-                const QString gid      = q.value(6).toString();
-                const QString gname    = q.value(7).toString();
-                const QString ppath    = q.value(8).toString();
-                const QString fpath    = q.value(9).toString();
-                const QByteArray bmap  = q.value(10).toByteArray();
-                const qint64 created   = q.value(11).toLongLong();
-                const qint64 tsSecs    = q.value(12).toLongLong();
+                const QByteArray fkey  = q.value(6).toByteArray();
+                const QString gid      = q.value(7).toString();
+                const QString gname    = q.value(8).toString();
+                const QString ppath    = q.value(9).toString();
+                const QString fpath    = q.value(10).toString();
+                const QByteArray bmap  = q.value(11).toByteArray();
+                const qint64 created   = q.value(12).toLongLong();
+                const qint64 tsSecs    = q.value(13).toLongLong();
 
                 // Partial file must still exist on disk. If user deleted it
                 // out of band, drop the row and move on.
@@ -1071,6 +1144,12 @@ void FileTransferManager::loadPersistedTransfers()
                 }
 
                 m_incomingTransfers.insert(tid, xferPtr);
+
+                // Fix #5: hand the restored fileKey back to ChatController so
+                // resumption chunks can actually decrypt after restart.
+                if (fkey.size() == 32) {
+                    emit incomingFileKeyRestored(peerId, tid, fkey);
+                }
             }
         }
     }

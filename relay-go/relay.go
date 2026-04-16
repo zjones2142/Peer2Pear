@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/big"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -29,30 +30,37 @@ import (
 // The relay reads only bytes 0-32 for routing. Everything else is opaque.
 
 const (
-	envelopeVersion    = 0x01
-	envelopeMinSize    = 33       // version + 32-byte pubkey
-	maxEnvelopeBytes   = 256 << 10 // 256 KiB
-	replayWindowMs     = 5 * 60 * 1000
-	wsWriteTimeout     = 10 * time.Second
-	wsReadTimeout      = 60 * time.Second
-	wsPingInterval     = 30 * time.Second
-	wsAuthTimeout      = 10 * time.Second
-	forwardTimeout     = 10 * time.Second
+	envelopeVersion  = 0x01
+	envelopeMinSize  = 33        // version + 32-byte pubkey
+	maxEnvelopeBytes = 256 << 10 // 256 KiB
+	replayWindowMs   = 5 * 60 * 1000
+	wsWriteTimeout   = 10 * time.Second
+	wsReadTimeout    = 60 * time.Second
+	wsPingInterval   = 30 * time.Second
+	wsAuthTimeout    = 10 * time.Second
+	forwardTimeout   = 10 * time.Second
 
 	// Rate limiting for /v1/send (per IP)
-	rateLimitPerMin    = 60   // max envelopes per IP per minute
-	rateLimitWindow    = 60   // window in seconds
+	rateLimitPerMin = 60 // max envelopes per IP per minute
+	rateLimitWindow = 60 // window in seconds
+
+	// Fix #10: per-recipient ingress rate limit.  Per-IP alone can be bypassed
+	// by rotating source IPs (cheap with a VPS + multiple egresses).  This
+	// second limiter caps inbound envelopes per recipient pubkey regardless
+	// of origin.  Sealed-sender means we can't rate-limit per-sender at the
+	// /v1/send boundary, but recipient pubkey IS visible in the envelope header.
+	recipientRateLimitPerMin = 300
 
 	// H4: max peer IDs a single peer can subscribe to for presence
-	maxPresenceSubs    = 200
+	maxPresenceSubs = 200
 
 	// M5: global max envelopes stored in mailbox
 	maxGlobalEnvelopes = 500_000
 
 	// DAITA: relay-side traffic analysis defense
-	coverTrafficMinSec = 5   // min seconds between cover packets
-	coverTrafficMaxSec = 15  // max seconds between cover packets
-	deliveryJitterMs   = 200 // max random delivery delay (ms)
+	coverTrafficMinSec = 5    // min seconds between cover packets
+	coverTrafficMaxSec = 15   // max seconds between cover packets
+	deliveryJitterMs   = 200  // max random delivery delay (ms)
 	dummyVersion       = 0x00 // version byte for dummy envelopes (client discards)
 )
 
@@ -83,17 +91,24 @@ func newRateLimiter() *rateLimiter {
 
 // allow returns true if the IP is within its rate limit.
 func (rl *rateLimiter) allow(ip string) bool {
+	return rl.allowWithLimit(ip, rateLimitPerMin)
+}
+
+// allowWithLimit applies a caller-specified per-key cap. Same sliding window.
+// Fix #10: lets us reuse the struct for per-recipient limiting with a
+// different (higher) ceiling than the per-IP one.
+func (rl *rateLimiter) allowWithLimit(key string, limit int) bool {
 	now := time.Now().Unix()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	e, ok := rl.entries[ip]
+	e, ok := rl.entries[key]
 	if !ok || now >= e.resetAt {
-		rl.entries[ip] = &ipRateEntry{count: 1, resetAt: now + rateLimitWindow}
+		rl.entries[key] = &ipRateEntry{count: 1, resetAt: now + rateLimitWindow}
 		return true
 	}
 	e.count++
-	return e.count <= rateLimitPerMin
+	return e.count <= limit
 }
 
 func (rl *rateLimiter) purge() {
@@ -119,15 +134,16 @@ type Peer struct {
 
 type Hub struct {
 	mu         sync.RWMutex
-	peers      map[string]*Peer // peer_id → *Peer
+	peers      map[string]*Peer           // peer_id → *Peer
 	subs       map[string]map[string]bool // subscriber_id → set of watched peer_ids
 	mbox       *Mailbox
-	rl         *rateLimiter
-	trustProxy bool // H2 fix: only trust X-Forwarded-For when behind a reverse proxy
+	rl         *rateLimiter // per-IP ingress (Fix #8 now also covers legacy)
+	rlRecip    *rateLimiter // Fix #10: per-recipient ingress cap
+	trustProxy bool         // H2 fix: only trust X-Forwarded-For when behind a reverse proxy
 
 	// H3 fix: track seen auth nonces to prevent replay within the 5-min window
-	authMu    sync.Mutex
-	seenAuth  map[string]int64 // "peer_id|ts" → expiry unix ms
+	authMu   sync.Mutex
+	seenAuth map[string]int64 // "peer_id|ts" → expiry unix ms
 
 	upgrader websocket.Upgrader
 }
@@ -138,6 +154,7 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 		subs:       make(map[string]map[string]bool),
 		mbox:       mbox,
 		rl:         newRateLimiter(),
+		rlRecip:    newRateLimiter(),
 		trustProxy: trustProxy,
 		seenAuth:   make(map[string]int64),
 		upgrader: websocket.Upgrader{
@@ -322,6 +339,13 @@ func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
 	recipientID, err := parseRecipient(body)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Fix #10: per-recipient ingress limit — independent of source IP.
+	// An attacker rotating IPs can no longer flood a specific victim's mailbox.
+	if !h.rlRecip.allowWithLimit(recipientID, recipientRateLimitPerMin) {
+		httpError(w, http.StatusTooManyRequests, "recipient rate limit exceeded")
 		return
 	}
 
@@ -554,13 +578,15 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid relay address")
 		return
 	}
-	// M4 fix: block forwarding to private/loopback addresses (SSRF prevention)
-	host := strings.Split(forwardTo, ":")[0]
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" ||
-		host == "0.0.0.0" || strings.HasPrefix(host, "10.") ||
-		strings.HasPrefix(host, "192.168.") || strings.HasPrefix(host, "172.") ||
-		strings.HasPrefix(host, "169.254.") {
-		httpError(w, http.StatusForbidden, "forwarding to private addresses not allowed")
+
+	// Fix #11: SSRF hardening — resolve DNS, reject any resolved IP that
+	// lands in loopback/private/link-local/ULA/CGNAT.  The previous check
+	// did string-prefix comparisons on the raw host (fooled by bracketed
+	// IPv6 like `[::1]:443` → `strings.Split(host, ":")[0] == "["`) and
+	// skipped DNS resolution entirely (allowing rebinding attacks).
+	if reason, ok := forwardHostSafe(forwardTo); !ok {
+		httpError(w, http.StatusForbidden,
+			"forwarding not allowed: "+reason)
 		return
 	}
 
@@ -568,6 +594,15 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 	if err != nil || len(body) > maxEnvelopeBytes {
 		httpError(w, http.StatusRequestEntityTooLarge, "envelope too large")
 		return
+	}
+
+	// Apply per-recipient cap to forwarded traffic too — parse the recipient
+	// out of the inner envelope header.
+	if rid, err := parseRecipient(body); err == nil {
+		if !h.rlRecip.allowWithLimit(rid, recipientRateLimitPerMin) {
+			httpError(w, http.StatusTooManyRequests, "recipient rate limit exceeded")
+			return
+		}
 	}
 
 	// Forward to the target relay's /v1/send
@@ -589,6 +624,57 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Fix #11: SSRF guard.  Parses host[:port], resolves DNS, and rejects any
+// resolved IP that lands in loopback / private / link-local / ULA / CGNAT.
+// Returns (reason, true=safe).
+func forwardHostSafe(forwardTo string) (string, bool) {
+	// Split host[:port].  If no port, treat the whole thing as host.
+	host, _, err := net.SplitHostPort(forwardTo)
+	if err != nil {
+		host = forwardTo
+	}
+
+	// Strip brackets that net.SplitHostPort sometimes leaves around bare IPv6.
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if host == "" {
+		return "empty host", false
+	}
+
+	// Block explicit names regardless of resolution (defense in depth).
+	switch strings.ToLower(host) {
+	case "localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback":
+		return "loopback name", false
+	}
+
+	// Resolve — rejects on failure so unresolvable hosts can't slip through.
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return "cannot resolve host", false
+	}
+
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() ||
+			ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			ip.IsMulticast() || ip.IsUnspecified() ||
+			ip.IsInterfaceLocalMulticast() {
+			return fmt.Sprintf("blocked address %s", ip.String()), false
+		}
+		// CGNAT 100.64.0.0/10 — not covered by IsPrivate.
+		if v4 := ip.To4(); v4 != nil {
+			if v4[0] == 100 && (v4[1]&0xC0) == 64 {
+				return "CGNAT range blocked", false
+			}
+		}
+		// Reject IPv4-mapped IPv6 to loopback/private (e.g., ::ffff:127.0.0.1)
+		// — IsLoopback/IsPrivate already catches these on modern Go, but
+		// an explicit belt-and-braces.
+		if v4 := ip.To4(); v4 != nil && v4.IsLoopback() {
+			return "ipv4-mapped loopback blocked", false
+		}
+	}
+	return "", true
+}
 
 func parseRecipient(envelope []byte) (string, error) {
 	if len(envelope) < envelopeMinSize {

@@ -154,6 +154,7 @@ private:
     bool          m_multiHop = false;
 
     QUrl pickSendRelay();           // round-robin through send relay pool
+    int  pickJitterMs() const;      // Fix #9: random delay in [min,max]
     void postEnvelope(const QUrl& relayUrl, const QByteArray& envelope,
                       IHttpClient::Callback cb); // single-hop POST
     void forwardEnvelope(const QUrl& viaRelay, const QUrl& toRelay,

@@ -23,10 +23,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import logging
 import os
 import random
 import secrets
+import socket
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -66,27 +68,34 @@ DB_PATH = os.environ.get("DB_PATH", "/tmp/peer2pear_relay.db")
 RATE_LIMIT_PER_MIN = 60   # max envelopes per IP per minute
 RATE_LIMIT_WINDOW  = 60   # seconds
 
-# ── Per-IP rate limiter ──────────────────────────────────────────────────────
+# Fix #10: per-recipient ingress cap — independent of source IP so an attacker
+# rotating IPs can no longer flood a specific victim.  Recipient pubkey IS
+# visible in the envelope header (or X-To for legacy), so this is enforceable
+# without compromising sealed-sender anonymity.
+RECIPIENT_RATE_LIMIT_PER_MIN = 300
+
+# ── Sliding-window rate limiter (per-IP and per-recipient share the struct) ──
 
 class _RateLimiter:
     def __init__(self) -> None:
-        self._entries: dict[str, tuple[int, float]] = {}  # ip → (count, reset_at)
+        self._entries: dict[str, tuple[int, float]] = {}  # key → (count, reset_at)
 
-    def allow(self, ip: str) -> bool:
+    def allow(self, key: str, limit: int = RATE_LIMIT_PER_MIN) -> bool:
         now = time.time()
-        entry = self._entries.get(ip)
+        entry = self._entries.get(key)
         if entry is None or now >= entry[1]:
-            self._entries[ip] = (1, now + RATE_LIMIT_WINDOW)
+            self._entries[key] = (1, now + RATE_LIMIT_WINDOW)
             return True
         count = entry[0] + 1
-        self._entries[ip] = (count, entry[1])
-        return count <= RATE_LIMIT_PER_MIN
+        self._entries[key] = (count, entry[1])
+        return count <= limit
 
     def purge(self) -> None:
         now = time.time()
-        self._entries = {ip: e for ip, e in self._entries.items() if now < e[1]}
+        self._entries = {k: e for k, e in self._entries.items() if now < e[1]}
 
-_rate_limiter = _RateLimiter()
+_rate_limiter   = _RateLimiter()
+_recip_limiter  = _RateLimiter()  # Fix #10: per-recipient ingress cap
 
 # H3 fix: track seen auth nonces to prevent replay within the 5-min window
 _seen_auth: dict[str, float] = {}  # "peer_id|ts" → expiry_time
@@ -117,6 +126,56 @@ def _get_client_ip(request: Request) -> str:
 def _hash_ip(ip: str) -> str:
     """Hash IP for rate limiting — never store raw IPs."""
     return hashlib.sha256(ip.encode()).hexdigest()[:32]
+
+
+# Fix #11: SSRF guard — parse host[:port], resolve DNS, reject any IP that
+# lands in loopback / private / link-local / ULA / CGNAT / multicast /
+# unspecified.  Returns None if safe, else a human-readable reason.
+def _forward_host_reason(forward_to: str) -> Optional[str]:
+    host = forward_to
+    # Strip optional [brackets] before splitting off port (IPv6 literals).
+    if host.startswith("["):
+        close = host.find("]")
+        if close <= 0:
+            return "malformed IPv6 literal"
+        host = host[1:close]
+    else:
+        # Only split on the LAST colon — IPv6 has many colons, hostnames have none.
+        last_colon = host.rfind(":")
+        if last_colon > 0 and host.count(":") == 1:
+            host = host[:last_colon]
+
+    if not host:
+        return "empty host"
+
+    low = host.lower()
+    if low in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
+        return "loopback name"
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return "cannot resolve host"
+
+    if not infos:
+        return "no addresses resolved"
+
+    for info in infos:
+        sockaddr = info[4]
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return f"invalid address: {sockaddr[0]}"
+
+        if (ip.is_loopback or ip.is_private or ip.is_link_local or
+                ip.is_multicast or ip.is_unspecified or ip.is_reserved):
+            return f"blocked address {ip}"
+        # CGNAT 100.64.0.0/10 — not covered by is_private.
+        if ip.version == 4:
+            packed = ip.packed
+            if packed[0] == 100 and (packed[1] & 0xC0) == 64:
+                return "CGNAT range blocked"
+    return None
 
 def _generate_dummy_envelope() -> bytes:
     """DAITA: generate a random dummy envelope that the client discards (version 0x00)."""
@@ -282,6 +341,10 @@ async def v1_send(request: Request):
         raise HTTPException(413, f"envelope too large: {len(body)} > {MAX_ENVELOPE_BYTES}")
 
     to_id = parse_recipient_from_envelope(body)
+
+    # Fix #10: per-recipient cap.
+    if not _recip_limiter.allow(to_id, RECIPIENT_RATE_LIMIT_PER_MIN):
+        raise HTTPException(429, "recipient rate limit exceeded")
 
     # Try direct WebSocket push
     ws = connected_peers.get(to_id)
@@ -479,12 +542,22 @@ async def v1_forward(
     if "/" in x_forward_to or " " in x_forward_to:
         raise HTTPException(400, "invalid relay address")
 
-    # M4 fix: block forwarding to private/loopback addresses (SSRF prevention)
-    host = x_forward_to.split(":")[0].lower()
-    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or \
-       host.startswith("10.") or host.startswith("192.168.") or \
-       host.startswith("172.") or host.startswith("169.254."):
-        raise HTTPException(403, "forwarding to private addresses not allowed")
+    # Fix #11: SSRF hardening — the old prefix-match approach was fooled by
+    # bracketed IPv6 (`[::1]:443` → split[":"][0] = "[") and never resolved
+    # DNS (rebinding attacks).  Resolve and check every returned address.
+    reason = _forward_host_reason(x_forward_to)
+    if reason is not None:
+        raise HTTPException(403, f"forwarding not allowed: {reason}")
+
+    # Per-recipient cap on forwarded traffic too — parse the inner envelope.
+    try:
+        fwd_to_id = parse_recipient_from_envelope(body)
+        if not _recip_limiter.allow(fwd_to_id, RECIPIENT_RATE_LIMIT_PER_MIN):
+            raise HTTPException(429, "recipient rate limit exceeded")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # not a parseable envelope — let the downstream relay decide
 
     try:
         async with httpx.AsyncClient() as client:
@@ -558,6 +631,14 @@ async def mbox_enqueue(
     x_ttl_ms: Optional[int] = Header(None,  alias="X-TtlMs"),
     x_env_id: Optional[str] = Header(None,  alias="X-EnvId"),
 ):
+    # Fix #8: legacy enqueue previously skipped rate limiting, which let any
+    # attacker flood a victim's mailbox via this endpoint while /v1/send was
+    # throttled.  Apply the same per-IP and per-recipient caps.
+    if not _rate_limiter.allow(_hash_ip(_get_client_ip(request))):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    if not _recip_limiter.allow(x_to, RECIPIENT_RATE_LIMIT_PER_MIN):
+        raise HTTPException(status_code=429, detail="recipient rate limit exceeded")
+
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="empty body")

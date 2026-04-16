@@ -7,21 +7,26 @@
  * Hides the sender's identity from the relay server. The server only sees
  * the recipient (via the HTTP X-To header) and an opaque sealed blob.
  *
- * Classical wire format (version 0x00):
- *   0x00 || ephPub(32) || AEAD(envelopeKey, senderEdPub(32) || sig(64) || innerCt)
+ * Classical v2 wire format (version 0x02):
+ *   0x02 || ephPub(32) || AEAD(envelopeKey, AAD=ephPub||recipientEdPub,
+ *                               envelopeId(16) || senderEdPub(32) || sig(64) || innerCt)
  *   envelopeKey = BLAKE2b-256(ecdhShared)
  *
- * Hybrid wire format (version 0x01):
- *   0x01 || ephPub(32) || kemCt(1088) || AEAD(envelopeKey, senderEdPub(32) || sig(64) || innerCt)
+ * Hybrid v2 wire format (version 0x03):
+ *   0x03 || ephPub(32) || kemCt(1088) || AEAD(envelopeKey, AAD=ephPub||recipientEdPub,
+ *                                              envelopeId(16) || senderEdPub(32) || sig(64) || innerCt)
  *   envelopeKey = BLAKE2b-256(ecdhShared || kemShared)
  *
- * The sender signs the inner ciphertext with their Ed25519 key to prove
- * identity to the recipient without exposing it to the server.
+ * The sender signs (envelopeId || innerPayload) with their Ed25519 key.
+ * Binding recipientEdPub into the AEAD AAD prevents a malicious relay from
+ * re-routing the sealed blob to a different recipient.
+ * The envelopeId is 16 random bytes that the receiver uses for replay detection.
  */
 
 struct UnsealResult {
     QByteArray senderEdPub;   // 32 bytes — sender's Ed25519 public key
     QByteArray innerPayload;  // decrypted inner ciphertext
+    QByteArray envelopeId;    // 16 bytes — unique per-envelope id, for replay dedup
     bool       valid = false;
 };
 
@@ -36,6 +41,8 @@ public:
     // is included alongside the classical Ed25519 signature.
     //
     // recipientCurvePub: recipient's X25519 public key (32)
+    // recipientEdPub:    recipient's Ed25519 public key (32) — bound into AAD so
+    //                    the envelope can't be re-routed to a different recipient
     // senderEdPub:       sender's Ed25519 public key (32)
     // senderEdPriv:      sender's Ed25519 private key (64)
     // innerPayload:      the ratchet ciphertext to seal
@@ -43,6 +50,7 @@ public:
     // senderDsaPub:      sender's ML-DSA-65 public key (1952, optional)
     // senderDsaPriv:     sender's ML-DSA-65 private key (4032, optional)
     static QByteArray seal(const QByteArray& recipientCurvePub,
+                           const QByteArray& recipientEdPub,
                            const QByteArray& senderEdPub,
                            const QByteArray& senderEdPriv,
                            const QByteArray& innerPayload,
@@ -66,10 +74,13 @@ public:
     // Unseal an envelope using the recipient's keys.
     //
     // recipientCurvePriv: recipient's X25519 private key (32)
-    // sealedBytes:        the sealed envelope (classical or hybrid)
+    // recipientEdPub:     recipient's Ed25519 public key (32) — must match the
+    //                     AAD the sender used, or AEAD decryption will fail.
+    // sealedBytes:        the sealed envelope (classical v2 or hybrid v2)
     // recipientKemPriv:   recipient's ML-KEM-768 private key (2400, optional)
-    //                     Required for hybrid envelopes (version 0x01).
+    //                     Required for hybrid envelopes (version 0x03).
     static UnsealResult unseal(const QByteArray& recipientCurvePriv,
+                                const QByteArray& recipientEdPub,
                                 const QByteArray& sealedBytes,
                                 const QByteArray& recipientKemPriv = {});
 };

@@ -189,6 +189,29 @@ public:
     /// Called from the same maintenance tick as purgeStaleTransfers().
     void purgeStaleOutbound();
 
+    /// Announce an incoming file transfer with locked metadata (Fix #3).
+    /// Creates the IncomingTransfer record, opens the partial file, and
+    /// persists to DB. Called after ChatController processes a `file_key`
+    /// announcement and consent is granted (auto-accept or user Accept).
+    ///
+    /// Once announced, any arriving chunk whose metadata disagrees with the
+    /// announced (fileSize, totalChunks, fileHash) is dropped — preventing
+    /// a sender from announcing a small file and then streaming a large one.
+    ///
+    /// Returns true on success. Returns false if a transfer with this id is
+    /// already registered (idempotent no-op with log), or if the partial
+    /// file can't be opened.
+    bool announceIncoming(const QString& fromId,
+                           const QString& transferId,
+                           const QString& fileName,
+                           qint64 fileSize,
+                           int totalChunks,
+                           const QByteArray& fileHash,
+                           const QByteArray& fileKey,
+                           qint64 announcedTsSecs,
+                           const QString& groupId = {},
+                           const QString& groupName = {});
+
     /// Try to handle an envelope payload as a file chunk.
     /// Decrypted chunks are written directly to disk — the chunk buffer is
     /// the only in-RAM copy at any time.
@@ -234,6 +257,14 @@ signals:
     void outboundBlockedByPolicy(const QString& transferId,
                                   const QString& peerId,
                                   bool byReceiver);
+
+    /// Phase 4/Fix #5: emitted from loadPersistedTransfers() for each inbound
+    /// transfer whose fileKey was restored from the DB. ChatController hooks
+    /// this to repopulate its in-memory m_fileKeys map so resumption chunks
+    /// can decrypt after an app restart.
+    void incomingFileKeyRestored(const QString& fromPeerIdB64u,
+                                  const QString& transferId,
+                                  const QByteArray& fileKey);
 
     /// Progress + completion signal.
     /// savedPath is set when the transfer is complete (the final file on disk).

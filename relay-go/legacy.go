@@ -53,9 +53,22 @@ func checkRecipientSig(toID string, ts int64, nonce, sig, action, envID string) 
 // ── POST /mbox/enqueue ───────────────────────────────────────────────────────
 
 func (h *Hub) LegacyEnqueue(w http.ResponseWriter, r *http.Request) {
+	// Fix #8: legacy /mbox/enqueue was bypassing both rate limiters entirely,
+	// nullifying H3 for any attacker willing to hit the legacy endpoint.
+	// Apply the same per-IP and per-recipient ceilings used by /v1/send.
+	if !h.rl.allow(hashIP(h.clientIP(r))) {
+		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
 	xTo := r.Header.Get("X-To")
 	if xTo == "" {
 		httpError(w, http.StatusBadRequest, "missing X-To header")
+		return
+	}
+
+	if !h.rlRecip.allowWithLimit(xTo, recipientRateLimitPerMin) {
+		httpError(w, http.StatusTooManyRequests, "recipient rate limit exceeded")
 		return
 	}
 

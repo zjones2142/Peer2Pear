@@ -244,10 +244,11 @@ private:
     void announceKemPub(const QString& peerIdB64u);
 
     // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
-    // Populated by file_key announcements (after consent), consumed by handleFileEnvelope()
+    // Populated by file_key announcements (after consent), consumed by handleFileEnvelope().
+    // Lifetime bounded by FileTransferManager's 7-day partial-file purge — no
+    // separate in-memory TTL (Fix #4: the older 30-min TTL would expire keys
+    // while the DB still held the transfer, causing livelock resumptions).
     QMap<QString, QByteArray> m_fileKeys;
-    // M8 fix: creation timestamps for m_fileKeys entries (epoch seconds)
-    QMap<QString, qint64> m_fileKeyTimes;
 
     // ── Phase 2: incoming file transfers awaiting user consent ──────────────
     // When a file_key arrives but policy says "prompt", we stash the key here
@@ -258,6 +259,9 @@ private:
         QString    fileName;
         qint64     fileSize    = 0;
         QByteArray fileKey;            // 32 bytes, zeroed on drop
+        QByteArray fileHash;           // 32 bytes — locked at file_key time
+        int        totalChunks  = 0;   // locked at file_key time
+        qint64     announcedTs  = 0;   // sender's ts from file_key
         QString    groupId;
         QString    groupName;
         qint64     announcedSecs = 0;
