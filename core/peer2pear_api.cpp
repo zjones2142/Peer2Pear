@@ -384,6 +384,18 @@ void p2p_subscribe_presence(p2p_context* ctx, const char** peer_ids, int count)
     ctx->controller.subscribePresence(ids);
 }
 
+void p2p_add_send_relay(p2p_context* ctx, const char* url)
+{
+    if (!ctx || !url) return;
+    ctx->controller.relay().addSendRelay(QUrl(QString::fromUtf8(url)));
+}
+
+void p2p_set_privacy_level(p2p_context* ctx, int level)
+{
+    if (!ctx) return;
+    ctx->controller.relay().setPrivacyLevel(level);
+}
+
 // ── Platform → Core events ──────────────────────────────────────────────────
 
 void p2p_ws_on_connected(p2p_context* ctx)

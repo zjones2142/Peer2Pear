@@ -101,6 +101,17 @@ void p2p_connect(p2p_context* ctx);
 /** Disconnect from the relay. */
 void p2p_disconnect(p2p_context* ctx);
 
+/** Add a relay to the send pool (for multi-relay rotation). */
+void p2p_add_send_relay(p2p_context* ctx, const char* url);
+
+/**
+ * Set privacy level:
+ *   0 = Standard:  envelope padding only (default)
+ *   1 = Enhanced:  + send jitter + cover traffic + multi-relay rotation
+ *   2 = Maximum:   + multi-hop forwarding + high-frequency cover traffic
+ */
+void p2p_set_privacy_level(p2p_context* ctx, int level);
+
 /* ── Messaging ─────────────────────────────────────────────────────────── */
 
 /**

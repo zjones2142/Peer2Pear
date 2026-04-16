@@ -2,11 +2,16 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
+	mrand "math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -43,6 +48,12 @@ const (
 
 	// M5: global max envelopes stored in mailbox
 	maxGlobalEnvelopes = 500_000
+
+	// DAITA: relay-side traffic analysis defense
+	coverTrafficMinSec = 5   // min seconds between cover packets
+	coverTrafficMaxSec = 15  // max seconds between cover packets
+	deliveryJitterMs   = 200 // max random delivery delay (ms)
+	dummyVersion       = 0x00 // version byte for dummy envelopes (client discards)
 )
 
 // ── Per-IP rate limiter ─────────────────────────────────────────────────────
@@ -199,12 +210,19 @@ func (h *Hub) unregister(peerID string) {
 }
 
 // deliverOrStore tries WebSocket push first, falls back to mailbox storage.
+// DAITA: adds random jitter before delivery to break timing correlation between
+// "relay received POST from IP X" and "relay pushed to peer Y".
 func (h *Hub) deliverOrStore(recipientID string, envelope []byte) (delivered bool, err error) {
 	h.mu.RLock()
 	p, online := h.peers[recipientID]
 	h.mu.RUnlock()
 
 	if online {
+		// DAITA: random delivery jitter (0-200ms)
+		if deliveryJitterMs > 0 {
+			jitter := time.Duration(mrand.Intn(deliveryJitterMs)) * time.Millisecond
+			time.Sleep(jitter)
+		}
 		select {
 		case p.Send <- envelope:
 			return true, nil
@@ -247,6 +265,35 @@ func (h *Hub) notifyPresence(peerID string, online bool) {
 
 // ── POST /v1/send — Anonymous envelope submission ────────────────────────────
 
+// ── DAITA helpers ────────────────────────────────────────────────────────────
+
+// generateDummyEnvelope creates a random-looking envelope with version byte 0x00
+// that the client recognizes and discards. Uses standard bucket sizes.
+func generateDummyEnvelope() []byte {
+	buckets := []int{2048, 16384, 262144}
+	size := buckets[mrand.Intn(len(buckets))]
+	buf := make([]byte, size)
+	rand.Read(buf)
+	buf[0] = dummyVersion // client checks this byte and discards
+	return buf
+}
+
+// randomDuration returns a random duration between min and max seconds.
+func randomCoverInterval() time.Duration {
+	spread := coverTrafficMaxSec - coverTrafficMinSec
+	if spread <= 0 {
+		return time.Duration(coverTrafficMinSec) * time.Second
+	}
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(spread)))
+	return time.Duration(coverTrafficMinSec+int(n.Int64())) * time.Second
+}
+
+// hashIP returns a hex-encoded SHA-256 hash of the IP (for rate limiting without storing raw IPs).
+func hashIP(ip string) string {
+	h := sha256.Sum256([]byte(ip))
+	return hex.EncodeToString(h[:16]) // truncate to 128 bits — sufficient for rate limiting
+}
+
 func (h *Hub) clientIP(r *http.Request) string {
 	if h.trustProxy {
 		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
@@ -257,7 +304,7 @@ func (h *Hub) clientIP(r *http.Request) string {
 }
 
 func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
-	if !h.rl.allow(h.clientIP(r)) {
+	if !h.rl.allow(hashIP(h.clientIP(r))) {
 		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
@@ -403,6 +450,25 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// DAITA: cover traffic injection — send random dummy envelopes at
+	// unpredictable intervals so an observer can't distinguish real
+	// deliveries from noise on the WebSocket stream.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(randomCoverInterval()):
+				dummy := generateDummyEnvelope()
+				select {
+				case peer.Send <- dummy:
+				default:
+					// buffer full — skip this cover packet
+				}
+			}
+		}
+	}()
+
 	// Step 5: Read loop — handle presence queries
 	conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 	conn.SetPongHandler(func(string) error {
@@ -474,7 +540,7 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/forward — Multi-hop relay forwarding ────────────────────────────
 
 func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
-	if !h.rl.allow(h.clientIP(r)) {
+	if !h.rl.allow(hashIP(h.clientIP(r))) {
 		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}

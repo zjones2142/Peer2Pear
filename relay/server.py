@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 import os
+import random
 import secrets
 import sqlite3
 import time
@@ -52,6 +54,12 @@ MAX_TTL_MS         = 7 * 24 * 60 * 60 * 1_000     # hard cap
 REPLAY_WINDOW_MS   = 5 * 60 * 1_000               # 5 min auth window
 CLEANUP_INTERVAL_S = 60 * 60                       # purge every hour
 FORWARD_TIMEOUT_S  = 10                            # timeout for relay-to-relay forward
+
+# DAITA: relay-side traffic analysis defense
+COVER_TRAFFIC_MIN_SEC = 5   # min seconds between cover packets
+COVER_TRAFFIC_MAX_SEC = 15  # max seconds between cover packets
+DELIVERY_JITTER_MS    = 200 # max random delivery delay (ms)
+DUMMY_VERSION         = 0x00 # version byte for dummy envelopes (client discards)
 
 DB_PATH = os.environ.get("DB_PATH", "/tmp/peer2pear_relay.db")
 
@@ -105,6 +113,28 @@ def _get_client_ip(request: Request) -> str:
         if forwarded:
             return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+def _hash_ip(ip: str) -> str:
+    """Hash IP for rate limiting — never store raw IPs."""
+    return hashlib.sha256(ip.encode()).hexdigest()[:32]
+
+def _generate_dummy_envelope() -> bytes:
+    """DAITA: generate a random dummy envelope that the client discards (version 0x00)."""
+    buckets = [2048, 16384, 262144]
+    size = random.choice(buckets)
+    buf = bytearray(secrets.token_bytes(size))
+    buf[0] = DUMMY_VERSION
+    return bytes(buf)
+
+async def _cover_traffic_loop(ws: WebSocket, peer_id: str):
+    """DAITA: send random dummy envelopes at unpredictable intervals."""
+    try:
+        while True:
+            delay = random.uniform(COVER_TRAFFIC_MIN_SEC, COVER_TRAFFIC_MAX_SEC)
+            await asyncio.sleep(delay)
+            await ws.send_bytes(_generate_dummy_envelope())
+    except Exception:
+        pass  # connection closed — stop cover traffic
 
 # ── In-memory presence ────────────────────────────────────────────────────────
 
@@ -245,7 +275,7 @@ async def notify_presence(peer_id: str, online: bool):
 
 @app.post("/v1/send")
 async def v1_send(request: Request):
-    if not _rate_limiter.allow(_get_client_ip(request)):
+    if not _rate_limiter.allow(_hash_ip(_get_client_ip(request))):
         raise HTTPException(429, "rate limit exceeded")
     body = await request.body()
     if len(body) > MAX_ENVELOPE_BYTES:
@@ -257,6 +287,9 @@ async def v1_send(request: Request):
     ws = connected_peers.get(to_id)
     if ws:
         try:
+            # DAITA: random delivery jitter to break timing correlation
+            if DELIVERY_JITTER_MS > 0:
+                await asyncio.sleep(random.uniform(0, DELIVERY_JITTER_MS / 1000))
             await ws.send_bytes(body)
             log.info(f"relayed: to={to_id[:8]}… size={len(body)}B")
             return {"delivered": True}
@@ -351,6 +384,9 @@ async def v1_receive(ws: WebSocket):
         presence_subscriptions[peer_id] = set()
         log.info(f"connected: {peer_id[:8]}…")
 
+        # DAITA: start cover traffic injection for this peer
+        cover_task = asyncio.create_task(_cover_traffic_loop(ws, peer_id))
+
         # Notify subscribers that this peer came online
         await notify_presence(peer_id, online=True)
 
@@ -407,6 +443,7 @@ async def v1_receive(ws: WebSocket):
         log.warning(f"ws error for {(peer_id or '?')[:8]}…: {e}")
     finally:
         if peer_id:
+            cover_task.cancel()  # DAITA: stop cover traffic for this peer
             connected_peers.pop(peer_id, None)
             presence_subscriptions.pop(peer_id, None)
             log.info(f"disconnected: {peer_id[:8]}…")
@@ -430,7 +467,7 @@ async def v1_forward(
     request: Request,
     x_forward_to: str = Header(..., alias="X-Forward-To"),
 ):
-    if not _rate_limiter.allow(_get_client_ip(request)):
+    if not _rate_limiter.allow(_hash_ip(_get_client_ip(request))):
         raise HTTPException(429, "rate limit exceeded")
     body = await request.body()
     if len(body) > MAX_ENVELOPE_BYTES:

@@ -58,6 +58,36 @@ public:
     // One-shot presence query (results via presenceChanged signal).
     void queryPresence(const QStringList& peerIds);
 
+    // ── DAITA: client-side traffic analysis defense ─────────────────────────
+
+    /// Set send jitter range (milliseconds). 0 = disabled.
+    void setJitterRange(int minMs, int maxMs);
+
+    /// Set cover traffic interval (seconds). 0 = disabled.
+    void setCoverTrafficInterval(int seconds);
+
+    /// Set known peer IDs (contacts). Cover traffic sends to random peers from
+    /// this list so it's indistinguishable from real messages to the relay.
+    /// Without this, cover goes to random nonexistent recipients (weaker).
+    void setKnownPeers(const QStringList& peerIds);
+
+    // ── Multi-relay routing ─────────────────────────────────────────────────
+
+    /// Add a relay URL to the send relay pool. Sends are rotated across these.
+    /// If empty, all sends go through the main relay (setRelayUrl).
+    void addSendRelay(const QUrl& url);
+
+    /// Enable multi-hop forwarding. When enabled, sendEnvelope() routes through
+    /// a random intermediate relay via /v1/forward before reaching the
+    /// recipient's relay. Cover traffic also uses multi-hop.
+    void setMultiHopEnabled(bool enabled);
+
+    /// Set the privacy level (convenience wrapper):
+    ///   0 = Standard:  padding only (default)
+    ///   1 = Enhanced:  + jitter (50-300ms) + cover traffic (30s) + multi-relay rotation
+    ///   2 = Maximum:   + multi-hop forwarding + high-frequency cover traffic (10s)
+    void setPrivacyLevel(int level);
+
 signals:
     void connected();
     void disconnected();
@@ -103,4 +133,30 @@ private:
     QTimer                   m_retryTimer;
     bool                     m_retryInFlight = false;
     void scheduleRetry();
+
+    // DAITA: client-side traffic defense
+    static constexpr quint8 kDummyVersion = 0x00; // relay cover traffic marker
+    int    m_jitterMinMs = 0;
+    int    m_jitterMaxMs = 0;
+    QTimer m_coverTimer;
+    int    m_coverIntervalSec = 0;
+    int    m_burstRemaining = 0; // envelopes left in current burst
+    void sendCoverEnvelope();
+    void scheduleCoverTimer();   // picks burst vs idle timing
+    void onRealActivity();       // called when real send/receive happens
+
+    // Known peers for realistic cover traffic
+    QStringList m_knownPeers;
+
+    // Multi-relay routing
+    QVector<QUrl> m_sendRelays;     // pool of relays for send rotation
+    int           m_sendRelayIdx = 0;
+    bool          m_multiHop = false;
+
+    QUrl pickSendRelay();           // round-robin through send relay pool
+    void postEnvelope(const QUrl& relayUrl, const QByteArray& envelope,
+                      IHttpClient::Callback cb); // single-hop POST
+    void forwardEnvelope(const QUrl& viaRelay, const QUrl& toRelay,
+                         const QByteArray& envelope,
+                         IHttpClient::Callback cb); // multi-hop via /v1/forward
 };

@@ -54,6 +54,7 @@ public:
     static QByteArray blake2b256(const QByteArray& data) { return FileTransferManager::blake2b256(data); }
 
     FileTransferManager& fileTransferMgr() { return m_fileMgr; }
+    RelayClient& relay() { return m_relay; }
 
     void connectToRelay();
     void disconnectFromRelay();

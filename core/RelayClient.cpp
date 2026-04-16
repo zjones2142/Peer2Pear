@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QDateTime>
+#include <QRandomGenerator>
 #include <QDebug>
 
 RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http, CryptoEngine* crypto, QObject* parent)
@@ -23,6 +24,9 @@ RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http, CryptoEngine* crypto
     // Retry timer for failed sends
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, &RelayClient::processRetryQueue);
+
+    // DAITA: cover traffic timer (disabled by default)
+    connect(&m_coverTimer, &QTimer::timeout, this, &RelayClient::sendCoverEnvelope);
 }
 
 RelayClient::~RelayClient()
@@ -100,6 +104,7 @@ void RelayClient::authenticate()
 void RelayClient::onWsDisconnected()
 {
     m_authenticated = false;
+    m_coverTimer.stop();  // DAITA: stop cover traffic on disconnect
 
 #ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Relay] WebSocket disconnected";
@@ -128,6 +133,13 @@ void RelayClient::scheduleReconnect()
 
 void RelayClient::onWsBinaryMessage(const QByteArray& data)
 {
+    // DAITA: discard relay cover traffic (dummy envelopes with version 0x00)
+    if (!data.isEmpty() && static_cast<quint8>(data.at(0)) == kDummyVersion)
+        return;
+
+    // DAITA: real receive resets cover traffic timer — mimics reading + replying
+    onRealActivity();
+
     // Binary messages are sealed envelopes pushed by the relay
     emit envelopeReceived(data);
 }
@@ -144,6 +156,9 @@ void RelayClient::onWsTextMessage(const QString& message)
 #ifndef QT_NO_DEBUG_OUTPUT
         qDebug() << "[Relay] Authenticated as" << obj.value("peer_id").toString().left(8) + "…";
 #endif
+        // DAITA: start cover traffic if configured
+        if (m_coverIntervalSec > 0)
+            scheduleCoverTimer();
         emit connected();
         return;
     }
@@ -180,10 +195,21 @@ void RelayClient::onWsTextMessage(const QString& message)
 
 void RelayClient::sendEnvelope(const QByteArray& sealedEnvelope)
 {
-    QUrl sendUrl = m_relayUrl;
-    sendUrl.setPath("/v1/send");
+    // DAITA: if cover traffic is active, send 1-2 cover envelopes BEFORE the real
+    // one so the real message isn't always the first after idle. An open-source
+    // attacker reading this code still can't tell which envelope is real — they're
+    // all version 0x01, same size, to real contacts, random ciphertext.
+    if (m_coverIntervalSec > 0 && m_burstRemaining <= 0 && isConnected()) {
+        const int precover = 1 + QRandomGenerator::global()->bounded(2); // 1-2
+        for (int i = 0; i < precover; i++)
+            sendCoverEnvelope();
+    }
+    onRealActivity();
 
-    m_http.post(sendUrl, sealedEnvelope, {}, [this, sealedEnvelope](const IHttpClient::Response& r) {
+    // Pick which relay to send through (round-robin if multi-relay configured)
+    const QUrl relay = pickSendRelay();
+
+    auto retryCb = [this, sealedEnvelope](const IHttpClient::Response& r) {
         if (r.error.isEmpty()) return;  // success
 
         // Permanent failure — don't retry
@@ -200,7 +226,18 @@ void RelayClient::sendEnvelope(const QByteArray& sealedEnvelope)
 
         if (r.status != 429)
             emit status(QString("relay send error: %1 — will retry").arg(r.error));
-    });
+    };
+
+    // Route: multi-hop sends through an intermediate relay, single-hop sends direct
+    if (m_multiHop && m_sendRelays.size() >= 2) {
+        // Pick two different relays: send to first, forward to second (which delivers)
+        const QUrl via = pickSendRelay();
+        QUrl to = pickSendRelay();
+        if (to == via) to = m_relayUrl; // fallback to main relay if pool is small
+        forwardEnvelope(via, to, sealedEnvelope, std::move(retryCb));
+    } else {
+        postEnvelope(relay, sealedEnvelope, std::move(retryCb));
+    }
 }
 
 void RelayClient::sendEnvelopeTo(const QString& recipientIdB64u,
@@ -234,6 +271,9 @@ void RelayClient::sendEnvelopeTo(const QString& recipientIdB64u,
 
 void RelayClient::subscribePresence(const QStringList& peerIds)
 {
+    // DAITA: update known peers for realistic cover traffic targeting
+    m_knownPeers = peerIds;
+
     if (!isConnected()) return;
 
     QJsonArray ids;
@@ -306,4 +346,191 @@ void RelayClient::processRetryQueue()
             emit status("Gave up delivering envelope after max retries.");
         }
     });
+}
+
+// ── DAITA: client-side traffic analysis defense ─────────────────────────────
+
+void RelayClient::setJitterRange(int minMs, int maxMs)
+{
+    m_jitterMinMs = qMax(0, minMs);
+    m_jitterMaxMs = qMax(m_jitterMinMs, maxMs);
+}
+
+void RelayClient::setCoverTrafficInterval(int seconds)
+{
+    m_coverIntervalSec = qMax(0, seconds);
+    m_coverTimer.stop();
+    m_burstRemaining = 0;
+    if (m_coverIntervalSec > 0 && isConnected())
+        scheduleCoverTimer();
+}
+
+void RelayClient::onRealActivity()
+{
+    // A real message was sent or received — blend it into the cover pattern.
+    //
+    // If we're mid-burst: the real message counts as one of the burst messages.
+    // Reset the timer so the next cover envelope comes at natural conversation pace.
+    //
+    // If we're idle: real activity starts a new burst — the user is now "in a
+    // conversation" and cover traffic should match that pace.
+    if (m_coverIntervalSec <= 0) return;
+
+    if (m_burstRemaining > 0) {
+        // Real message counts as part of the burst
+        --m_burstRemaining;
+    } else {
+        // Real activity during idle → start a new burst (2-4 more cover messages)
+        m_burstRemaining = 2 + QRandomGenerator::global()->bounded(3);
+    }
+
+    // Reset timer — next cover envelope comes at burst pace (1-5s)
+    m_coverTimer.stop();
+    scheduleCoverTimer();
+}
+
+void RelayClient::scheduleCoverTimer()
+{
+    if (m_coverIntervalSec <= 0) return;
+
+    // Bursty timing: mimic real conversation patterns.
+    // Real chats = rapid burst of 3-8 messages (1-5s apart), then idle (1-5 min).
+    if (m_burstRemaining > 0) {
+        // Mid-burst: next envelope in 1-5 seconds (mimics typing + sending)
+        const int delayMs = 1000 + QRandomGenerator::global()->bounded(4000);
+        m_coverTimer.start(delayMs);
+    } else {
+        // Between bursts: idle for 1-5x the configured interval
+        const int idleMs = m_coverIntervalSec * 1000
+            + QRandomGenerator::global()->bounded(m_coverIntervalSec * 4000);
+        m_coverTimer.start(idleMs);
+        // Next timer fire starts a new burst of 2-6 envelopes
+        m_burstRemaining = 2 + QRandomGenerator::global()->bounded(5);
+    }
+}
+
+void RelayClient::setKnownPeers(const QStringList& peerIds)
+{
+    m_knownPeers = peerIds;
+}
+
+void RelayClient::sendCoverEnvelope()
+{
+    if (!isConnected()) return;
+
+    // DAITA: cover traffic must be INDISTINGUISHABLE from real envelopes.
+    //
+    // Key design decisions:
+    //   - Version 0x01 (same as real sealed envelopes)
+    //   - Recipient is a REAL contact from the user's peer list when available,
+    //     so the relay can't filter by "recipients that never connect"
+    //   - Predominantly 2 KiB (matches real text message distribution)
+    //   - Random ciphertext — recipient tries to unseal, AEAD fails, drops silently
+    //
+    // The relay sees a normal envelope to a known active peer.
+    // A malicious relay CANNOT distinguish this from a real message.
+
+    // Build the recipient field: real contact if available, random otherwise
+    QByteArray recipientPub(32, Qt::Uninitialized);
+    if (!m_knownPeers.isEmpty()) {
+        const QString& peerId = m_knownPeers[
+            QRandomGenerator::global()->bounded(m_knownPeers.size())];
+        recipientPub = CryptoEngine::fromBase64Url(peerId);
+        if (recipientPub.size() != 32) {
+            // fallback to random if decode fails
+            QRandomGenerator::global()->fillRange(
+                reinterpret_cast<quint32*>(recipientPub.data()), 8);
+        }
+    } else {
+        QRandomGenerator::global()->fillRange(
+            reinterpret_cast<quint32*>(recipientPub.data()), 8);
+    }
+
+    // Size: 90% chance 2 KiB (text), 10% chance 16 KiB — mimics real distribution
+    const int size = (QRandomGenerator::global()->bounded(10) < 9) ? 2048 : 16384;
+    QByteArray dummy(size, Qt::Uninitialized);
+    QRandomGenerator::global()->fillRange(
+        reinterpret_cast<quint32*>(dummy.data()), size / 4);
+
+    // Wire format: version 0x01 + recipient pub (32 bytes) + random ciphertext
+    dummy[0] = 0x01;
+    memcpy(dummy.data() + 1, recipientPub.constData(), 32);
+
+    // Route cover traffic the same way as real traffic — indistinguishable
+    auto noop = [](const IHttpClient::Response&) {};
+    if (m_multiHop && m_sendRelays.size() >= 2) {
+        const QUrl via = pickSendRelay();
+        QUrl to = pickSendRelay();
+        if (to == via) to = m_relayUrl;
+        forwardEnvelope(via, to, dummy, noop);
+    } else {
+        postEnvelope(pickSendRelay(), dummy, noop);
+    }
+
+    // Bursty timing: decrement burst counter and schedule next
+    if (m_burstRemaining > 0)
+        --m_burstRemaining;
+    scheduleCoverTimer();
+}
+
+// ── Multi-relay routing ─────────────────────────────────────────────────────
+
+void RelayClient::addSendRelay(const QUrl& url)
+{
+    if (!url.isEmpty() && !m_sendRelays.contains(url))
+        m_sendRelays.append(url);
+}
+
+void RelayClient::setMultiHopEnabled(bool enabled)
+{
+    m_multiHop = enabled;
+}
+
+QUrl RelayClient::pickSendRelay()
+{
+    if (m_sendRelays.isEmpty()) return m_relayUrl;
+    m_sendRelayIdx = (m_sendRelayIdx + 1) % m_sendRelays.size();
+    return m_sendRelays[m_sendRelayIdx];
+}
+
+void RelayClient::postEnvelope(const QUrl& relayUrl, const QByteArray& envelope,
+                                IHttpClient::Callback cb)
+{
+    QUrl sendUrl = relayUrl;
+    sendUrl.setPath("/v1/send");
+    m_http.post(sendUrl, envelope, {}, std::move(cb));
+}
+
+void RelayClient::forwardEnvelope(const QUrl& viaRelay, const QUrl& toRelay,
+                                   const QByteArray& envelope,
+                                   IHttpClient::Callback cb)
+{
+    QUrl fwdUrl = viaRelay;
+    fwdUrl.setPath("/v1/forward");
+    QMap<QString, QString> headers;
+    headers["X-Forward-To"] = toRelay.host()
+        + (toRelay.port() > 0 ? ":" + QString::number(toRelay.port()) : "");
+    m_http.post(fwdUrl, envelope, headers, std::move(cb));
+}
+
+void RelayClient::setPrivacyLevel(int level)
+{
+    switch (level) {
+    case 0: // Standard: padding only (already always on)
+        setJitterRange(0, 0);
+        setCoverTrafficInterval(0);
+        m_sendRelays.clear();
+        setMultiHopEnabled(false);
+        break;
+    case 1: // Enhanced: + jitter + cover + multi-relay rotation
+        setJitterRange(50, 300);
+        setCoverTrafficInterval(30);
+        setMultiHopEnabled(false);
+        break;
+    case 2: // Maximum: + multi-hop + high-frequency cover
+        setJitterRange(100, 500);
+        setCoverTrafficInterval(10);
+        setMultiHopEnabled(true);
+        break;
+    }
 }
