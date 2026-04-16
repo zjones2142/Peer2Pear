@@ -251,6 +251,26 @@ MainWindow::MainWindow(QWidget *parent)
     // Apply persisted notification state to the notifier
     m_notifier->setEnabled(m_settingsPanel->notificationsEnabled());
 
+    // Phase 2: file transfer consent settings → ChatController
+    connect(m_settingsPanel, &SettingsPanel::fileAutoAcceptMaxChanged,
+            &m_controller,   &ChatController::setFileAutoAcceptMaxMB);
+    connect(m_settingsPanel, &SettingsPanel::fileHardMaxChanged,
+            &m_controller,   &ChatController::setFileHardMaxMB);
+    connect(m_settingsPanel, &SettingsPanel::fileRequireP2PToggled,
+            &m_controller,   &ChatController::setFileRequireP2P);
+
+    // Phase 2: file accept/decline prompt + cancel notifications → ChatView
+    connect(&m_controller, &ChatController::fileAcceptRequested,
+            m_chatView,    &ChatView::onFileAcceptRequested);
+    connect(&m_controller, &ChatController::fileTransferCanceled,
+            m_chatView,    &ChatView::onFileTransferCanceled);
+
+    // Phase 3: delivery confirmation + transport-policy block
+    connect(&m_controller, &ChatController::fileTransferDelivered,
+            m_chatView,    &ChatView::onFileTransferDelivered);
+    connect(&m_controller, &ChatController::fileTransferBlocked,
+            m_chatView,    &ChatView::onFileTransferBlocked);
+
     // ── Resize debounce ───────────────────────────────────────────────────────
     m_resizeDebounce.setSingleShot(true);
     m_resizeDebounce.setInterval(100);

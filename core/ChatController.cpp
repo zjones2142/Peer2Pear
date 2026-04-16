@@ -16,6 +16,7 @@
 #include <QDateTime>
 #include <QTimeZone>
 #include <QUuid>
+#include <QFileInfo>
 // SqlCipherQuery is available via ChatController.hpp -> SqlCipherDb.hpp
 #include <sodium.h>
 
@@ -77,6 +78,52 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* paren
         }
     });
 
+    // Phase 2: outbound-abandoned = sender gave up (timeout) or receiver declined.
+    // We've already emitted fileTransferCanceled in the decline/cancel handlers,
+    // but the timeout path only fires from FileTransferManager::purgeStaleOutbound().
+    connect(&m_fileMgr, &FileTransferManager::outboundAbandoned,
+            this, [this](const QString& transferId, const QString& /*peerId*/) {
+        emit fileTransferCanceled(transferId, false); // sender-side timeout
+    });
+
+    // Phase 2: inbound canceled (sender sent file_cancel or local user canceled).
+    // Same signal — UI removes the progress indicator.
+    connect(&m_fileMgr, &FileTransferManager::inboundCanceled,
+            this, [this](const QString& transferId, const QString& /*peerId*/) {
+        // The cancel handler above already emitted fileTransferCanceled; this
+        // catch covers cases where something else (e.g., future direct cancel
+        // in FileTransferManager) triggers the cleanup.
+        emit fileTransferCanceled(transferId, false);
+    });
+
+    // Phase 3: transport policy blocked the transfer after P2P wait expired.
+    connect(&m_fileMgr, &FileTransferManager::outboundBlockedByPolicy,
+            this, [this](const QString& transferId, const QString& /*peerId*/, bool byReceiver) {
+        emit fileTransferBlocked(transferId, byReceiver);
+    });
+
+    // Phase 3: receiver finished writing and verified — send file_ack.
+    connect(&m_fileMgr, &FileTransferManager::fileChunkReceived,
+            this, [this](const QString& fromPeerId,
+                         const QString& transferId,
+                         const QString& /*fileName*/,
+                         qint64 /*fileSize*/,
+                         int chunksReceived,
+                         int chunksTotal,
+                         const QString& savedPath,
+                         const QDateTime& /*ts*/,
+                         const QString& /*groupId*/,
+                         const QString& /*groupName*/) {
+        // Full file landed + hash verified: savedPath is non-empty.
+        // Hash failure emits with empty savedPath — don't ack in that case.
+        if (chunksReceived == chunksTotal && !savedPath.isEmpty()) {
+            QJsonObject ack;
+            ack["type"]       = "file_ack";
+            ack["transferId"] = transferId;
+            sendFileControlMessage(fromPeerId, ack);
+        }
+    });
+
     // Periodic maintenance: handshake pruning, file key cleanup, ICE cleanup
     connect(&m_maintenanceTimer, &QTimer::timeout, this, [this]() {
         // H3 fix: reset per-sender rate limit counters
@@ -84,6 +131,8 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* paren
 
         // Purge stale incomplete transfers
         m_fileMgr.purgeStaleTransfers();
+        // Phase 2: drop outbound transfers that never got a file_accept in 10 minutes
+        m_fileMgr.purgeStaleOutbound();
 
         // H2/SEC9: prune stuck handshakes
         if (m_sessionStore) {
@@ -178,6 +227,11 @@ void ChatController::setDatabase(SqlCipherDb& db)
     }
 
     m_sessionMgr = std::make_unique<SessionManager>(m_crypto, *m_sessionStore);
+
+    // Phase 4: wire up file-transfer persistence and restore any in-flight state.
+    m_fileMgr.setDatabase(&db);
+    m_fileMgr.loadPersistedTransfers();
+    m_fileMgr.purgeStalePartialFiles();
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
     m_sessionMgr->setSendResponseFn([this](const QString& peerId, const QByteArray& blob) {
@@ -301,24 +355,43 @@ void ChatController::sendAvatar(const QString& peerIdB64u,
 
 QString ChatController::sendFile(const QString& peerIdB64u,
                                  const QString& fileName,
-                                 const QByteArray& fileData)
+                                 const QString& filePath)
 {
-    if (fileData.size() > FileTransferManager::kMaxFileBytes) {
+    QFileInfo finfo(filePath);
+    if (!finfo.exists() || !finfo.isFile()) {
+        emit status(QString("File not found: %1").arg(filePath));
+        return {};
+    }
+    const qint64 fileSize = finfo.size();
+    if (fileSize > FileTransferManager::kMaxFileBytes) {
         emit status(QString("File too large (max %1 MB).")
                         .arg(FileTransferManager::kMaxFileBytes / (1024 * 1024)));
         return {};
     }
 
+    // Streaming hash — one pass over the file, bounded RAM.
+    const QByteArray fileHash = FileTransferManager::blake2b256File(filePath);
+    if (fileHash.size() != 32) {
+        emit status(QString("Could not hash file: %1").arg(fileName));
+        return {};
+    }
+    const int chunkCount = int((fileSize + FileTransferManager::kChunkBytes - 1)
+                                / FileTransferManager::kChunkBytes);
+
     const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    // Send file_key announcement through the ratchet to derive a forward-secret key
+    // Send file_key announcement through the ratchet to derive a forward-secret key.
+    // The announcement now includes fileHash + chunkCount so the receiver can allocate
+    // its partial-file bitmap and verify the final hash without waiting for every chunk's metadata.
     QJsonObject announce;
-    announce["from"]       = myIdB64u();
-    announce["type"]       = "file_key";
-    announce["transferId"] = transferId;
-    announce["fileName"]   = fileName;
-    announce["fileSize"]   = fileData.size();
-    announce["ts"]         = QDateTime::currentSecsSinceEpoch();
+    announce["from"]        = myIdB64u();
+    announce["type"]        = "file_key";
+    announce["transferId"]  = transferId;
+    announce["fileName"]    = fileName;
+    announce["fileSize"]    = fileSize;
+    announce["fileHash"]    = CryptoEngine::toBase64Url(fileHash);
+    announce["chunkCount"]  = chunkCount;
+    announce["ts"]          = QDateTime::currentSecsSinceEpoch();
 
     const QByteArray pt = QJsonDocument(announce).toJson(QJsonDocument::Compact);
     QByteArray sealedEnv = sealForPeer(peerIdB64u, pt);
@@ -328,50 +401,67 @@ QString ChatController::sendFile(const QString& peerIdB64u,
         return {};
     }
 
-    // Send the announcement (always via mailbox for reliability)
     m_relay.sendEnvelope(sealedEnv);
 
-    // Extract the ratchet-derived key for chunk encryption
     QByteArray fileKey = m_sessionMgr->lastMessageKey();
 #ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[FILE] file_key announced for" << transferId.left(8) + "..."
-             << "to" << peerIdB64u.left(8) + "...";
+             << "to" << peerIdB64u.left(8) + "..." << "size=" << fileSize;
 #endif
 
-    const QString result = m_fileMgr.sendFileWithKey(myIdB64u(), peerIdB64u, fileKey,
-                                                      transferId, fileName, fileData);
+    // Phase 2: queue outbound state. Chunks don't fly until file_accept arrives.
+    m_fileMgr.queueOutboundFile(myIdB64u(), peerIdB64u, fileKey,
+                                 transferId, fileName, filePath,
+                                 fileSize, fileHash);
     sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
-    return result;
+    return transferId;
 }
 
 QString ChatController::sendGroupFile(const QString& groupId,
                                       const QString& groupName,
                                       const QStringList& memberPeerIds,
                                       const QString& fileName,
-                                      const QByteArray& fileData)
+                                      const QString& filePath)
 {
-    if (fileData.size() > FileTransferManager::kMaxFileBytes) {
+    QFileInfo finfo(filePath);
+    if (!finfo.exists() || !finfo.isFile()) {
+        emit status(QString("File not found: %1").arg(filePath));
+        return {};
+    }
+    const qint64 fileSize = finfo.size();
+    if (fileSize > FileTransferManager::kMaxFileBytes) {
         emit status(QString("File too large (max %1 MB).")
                         .arg(FileTransferManager::kMaxFileBytes / (1024 * 1024)));
         return {};
     }
 
+    // Hash the file once up-front (streaming) and reuse for all members.
+    const QByteArray fileHash = FileTransferManager::blake2b256File(filePath);
+    if (fileHash.size() != 32) {
+        emit status(QString("Could not hash file: %1").arg(fileName));
+        return {};
+    }
+    const int chunkCount = int((fileSize + FileTransferManager::kChunkBytes - 1)
+                                / FileTransferManager::kChunkBytes);
+
     const QString myId = myIdB64u();
     const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    // Send per-member file_key announcements through the ratchet
+    // Per-member file_key announcement, then per-member streamed send.
     for (const QString& peerId : memberPeerIds) {
         if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
 
         QJsonObject announce;
-        announce["from"]       = myId;
-        announce["type"]       = "file_key";
-        announce["transferId"] = transferId;
-        announce["fileName"]   = fileName;
-        announce["fileSize"]   = fileData.size();
-        announce["ts"]         = QDateTime::currentSecsSinceEpoch();
-        announce["groupId"]    = groupId;
-        announce["groupName"]  = groupName;
+        announce["from"]        = myId;
+        announce["type"]        = "file_key";
+        announce["transferId"]  = transferId;
+        announce["fileName"]    = fileName;
+        announce["fileSize"]    = fileSize;
+        announce["fileHash"]    = CryptoEngine::toBase64Url(fileHash);
+        announce["chunkCount"]  = chunkCount;
+        announce["ts"]          = QDateTime::currentSecsSinceEpoch();
+        announce["groupId"]     = groupId;
+        announce["groupName"]   = groupName;
 
         const QByteArray pt = QJsonDocument(announce).toJson(QJsonDocument::Compact);
         QByteArray sealedEnv = sealForPeer(peerId, pt);
@@ -388,16 +478,20 @@ QString ChatController::sendGroupFile(const QString& groupId,
                  << "to" << peerId.left(8) + "...";
 #endif
 
+        // NOTE: Phase 2 intentionally does NOT gate group files on per-member
+        // consent. Each group member would need an independent file_accept
+        // roundtrip, which complicates the N-way announcement model. Group
+        // files stream immediately (old behavior), 1:1 files use the consent
+        // gate. Group-member consent is future work.
         m_fileMgr.sendFileWithKey(myId, peerId, fileKey,
-                                  transferId, fileName, fileData,
+                                  transferId, fileName, filePath,
+                                  fileSize, fileHash,
                                   groupId, groupName);
         sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
     }
 
-    const int totalChunks = int((fileData.size() + FileTransferManager::kChunkBytes - 1)
-                                / FileTransferManager::kChunkBytes);
-    emit status(QString("'%1' queued in %2 chunk(s) -> group %3")
-                    .arg(fileName).arg(totalChunks).arg(groupName));
+    emit status(QString("'%1' streamed in %2 chunk(s) -> group %3")
+                    .arg(fileName).arg(chunkCount).arg(groupName));
     return transferId;
 }
 
@@ -419,6 +513,24 @@ void ChatController::onRelayConnected()
     qDebug() << "[ChatController] Relay connected, envelopes will be pushed.";
 #endif
     emit relayConnected();
+
+    // Phase 4: for each incomplete incoming transfer, tell the sender which
+    // chunks we still need so they can re-send them.
+    const auto pendings = m_fileMgr.pendingResumptions();
+    for (const auto& pr : pendings) {
+        QJsonArray chunks;
+        for (quint32 idx : pr.missingChunks) chunks.append(int(idx));
+        QJsonObject msg;
+        msg["type"]       = "file_request";
+        msg["transferId"] = pr.transferId;
+        msg["chunks"]     = chunks;
+        sendFileControlMessage(pr.peerId, msg);
+#ifndef QT_NO_DEBUG_OUTPUT
+        qDebug() << "[FILE] requested resumption of" << pr.transferId.left(8)
+                 << "from" << pr.peerId.left(8) + "..."
+                 << "missing" << pr.missingChunks.size() << "chunks";
+#endif
+    }
 }
 
 void ChatController::subscribePresence(const QStringList& peerIds)
@@ -445,6 +557,112 @@ void ChatController::setTurnServer(const QString& host, int port,
 void ChatController::checkPresence(const QStringList& peerIds)
 {
     m_relay.queryPresence(peerIds);
+}
+
+// ── Phase 2: file-transfer consent / cancel ──────────────────────────────────
+
+void ChatController::sendFileControlMessage(const QString& peerIdB64u,
+                                             const QJsonObject& msg)
+{
+    // Include a fresh msgId so the receiver can dedup any duplicated delivery.
+    QJsonObject payload = msg;
+    payload["from"]  = myIdB64u();
+    payload["ts"]    = QDateTime::currentSecsSinceEpoch();
+    payload["msgId"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    QByteArray sealed = sealForPeer(peerIdB64u, pt);
+    if (sealed.isEmpty()) {
+        qWarning() << "[FILE] BLOCKED — cannot seal" << msg.value("type").toString()
+                   << "for" << peerIdB64u.left(8) + "...";
+        return;
+    }
+    m_relay.sendEnvelope(sealed);
+}
+
+void ChatController::acceptFileTransfer(const QString& transferId, bool requireP2P)
+{
+    auto it = m_pendingIncomingFiles.find(transferId);
+    if (it == m_pendingIncomingFiles.end()) {
+        qWarning() << "[FILE] acceptFileTransfer: no pending transfer" << transferId.left(8);
+        return;
+    }
+
+    // Move the stashed key into the active file-keys map so chunks decrypt.
+    const QString peerId   = it->peerId;
+    const QString compound = peerId + ":" + transferId;
+    m_fileKeys[compound]     = it->fileKey;           // copy
+    m_fileKeyTimes[compound] = QDateTime::currentSecsSinceEpoch();
+
+    sodium_memzero(it->fileKey.data(), it->fileKey.size());
+    m_pendingIncomingFiles.erase(it);
+
+    QJsonObject msg;
+    msg["type"]       = "file_accept";
+    msg["transferId"] = transferId;
+    // Respect the receiver's global "no relay" preference, or the per-call override.
+    if (requireP2P || m_fileRequireP2P) msg["requireP2P"] = true;
+    sendFileControlMessage(peerId, msg);
+}
+
+void ChatController::declineFileTransfer(const QString& transferId)
+{
+    auto it = m_pendingIncomingFiles.find(transferId);
+    if (it == m_pendingIncomingFiles.end()) return;
+
+    const QString peerId = it->peerId;
+    sodium_memzero(it->fileKey.data(), it->fileKey.size());
+    m_pendingIncomingFiles.erase(it);
+
+    QJsonObject msg;
+    msg["type"]       = "file_decline";
+    msg["transferId"] = transferId;
+    // NO reason field — see privacy mitigations §4 in the plan.
+    sendFileControlMessage(peerId, msg);
+
+    emit fileTransferCanceled(transferId, true);  // receiver declined
+}
+
+void ChatController::cancelFileTransfer(const QString& transferId)
+{
+    // Figure out which role we hold for this transferId and clean up + notify.
+
+    // Outbound pending (sender canceling a queued-but-unaccepted send)?
+    const QString outboundPeer = m_fileMgr.outboundPeerFor(transferId);
+    if (!outboundPeer.isEmpty()) {
+        m_fileMgr.abandonOutboundTransfer(transferId);
+        QJsonObject msg;
+        msg["type"]       = "file_cancel";
+        msg["transferId"] = transferId;
+        sendFileControlMessage(outboundPeer, msg);
+        emit fileTransferCanceled(transferId, false);  // sender-initiated
+        return;
+    }
+
+    // Inbound, pre-accept (user changed mind before answering prompt)?
+    auto itPending = m_pendingIncomingFiles.find(transferId);
+    if (itPending != m_pendingIncomingFiles.end()) {
+        const QString peerId = itPending->peerId;
+        sodium_memzero(itPending->fileKey.data(), itPending->fileKey.size());
+        m_pendingIncomingFiles.erase(itPending);
+        QJsonObject msg;
+        msg["type"]       = "file_cancel";
+        msg["transferId"] = transferId;
+        sendFileControlMessage(peerId, msg);
+        emit fileTransferCanceled(transferId, true);   // receiver-initiated
+        return;
+    }
+
+    // Inbound, in-progress (user canceled mid-stream)?
+    const QString inboundPeer = m_fileMgr.inboundPeerFor(transferId);
+    if (!inboundPeer.isEmpty()) {
+        m_fileMgr.cancelInboundTransfer(transferId);
+        QJsonObject msg;
+        msg["type"]       = "file_cancel";
+        msg["transferId"] = transferId;
+        sendFileControlMessage(inboundPeer, msg);
+        emit fileTransferCanceled(transferId, true);
+    }
 }
 
 void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
@@ -644,6 +862,8 @@ QuicConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bo
         if (state == NICE_COMPONENT_STATE_READY) {
             const QString mode = conn->quicActive() ? "QUIC" : "ICE";
             emit status("P2P ready (" + mode + ") with " + peerIdB64u);
+            // Phase 3: flush any outbound file transfers waiting for P2P.
+            m_fileMgr.notifyP2PReady(peerIdB64u);
         } else if (state == NICE_COMPONENT_STATE_FAILED) {
             emit status("P2P failed for " + peerIdB64u);
         }
@@ -956,20 +1176,180 @@ void ChatController::onEnvelope(const QByteArray& body)
             }
 #endif // PEER2PEAR_P2P
         } else if (type == "file_key") {
-            // File key announcement: store the ratchet-derived key for chunk decryption.
-            // M4 fix: key on senderId:transferId to avoid collisions when multiple
-            // senders use the same transferId (e.g., group file transfers).
+            // File key announcement. Phase 2: evaluate consent policy BEFORE
+            // installing the key. Chunks that arrive before the user accepts
+            // will fail to find a matching key and be dropped silently.
             const QString transferId = o.value("transferId").toString();
-            if (!transferId.isEmpty() && msgKey.size() == 32) {
-                const QString compoundKey = senderId + ":" + transferId;
+            const QString fileName   = o.value("fileName").toString("file");
+            const qint64  fileSize   = o.value("fileSize").toVariant().toLongLong();
+            const QString gId        = o.value("groupId").toString();
+            const QString gName      = o.value("groupName").toString();
+
+            if (transferId.isEmpty() || msgKey.size() != 32) {
+                sodium_memzero(msgKey.data(), msgKey.size());
+                return;
+            }
+
+            const QString compoundKey = senderId + ":" + transferId;
+
+            // Evaluate global size policy.
+            // (Per-contact policy will be layered on top in a follow-up.)
+            const qint64 fileSizeMB = fileSize / (1024 * 1024);
+            bool autoAccept = false;
+            bool autoDecline = false;
+            if (fileSize > qint64(m_fileHardMaxMB) * 1024 * 1024) {
+                autoDecline = true;
+            } else if (fileSize <= qint64(m_fileAutoAcceptMaxMB) * 1024 * 1024) {
+                autoAccept = true;
+            }
+            // Group files: always auto-accept (Phase 2 defers group consent).
+            if (!gId.isEmpty() && !autoDecline) autoAccept = true;
+
+            if (autoDecline) {
+#ifndef QT_NO_DEBUG_OUTPUT
+                qDebug() << "[FILE] auto-decline" << fileName << "(" << fileSizeMB << "MB )"
+                         << "from" << senderId.left(8) + "... — exceeds hard max";
+#endif
+                QJsonObject declineMsg;
+                declineMsg["type"]       = "file_decline";
+                declineMsg["transferId"] = transferId;
+                sendFileControlMessage(senderId, declineMsg);
+                sodium_memzero(msgKey.data(), msgKey.size());
+            } else if (autoAccept) {
+                // Install key immediately so arriving chunks decrypt.
                 m_fileKeys[compoundKey] = msgKey;  // M3+M4 fix
                 m_fileKeyTimes[compoundKey] = QDateTime::currentSecsSinceEpoch();  // M8 fix
                 sodium_memzero(msgKey.data(), msgKey.size());
+
+                QJsonObject acceptMsg;
+                acceptMsg["type"]       = "file_accept";
+                acceptMsg["transferId"] = transferId;
+                if (m_fileRequireP2P) acceptMsg["requireP2P"] = true;
+                sendFileControlMessage(senderId, acceptMsg);
+
 #ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[FILE] stored ratchet key for transfer" << transferId.left(8) + "..."
+                qDebug() << "[FILE] auto-accept" << fileName << "(" << fileSizeMB << "MB)"
                          << "from" << senderId.left(8) + "...";
 #endif
+            } else {
+                // Stash in pending — don't install key yet. User will accept/decline.
+                PendingIncoming p;
+                p.peerId         = senderId;
+                p.fileName       = fileName;
+                p.fileSize       = fileSize;
+                p.fileKey        = QByteArray(msgKey.constData(), msgKey.size());
+                p.groupId        = gId;
+                p.groupName      = gName;
+                p.announcedSecs  = QDateTime::currentSecsSinceEpoch();
+                m_pendingIncomingFiles.insert(transferId, p);
+                sodium_memzero(msgKey.data(), msgKey.size());
+
+#ifndef QT_NO_DEBUG_OUTPUT
+                qDebug() << "[FILE] prompt needed for" << fileName << "(" << fileSizeMB << "MB)"
+                         << "from" << senderId.left(8) + "...";
+#endif
+                emit fileAcceptRequested(senderId, transferId, fileName, fileSize);
             }
+
+        } else if (type == "file_accept") {
+            // Sender-side: receiver agreed to the transfer.
+            const QString transferId = o.value("transferId").toString();
+            const bool requireP2P    = o.value("requireP2P").toBool(false);
+            if (!transferId.isEmpty()) {
+                // Sender's side of the "no relay" preference (global toggle).
+                // Desktop surfaces this via the "Require direct connection"
+                // setting too — not privacy-level yet; that can come later.
+                const bool senderRequiresP2P = m_fileRequireP2P;
+
+                // Is P2P ready for this peer right now?
+                bool p2pReady = false;
+#ifdef PEER2PEAR_P2P
+                if (m_p2pConnections.contains(senderId) &&
+                    m_p2pConnections[senderId]->isReady()) {
+                    p2pReady = true;
+                }
+#endif
+
+                if (!m_fileMgr.startOutboundStream(transferId, requireP2P,
+                                                    senderRequiresP2P, p2pReady)) {
+                    qWarning() << "[FILE] file_accept for unknown transferId"
+                               << transferId.left(8);
+                    return;
+                }
+
+#ifdef PEER2PEAR_P2P
+                // If P2P isn't up yet and the file was large, kick off ICE so
+                // the WaitingForP2P state has something to wait for.
+                if (!p2pReady) initiateP2PConnection(senderId);
+#endif
+            }
+
+        } else if (type == "file_decline") {
+            // Sender-side: receiver refused. Drop outbound state, notify UI.
+            const QString transferId = o.value("transferId").toString();
+            if (!transferId.isEmpty()) {
+                m_fileMgr.abandonOutboundTransfer(transferId);
+                emit fileTransferCanceled(transferId, true); // byReceiver
+                emit status("File transfer declined by recipient.");
+            }
+
+        } else if (type == "file_ack") {
+            // Sender-side: receiver confirmed delivery + hash ok.
+            const QString transferId = o.value("transferId").toString();
+            if (!transferId.isEmpty()) {
+                emit fileTransferDelivered(transferId);
+                // Phase 4: drop sender-side state now that the transfer is acked.
+                m_fileMgr.forgetSentTransfer(transferId);
+            }
+
+        } else if (type == "file_request") {
+            // Receiver is asking us (sender) to re-send these chunk indices.
+            // Phase 4 resumption path.
+            const QString transferId = o.value("transferId").toString();
+            const QJsonArray chunksArr = o.value("chunks").toArray();
+            if (transferId.isEmpty() || chunksArr.isEmpty()) return;
+            QList<quint32> indices;
+            indices.reserve(chunksArr.size());
+            for (const QJsonValue& v : chunksArr) {
+                const int i = v.toInt(-1);
+                if (i >= 0) indices.append(quint32(i));
+            }
+            if (!m_fileMgr.resendChunks(transferId, indices)) {
+                qWarning() << "[FILE] file_request for unknown transferId"
+                           << transferId.left(8) + "...";
+            }
+
+        } else if (type == "file_cancel") {
+            // Either side: the peer canceled. Figure out which role we're in.
+            const QString transferId = o.value("transferId").toString();
+            if (transferId.isEmpty()) return;
+
+            // Outbound (we're the sender)?
+            if (!m_fileMgr.outboundPeerFor(transferId).isEmpty()) {
+                m_fileMgr.abandonOutboundTransfer(transferId);
+                // Phase 4: also drop the sent-transfer DB row in case we were mid-stream.
+                m_fileMgr.forgetSentTransfer(transferId);
+                emit fileTransferCanceled(transferId, true); // canceled by receiver
+                return;
+            }
+            // Also handle "sender was already streaming when receiver canceled":
+            // m_outboundPending is empty, but m_sentTransfers has the record.
+            m_fileMgr.forgetSentTransfer(transferId);
+
+            // Inbound pending (we were about to prompt)?
+            auto itPending = m_pendingIncomingFiles.find(transferId);
+            if (itPending != m_pendingIncomingFiles.end()) {
+                sodium_memzero(itPending->fileKey.data(), itPending->fileKey.size());
+                m_pendingIncomingFiles.erase(itPending);
+                emit fileTransferCanceled(transferId, false); // sender canceled
+                return;
+            }
+            // Inbound in-progress (sender pulled the plug mid-stream)?
+            if (!m_fileMgr.inboundPeerFor(transferId).isEmpty()) {
+                m_fileMgr.cancelInboundTransfer(transferId);
+                emit fileTransferCanceled(transferId, false);
+            }
+
         } else if (type == "kem_pub_announce") {
             // Post-quantum KEM public key exchange — store the peer's ML-KEM-768 pub
             QByteArray kemPub = CryptoEngine::fromBase64Url(o.value("kem_pub_b64u").toString());

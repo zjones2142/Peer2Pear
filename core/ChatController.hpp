@@ -34,18 +34,18 @@ public:
     // Send encrypted text to a peer
     void sendText(const QString& peerIdB64u, const QString& text);
 
-    // Send an encrypted file via FileTransferManager.
+    // Send an encrypted file via FileTransferManager — path-based, streams from disk.
     // Returns the transferId on success or an empty string on failure.
     QString sendFile(const QString& peerIdB64u,
                      const QString& fileName,
-                     const QByteArray& fileData);
+                     const QString& filePath);
 
-    // Send an encrypted file to every member of a group chat.
+    // Send an encrypted file to every member of a group chat — path-based.
     QString sendGroupFile(const QString& groupId,
                           const QString& groupName,
                           const QStringList& memberPeerIds,
                           const QString& fileName,
-                          const QByteArray& fileData);
+                          const QString& filePath);
 
     // Maximum allowed file size in bytes (25 MB).
     static constexpr qint64 maxFileBytes() { return FileTransferManager::kMaxFileBytes; }
@@ -92,6 +92,31 @@ public:
     const QMap<QString, qint64>& groupSeqOut() const { return m_groupSeqOut; }
     const QMap<QString, qint64>& groupSeqIn()  const { return m_groupSeqIn;  }
 
+    // ── Phase 2: file-transfer consent ──────────────────────────────────────
+
+    /// Accept a pending incoming file transfer. Installs the ratchet-derived
+    /// file key so subsequent chunks decrypt, and sends file_accept to the sender.
+    /// requireP2P tells the sender "I refuse relay fallback for this transfer"
+    /// (Phase 3 enforces it; for now just forwarded in the file_accept message).
+    void acceptFileTransfer(const QString& transferId, bool requireP2P = false);
+
+    /// Decline a pending incoming file transfer. Discards the stashed key and
+    /// sends file_decline (no reason field — anti-probing).
+    void declineFileTransfer(const QString& transferId);
+
+    /// Cancel an in-flight transfer — works for both outbound and inbound.
+    /// Sender: aborts streaming, drops state. Receiver: closes + deletes partial.
+    /// Sends file_cancel to the peer.
+    void cancelFileTransfer(const QString& transferId);
+
+    /// Global consent settings (persisted by the caller via DatabaseManager).
+    void setFileAutoAcceptMaxMB(int mb) { m_fileAutoAcceptMaxMB = mb; }
+    void setFileHardMaxMB(int mb)       { m_fileHardMaxMB       = mb; }
+    void setFileRequireP2P(bool on)     { m_fileRequireP2P      = on; }
+    int  fileAutoAcceptMaxMB() const    { return m_fileAutoAcceptMaxMB; }
+    int  fileHardMaxMB() const          { return m_fileHardMaxMB; }
+    bool fileRequireP2P() const         { return m_fileRequireP2P; }
+
 signals:
     void status(const QString& s);
     void relayConnected();
@@ -125,9 +150,34 @@ signals:
     // doesn't understand hybrid PQ Noise messages.
     void peerMayNeedUpgrade(const QString& peerIdB64u);
 
+    // ── Phase 2: file consent / cancellation signals ────────────────────────
+
+    /// Receiver-side: an incoming file transfer needs user consent.
+    /// UI should prompt Accept / Decline (with optional "require direct connection").
+    void fileAcceptRequested(const QString& fromPeerIdB64u,
+                             const QString& transferId,
+                             const QString& fileName,
+                             qint64 fileSize);
+
+    /// Either direction: transfer was canceled, declined, or abandoned.
+    /// byReceiver = true  → sender lost the race (receiver declined/canceled)
+    /// byReceiver = false → receiver lost the race (sender canceled/gave up)
+    void fileTransferCanceled(const QString& transferId, bool byReceiver);
+
+    /// Phase 3: receiver confirmed the full file arrived with a valid hash.
+    /// Sender-side UI should flip the record to Delivered.
+    void fileTransferDelivered(const QString& transferId);
+
+    /// Phase 3: the transport policy (Privacy Level 2 or fileRequireP2P)
+    /// blocked the transfer after P2P failed to come up in time.
+    /// byReceiver = true → receiver's requireP2P refused relay fallback
+    /// byReceiver = false → our own privacy setting refused relay fallback
+    void fileTransferBlocked(const QString& transferId, bool byReceiver);
+
     // Emitted each time a chunk of an incoming transfer arrives.
-    // chunksReceived == chunksTotal signals completion; fileData contains
-    // the fully reassembled plaintext only at that final emission.
+    // chunksReceived == chunksTotal signals completion; savedPath is the
+    // on-disk location of the received file (non-empty only when complete).
+    // Files are streamed to disk — no full-file buffer is ever held in RAM.
     // groupId is non-empty when this file was sent to a group chat.
     void fileChunkReceived(const QString& fromPeerIdB64u,
                            const QString& transferId,
@@ -135,7 +185,7 @@ signals:
                            qint64         fileSize,
                            int            chunksReceived,
                            int            chunksTotal,
-                           const QByteArray& fileData,   // non-empty only when complete
+                           const QString& savedPath,     // non-empty only when complete
                            const QDateTime& timestamp,
                            const QString& groupId = {},
                            const QString& groupName = {});
@@ -194,10 +244,34 @@ private:
     void announceKemPub(const QString& peerIdB64u);
 
     // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
-    // Populated by file_key announcements, consumed by handleFileEnvelope()
+    // Populated by file_key announcements (after consent), consumed by handleFileEnvelope()
     QMap<QString, QByteArray> m_fileKeys;
     // M8 fix: creation timestamps for m_fileKeys entries (epoch seconds)
     QMap<QString, qint64> m_fileKeyTimes;
+
+    // ── Phase 2: incoming file transfers awaiting user consent ──────────────
+    // When a file_key arrives but policy says "prompt", we stash the key here
+    // (instead of m_fileKeys) so chunks arriving before the user responds will
+    // drop silently. On accept → move into m_fileKeys. On decline → zero + drop.
+    struct PendingIncoming {
+        QString    peerId;
+        QString    fileName;
+        qint64     fileSize    = 0;
+        QByteArray fileKey;            // 32 bytes, zeroed on drop
+        QString    groupId;
+        QString    groupName;
+        qint64     announcedSecs = 0;
+    };
+    QMap<QString, PendingIncoming> m_pendingIncomingFiles;
+
+    // Consent settings (persisted by the application via DatabaseManager).
+    // Defaults match v1 behavior: everything below hard-max auto-accepts.
+    int  m_fileAutoAcceptMaxMB = 100;  // everything ≤ this auto-accepts
+    int  m_fileHardMaxMB       = 100;  // anything > this auto-declines
+    bool m_fileRequireP2P      = false;
+
+    // Internal: construct and route control messages via ratchet.
+    void sendFileControlMessage(const QString& peerIdB64u, const QJsonObject& msg);
 
     // H3 fix: per-sender envelope rate limiting
     // Tracks (senderId -> count) within current poll cycle; reset each poll.

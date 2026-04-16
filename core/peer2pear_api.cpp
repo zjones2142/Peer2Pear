@@ -163,11 +163,25 @@ struct p2p_context {
         void* presence_ud = nullptr;
 
         void (*on_file_progress)(const char*, const char*, const char*,
-                                 int64_t, int, int, const uint8_t*, int, int64_t, void*) = nullptr;
+                                 int64_t, int, int, const char*, int64_t, void*) = nullptr;
         void* file_progress_ud = nullptr;
 
         void (*on_avatar)(const char*, const char*, const char*, void*) = nullptr;
         void* avatar_ud = nullptr;
+
+        // Phase 2
+        void (*on_file_request)(const char*, const char*, const char*, int64_t, void*) = nullptr;
+        void* file_request_ud = nullptr;
+
+        void (*on_file_canceled)(const char*, int, void*) = nullptr;
+        void* file_canceled_ud = nullptr;
+
+        // Phase 3
+        void (*on_file_delivered)(const char*, void*) = nullptr;
+        void* file_delivered_ud = nullptr;
+
+        void (*on_file_blocked)(const char*, int, void*) = nullptr;
+        void* file_blocked_ud = nullptr;
     } cb;
 
     QString dataDir;
@@ -249,19 +263,18 @@ static void wire_signals(p2p_context* ctx)
     QObject::connect(c, &ChatController::fileChunkReceived,
         [ctx](const QString& from, const QString& transferId,
               const QString& fileName, qint64 fileSize,
-              int chunksRcvd, int chunksTotal, const QByteArray& fileData,
+              int chunksRcvd, int chunksTotal, const QString& savedPath,
               const QDateTime& ts, const QString& /*groupId*/,
               const QString& /*groupName*/) {
         if (ctx->cb.on_file_progress) {
             const QByteArray f = from.toUtf8();
             const QByteArray tid = transferId.toUtf8();
             const QByteArray fn = fileName.toUtf8();
+            const QByteArray sp = savedPath.toUtf8();
             ctx->cb.on_file_progress(
                 f.constData(), tid.constData(), fn.constData(),
                 fileSize, chunksRcvd, chunksTotal,
-                fileData.isEmpty() ? nullptr
-                    : reinterpret_cast<const uint8_t*>(fileData.constData()),
-                fileData.size(),
+                savedPath.isEmpty() ? nullptr : sp.constData(),
                 ts.toSecsSinceEpoch(),
                 ctx->cb.file_progress_ud);
         }
@@ -275,6 +288,48 @@ static void wire_signals(p2p_context* ctx)
             const QByteArray a = b64.toUtf8();
             ctx->cb.on_avatar(p.constData(), n.constData(), a.constData(),
                               ctx->cb.avatar_ud);
+        }
+    });
+
+    // Phase 2: file-consent prompt.
+    QObject::connect(c, &ChatController::fileAcceptRequested,
+        [ctx](const QString& from, const QString& tid,
+              const QString& fileName, qint64 fileSize) {
+        if (ctx->cb.on_file_request) {
+            const QByteArray f  = from.toUtf8();
+            const QByteArray t  = tid.toUtf8();
+            const QByteArray fn = fileName.toUtf8();
+            ctx->cb.on_file_request(f.constData(), t.constData(), fn.constData(),
+                                    fileSize, ctx->cb.file_request_ud);
+        }
+    });
+
+    // Phase 2: transfer canceled/declined either direction.
+    QObject::connect(c, &ChatController::fileTransferCanceled,
+        [ctx](const QString& tid, bool byReceiver) {
+        if (ctx->cb.on_file_canceled) {
+            const QByteArray t = tid.toUtf8();
+            ctx->cb.on_file_canceled(t.constData(), byReceiver ? 1 : 0,
+                                     ctx->cb.file_canceled_ud);
+        }
+    });
+
+    // Phase 3: delivery confirmation.
+    QObject::connect(c, &ChatController::fileTransferDelivered,
+        [ctx](const QString& tid) {
+        if (ctx->cb.on_file_delivered) {
+            const QByteArray t = tid.toUtf8();
+            ctx->cb.on_file_delivered(t.constData(), ctx->cb.file_delivered_ud);
+        }
+    });
+
+    // Phase 3: transport-policy blocked.
+    QObject::connect(c, &ChatController::fileTransferBlocked,
+        [ctx](const QString& tid, bool byReceiver) {
+        if (ctx->cb.on_file_blocked) {
+            const QByteArray t = tid.toUtf8();
+            ctx->cb.on_file_blocked(t.constData(), byReceiver ? 1 : 0,
+                                    ctx->cb.file_blocked_ud);
         }
     });
 }
@@ -353,17 +408,53 @@ int p2p_send_group_text(p2p_context* ctx,
 const char* p2p_send_file(p2p_context* ctx,
                           const char* peer_id,
                           const char* file_name,
-                          const uint8_t* file_data,
-                          int file_len)
+                          const char* file_path)
 {
-    if (!ctx || !peer_id || !file_name || !file_data) return nullptr;
+    if (!ctx || !peer_id || !file_name || !file_path) return nullptr;
     QString tid = ctx->controller.sendFile(
         QString::fromUtf8(peer_id),
         QString::fromUtf8(file_name),
-        QByteArray(reinterpret_cast<const char*>(file_data), file_len));
+        QString::fromUtf8(file_path));
     if (tid.isEmpty()) return nullptr;
     ctx->scratch = tid.toStdString();
     return ctx->scratch.c_str();
+}
+
+// ── Phase 2: file consent + cancel ──────────────────────────────────────────
+
+void p2p_respond_file_request(p2p_context* ctx,
+                              const char* transfer_id,
+                              int accept,
+                              int require_p2p)
+{
+    if (!ctx || !transfer_id) return;
+    const QString tid = QString::fromUtf8(transfer_id);
+    if (accept) {
+        ctx->controller.acceptFileTransfer(tid, require_p2p != 0);
+    } else {
+        ctx->controller.declineFileTransfer(tid);
+    }
+}
+
+void p2p_cancel_transfer(p2p_context* ctx, const char* transfer_id)
+{
+    if (!ctx || !transfer_id) return;
+    ctx->controller.cancelFileTransfer(QString::fromUtf8(transfer_id));
+}
+
+void p2p_set_file_auto_accept_mb(p2p_context* ctx, int mb)
+{
+    if (ctx) ctx->controller.setFileAutoAcceptMaxMB(mb);
+}
+
+void p2p_set_file_hard_max_mb(p2p_context* ctx, int mb)
+{
+    if (ctx) ctx->controller.setFileHardMaxMB(mb);
+}
+
+void p2p_set_file_require_p2p(p2p_context* ctx, int enabled)
+{
+    if (ctx) ctx->controller.setFileRequireP2P(enabled != 0);
 }
 
 void p2p_check_presence(p2p_context* ctx, const char** peer_ids, int count)
@@ -475,7 +566,7 @@ void p2p_set_on_presence(p2p_context* ctx,
 
 void p2p_set_on_file_progress(p2p_context* ctx,
     void (*cb)(const char*, const char*, const char*,
-               int64_t, int, int, const uint8_t*, int, int64_t, void*),
+               int64_t, int, int, const char*, int64_t, void*),
     void* ud)
 {
     if (!ctx) return;
@@ -490,4 +581,40 @@ void p2p_set_on_avatar(p2p_context* ctx,
     if (!ctx) return;
     ctx->cb.on_avatar = cb;
     ctx->cb.avatar_ud = ud;
+}
+
+void p2p_set_on_file_request(p2p_context* ctx,
+    void (*cb)(const char*, const char*, const char*, int64_t, void*),
+    void* ud)
+{
+    if (!ctx) return;
+    ctx->cb.on_file_request    = cb;
+    ctx->cb.file_request_ud    = ud;
+}
+
+void p2p_set_on_file_canceled(p2p_context* ctx,
+    void (*cb)(const char*, int, void*),
+    void* ud)
+{
+    if (!ctx) return;
+    ctx->cb.on_file_canceled    = cb;
+    ctx->cb.file_canceled_ud    = ud;
+}
+
+void p2p_set_on_file_delivered(p2p_context* ctx,
+    void (*cb)(const char*, void*),
+    void* ud)
+{
+    if (!ctx) return;
+    ctx->cb.on_file_delivered    = cb;
+    ctx->cb.file_delivered_ud    = ud;
+}
+
+void p2p_set_on_file_blocked(p2p_context* ctx,
+    void (*cb)(const char*, int, void*),
+    void* ud)
+{
+    if (!ctx) return;
+    ctx->cb.on_file_blocked    = cb;
+    ctx->cb.file_blocked_ud    = ud;
 }

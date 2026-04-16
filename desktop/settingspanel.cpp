@@ -86,6 +86,9 @@ void SettingsPanel::buildUI()
     // ── Data section (import / export) ──────────────────────────────────────
     bodyLayout->addWidget(makeDataSection());
 
+    // ── File transfer settings ──────────────────────────────────────────────
+    bodyLayout->addWidget(makeFileTransferSection());
+
     // ── About section ─────────────────────────────────────────────────────────
     bodyLayout->addWidget(makeSection("ABOUT", {
                                                 { "Version",  "0.1.0"     },
@@ -214,6 +217,27 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
     const QString saved = m_db->loadSetting("notificationsEnabled", "true");
     m_notificationsEnabled = (saved == "true");
     applyNotificationState();
+
+    // Phase 2: load file-transfer consent settings. Defaults preserve v1
+    // behavior (everything ≤100 MB accepts, no relay requirement).
+    const int softMB = m_db->loadSetting("fileAutoAcceptMaxMB", "100").toInt();
+    const int hardMB = m_db->loadSetting("fileHardMaxMB",       "100").toInt();
+    if (m_fileAutoAcceptSpin) {
+        QSignalBlocker blocker(m_fileAutoAcceptSpin);
+        m_fileAutoAcceptSpin->setValue(softMB);
+    }
+    if (m_fileHardMaxSpin) {
+        QSignalBlocker blocker(m_fileHardMaxSpin);
+        m_fileHardMaxSpin->setValue(hardMB);
+    }
+
+    m_requireP2PEnabled = (m_db->loadSetting("fileRequireP2P", "false") == "true");
+    applyRequireP2PState();
+
+    // Emit initial values so MainWindow/ChatController sync up.
+    emit fileAutoAcceptMaxChanged(softMB);
+    emit fileHardMaxChanged(hardMB);
+    emit fileRequireP2PToggled(m_requireP2PEnabled);
 }
 
 void SettingsPanel::applyNotificationState()
@@ -724,4 +748,230 @@ QWidget *SettingsPanel::makeAboutHelpSection()
     cardLayout->addWidget(guideLabel);
 
     return card;
+}
+
+// ── Phase 2: File transfer consent ───────────────────────────────────────────
+
+QWidget *SettingsPanel::makeFileTransferSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    QLabel *heading = new QLabel("FILE TRANSFERS");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    auto addDivider = [&]() {
+        QFrame *div = new QFrame();
+        div->setFrameShape(QFrame::HLine);
+        div->setStyleSheet(
+            "color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;"
+            );
+        cardLayout->addWidget(div);
+    };
+
+    // Shared row-row style for the two SpinBox rows.
+    auto makeSpinRow = [&](const QString &labelText, const QString &sublabelText,
+                            QSpinBox *spin, int defaultMB) -> QWidget * {
+        QWidget *row = new QWidget();
+        row->setStyleSheet("background: transparent; border: none;");
+
+        QVBoxLayout *rv = new QVBoxLayout(row);
+        rv->setContentsMargins(16, 10, 16, 10);
+        rv->setSpacing(4);
+
+        QHBoxLayout *top = new QHBoxLayout();
+        top->setContentsMargins(0, 0, 0, 0);
+        top->setSpacing(8);
+
+        QLabel *mainLbl = new QLabel(labelText);
+        mainLbl->setStyleSheet(
+            "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+            );
+
+        spin->setRange(1, 10000);
+        spin->setValue(defaultMB);
+        spin->setSuffix(" MB");
+        spin->setFixedWidth(110);
+        spin->setStyleSheet(
+            "QSpinBox {"
+            "  background-color: #1a1a1a;"
+            "  color: #e0e0e0;"
+            "  border: 1px solid #2a2a2a;"
+            "  border-radius: 6px;"
+            "  padding: 3px 6px;"
+            "  font-size: 13px;"
+            "}"
+            );
+
+        top->addWidget(mainLbl);
+        top->addStretch();
+        top->addWidget(spin);
+        rv->addLayout(top);
+
+        QLabel *subLbl = new QLabel(sublabelText);
+        subLbl->setStyleSheet(
+            "color: #777777; font-size: 11px; background: transparent; border: none;"
+            );
+        subLbl->setWordWrap(true);
+        rv->addWidget(subLbl);
+
+        return row;
+    };
+
+    // Auto-accept row
+    m_fileAutoAcceptSpin = new QSpinBox();
+    cardLayout->addWidget(makeSpinRow(
+        "Auto-accept files up to",
+        "Files at or below this size download without asking.",
+        m_fileAutoAcceptSpin,
+        100));
+    connect(m_fileAutoAcceptSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &SettingsPanel::onFileAutoAcceptSpin);
+
+    addDivider();
+
+    // Hard max row
+    m_fileHardMaxSpin = new QSpinBox();
+    cardLayout->addWidget(makeSpinRow(
+        "Never accept files larger than",
+        "Files above this size are declined automatically, no notification.",
+        m_fileHardMaxSpin,
+        100));
+    connect(m_fileHardMaxSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &SettingsPanel::onFileHardMaxSpin);
+
+    addDivider();
+
+    // Require P2P toggle row
+    QWidget *p2pRow = new QWidget();
+    p2pRow->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *pv = new QVBoxLayout(p2pRow);
+    pv->setContentsMargins(16, 10, 16, 10);
+    pv->setSpacing(4);
+
+    QHBoxLayout *p2pTop = new QHBoxLayout();
+    p2pTop->setContentsMargins(0, 0, 0, 0);
+    p2pTop->setSpacing(8);
+
+    QLabel *p2pLabel = new QLabel("Require direct connection for files");
+    p2pLabel->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+
+    m_requireP2PStatusLbl = new QLabel("Off");
+    m_requireP2PStatusLbl->setStyleSheet(
+        "color: #888888; font-size: 13px; background: transparent; border: none;"
+        );
+    m_requireP2PStatusLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    m_requireP2PToggleBtn = new QPushButton("Enable");
+    m_requireP2PToggleBtn->setFixedSize(76, 28);
+    m_requireP2PToggleBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #1a2a1a;"
+        "  color: #77cc77;"
+        "  border: 1px solid #2e5e2e;"
+        "  border-radius: 6px;"
+        "  font-size: 12px;"
+        "}"
+        "QPushButton:hover { background-color: #203020; }"
+        );
+    connect(m_requireP2PToggleBtn, &QPushButton::clicked,
+            this, &SettingsPanel::onToggleRequireP2P);
+
+    p2pTop->addWidget(p2pLabel);
+    p2pTop->addStretch();
+    p2pTop->addWidget(m_requireP2PStatusLbl);
+    p2pTop->addSpacing(8);
+    p2pTop->addWidget(m_requireP2PToggleBtn);
+    pv->addLayout(p2pTop);
+
+    QLabel *p2pSub = new QLabel(
+        "If on, files from contacts are only accepted when a direct P2P "
+        "connection is available. Relayed files are refused."
+        );
+    p2pSub->setStyleSheet(
+        "color: #777777; font-size: 11px; background: transparent; border: none;"
+        );
+    p2pSub->setWordWrap(true);
+    pv->addWidget(p2pSub);
+
+    cardLayout->addWidget(p2pRow);
+
+    return card;
+}
+
+void SettingsPanel::onFileAutoAcceptSpin(int mb)
+{
+    if (m_db) m_db->saveSetting("fileAutoAcceptMaxMB", QString::number(mb));
+    emit fileAutoAcceptMaxChanged(mb);
+}
+
+void SettingsPanel::onFileHardMaxSpin(int mb)
+{
+    if (m_db) m_db->saveSetting("fileHardMaxMB", QString::number(mb));
+    emit fileHardMaxChanged(mb);
+}
+
+void SettingsPanel::onToggleRequireP2P()
+{
+    m_requireP2PEnabled = !m_requireP2PEnabled;
+    if (m_db) m_db->saveSetting("fileRequireP2P",
+                                 m_requireP2PEnabled ? "true" : "false");
+    applyRequireP2PState();
+    emit fileRequireP2PToggled(m_requireP2PEnabled);
+}
+
+void SettingsPanel::applyRequireP2PState()
+{
+    if (!m_requireP2PStatusLbl || !m_requireP2PToggleBtn) return;
+    if (m_requireP2PEnabled) {
+        m_requireP2PStatusLbl->setText("On");
+        m_requireP2PStatusLbl->setStyleSheet(
+            "color: #4caf50; font-size: 13px; background: transparent; border: none;"
+            );
+        m_requireP2PToggleBtn->setText("Disable");
+        m_requireP2PToggleBtn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #2e1a1a;"
+            "  color: #cc5555;"
+            "  border: 1px solid #5e2e2e;"
+            "  border-radius: 6px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: #3a2020; }"
+            );
+    } else {
+        m_requireP2PStatusLbl->setText("Off");
+        m_requireP2PStatusLbl->setStyleSheet(
+            "color: #888888; font-size: 13px; background: transparent; border: none;"
+            );
+        m_requireP2PToggleBtn->setText("Enable");
+        m_requireP2PToggleBtn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1a2a1a;"
+            "  color: #77cc77;"
+            "  border: 1px solid #2e5e2e;"
+            "  border-radius: 6px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: #203020; }"
+            );
+    }
 }

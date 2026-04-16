@@ -7,6 +7,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFrame>
+#include <QSpinBox>
 
 class DatabaseManager;
 
@@ -32,18 +33,28 @@ signals:
     void exportContactsClicked();
     void importContactsClicked();
 
+    // Phase 2: file-transfer consent settings changed.
+    void fileAutoAcceptMaxChanged(int mb);
+    void fileHardMaxChanged(int mb);
+    void fileRequireP2PToggled(bool on);
+
 private slots:
     void onToggleNotifications();
     void onToggleDnd();
+    void onFileAutoAcceptSpin(int mb);
+    void onFileHardMaxSpin(int mb);
+    void onToggleRequireP2P();
 
 private:
     void buildUI();
     void applyNotificationState();   // sync UI labels to m_notificationsEnabled
+    void applyRequireP2PState();
     QWidget *makeProfileSection();
     QWidget *makeSection(const QString &sectionTitle,
                          const QList<QPair<QString, QString>> &rows);
     QWidget *makeNotificationsSection();
     QWidget *makeDataSection();
+    QWidget *makeFileTransferSection();
     QWidget *makeAboutHelpSection();
 
     // Profile
@@ -64,6 +75,13 @@ private:
     bool         m_dndEnabled           = false;
     QPushButton *m_dndToggleBtn         = nullptr;
     QLabel      *m_dndStatusLabel       = nullptr;
+
+    // Phase 2: file-transfer consent
+    QSpinBox    *m_fileAutoAcceptSpin   = nullptr;  // MB
+    QSpinBox    *m_fileHardMaxSpin      = nullptr;  // MB
+    bool         m_requireP2PEnabled    = false;
+    QPushButton *m_requireP2PToggleBtn  = nullptr;
+    QLabel      *m_requireP2PStatusLbl  = nullptr;
 };
 
 #endif // SETTINGSPANEL_H

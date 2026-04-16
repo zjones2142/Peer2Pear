@@ -67,18 +67,34 @@ public slots:
     void onGroupRenamed(const QString &groupId, const QString &newName);
     void onGroupAvatarReceived(const QString &groupId, const QString &avatarB64);
 
-    // Fired for every arriving chunk.
-    // fileData is non-empty only when chunksReceived == chunksTotal (transfer complete).
+    // Fired for every arriving chunk. Files are streamed to disk by
+    // FileTransferManager — savedPath is the on-disk location of the final
+    // file and is non-empty only when chunksReceived == chunksTotal.
     void onFileChunkReceived(const QString &fromPeerIdB64u,
                              const QString &transferId,
                              const QString &fileName,
                              qint64         fileSize,
                              int            chunksReceived,
                              int            chunksTotal,
-                             const QByteArray &fileData,
+                             const QString &savedPath,
                              const QDateTime  &timestamp,
                              const QString &groupId = {},
                              const QString &groupName = {});
+
+    // Phase 2: a peer is offering a file and needs consent.
+    void onFileAcceptRequested(const QString &fromPeerIdB64u,
+                               const QString &transferId,
+                               const QString &fileName,
+                               qint64 fileSize);
+
+    // Phase 2: transfer was canceled/declined by either side.
+    void onFileTransferCanceled(const QString &transferId, bool byReceiver);
+
+    // Phase 3: sender-side — receiver confirmed delivery.
+    void onFileTransferDelivered(const QString &transferId);
+
+    // Phase 3: transport policy blocked the transfer (no P2P + requireP2P on).
+    void onFileTransferBlocked(const QString &transferId, bool byReceiver);
 
 signals:
     void unreadChanged(int totalUnread);

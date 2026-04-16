@@ -956,7 +956,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
                                    qint64         fileSize,
                                    int            chunksReceived,
                                    int            chunksTotal,
-                                   const QByteArray &fileData,
+                                   const QString &savedPath,
                                    const QDateTime  &timestamp,
                                    const QString &groupId,
                                    const QString &groupName)
@@ -1017,29 +1017,17 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
     const bool complete = (chunksReceived == chunksTotal);
 
     if (complete) {
-        rec->status = FileTransferStatus::Complete;
         m_chats[chatIndex].lastActive = QDateTime::currentDateTimeUtc();
 
-        // Auto-save to Downloads/Peer2Pear/<transferId>/filename
-        // Sanitise filename: strip path separators to prevent directory traversal
-        const QString safeName = QFileInfo(fileName).fileName().isEmpty()
-                                     ? "file"
-                                     : QFileInfo(fileName).fileName();
-        const QString saveDir = QStandardPaths::writableLocation(
-                                    QStandardPaths::DownloadLocation)
-                                + "/Peer2Pear/" + transferId;
-        QDir().mkpath(saveDir);
-        const QString savePath = saveDir + "/" + safeName;
-        QFile f(savePath);
-        bool saved = false;
-        if (f.open(QIODevice::WriteOnly)) {
-            f.write(fileData);
-            f.close();
-            saved = true;
-            rec->savedPath = savePath;
+        // FileTransferManager has already streamed the file to disk at savedPath.
+        // An empty savedPath means the transfer failed (hash mismatch, write error, etc).
+        const bool saved = !savedPath.isEmpty() && QFileInfo::exists(savedPath);
+        if (saved) {
+            rec->status    = FileTransferStatus::Complete;
+            rec->savedPath = savedPath;
         } else {
-            qWarning() << "Could not auto-save file to" << savePath << ":" << f.errorString();
             rec->status = FileTransferStatus::Failed;
+            qWarning() << "File transfer failed:" << fileName << "(no savedPath)";
         }
 
         if (m_db) m_db->saveFileRecord(key, *rec);
@@ -1049,7 +1037,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
             const QString senderName = m_chats[chatIndex].name;
             const QString toastMsg = saved
                 ? QString("📎 %1 from %2").arg(fileName, senderName)
-                : QString("⚠ File from %1 could not be saved: %2").arg(senderName, fileName);
+                : QString("⚠ File from %1 failed: %2").arg(senderName, fileName);
             showToast(toastMsg);
             if (m_notifier)
                 m_notifier->notify(senderName, toastMsg);
@@ -1183,23 +1171,22 @@ void ChatView::onAttachFile()
         QStandardPaths::writableLocation(QStandardPaths::HomeLocation));
     if (path.isEmpty()) return;
 
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        QMessageBox::warning(m_ui->centralwidget, "Error",
-                             "Could not open file: " + f.errorString());
+    // Path-based: we never load the file into RAM. Just stat its size.
+    QFileInfo finfo(path);
+    if (!finfo.exists() || !finfo.isFile()) {
+        QMessageBox::warning(m_ui->centralwidget, "Error", "File not found.");
         return;
     }
-    const QByteArray data = f.readAll();
-    f.close();
-
-    constexpr qint64 kMax = ChatController::maxFileBytes();   // 25 MB
-    if (data.size() > kMax) {
+    const qint64 fileSize = finfo.size();
+    constexpr qint64 kMax = ChatController::maxFileBytes();
+    if (fileSize > kMax) {
         QMessageBox::warning(m_ui->centralwidget, "File Too Large",
-                             "Maximum file size is 25 MB.\nThis file is " + formatFileSize(data.size()) + ".");
+                             QString("Maximum file size is %1 MB.\nThis file is %2.")
+                                 .arg(kMax / (1024 * 1024)).arg(formatFileSize(fileSize)));
         return;
     }
 
-    const QString fileName = QFileInfo(path).fileName();
+    const QString fileName = finfo.fileName();
 
     // ── Send to all keys for this contact / group ──────────────────────────────
     QString localTransferId;
@@ -1208,30 +1195,29 @@ void ChatView::onAttachFile()
 
     if (chat.isGroup) {
         localTransferId = m_controller->sendGroupFile(
-            chat.groupId, chat.name, chat.keys, fileName, data);
+            chat.groupId, chat.name, chat.keys, fileName, path);
         if (!localTransferId.isEmpty())
-            totalChunks = int((data.size() + kChunk - 1) / kChunk);
+            totalChunks = int((fileSize + kChunk - 1) / kChunk);
     } else {
         // 1:1: send to every key belonging to this contact
         for (const QString &key : chat.keys) {
             if (key.trimmed().isEmpty()) continue;
-            const QString tid = m_controller->sendFile(key.trimmed(), fileName, data);
+            const QString tid = m_controller->sendFile(key.trimmed(), fileName, path);
             if (!tid.isEmpty() && localTransferId.isEmpty()) {
                 localTransferId = tid;
-                totalChunks = int((data.size() + kChunk - 1) / kChunk);
+                totalChunks = int((fileSize + kChunk - 1) / kChunk);
             }
         }
     }
 
     if (localTransferId.isEmpty()) return; // all keys failed
 
-    // Record sent transfer with accurate chunk count and Sending status.
-    // savedPath stores the original file path so the Download button can re-open it.
+    // Record sent transfer. savedPath = original path so the Download button re-opens it.
     const QString key = chatKey(chat);
     FileTransferRecord rec;
     rec.transferId     = localTransferId;
     rec.fileName       = fileName;
-    rec.fileSize       = data.size();
+    rec.fileSize       = fileSize;
     rec.peerIdB64u     = chat.peerIdB64u;
     rec.peerName       = chat.name;
     rec.timestamp      = QDateTime::currentDateTime();
@@ -1239,14 +1225,14 @@ void ChatView::onAttachFile()
     rec.status         = FileTransferStatus::Complete;
     rec.chunksTotal    = totalChunks;
     rec.chunksComplete = totalChunks;
-    rec.savedPath      = path;   // original file — lets Download open it directly
+    rec.savedPath      = path;
     m_filesByKey[key].append(rec);
     if (m_db) m_db->saveFileRecord(key, rec);
 
     rebuildFilesTab();
 
     // Delivery notice bubble in chat
-    addFileBubble(fileName, data.size(), true);
+    addFileBubble(fileName, fileSize, true);
 }
 
 // ── Private slots ─────────────────────────────────────────────────────────────
@@ -2781,6 +2767,36 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         vl->addWidget(btnContainer);
     }
 
+    // ── Cancel button (in-flight only) ───────────────────────────────────────
+    if (inFlight) {
+        auto *btnContainer = new QWidget(card);
+        btnContainer->setStyleSheet("background:transparent;");
+        auto *bl = new QVBoxLayout(btnContainer);
+        bl->setContentsMargins(14, 10, 14, 0);
+
+        auto *cancelFileBtn = new QPushButton("✕   Cancel transfer", btnContainer);
+        cancelFileBtn->setFixedHeight(34);
+        cancelFileBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        cancelFileBtn->setStyleSheet(
+            "QPushButton{"
+            "  background-color:#2e1a1a;"
+            "  color:#cc5555;"
+            "  border:1px solid #5e2e2e;"
+            "  border-radius:8px;"
+            "  font-size:12px;"
+            "}"
+            "QPushButton:hover{ background-color:#3a2020; }"
+            );
+
+        const QString transferId = rec.transferId;
+        QObject::connect(cancelFileBtn, &QPushButton::clicked, [this, transferId]() {
+            m_controller->cancelFileTransfer(transferId);
+        });
+
+        bl->addWidget(cancelFileBtn);
+        vl->addWidget(btnContainer);
+    }
+
     return card;
 }
 
@@ -2818,4 +2834,103 @@ void ChatView::showToast(const QString &message)
     m_toastLabel->raise();
     m_toastLabel->show();
     QTimer::singleShot(3000, m_toastLabel, &QLabel::hide);
+}
+
+// ── Phase 2: file transfer consent + cancel ──────────────────────────────────
+
+void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
+                                      const QString &transferId,
+                                      const QString &fileName,
+                                      qint64 fileSize)
+{
+    // Figure out which contact/chat this is so we can show a friendly name.
+    QString senderName = fromPeerIdB64u.left(8) + "...";
+    for (const ChatData &c : m_chats) {
+        if (c.keys.contains(fromPeerIdB64u)) {
+            senderName = c.name;
+            break;
+        }
+    }
+
+    QMessageBox box(m_ui->centralwidget);
+    box.setWindowTitle("Incoming File");
+    box.setText(QString("<b>%1</b> wants to send you a file:<br><br>"
+                        "<b>%2</b><br>"
+                        "<span style='color:#888'>%3</span>")
+                    .arg(senderName, fileName, formatFileSize(fileSize)));
+    box.setIcon(QMessageBox::Question);
+
+    QPushButton *acceptBtn  = box.addButton("Accept",  QMessageBox::AcceptRole);
+    QPushButton *declineBtn = box.addButton("Decline", QMessageBox::RejectRole);
+    box.setDefaultButton(acceptBtn);
+
+    box.exec();
+    if (box.clickedButton() == acceptBtn) {
+        // Respect the user's global "require P2P" setting — ChatController
+        // will OR it with our per-call flag.
+        m_controller->acceptFileTransfer(transferId, /*requireP2P=*/false);
+    } else {
+        m_controller->declineFileTransfer(transferId);
+    }
+    Q_UNUSED(declineBtn);
+}
+
+void ChatView::onFileTransferCanceled(const QString &transferId, bool byReceiver)
+{
+    // Walk every chat's file records and mark the matching transfer as failed.
+    for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
+        auto &records = it.value();
+        for (auto &rec : records) {
+            if (rec.transferId != transferId) continue;
+            if (rec.status == FileTransferStatus::Complete) return; // too late
+            rec.status = FileTransferStatus::Failed;
+            if (m_db) m_db->saveFileRecord(it.key(), rec);
+            rebuildFilesTab();
+            break;
+        }
+    }
+
+    const QString msg = byReceiver
+        ? "File transfer was declined or canceled by the recipient."
+        : "File transfer canceled by sender.";
+    showToast(msg);
+}
+
+void ChatView::onFileTransferDelivered(const QString &transferId)
+{
+    // Sender-side: flip the record's status to Complete with a confirmation.
+    for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
+        auto &records = it.value();
+        for (auto &rec : records) {
+            if (rec.transferId != transferId) continue;
+            if (!rec.sent) return; // only meaningful on sender side
+            // Transfer landed + hash verified. Keep status Complete but reflect delivery.
+            rec.chunksComplete = rec.chunksTotal;
+            rec.status         = FileTransferStatus::Complete;
+            if (m_db) m_db->saveFileRecord(it.key(), rec);
+            rebuildFilesTab();
+            showToast(QString("Delivered: %1").arg(rec.fileName));
+            return;
+        }
+    }
+}
+
+void ChatView::onFileTransferBlocked(const QString &transferId, bool byReceiver)
+{
+    // Mark as failed + toast explanation.
+    for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
+        auto &records = it.value();
+        for (auto &rec : records) {
+            if (rec.transferId != transferId) continue;
+            rec.status = FileTransferStatus::Failed;
+            if (m_db) m_db->saveFileRecord(it.key(), rec);
+            rebuildFilesTab();
+            break;
+        }
+    }
+
+    const QString msg = byReceiver
+        ? "Recipient requires a direct connection for files. Transfer aborted."
+        : "Your privacy settings block relay fallback for files. Transfer aborted.";
+    showToast(msg);
 }

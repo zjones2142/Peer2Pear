@@ -133,14 +133,54 @@ int p2p_send_group_text(p2p_context* ctx,
 /* ── File transfer ─────────────────────────────────────────────────────── */
 
 /**
- * Send an encrypted file to a peer.
+ * Send an encrypted file to a peer. Path-based — the file is streamed from
+ * disk and never fully loaded into RAM. The caller owns the file on disk.
+ *
+ * The receiver evaluates consent on arrival: auto-accept, auto-decline, or
+ * prompt their user. Chunks are not streamed until a file_accept arrives.
+ *
+ * @param peer_id    base64url recipient public key
+ * @param file_name  display name shown to the receiver (basename)
+ * @param file_path  absolute path to the source file
  * @return Transfer ID string (valid until next call), or NULL on failure.
  */
 const char* p2p_send_file(p2p_context* ctx,
                           const char* peer_id,
                           const char* file_name,
-                          const uint8_t* file_data,
-                          int file_len);
+                          const char* file_path);
+
+/**
+ * Respond to a pending incoming file transfer (Phase 2 consent).
+ * Called from the app after the user taps Accept or Decline in response to
+ * an on_file_request callback.
+ *
+ * @param accept       1 = accept, 0 = decline
+ * @param require_p2p  only meaningful when accept==1. If 1, the sender is
+ *                     told to abort rather than fall back to relay.
+ */
+void p2p_respond_file_request(p2p_context* ctx,
+                              const char* transfer_id,
+                              int accept,
+                              int require_p2p);
+
+/**
+ * Cancel an in-flight transfer. Works for both outbound (sender canceling
+ * their own send) and inbound (receiver canceling mid-stream). Sends
+ * file_cancel to the peer and cleans up local state.
+ */
+void p2p_cancel_transfer(p2p_context* ctx, const char* transfer_id);
+
+/* ── File-transfer consent settings ───────────────────────────────────── */
+
+/**
+ * Phase 2 consent settings. Files ≤ auto_accept_mb auto-accept.
+ * Files > hard_max_mb auto-decline. Between the two prompts the user.
+ * If require_p2p is true, file_accept responses tell the sender to abort
+ * unless a direct P2P connection is available.
+ */
+void p2p_set_file_auto_accept_mb(p2p_context* ctx, int mb);
+void p2p_set_file_hard_max_mb(p2p_context* ctx, int mb);
+void p2p_set_file_require_p2p(p2p_context* ctx, int enabled);
 
 /* ── Presence ──────────────────────────────────────────────────────────── */
 
@@ -215,6 +255,12 @@ void p2p_set_on_group_message(p2p_context* ctx,
 void p2p_set_on_presence(p2p_context* ctx,
     void (*cb)(const char* peer_id, int online, void* ud), void* ud);
 
+/**
+ * File transfer progress callback.
+ * saved_path is the on-disk location of the received file, non-NULL only
+ * when chunks_received == chunks_total (transfer complete). Files are
+ * streamed directly to disk — no full-file buffer is ever passed to the app.
+ */
 void p2p_set_on_file_progress(p2p_context* ctx,
     void (*cb)(const char* from_peer_id,
                const char* transfer_id,
@@ -222,8 +268,7 @@ void p2p_set_on_file_progress(p2p_context* ctx,
                int64_t file_size,
                int chunks_received,
                int chunks_total,
-               const uint8_t* file_data,  /* non-NULL only when complete */
-               int file_data_len,
+               const char* saved_path,   /* non-NULL only when complete */
                int64_t timestamp_sec,
                void* ud),
     void* ud);
@@ -233,6 +278,44 @@ void p2p_set_on_avatar(p2p_context* ctx,
                const char* display_name,
                const char* avatar_b64,
                void* ud),
+    void* ud);
+
+/**
+ * Phase 2: an incoming file transfer needs the user's consent.
+ * The app should display a prompt with sender + filename + size and then
+ * call p2p_respond_file_request() with the user's choice.
+ */
+void p2p_set_on_file_request(p2p_context* ctx,
+    void (*cb)(const char* from_peer_id,
+               const char* transfer_id,
+               const char* file_name,
+               int64_t file_size,
+               void* ud),
+    void* ud);
+
+/**
+ * Phase 2: a transfer was canceled, declined, or abandoned.
+ * by_receiver == 1 → receiver declined or canceled
+ * by_receiver == 0 → sender canceled or the outbound-pending timer expired
+ */
+void p2p_set_on_file_canceled(p2p_context* ctx,
+    void (*cb)(const char* transfer_id, int by_receiver, void* ud),
+    void* ud);
+
+/**
+ * Phase 3: sender-side — receiver confirmed the full file landed + hash ok.
+ */
+void p2p_set_on_file_delivered(p2p_context* ctx,
+    void (*cb)(const char* transfer_id, void* ud),
+    void* ud);
+
+/**
+ * Phase 3: transport policy blocked the transfer (P2P required, P2P failed).
+ * by_receiver == 1 → recipient's requireP2P refused relay fallback
+ * by_receiver == 0 → our own require_p2p setting refused relay fallback
+ */
+void p2p_set_on_file_blocked(p2p_context* ctx,
+    void (*cb)(const char* transfer_id, int by_receiver, void* ud),
     void* ud);
 
 #ifdef __cplusplus
