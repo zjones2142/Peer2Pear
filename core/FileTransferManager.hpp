@@ -54,9 +54,10 @@ public:
     //
     // Max plaintext chunk = 262 144 - 385 = ~261 759 bytes.
     // We use 240 KB = 245 760 bytes for a comfortable margin.
-    // A 25 MB file therefore travels in at most ceil(25600 / 240) = 107 chunks.
     static constexpr qint64 kChunkBytes   = 240LL * 1024;   // 245 760 bytes
-    static constexpr qint64 kMaxFileBytes  =  25LL * 1024 * 1024;
+    // 100 MB file limit → ceil(100*1024/240) = 428 chunks.
+    // Streaming from disk (for larger files) is a future refactor.
+    static constexpr qint64 kMaxFileBytes  = 100LL * 1024 * 1024;
 
     // Send a file to a single peer using a ratchet-derived key.
     // The caller (ChatController) sends a file_key announcement through the
