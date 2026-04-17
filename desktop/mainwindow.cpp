@@ -165,13 +165,16 @@ MainWindow::MainWindow(QWidget *parent)
     const QString relayUrl = m_db.loadSetting("relayUrl", "http://localhost:8443");
     m_controller.setRelayUrl(QUrl(relayUrl));
 
-    // TURN relay for symmetric NAT fallback
+#ifdef PEER2PEAR_P2P
+    // TURN relay for symmetric NAT fallback — only meaningful when P2P is
+    // compiled in.  setTurnServer() itself is declared behind the same flag.
     const QString turnHost = m_db.loadSetting("turnHost", "peer2pear.com");
     const int     turnPort = m_db.loadSetting("turnPort", "3478").toInt();
     const QString turnUser = m_db.loadSetting("turnUser", "peer2pear");
     const QString turnPass = m_db.loadSetting("turnPass", "peer2pear");
     if (!turnHost.isEmpty())
         m_controller.setTurnServer(turnHost, turnPort, turnUser, turnPass);
+#endif
 
     m_controller.connectToRelay();
 

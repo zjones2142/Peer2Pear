@@ -990,7 +990,9 @@ static QBitArray blobToBitArray(const QByteArray& blob)
                       (quint32(quint8(blob[2])) <<  8) |
                        quint32(quint8(blob[3]));
     if (blob.size() < 4 + int((n + 7) / 8)) return {};
-    QBitArray bits{qsizetype(n)};
+    // Use int(n) so this compiles under both Qt 5 (QBitArray takes int) and
+    // Qt 6 (takes qsizetype = long long; int widens implicitly).
+    QBitArray bits{int(n)};
     const char* packed = blob.constData() + 4;
     for (int i = 0; i < int(n); ++i) {
         if (quint8(packed[i / 8]) & (1u << (i % 8))) bits.setBit(i);

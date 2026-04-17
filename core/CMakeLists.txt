@@ -34,8 +34,8 @@ set(CORE_SOURCES
 
 add_library(peer2pear-core STATIC ${CORE_SOURCES})
 
-# Optional P2P transport (ICE/QUIC). OFF by default — desktop/ enables it.
-option(PEER2PEAR_P2P "Enable P2P transport (ICE/QUIC)" OFF)
+# NOTE: PEER2PEAR_P2P is declared at the top-level CMakeLists.txt so it
+# can drive vcpkg manifest features.  Don't redeclare it here.
 
 # Public include directory so desktop/ (and future mobile/) can
 # #include "ChatController.hpp" etc. without path prefixes.

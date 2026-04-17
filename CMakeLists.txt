@@ -1,5 +1,22 @@
 cmake_minimum_required(VERSION 3.16)
 
+# ── Build options ─────────────────────────────────────────────────────────────
+# Declared BEFORE the toolchain file / project() so they can drive vcpkg
+# feature selection.  Order matters: vcpkg reads VCPKG_MANIFEST_FEATURES
+# during toolchain load, which happens inside project().
+option(PEER2PEAR_P2P
+    "Enable direct peer-to-peer transport (QUIC over ICE). Adds msquic + libnice + glib dependencies; on Windows this requires MSVC."
+    ON)
+
+# Forward the option into vcpkg's manifest feature selection so the extra
+# P2P deps only get pulled in when actually needed.  FORCE ensures a flip
+# from ON to OFF invalidates the previous cached value.
+if(PEER2PEAR_P2P)
+    set(VCPKG_MANIFEST_FEATURES "p2p" CACHE STRING "vcpkg manifest features" FORCE)
+else()
+    set(VCPKG_MANIFEST_FEATURES "" CACHE STRING "vcpkg manifest features" FORCE)
+endif()
+
 # Force the vcpkg toolchain — must come BEFORE project()
 set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake"
     CACHE STRING "Vcpkg toolchain file")
@@ -26,15 +43,19 @@ endif()
 # ── vcpkg Dependencies ────────────────────────────────────────────────────────
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(liboqs CONFIG REQUIRED)
-find_package(msquic CONFIG REQUIRED)
-
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
-pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0 gobject-2.0 gio-2.0)
 
-if(APPLE)
-    set_property(TARGET PkgConfig::NICE PROPERTY INTERFACE_LINK_OPTIONS "")
-    set_property(TARGET PkgConfig::GLIB PROPERTY INTERFACE_LINK_OPTIONS "")
+# P2P-only deps: msquic needs MSVC on Windows; libnice + GLib aren't needed
+# for the relay-only build path.  Gated so the default build can succeed
+# on a plain MinGW / non-MSVC toolchain when PEER2PEAR_P2P=OFF.
+if(PEER2PEAR_P2P)
+    find_package(msquic CONFIG REQUIRED)
+    pkg_check_modules(NICE REQUIRED IMPORTED_TARGET nice)
+    pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0 gobject-2.0 gio-2.0)
+    if(APPLE)
+        set_property(TARGET PkgConfig::NICE PROPERTY INTERFACE_LINK_OPTIONS "")
+        set_property(TARGET PkgConfig::GLIB PROPERTY INTERFACE_LINK_OPTIONS "")
+    endif()
 endif()
 
 # ── SQLCipher ─────────────────────────────────────────────────────────────────

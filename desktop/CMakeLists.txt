@@ -13,10 +13,16 @@ set(DESKTOP_SOURCES
     QtWebSocket.hpp
     QtHttpClient.hpp
     databasemanager.cpp  databasemanager.h
-    NiceConnection.cpp   NiceConnection.hpp
-    QuicConnection.cpp   QuicConnection.hpp
     resources.qrc
 )
+
+# P2P transport sources are only compiled when the feature is enabled.
+if(PEER2PEAR_P2P)
+    list(APPEND DESKTOP_SOURCES
+        NiceConnection.cpp   NiceConnection.hpp
+        QuicConnection.cpp   QuicConnection.hpp
+    )
+endif()
 
 if(WIN32)
     list(APPEND DESKTOP_SOURCES windows_icon.rc)
@@ -35,29 +41,40 @@ else()
     endif()
 endif()
 
-# Enable P2P transport in the core library for this build.
-# Core's ChatController.cpp conditionally includes QuicConnection.hpp when
-# PEER2PEAR_P2P is defined, which pulls in NiceConnection.hpp → nice/agent.h
-# → glib-object.h and msquic.h. Core needs these include paths but does NOT
-# link the libraries (QuicConnection/NiceConnection are compiled by desktop).
-target_compile_definitions(peer2pear-core PUBLIC PEER2PEAR_P2P)
+# Core needs to see the desktop headers (ChatController.hpp etc. are in
+# core/, but the IWebSocket / IHttpClient implementations live in desktop/).
 target_include_directories(peer2pear-core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    $<TARGET_PROPERTY:PkgConfig::NICE,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:PkgConfig::GLIB,INTERFACE_INCLUDE_DIRECTORIES>
-    $<TARGET_PROPERTY:msquic,INTERFACE_INCLUDE_DIRECTORIES>
     $<TARGET_PROPERTY:Qt${QT_VERSION_MAJOR}::Network,INTERFACE_INCLUDE_DIRECTORIES>
 )
+
+# When PEER2PEAR_P2P=ON, tell core it's compiling against P2P transport
+# (so ChatController's #ifdef blocks light up), and add libnice/glib/msquic
+# include paths so the headers in those conditional blocks resolve.
+if(PEER2PEAR_P2P)
+    target_compile_definitions(peer2pear-core PUBLIC PEER2PEAR_P2P)
+    target_include_directories(peer2pear-core PUBLIC
+        $<TARGET_PROPERTY:PkgConfig::NICE,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:PkgConfig::GLIB,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:msquic,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+endif()
 
 target_link_libraries(Peer2Pear PRIVATE
     peer2pear-core
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
     Qt${QT_VERSION_MAJOR}::WebSockets
-    msquic
-    PkgConfig::NICE
-    PkgConfig::GLIB
 )
+
+# P2P-only link deps.
+if(PEER2PEAR_P2P)
+    target_link_libraries(Peer2Pear PRIVATE
+        msquic
+        PkgConfig::NICE
+        PkgConfig::GLIB
+    )
+endif()
 
 # ── Bundle and Platform Properties ────────────────────────────────────────────
 if(${QT_VERSION} VERSION_LESS 6.1.0)
