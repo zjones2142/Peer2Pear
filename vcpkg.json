@@ -3,7 +3,17 @@
   "version": "0.2.0",
   "dependencies": [
     "libsodium",
-    "liboqs"
+    "liboqs",
+    {
+      "name": "sqlcipher",
+      "platform": "windows",
+      "$comment": "On macOS/Linux sqlcipher comes from brew/apt; on Windows vcpkg supplies it."
+    },
+    {
+      "name": "pkgconf",
+      "platform": "windows",
+      "$comment": "Windows lacks a system pkg-config; vcpkg provides the shim used by CMakeLists."
+    }
   ],
   "features": {
     "p2p": {

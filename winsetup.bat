@@ -4,9 +4,11 @@ REM
 REM Comprehensive one-command setup.  Installs via winget:
 REM   - git, cmake, ninja, Python
 REM   - Visual Studio 2022 Build Tools (VC workload, Windows 10/11 SDK)
-REM Then uses aqtinstall to download Qt 6.7.3 (msvc2022_64 + WebSockets
-REM module) to C:\Qt\, clones and bootstraps vcpkg, installs sqlcipher and
-REM pkgconf through vcpkg, and setx's CMAKE_PREFIX_PATH so CMake finds Qt.
+REM Then uses aqtinstall to download Qt (msvc2019_64 + WebSockets module)
+REM to C:\Qt\, clones and bootstraps vcpkg, runs vcpkg in manifest mode to
+REM install everything listed in vcpkg.json (sqlcipher, pkgconf, libsodium,
+REM liboqs, and the "p2p" feature's msquic/libnice/glib), and setx's
+REM CMAKE_PREFIX_PATH so CMake finds Qt.
 REM
 REM Idempotent -- re-running after a successful setup is a no-op.
 REM
@@ -22,6 +24,11 @@ REM Written in goto-style (no parenthesized IF blocks) because nested
 REM IFs cause cmd.exe parser errors, especially under PowerShell.
 
 setlocal
+
+REM Clear any stray VCPKG_ROOT so we don't fight an old env var pointing at
+REM a different vcpkg clone (e.g. an "external\vcpkg" submodule from a past
+REM setup).  We always use the vcpkg folder inside this repo.
+set "VCPKG_ROOT="
 
 set "INSTALLED_SOMETHING=0"
 
@@ -178,10 +185,14 @@ REM (setx writes the USER env var; takes effect in new terminals.)
 setx CMAKE_PREFIX_PATH "%QT_DIR%" >nul
 
 REM ---- vcpkg -----------------------------------------------------------
-REM vcpkg.json declares libsodium, liboqs, msquic, libnice, glib -- those
-REM get auto-installed on first CMake configure via the toolchain file.
-REM sqlcipher + pkgconf are installed classic-mode below because the build
-REM uses system pkg-config to locate them.
+REM vcpkg.json lists everything the build needs:
+REM   - core:          libsodium, liboqs
+REM   - windows-only:  sqlcipher, pkgconf
+REM   - feature "p2p": msquic, libnice, glib  (default ON)
+REM
+REM We run vcpkg in MANIFEST mode -- positional package args are not
+REM supported once a vcpkg.json exists in the repo root, so everything
+REM has to come from the manifest.
 
 if exist "vcpkg\" goto vcpkg_clone_done
 echo Cloning vcpkg...
@@ -203,8 +214,11 @@ goto vcpkg_install
 echo   [ok] vcpkg already bootstrapped
 
 :vcpkg_install
-echo Installing sqlcipher and pkgconf via vcpkg (may take several minutes on first run)...
-.\vcpkg\vcpkg.exe install sqlcipher:x64-windows pkgconf:x64-windows
+REM Install the manifest's deps + the "p2p" feature (matches the default
+REM PEER2PEAR_P2P=ON CMake option).  First run takes 15-30 minutes because
+REM every dep compiles from source; subsequent runs are near-instant.
+echo Installing vcpkg manifest dependencies (may take 15-30 minutes on first run)...
+.\vcpkg\vcpkg.exe install --x-feature=p2p
 if errorlevel 1 goto err_generic
 
 echo.
