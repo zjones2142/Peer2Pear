@@ -90,9 +90,12 @@ void SettingsPanel::buildUI()
     bodyLayout->addWidget(makeFileTransferSection());
 
     // ── About section ─────────────────────────────────────────────────────────
+    // Version    = app version (matches project(Peer2Pear VERSION ...) in CMakeLists.txt)
+    // Protocol   = wire-protocol version (matches the relay's /healthz "version" field
+    //              so interop can be reasoned about across client/server pairs)
     bodyLayout->addWidget(makeSection("ABOUT", {
-                                                { "Version",  "0.1.0"     },
-                                                { "Protocol", "Peer2Pear P2P + Sealed Sender" },
+                                                { "Version",  "0.2.0" },
+                                                { "Protocol", "2.0.0" },
                                                 }));
 
     // ── Getting Started / Help section ───────────────────────────────────────
@@ -712,32 +715,47 @@ QWidget *SettingsPanel::makeAboutHelpSection()
         "<b style='color:#cccccc; font-size:13px;'>Getting Started</b><br>"
         "<br>"
         "<b style='color:#4caf50;'>1. Share your public key</b><br>"
-        "Your public key is your identity. Copy it from the Profile "
-        "section above and share it with your contacts.<br>"
+        "Your public key is your identity &mdash; 43 characters, base64url. "
+        "Copy it from the Profile section above and share with contacts "
+        "however you like (text, QR, in person). No phone number, email, "
+        "or account required.<br>"
         "<br>"
         "<b style='color:#4caf50;'>2. Add a contact</b><br>"
-        "Tap <b>New Chat</b>, enter a name, and paste their "
-        "public key (43 characters, base64url).<br>"
+        "Tap <b>New Chat</b>, paste their public key, and give them a "
+        "display name you'll recognize.<br>"
         "<br>"
         "<b style='color:#4caf50;'>3. Start messaging</b><br>"
-        "Select a contact and type a message. Messages are "
-        "end-to-end encrypted automatically.<br>"
+        "Select a contact and type. Every message is end-to-end encrypted "
+        "with hybrid classical + post-quantum keys before it leaves your "
+        "device.<br>"
         "<br>"
         "<b style='color:#4caf50;'>4. Send files</b><br>"
-        "Use the attach button (paperclip) to send files up to 25 MB. "
-        "Files appear in the <b>Files</b> tab.<br>"
+        "Use the paperclip to send files up to 100 MB. Files stream "
+        "encrypted in 240 KB chunks with integrity checks, and resume "
+        "automatically if your connection drops mid-transfer.<br>"
         "<br>"
         "<b style='color:#4caf50;'>5. Group chats</b><br>"
-        "Create a group by adding multiple keys when creating a new chat. "
-        "All group messages are individually encrypted for each member.<br>"
+        "Create a group by adding multiple keys when starting a new chat. "
+        "Each member gets their own encrypted copy of every message.<br>"
         "<br>"
         "<b style='color:#cccccc;'>How it works</b><br>"
-        "Peer2Pear uses direct peer-to-peer connections when possible "
-        "(via ICE/STUN/TURN) for real-time delivery, and an encrypted "
-        "mailbox relay for offline messages. Your messages are encrypted "
-        "with the Noise Protocol (IK handshake) and Double Ratchet, "
-        "providing forward secrecy and post-compromise security. "
-        "The server never sees your plaintext."
+        "Peer2Pear is relay-first: your messages travel through a simple "
+        "WebSocket relay server, encrypted end-to-end. The relay never "
+        "sees your plaintext, never learns who you're talking to "
+        "(sealed sender), and can't re-route messages to anyone else "
+        "(envelope-level AAD binding). When both peers are online and "
+        "direct P2P is enabled, messages can flow directly between devices "
+        "for lower latency &mdash; but the relay path always works as a "
+        "fallback.<br>"
+        "<br>"
+        "<b style='color:#cccccc;'>Security</b><br>"
+        "&bull; Hybrid post-quantum crypto (X25519 + ML-KEM-768) at every layer<br>"
+        "&bull; Noise IK handshake + Double Ratchet for per-message forward secrecy<br>"
+        "&bull; Sealed sender with envelope-level replay protection<br>"
+        "&bull; Encrypted-at-rest local storage (SQLCipher AES-256)<br>"
+        "&bull; Optional multi-hop onion routing via multiple relays<br>"
+        "<br>"
+        "Your messages are yours. Your keys never leave your device."
         "</p>"
         );
     guideLabel->setWordWrap(true);

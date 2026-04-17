@@ -28,16 +28,58 @@ MainWindow::MainWindow(QWidget *parent)
     // ── Identity unlock ───────────────────────────────────────────────────────
     // Passphrase must be obtained BEFORE opening the DB so we can derive the
     // SQLCipher page-level encryption key via Argon2id.
-    while (true) {
-        bool ok = false;
-        QString pass = QInputDialog::getText(this, "Unlock Identity",
-                                             "Enter passphrase to unlock this device identity:",
-                                             QLineEdit::Password, "", &ok);
+    //
+    // On first run the salt file doesn't exist yet — show a "create passphrase"
+    // flow with a double-entry confirmation so a typo doesn't silently lock
+    // the user out of an identity they can't recover.  On subsequent runs we
+    // show a simple unlock prompt.
+    const QString keysDirForCheck = QStandardPaths::writableLocation(
+        QStandardPaths::AppDataLocation) + "/keys";
 
+    while (true) {
+        // Re-check each iteration so if a prior iteration partially succeeded
+        // (e.g., salt got created but DB open failed), subsequent prompts
+        // correctly use the unlock wording rather than the create wording.
+        const bool firstRun = !QFile::exists(keysDirForCheck + "/db_salt.bin");
+
+        bool ok = false;
+        const QString title = firstRun ? "Create Passphrase" : "Unlock Identity";
+        const QString prompt = firstRun
+            ? QStringLiteral(
+                "Welcome to Peer2Pear.\n\n"
+                "Create a passphrase to protect your identity and local data.\n"
+                "This passphrase cannot be recovered if you forget it \u2014 write it "
+                "down somewhere safe.")
+            : QStringLiteral(
+                "Enter passphrase to unlock this device identity:");
+
+        QString pass = QInputDialog::getText(this, title, prompt,
+                                             QLineEdit::Password, "", &ok);
         if (!ok) { QTimer::singleShot(0, qApp, &QCoreApplication::quit); return; }
         if (pass.isEmpty()) {
             QMessageBox::warning(this, "Passphrase Required", "Passphrase cannot be empty.");
             continue;
+        }
+
+        // First-run: require double-entry.  A mismatched confirm is far cheaper
+        // to recover from than a silent typo the user will never type again.
+        if (firstRun) {
+            QString confirm = QInputDialog::getText(this, "Confirm Passphrase",
+                "Re-enter the passphrase to confirm:",
+                QLineEdit::Password, "", &ok);
+            if (!ok) {
+                CryptoEngine::secureZero(pass);
+                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+                return;
+            }
+            if (confirm != pass) {
+                QMessageBox::warning(this, "Passphrases Don't Match",
+                    "The two passphrases didn't match. Please try again.");
+                CryptoEngine::secureZero(pass);
+                CryptoEngine::secureZero(confirm);
+                continue;
+            }
+            CryptoEngine::secureZero(confirm);
         }
         try {
             // ── Unified key derivation (single Argon2id call) ────────────────

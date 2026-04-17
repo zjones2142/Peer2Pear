@@ -104,11 +104,16 @@ void OnboardingDialog::buildStep1()
 
     lay->addSpacing(12);
 
-    // Subtitle
-    QLabel *subtitle = new QLabel("Choose a display name to get started", page);
+    // Subtitle — welcome blurb for first-time users.  Explains the two
+    // headline properties (E2EE, account-free) so the user understands
+    // what they're signing up for before asking them for a name.
+    QLabel *subtitle = new QLabel(
+        "End-to-end encrypted messaging. No accounts, phone numbers, "
+        "or email required \u2014 just pick a display name to begin.",
+        page);
     subtitle->setAlignment(Qt::AlignCenter);
     subtitle->setWordWrap(true);
-    subtitle->setStyleSheet("color: #555555; font-size: 13px; background: transparent;");
+    subtitle->setStyleSheet("color: #888888; font-size: 13px; background: transparent;");
     lay->addWidget(subtitle);
 
     lay->addSpacing(32);
