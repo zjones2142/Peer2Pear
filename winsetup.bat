@@ -24,10 +24,20 @@ REM IFs cause cmd.exe parser errors, especially under PowerShell.
 setlocal
 
 set "INSTALLED_SOMETHING=0"
-set "QT_VERSION=6.7.3"
-set "QT_ARCH=win64_msvc2022_64"
+
+REM Qt version + aqtinstall arch.  Using Qt 6.5.3 LTS because it's the
+REM most broadly aqtinstall-compatible release.  "win64_msvc2019_64" is the
+REM only MSVC binary Qt ships for 6.5.x -- 6.8+ is when msvc2022_64 appears.
+REM These 2019 binaries are ABI-compatible with MSVC 2022, so they link
+REM fine against the compiler the VS Build Tools step installed.
+set "QT_VERSION=6.5.3"
+set "QT_ARCH=win64_msvc2019_64"
 set "QT_ROOT=C:\Qt"
-set "QT_DIR=%QT_ROOT%\%QT_VERSION%\msvc2022_64"
+
+REM Derive the install subdirectory from QT_ARCH: aqtinstall writes to
+REM "<QT_ROOT>\<version>\<arch-with-win64_-prefix-stripped>".
+set "QT_ARCH_DIR=%QT_ARCH:win64_=%"
+set "QT_DIR=%QT_ROOT%\%QT_VERSION%\%QT_ARCH_DIR%"
 
 echo Peer2Pear setup (Windows)
 echo.
@@ -149,8 +159,10 @@ REM ---- Qt 6 via aqtinstall ---------------------------------------------
 
 if exist "%QT_DIR%\bin\qmake.exe" goto qt_done
 
-echo Installing aqtinstall (pip)...
-py -m pip install --upgrade --user aqtinstall
+echo Installing latest aqtinstall (pip)...
+REM --force-reinstall in case a previous run cached a version with
+REM Python 3.14 parser quirks; --upgrade alone may skip.
+py -m pip install --upgrade --force-reinstall --user aqtinstall
 if errorlevel 1 goto err_aqtinstall
 
 echo Installing Qt %QT_VERSION% (%QT_ARCH%) with WebSockets module to %QT_ROOT% ...
