@@ -1,9 +1,9 @@
 @echo off
-REM Peer2Pear setup — Windows.
+REM Peer2Pear setup -- Windows.
 REM
 REM Installs Ninja (via winget), clones and bootstraps vcpkg, and installs
-REM SQLCipher + pkgconf through vcpkg.  Leaves the repo ready for Qt Creator
-REM or a manual `cmake --build` invocation.
+REM SQLCipher + pkgconf through vcpkg. Leaves the repo ready for Qt Creator
+REM or a manual "cmake --build" invocation.
 REM
 REM Idempotent: re-running after a successful setup is a no-op.
 REM
@@ -13,33 +13,33 @@ REM If new dependencies are added to the build, add the install step here too.
 setlocal EnableDelayedExpansion
 
 echo Peer2Pear setup (Windows)
-echo.
+echo(
 
-REM ── Required tools ──────────────────────────────────────────────────────
+REM ---- Required tools -------------------------------------------------
 
 where git >nul 2>&1
 if errorlevel 1 (
-    echo Error: 'git' not found in PATH.
+    echo Error: git not found in PATH.
     echo        Install from https://git-scm.com/download/win and re-run.
     exit /b 1
 )
 
 where cmake >nul 2>&1
 if errorlevel 1 (
-    echo Error: 'cmake' not found in PATH.
+    echo Error: cmake not found in PATH.
     echo        Install CMake from https://cmake.org, or add Qt's bundled
     echo        CMake to your PATH (C:\Qt\Tools\CMake_64\bin).
     exit /b 1
 )
 
-REM ── Ninja ───────────────────────────────────────────────────────────────
+REM ---- Ninja ----------------------------------------------------------
 
 where ninja >nul 2>&1
 if errorlevel 1 (
-    echo Ninja not found.  Attempting install via winget...
+    echo Ninja not found. Attempting install via winget...
     where winget >nul 2>&1
     if errorlevel 1 (
-        echo Error: winget not found either.  Install Ninja manually:
+        echo Error: winget not found either. Install Ninja manually:
         echo        - https://github.com/ninja-build/ninja/releases
         echo        - Or: choco install ninja
         echo        - Or: scoop install ninja
@@ -50,17 +50,17 @@ if errorlevel 1 (
         echo Error: winget failed to install Ninja.
         exit /b 1
     )
-    echo   [ok] Ninja installed.  You may need to restart your terminal so Ninja lands in PATH.
+    echo   [ok] Ninja installed. Restart your terminal if "ninja" is still not in PATH.
 ) else (
     echo   [ok] ninja
 )
 
-REM ── vcpkg (manifest mode via vcpkg.json) ────────────────────────────────
+REM ---- vcpkg ----------------------------------------------------------
 REM
-REM vcpkg.json declares libsodium, liboqs, msquic, libnice, glib.  Those get
-REM auto-installed on first CMake configure via the toolchain file.  The
-REM dependencies below (sqlcipher, pkgconf) are installed classic-mode here
-REM because the top-level build uses system pkg-config to discover them.
+REM vcpkg.json declares libsodium, liboqs, msquic, libnice, glib, which
+REM get auto-installed on first CMake configure via the toolchain file.
+REM SQLCipher + pkgconf are installed classic-mode below because the
+REM top-level build uses pkg-config to discover them.
 
 if not exist "vcpkg\" (
     echo Cloning vcpkg...
@@ -78,9 +78,9 @@ if not exist "vcpkg\vcpkg.exe" (
     echo   [ok] vcpkg already bootstrapped
 )
 
-REM ── SQLCipher + pkgconf via vcpkg ───────────────────────────────────────
+REM ---- SQLCipher + pkgconf via vcpkg ----------------------------------
 REM
-REM CMakeLists.txt uses pkg_check_modules(SQLCIPHER ... sqlcipher).  On
+REM CMakeLists.txt uses pkg_check_modules(SQLCIPHER ... sqlcipher). On
 REM Windows this needs both the sqlcipher library and a pkg-config shim,
 REM neither of which ship with the OS.
 
@@ -91,16 +91,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo.
+echo(
 echo Setup complete.
-echo.
+echo(
 echo Next steps:
 echo   - Open CMakeLists.txt in Qt Creator, OR
 echo   - Build from the command line:
 echo         cmake -B build -S . -G Ninja -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake
 echo         cmake --build build
-echo.
-echo The first CMake configure will take several minutes — vcpkg builds
+echo(
+echo The first CMake configure will take several minutes -- vcpkg builds
 echo libsodium, liboqs, msquic, libnice, and glib from source.
-echo.
+echo(
 pause
