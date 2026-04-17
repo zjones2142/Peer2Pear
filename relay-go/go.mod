@@ -10,3 +10,5 @@ require (
 	// Run `go mod tidy` to resolve the go.sum entry.
 	golang.org/x/crypto v0.25.0
 )
+
+require golang.org/x/sys v0.22.0 // indirect

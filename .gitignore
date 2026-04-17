@@ -85,3 +85,4 @@ vcpkg/
 vcpkg_installed/
 .vcpkg/
 tests/
+Peer2Pear_QtProj/
