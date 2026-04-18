@@ -71,7 +71,7 @@ func main() {
 	mux.HandleFunc("/v1/receive", hub.HandleReceive) // WebSocket — no method restriction
 	mux.HandleFunc("POST /v1/forward", hub.HandleForward)
 	// Fix #7: onion routing endpoints.
-	mux.HandleFunc("GET  /v1/relay_info", hub.HandleRelayInfo)
+	mux.HandleFunc("GET /v1/relay_info", hub.HandleRelayInfo)
 	mux.HandleFunc("POST /v1/forward-onion", hub.HandleForwardOnion)
 	// NOTE: /v1/peers removed — exposing connected peer IDs is a privacy leak.
 	// NOTE: Legacy /mbox/* and /rvz/* endpoints removed.  The Qt client uses
