@@ -1,13 +1,16 @@
 #pragma once
 
-#include "IWebSocket.hpp"
 #include "IHttpClient.hpp"
-#include <QObject>
-#include <QUrl>
-#include <QTimer>
-#include <QMap>
-#include <QSet>
-#include <QVector>
+#include "ITimer.hpp"
+#include "IWebSocket.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
 
 class CryptoEngine;
 
@@ -21,21 +24,23 @@ class CryptoEngine;
  *   - Supports retry queue for failed sends
  *   - Delivers stored mailbox envelopes immediately on WS connect
  *
- * The relay never sees plaintext. It reads only the 'to' field
- * (bytes 1-32 of the envelope) for routing.
- *
- * Takes an IWebSocket& for platform portability — desktop provides
- * QtWebSocket, iOS provides URLSessionWebSocket, Android provides
- * OkHttpWebSocket. Each is ~50-80 lines of glue code.
+ * Types: std::string URL + peer IDs, Bytes envelopes.
+ * Async: ITimer for scheduling, std::function callbacks for events.
+ * No Qt — core/ is Qt-free as of Phase 7.
  */
-class RelayClient : public QObject {
-    Q_OBJECT
+class RelayClient {
 public:
-    explicit RelayClient(IWebSocket& ws, IHttpClient& http, CryptoEngine* crypto, QObject* parent = nullptr);
-    ~RelayClient() override;
+    using Bytes = std::vector<uint8_t>;
+
+    RelayClient(IWebSocket& ws, IHttpClient& http,
+                ITimerFactory& timers, CryptoEngine* crypto);
+    ~RelayClient();
+
+    RelayClient(const RelayClient&)            = delete;
+    RelayClient& operator=(const RelayClient&) = delete;
 
     // Set the relay server URL (e.g., "wss://relay.peer2pear.org:8443")
-    void setRelayUrl(const QUrl& url);
+    void setRelayUrl(const std::string& url);
 
     // Connect the WebSocket receive channel (authenticates with Ed25519 sig)
     void connectToRelay();
@@ -44,134 +49,108 @@ public:
 
     // Send a sealed envelope anonymously via HTTP POST /v1/send.
     // The recipient is parsed from the envelope header (bytes 1-32).
-    void sendEnvelope(const QByteArray& sealedEnvelope);
+    void sendEnvelope(const Bytes& sealedEnvelope);
 
     // Presence: subscribe to online/offline updates for a set of peers.
-    // Results are pushed via presenceChanged signal.
-    void subscribePresence(const QStringList& peerIds);
+    void subscribePresence(const std::vector<std::string>& peerIds);
 
-    // One-shot presence query (results via presenceChanged signal).
-    void queryPresence(const QStringList& peerIds);
+    // One-shot presence query.
+    void queryPresence(const std::vector<std::string>& peerIds);
 
     // ── DAITA: client-side traffic analysis defense ─────────────────────────
-
-    /// Set send jitter range (milliseconds). 0 = disabled.
     void setJitterRange(int minMs, int maxMs);
-
-    /// Set cover traffic interval (seconds). 0 = disabled.
     void setCoverTrafficInterval(int seconds);
-
-    /// Set known peer IDs (contacts). Cover traffic sends to random peers from
-    /// this list so it's indistinguishable from real messages to the relay.
-    /// Without this, cover goes to random nonexistent recipients (weaker).
-    void setKnownPeers(const QStringList& peerIds);
+    void setKnownPeers(const std::vector<std::string>& peerIds);
 
     // ── Multi-relay routing ─────────────────────────────────────────────────
-
-    /// Add a relay URL to the send relay pool. Sends are rotated across these.
-    /// If empty, all sends go through the main relay (setRelayUrl).
-    void addSendRelay(const QUrl& url);
-
-    /// Enable multi-hop forwarding. When enabled, sendEnvelope() routes through
-    /// a random intermediate relay via /v1/forward before reaching the
-    /// recipient's relay. Cover traffic also uses multi-hop.
-    ///
-    /// Fix #7: multi-hop now uses onion layering when it has an entry-hop's
-    /// X25519 pubkey cached (fetched from /v1/relay_info).  If no pubkey is
-    /// cached, falls back to the single-layer /v1/forward path (still
-    /// functional but the entry hop can see the final recipient).
+    void addSendRelay(const std::string& url);
     void setMultiHopEnabled(bool enabled);
-
-    /// Fix #7: fetch `/v1/relay_info` from each configured relay and cache
-    /// the returned X25519 pubkey.  Called automatically on successful WS
-    /// connect; can also be called explicitly if the relay pool changes.
     void refreshRelayInfo();
 
-    /// Set the privacy level (convenience wrapper):
+    /// Set the privacy level:
     ///   0 = Standard:  padding only (default)
     ///   1 = Enhanced:  + jitter (50-300ms) + cover traffic (30s) + multi-relay rotation
     ///   2 = Maximum:   + multi-hop forwarding + high-frequency cover traffic (10s)
     void setPrivacyLevel(int level);
 
-signals:
-    void connected();
-    void disconnected();
-    void status(const QString& s);
-
-    // Emitted for each envelope received (real-time push or stored mailbox delivery)
-    void envelopeReceived(const QByteArray& envelope);
-
-    // Presence updates
-    void presenceChanged(const QString& peerIdB64u, bool online);
-
-private slots:
-    void onWsConnected();
-    void onWsDisconnected();
-    void onWsBinaryMessage(const QByteArray& data);
-    void onWsTextMessage(const QString& message);
+    // ── Event callbacks — set from outside before connecting ─────────────
+    //
+    // onConnected:        fires after WS authenticates successfully.
+    // onDisconnected:     fires on WS close (intentional or lost).
+    // onStatus:           human-readable status string; UI hook.
+    // onEnvelopeReceived: binary envelope received (real-time or stored).
+    // onPresenceChanged:  presence push from relay.
+    std::function<void()>                          onConnected;
+    std::function<void()>                          onDisconnected;
+    std::function<void(const std::string&)>        onStatus;
+    std::function<void(const Bytes&)>              onEnvelopeReceived;
+    std::function<void(const std::string&, bool)>  onPresenceChanged;
 
 private:
+    void onWsConnected();
+    void onWsDisconnected();
+    void onWsBinaryMessage(const Bytes& data);
+    void onWsTextMessage(const std::string& message);
+
     void authenticate();
     void scheduleReconnect();
     void processRetryQueue();
 
-    CryptoEngine*         m_crypto = nullptr;
-    IWebSocket&           m_ws;
-    IHttpClient&          m_http;
-    QUrl                  m_relayUrl;     // base URL (https/wss)
-    bool                  m_authenticated = false;
-    bool                  m_intentionalDisconnect = false;
+    void sendCoverEnvelope();
+    void scheduleCoverTimer();
+    void onRealActivity();
+
+    std::string pickSendRelay();
+    int         pickJitterMs() const;
+    void postEnvelope(const std::string& relayUrl, const Bytes& envelope,
+                      IHttpClient::Callback cb);
+    void forwardEnvelope(const std::string& viaRelay, const std::string& toRelay,
+                         const Bytes& envelope,
+                         IHttpClient::Callback cb);
+
+    void scheduleRetry();
+
+    void emitStatus(const std::string& s) { if (onStatus) onStatus(s); }
+
+    CryptoEngine*   m_crypto   = nullptr;
+    IWebSocket&     m_ws;
+    IHttpClient&    m_http;
+    ITimerFactory&  m_timers;
+    std::string     m_relayUrl;
+    bool            m_authenticated         = false;
+    bool            m_intentionalDisconnect = false;
 
     // Reconnect with exponential backoff
-    QTimer m_reconnectTimer;
+    std::unique_ptr<ITimer> m_reconnectTimer;
     int    m_reconnectAttempt = 0;
     static constexpr int kMaxReconnectDelaySec = 60;
 
     // Retry queue for failed sends
-    static constexpr int kMaxRetries = 5;
-    static constexpr int kMaxRetryQueue = 100; // M1 fix: prevent OOM
+    static constexpr int kMaxRetries    = 5;
+    static constexpr int kMaxRetryQueue = 100;
     struct PendingEnvelope {
-        QByteArray data;
-        int        retryCount = 0;
+        Bytes data;
+        int   retryCount = 0;
     };
-    QVector<PendingEnvelope> m_retryQueue;
-    QTimer                   m_retryTimer;
-    bool                     m_retryInFlight = false;
-    void scheduleRetry();
+    std::vector<PendingEnvelope> m_retryQueue;
+    std::unique_ptr<ITimer>      m_retryTimer;
+    bool                         m_retryInFlight = false;
 
     // DAITA: client-side traffic defense
-    static constexpr quint8 kDummyVersion = 0x00; // relay cover traffic marker
-    int    m_jitterMinMs = 0;
-    int    m_jitterMaxMs = 0;
-    QTimer m_coverTimer;
-    int    m_coverIntervalSec = 0;
-    int    m_burstRemaining = 0; // envelopes left in current burst
-    void sendCoverEnvelope();
-    void scheduleCoverTimer();   // picks burst vs idle timing
-    void onRealActivity();       // called when real send/receive happens
+    static constexpr uint8_t kDummyVersion = 0x00;
+    int                     m_jitterMinMs      = 0;
+    int                     m_jitterMaxMs      = 0;
+    std::unique_ptr<ITimer> m_coverTimer;
+    int                     m_coverIntervalSec = 0;
+    int                     m_burstRemaining   = 0;
 
-    // Known peers for realistic cover traffic
-    QStringList m_knownPeers;
-    // Fix #14: currently-online subset, updated from presence pushes.
-    // Cover traffic is only sent to peers in this set to avoid filling
-    // offline contacts' mailboxes and to match real-traffic distribution.
-    QSet<QString> m_onlinePeers;
+    std::vector<std::string> m_knownPeers;
+    std::set<std::string>    m_onlinePeers;
 
     // Multi-relay routing
-    QVector<QUrl> m_sendRelays;     // pool of relays for send rotation
-    int           m_sendRelayIdx = 0;
-    bool          m_multiHop = false;
+    std::vector<std::string> m_sendRelays;
+    size_t                   m_sendRelayIdx = 0;
+    bool                     m_multiHop     = false;
 
-    // Fix #7: per-relay X25519 pubkey cache for onion layering.
-    // Key: relay base URL string (e.g. "https://relay.example:8443")
-    // Val: 32-byte X25519 pub, empty if not yet fetched.
-    QMap<QString, QByteArray> m_relayX25519Pubs;
-
-    QUrl pickSendRelay();           // round-robin through send relay pool
-    int  pickJitterMs() const;      // Fix #9: random delay in [min,max]
-    void postEnvelope(const QUrl& relayUrl, const QByteArray& envelope,
-                      IHttpClient::Callback cb); // single-hop POST
-    void forwardEnvelope(const QUrl& viaRelay, const QUrl& toRelay,
-                         const QByteArray& envelope,
-                         IHttpClient::Callback cb); // multi-hop via /v1/forward
+    std::map<std::string, Bytes> m_relayX25519Pubs;
 };

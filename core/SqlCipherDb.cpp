@@ -1,26 +1,29 @@
 #include "SqlCipherDb.hpp"
 #include <sqlite3.h>
-#include <QDebug>
-#include <QByteArray>
 #include <sodium.h>
 #include <cstring>
+
+// Debug logging uses QDebug temporarily for consistency with the rest of
+// core/.  Phase 7 swaps this for a std::cerr macro alongside the QObject
+// strip.
+#include <QDebug>
+#include <QString>
 
 // ─── SqlCipherDb ─────────────────────────────────────────────────────────────
 
 SqlCipherDb::~SqlCipherDb() { close(); }
 
-bool SqlCipherDb::open(const QString& path, const QByteArray& key)
+bool SqlCipherDb::open(const std::string& path, const Bytes& key)
 {
     close();
     m_path = path;
 
-    const QByteArray pathUtf8 = path.toUtf8();
-    int rc = sqlite3_open_v2(pathUtf8.constData(), &m_db,
+    int rc = sqlite3_open_v2(path.c_str(), &m_db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                              SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE,
                              nullptr);
     if (rc != SQLITE_OK) {
-        m_lastError = QString::fromUtf8(sqlite3_errmsg(m_db));
+        m_lastError = m_db ? sqlite3_errmsg(m_db) : "sqlite3_open_v2 failed";
         qWarning() << "SqlCipherDb::open failed";
         sqlite3_close_v2(m_db);
         m_db = nullptr;
@@ -28,40 +31,46 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
     }
 
     // ── Apply encryption key ─────────────────────────────────────────────
-    if (!key.isEmpty()) {
+    if (!key.empty()) {
 #ifdef SQLITE_HAS_CODEC
         // Preferred: native sqlite3_key (available when linked against SQLCipher)
-        rc = sqlite3_key(m_db, key.constData(), key.size());
+        rc = sqlite3_key(m_db, key.data(), static_cast<int>(key.size()));
         if (rc != SQLITE_OK) {
-            m_lastError = QString::fromUtf8(sqlite3_errmsg(m_db));
-            qWarning() << "sqlite3_key failed:" << m_lastError;
+            m_lastError = sqlite3_errmsg(m_db);
+            qWarning() << "sqlite3_key failed:" << QString::fromStdString(m_lastError);
             close();
             return false;
         }
 #else
-        // Fallback: PRAGMA key with hex-encoded raw key
-        QString hexKey = QString::fromLatin1(key.toHex());
-        QString pragma = QStringLiteral("PRAGMA key = \"x'%1'\";").arg(hexKey);
+        // Fallback: PRAGMA key with hex-encoded raw key.
+        // Build the hex key ourselves so we can zero it right after use.
+        std::string hexKey;
+        hexKey.resize(key.size() * 2);
+        static const char kHex[] = "0123456789abcdef";
+        for (size_t i = 0; i < key.size(); ++i) {
+            hexKey[i * 2]     = kHex[(key[i] >> 4) & 0xF];
+            hexKey[i * 2 + 1] = kHex[key[i] & 0xF];
+        }
+        std::string pragma = "PRAGMA key = \"x'" + hexKey + "'\";";
         char* err = nullptr;
-        rc = sqlite3_exec(m_db, pragma.toUtf8().constData(), nullptr, nullptr, &err);
-        // Zero key material from local strings immediately
-        sodium_memzero(hexKey.data(), static_cast<size_t>(hexKey.size()) * sizeof(QChar));
-        sodium_memzero(pragma.data(), static_cast<size_t>(pragma.size()) * sizeof(QChar));
+        rc = sqlite3_exec(m_db, pragma.c_str(), nullptr, nullptr, &err);
+        // Zero key material from local strings immediately.
+        sodium_memzero(hexKey.data(), hexKey.size());
+        sodium_memzero(pragma.data(), pragma.size());
         if (rc != SQLITE_OK) {
-            m_lastError = err ? QString::fromUtf8(err) : QStringLiteral("PRAGMA key failed");
+            m_lastError = err ? err : "PRAGMA key failed";
             sqlite3_free(err);
             qWarning() << "SqlCipherDb: PRAGMA key failed";
             close();
             return false;
         }
 #endif
-        // Verify key by reading sqlite_master
+        // Verify key by reading sqlite_master.
         char* verifyErr = nullptr;
         rc = sqlite3_exec(m_db, "SELECT count(*) FROM sqlite_master;",
                           nullptr, nullptr, &verifyErr);
         if (rc != SQLITE_OK) {
-            m_lastError = verifyErr ? QString::fromUtf8(verifyErr)
-                                    : QStringLiteral("Key verification failed");
+            m_lastError = verifyErr ? verifyErr : "Key verification failed";
             sqlite3_free(verifyErr);
             qWarning() << "SqlCipherDb: wrong key or unencrypted database";
             close();
@@ -85,9 +94,9 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
     }
 
     if (!m_isSqlCipher) {
-        m_lastError = QStringLiteral(
+        m_lastError =
             "SQLCipher is required but the linked sqlite library is plain sqlite3. "
-            "Install SQLCipher and rebuild.");
+            "Install SQLCipher and rebuild.";
         qCritical() << "SqlCipherDb: SQLCipher required but not available";
         close();
         return false;
@@ -99,7 +108,7 @@ bool SqlCipherDb::open(const QString& path, const QByteArray& key)
     sqlite3_exec(m_db, "PRAGMA cipher_memory_security=ON;", nullptr, nullptr, nullptr);
 
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "SqlCipherDb: opened" << path << "(encrypted)";
+    qDebug() << "SqlCipherDb: opened" << QString::fromStdString(path) << "(encrypted)";
 #endif
     return true;
 }
@@ -132,82 +141,85 @@ void SqlCipherQuery::finalize()
     m_stepped = false;
 }
 
-bool SqlCipherQuery::prepare(const QString& sql)
+bool SqlCipherQuery::prepare(const std::string& sql)
 {
     finalize();
-    const QByteArray utf8 = sql.toUtf8();
-    int rc = sqlite3_prepare_v2(m_db, utf8.constData(), utf8.size(), &m_stmt, nullptr);
+    int rc = sqlite3_prepare_v2(m_db, sql.data(), static_cast<int>(sql.size()),
+                                 &m_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        m_lastError = QString::fromUtf8(sqlite3_errmsg(m_db));
+        m_lastError = sqlite3_errmsg(m_db);
         return false;
     }
     return true;
 }
 
-void SqlCipherQuery::bindValue(const QString& placeholder, const QVariant& val)
-{
-    m_binds.append({placeholder, val});
+void SqlCipherQuery::bindValue(const std::string& key, std::nullptr_t) {
+    m_binds.push_back({key, BindKind::Null, 0, 0.0, {}, {}});
+}
+void SqlCipherQuery::bindValue(const std::string& key, int v) {
+    m_binds.push_back({key, BindKind::Int, int64_t(v), 0.0, {}, {}});
+}
+void SqlCipherQuery::bindValue(const std::string& key, int64_t v) {
+    m_binds.push_back({key, BindKind::Int64, v, 0.0, {}, {}});
+}
+void SqlCipherQuery::bindValue(const std::string& key, double v) {
+    m_binds.push_back({key, BindKind::Double, 0, v, {}, {}});
+}
+void SqlCipherQuery::bindValue(const std::string& key, bool v) {
+    m_binds.push_back({key, BindKind::Bool, v ? 1 : 0, 0.0, {}, {}});
+}
+void SqlCipherQuery::bindValue(const std::string& key, const std::string& v) {
+    m_binds.push_back({key, BindKind::Text, 0, 0.0, v, {}});
+}
+void SqlCipherQuery::bindValue(const std::string& key, const char* v) {
+    m_binds.push_back({key, BindKind::Text, 0, 0.0, v ? std::string(v) : std::string(), {}});
+}
+void SqlCipherQuery::bindValue(const std::string& key, const Bytes& v) {
+    m_binds.push_back({key, BindKind::Blob, 0, 0.0, {}, v});
 }
 
 static void applyBinds(sqlite3_stmt* stmt,
-                        const QVector<QPair<QString, QVariant>>& binds)
+                        const std::vector<SqlCipherQuery::Bind>& binds)
 {
-    for (const auto& [name, val] : binds) {
-        int idx = sqlite3_bind_parameter_index(stmt, name.toUtf8().constData());
+    for (const auto& b : binds) {
+        int idx = sqlite3_bind_parameter_index(stmt, b.key.c_str());
         if (idx == 0) continue;  // unknown placeholder
 
-        if (val.isNull()) {
+        using K = SqlCipherQuery::BindKind;
+        switch (b.kind) {
+        case K::Null:
             sqlite3_bind_null(stmt, idx);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        } else if (val.typeId() == QMetaType::Int) {
-#else
-        } else if (val.type() == QVariant::Int) {
-#endif
-            sqlite3_bind_int(stmt, idx, val.toInt());
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        } else if (val.typeId() == QMetaType::LongLong ||
-                   val.typeId() == QMetaType::UInt ||
-                   val.typeId() == QMetaType::ULongLong) {
-#else
-        } else if (val.type() == QVariant::LongLong ||
-                   val.type() == QVariant::UInt ||
-                   val.type() == QVariant::ULongLong) {
-#endif
-            sqlite3_bind_int64(stmt, idx, val.toLongLong());
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        } else if (val.typeId() == QMetaType::Double) {
-#else
-        } else if (val.type() == QVariant::Double) {
-#endif
-            sqlite3_bind_double(stmt, idx, val.toDouble());
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        } else if (val.typeId() == QMetaType::QByteArray) {
-#else
-        } else if (val.type() == QVariant::ByteArray) {
-#endif
-            const QByteArray ba = val.toByteArray();
-            sqlite3_bind_blob(stmt, idx, ba.constData(), ba.size(), SQLITE_TRANSIENT);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        } else if (val.typeId() == QMetaType::Bool) {
-#else
-        } else if (val.type() == QVariant::Bool) {
-#endif
-            sqlite3_bind_int(stmt, idx, val.toBool() ? 1 : 0);
-        } else {
-            // Default: bind as text
-            const QByteArray utf8 = val.toString().toUtf8();
-            sqlite3_bind_text(stmt, idx, utf8.constData(), utf8.size(), SQLITE_TRANSIENT);
+            break;
+        case K::Int:
+        case K::Bool:
+            sqlite3_bind_int(stmt, idx, static_cast<int>(b.ival));
+            break;
+        case K::Int64:
+            sqlite3_bind_int64(stmt, idx, b.ival);
+            break;
+        case K::Double:
+            sqlite3_bind_double(stmt, idx, b.dval);
+            break;
+        case K::Text:
+            sqlite3_bind_text(stmt, idx, b.sval.data(),
+                              static_cast<int>(b.sval.size()), SQLITE_TRANSIENT);
+            break;
+        case K::Blob:
+            sqlite3_bind_blob(stmt, idx,
+                              b.bval.empty() ? "" : reinterpret_cast<const char*>(b.bval.data()),
+                              static_cast<int>(b.bval.size()), SQLITE_TRANSIENT);
+            break;
         }
     }
 }
 
-bool SqlCipherQuery::exec(const QString& sql)
+bool SqlCipherQuery::exec(const std::string& sql)
 {
     finalize();
     char* err = nullptr;
-    int rc = sqlite3_exec(m_db, sql.toUtf8().constData(), nullptr, nullptr, &err);
+    int rc = sqlite3_exec(m_db, sql.c_str(), nullptr, nullptr, &err);
     if (rc != SQLITE_OK) {
-        m_lastError = err ? QString::fromUtf8(err) : QString::fromUtf8(sqlite3_errmsg(m_db));
+        m_lastError = err ? err : sqlite3_errmsg(m_db);
         sqlite3_free(err);
         return false;
     }
@@ -218,7 +230,7 @@ bool SqlCipherQuery::exec(const QString& sql)
 bool SqlCipherQuery::exec()
 {
     if (!m_stmt) {
-        m_lastError = QStringLiteral("No prepared statement");
+        m_lastError = "No prepared statement";
         return false;
     }
 
@@ -231,7 +243,7 @@ bool SqlCipherQuery::exec()
     m_changes = sqlite3_changes(m_db);
 
     if (m_stepRc != SQLITE_ROW && m_stepRc != SQLITE_DONE) {
-        m_lastError = QString::fromUtf8(sqlite3_errmsg(m_db));
+        m_lastError = sqlite3_errmsg(m_db);
         return false;
     }
     return true;
@@ -242,7 +254,6 @@ bool SqlCipherQuery::next()
     if (!m_stmt) return false;
 
     if (m_stepped) {
-        // First call after exec() — use the saved step result
         m_stepped = false;
         return m_stepRc == SQLITE_ROW;
     }
@@ -251,30 +262,50 @@ bool SqlCipherQuery::next()
     return rc == SQLITE_ROW;
 }
 
-QVariant SqlCipherQuery::value(int column) const
+// ─── Column accessors ────────────────────────────────────────────────────────
+
+std::string SqlCipherQuery::valueText(int column) const
 {
     if (!m_stmt) return {};
+    const char* txt = reinterpret_cast<const char*>(
+        sqlite3_column_text(m_stmt, column));
+    const int sz = sqlite3_column_bytes(m_stmt, column);
+    return txt ? std::string(txt, size_t(sz)) : std::string();
+}
 
-    int type = sqlite3_column_type(m_stmt, column);
-    switch (type) {
-    case SQLITE_INTEGER:
-        return QVariant(static_cast<qlonglong>(sqlite3_column_int64(m_stmt, column)));
-    case SQLITE_FLOAT:
-        return QVariant(sqlite3_column_double(m_stmt, column));
-    case SQLITE_BLOB: {
-        const void* data = sqlite3_column_blob(m_stmt, column);
-        int sz = sqlite3_column_bytes(m_stmt, column);
-        return QVariant(QByteArray(static_cast<const char*>(data), sz));
-    }
-    case SQLITE_NULL:
-        return QVariant();
-    case SQLITE_TEXT:
-    default: {
-        const char* txt = reinterpret_cast<const char*>(sqlite3_column_text(m_stmt, column));
-        int sz = sqlite3_column_bytes(m_stmt, column);
-        return QVariant(QString::fromUtf8(txt, sz));
-    }
-    }
+int64_t SqlCipherQuery::valueInt64(int column) const
+{
+    return m_stmt ? sqlite3_column_int64(m_stmt, column) : 0;
+}
+
+int SqlCipherQuery::valueInt(int column) const
+{
+    return m_stmt ? sqlite3_column_int(m_stmt, column) : 0;
+}
+
+double SqlCipherQuery::valueDouble(int column) const
+{
+    return m_stmt ? sqlite3_column_double(m_stmt, column) : 0.0;
+}
+
+SqlCipherQuery::Bytes SqlCipherQuery::valueBlob(int column) const
+{
+    if (!m_stmt) return {};
+    const void* data = sqlite3_column_blob(m_stmt, column);
+    const int sz = sqlite3_column_bytes(m_stmt, column);
+    if (!data || sz <= 0) return {};
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    return Bytes(p, p + sz);
+}
+
+bool SqlCipherQuery::valueBool(int column) const
+{
+    return m_stmt ? sqlite3_column_int(m_stmt, column) != 0 : false;
+}
+
+bool SqlCipherQuery::isNull(int column) const
+{
+    return m_stmt ? (sqlite3_column_type(m_stmt, column) == SQLITE_NULL) : true;
 }
 
 int SqlCipherQuery::numRowsAffected() const

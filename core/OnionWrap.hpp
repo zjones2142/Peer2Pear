@@ -1,7 +1,8 @@
 #pragma once
 
-#include <QByteArray>
-#include <QString>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 /*
  * Onion layer for multi-hop relay routing.
@@ -33,6 +34,13 @@
  *
  * The crypto is crypto_box_easy (X25519-XSalsa20-Poly1305) — the same NaCl
  * Box used on both Go (x/crypto/nacl/box) and Python (pynacl.Box) relays.
+ *
+ * Types:
+ *   bytes → std::vector<uint8_t>       (binary buffers)
+ *   url   → std::string                (UTF-8)
+ *
+ * Ported off Qt containers 2026-04 as part of the core/ mobile-portability
+ * refactor.  See REFACTOR_PLAN.md.
  */
 
 class OnionWrap {
@@ -42,11 +50,11 @@ public:
     // innerBlob to nextHopUrl.
     //
     // @param relayX25519Pub   the hop's X25519 public key (32 bytes)
-    // @param nextHopUrl       full URL the hop should forward to
+    // @param nextHopUrl       full URL the hop should forward to (UTF-8)
     // @param innerBlob        the next layer's bytes (another onion or
     //                         a wrap-for-relay envelope at the final hop)
     // @return onion envelope bytes; empty on failure
-    static QByteArray wrap(const QByteArray& relayX25519Pub,
-                           const QString&    nextHopUrl,
-                           const QByteArray& innerBlob);
+    static std::vector<uint8_t> wrap(const std::vector<uint8_t>& relayX25519Pub,
+                                      const std::string&          nextHopUrl,
+                                      const std::vector<uint8_t>& innerBlob);
 };

@@ -28,8 +28,6 @@ set(CORE_SOURCES
     IHttpClient.hpp
     peer2pear.h
     peer2pear_api.cpp
-    chattypes.h
-    filetransfer.h
 )
 
 add_library(peer2pear-core STATIC ${CORE_SOURCES})
@@ -47,8 +45,14 @@ target_link_libraries(peer2pear-core PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     unofficial-sodium::sodium
     OQS::oqs
+    nlohmann_json::nlohmann_json
     ${SQLCIPHER_TARGET}
 )
+# NOTE: Qt::Core is on its way out.  The Qt strip is tracked in
+# REFACTOR_PLAN.md — subsystems are being migrated one at a time to
+# std:: containers + nlohmann/json.  When the last Qt::* reference leaves
+# core/, this line drops the Qt dependency entirely and mobile builds
+# no longer need Qt for iOS / Android.
 # NOTE: Qt::Network and Qt::WebSockets removed from core — abstracted behind
 # IHttpClient and IWebSocket interfaces. Desktop provides Qt implementations.
 

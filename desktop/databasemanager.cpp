@@ -1,4 +1,5 @@
 #include "databasemanager.h"
+#include "qt_bridge_temp.hpp"   // TEMP: bridge SqlCipherDb calls until desktop migrates too
 
 #include <QStandardPaths>
 #include <QDir>
@@ -54,13 +55,14 @@ bool DatabaseManager::open(const QByteArray &dbKey)
         }
     }
 
-    if (!m_db.open(dbPath, dbKey)) {
-        qWarning() << "DatabaseManager: failed to open DB:" << m_db.lastError();
+    if (!m_db.open(dbPath.toStdString(), p2p::bridge::toBytes(dbKey))) {
+        qWarning() << "DatabaseManager: failed to open DB:"
+                   << QString::fromStdString(m_db.lastError());
         return false;
     }
 
     createTables();
-    qDebug() << "DatabaseManager: opened" << m_db.databaseName()
+    qDebug() << "DatabaseManager: opened" << QString::fromStdString(m_db.databaseName())
              << (m_db.isSqlCipher() ? "(encrypted)" : "(plain)");
     return true;
 }
@@ -259,7 +261,7 @@ bool DatabaseManager::migrateToEncrypted(const QString &dbPath, const QByteArray
     // ── Step 2: Create a NEW encrypted DB, attach the OLD plaintext ─────
     SqlCipherDb encDb;
     if (!encDb.open(encPath, dbKey)) {
-        qWarning() << "Migration: failed to create encrypted DB:" << encDb.lastError();
+        qWarning() << "Migration: failed to create encrypted DB:" << encDb.lastErrorQ();
         QFile::remove(encPath);
         return false;
     }
@@ -440,7 +442,7 @@ QVector<ChatData> DatabaseManager::loadAllContacts() const
         "SELECT peer_id, name, subtitle, keys, is_blocked, is_group, group_id, avatar, last_active"
         " FROM contacts ORDER BY last_active DESC, rowid ASC;"
         );
-    if (!q.exec()) { qWarning() << "loadAllContacts:" << q.lastError(); return result; }
+    if (!q.exec()) { qWarning() << "loadAllContacts:" << q.lastErrorQ(); return result; }
 
     while (q.next()) {
         ChatData chat;
@@ -487,7 +489,7 @@ void DatabaseManager::saveContact(const ChatData &chat)
     q.bindValue(":is_group",    chat.isGroup    ? 1 : 0);
     q.bindValue(":group_id",    chat.groupId);
     q.bindValue(":avatar",      encryptField(chat.avatarData));
-    if (!q.exec()) qWarning() << "saveContact:" << q.lastError();
+    if (!q.exec()) qWarning() << "saveContact:" << q.lastErrorQ();
 }
 
 void DatabaseManager::deleteContact(const QString &peerIdB64u)
@@ -495,7 +497,7 @@ void DatabaseManager::deleteContact(const QString &peerIdB64u)
     SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM contacts WHERE peer_id=:peer_id;");
     q.bindValue(":peer_id", peerIdB64u);
-    if (!q.exec()) qWarning() << "deleteContact:" << q.lastError();
+    if (!q.exec()) qWarning() << "deleteContact:" << q.lastErrorQ();
 }
 
 void DatabaseManager::saveContactAvatar(const QString &peerIdB64u, const QString &avatarB64)
@@ -505,7 +507,7 @@ void DatabaseManager::saveContactAvatar(const QString &peerIdB64u, const QString
     q.prepare("UPDATE contacts SET avatar=:avatar WHERE peer_id=:peer_id;");
     q.bindValue(":avatar",  encryptField(avatarB64));
     q.bindValue(":peer_id", peerIdB64u);
-    if (!q.exec()) qWarning() << "saveContactAvatar:" << q.lastError();
+    if (!q.exec()) qWarning() << "saveContactAvatar:" << q.lastErrorQ();
 }
 
 void DatabaseManager::saveContactKemPub(const QString &peerIdB64u, const QByteArray &kemPub)
@@ -515,7 +517,7 @@ void DatabaseManager::saveContactKemPub(const QString &peerIdB64u, const QByteAr
     q.prepare("UPDATE contacts SET kem_pub=:kp WHERE peer_id=:peer_id;");
     q.bindValue(":kp",      kemPub);
     q.bindValue(":peer_id", peerIdB64u);
-    if (!q.exec()) qWarning() << "saveContactKemPub:" << q.lastError();
+    if (!q.exec()) qWarning() << "saveContactKemPub:" << q.lastErrorQ();
 }
 
 QByteArray DatabaseManager::loadContactKemPub(const QString &peerIdB64u) const
@@ -535,7 +537,7 @@ void DatabaseManager::updateLastActive(const QString &key)
     q.prepare("UPDATE contacts SET last_active=:ts WHERE peer_id=:peer_id;");
     q.bindValue(":ts",      QDateTime::currentSecsSinceEpoch());
     q.bindValue(":peer_id", key);
-    if (!q.exec()) qWarning() << "updateLastActive:" << q.lastError();
+    if (!q.exec()) qWarning() << "updateLastActive:" << q.lastErrorQ();
 }
 
 // ── Message operations ──────────────────────────────────────────────────────
@@ -554,7 +556,7 @@ void DatabaseManager::saveMessage(const QString &peerIdB64u, const Message &msg)
     q.bindValue(":timestamp", msg.timestamp.toUTC().toSecsSinceEpoch());
     q.bindValue(":msg_id",    msg.msgId);
     q.bindValue(":sender_name", encryptField(msg.senderName));
-    if (!q.exec()) { qWarning() << "saveMessage:" << q.lastError(); return; }
+    if (!q.exec()) { qWarning() << "saveMessage:" << q.lastErrorQ(); return; }
     updateLastActive(peerIdB64u);
 }
 
@@ -568,7 +570,7 @@ QVector<Message> DatabaseManager::loadMessages(const QString &peerIdB64u) const
         " WHERE peer_id=:peer_id ORDER BY timestamp ASC, id ASC;"
         );
     q.bindValue(":peer_id", peerIdB64u);
-    if (!q.exec()) { qWarning() << "loadMessages:" << q.lastError(); return result; }
+    if (!q.exec()) { qWarning() << "loadMessages:" << q.lastErrorQ(); return result; }
     while (q.next()) {
         Message msg;
         msg.sent      = q.value(0).toInt() == 1;
@@ -605,7 +607,7 @@ void DatabaseManager::saveFileRecord(const QString &chatKey, const FileTransferR
     q.bindValue(":ct",     rec.chunksTotal);
     q.bindValue(":cc",     rec.chunksComplete);
     q.bindValue(":sp",     encryptField(rec.savedPath));
-    if (!q.exec()) qWarning() << "saveFileRecord:" << q.lastError();
+    if (!q.exec()) qWarning() << "saveFileRecord:" << q.lastErrorQ();
 }
 
 void DatabaseManager::deleteFileRecord(const QString &transferId)
@@ -614,7 +616,7 @@ void DatabaseManager::deleteFileRecord(const QString &transferId)
     SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM file_transfers WHERE transfer_id=:tid;");
     q.bindValue(":tid", transferId);
-    if (!q.exec()) qWarning() << "deleteFileRecord:" << q.lastError();
+    if (!q.exec()) qWarning() << "deleteFileRecord:" << q.lastErrorQ();
 }
 
 QVector<FileTransferRecord> DatabaseManager::loadFileRecords(const QString &chatKey) const
@@ -628,7 +630,7 @@ QVector<FileTransferRecord> DatabaseManager::loadFileRecords(const QString &chat
         " FROM file_transfers WHERE chat_key=:ck ORDER BY timestamp ASC;"
         );
     q.bindValue(":ck", chatKey);
-    if (!q.exec()) { qWarning() << "loadFileRecords:" << q.lastError(); return result; }
+    if (!q.exec()) { qWarning() << "loadFileRecords:" << q.lastErrorQ(); return result; }
     while (q.next()) {
         FileTransferRecord rec;
         rec.transferId      = q.value(0).toString();
@@ -654,7 +656,7 @@ void DatabaseManager::saveSetting(const QString &key, const QString &value)
     SqlCipherQuery q(m_db);
     q.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES(:key,:value);");
     q.bindValue(":key", key); q.bindValue(":value", value);
-    if (!q.exec()) qWarning() << "saveSetting:" << q.lastError();
+    if (!q.exec()) qWarning() << "saveSetting:" << q.lastErrorQ();
 }
 
 QString DatabaseManager::loadSetting(const QString &key, const QString &def) const

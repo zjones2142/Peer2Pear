@@ -1,35 +1,79 @@
 #include "RelayClient.hpp"
 #include "CryptoEngine.hpp"
-#include "SealedEnvelope.hpp"  // Fix #13: cover traffic uses real wrap-for-relay framing
-#include "OnionWrap.hpp"       // Fix #7: onion layer for multi-hop forwarding
+#include "OnionWrap.hpp"
+#include "SealedEnvelope.hpp"
 #include <sodium.h>
+#include <nlohmann/json.hpp>
 
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
-#include <QDateTime>
-#include <QRandomGenerator>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <utility>
+
+// Qt usage is confined to the .cpp — URL manipulation only, via three tiny
+// helpers.  Phase 7 leaves this in place; a pure-std URL helper can replace
+// it later without touching any caller.
+#include <QUrl>
 #include <QDebug>
+#include <QString>
 
-RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http, CryptoEngine* crypto, QObject* parent)
-    : QObject(parent), m_crypto(crypto), m_ws(ws), m_http(http)
+using json = nlohmann::json;
+
+namespace {
+
+std::string urlWithPath(const std::string& baseUrl, const std::string& path) {
+    QUrl u(QString::fromStdString(baseUrl));
+    u.setPath(QString::fromStdString(path));
+    return u.toString().toStdString();
+}
+
+std::string baseOf(const std::string& url) {
+    QUrl u(QString::fromStdString(url));
+    return u.toString(QUrl::RemovePath | QUrl::RemoveQuery | QUrl::RemoveFragment)
+        .toStdString();
+}
+
+std::string wsUrl(const std::string& baseUrl, const std::string& path) {
+    QUrl u(QString::fromStdString(baseUrl));
+    if      (u.scheme() == "https") u.setScheme("wss");
+    else if (u.scheme() == "http")  u.setScheme("ws");
+    u.setPath(QString::fromStdString(path));
+    return u.toString().toStdString();
+}
+
+std::string hostPort(const std::string& url) {
+    QUrl u(QString::fromStdString(url));
+    const QString host = u.host();
+    if (u.port() > 0)
+        return (host + ":" + QString::number(u.port())).toStdString();
+    return host.toStdString();
+}
+
+int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+QString peerPrefix(const std::string& id) {
+    const size_t n = std::min<size_t>(8, id.size());
+    return QString::fromStdString(id.substr(0, n)) + "…";
+}
+
+}  // anonymous namespace
+
+RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http,
+                          ITimerFactory& timers, CryptoEngine* crypto)
+    : m_crypto(crypto), m_ws(ws), m_http(http), m_timers(timers)
 {
-    // IWebSocket callbacks
-    m_ws.onConnected     = [this]()                    { onWsConnected(); };
-    m_ws.onDisconnected  = [this]()                    { onWsDisconnected(); };
-    m_ws.onBinaryMessage = [this](const QByteArray& d) { onWsBinaryMessage(d); };
-    m_ws.onTextMessage   = [this](const QString& m)    { onWsTextMessage(m); };
+    m_ws.onConnected     = [this]()                           { onWsConnected(); };
+    m_ws.onDisconnected  = [this]()                           { onWsDisconnected(); };
+    m_ws.onBinaryMessage = [this](const IWebSocket::Bytes& d) { onWsBinaryMessage(d); };
+    m_ws.onTextMessage   = [this](const std::string& m)       { onWsTextMessage(m); };
 
-    // Reconnect timer
-    m_reconnectTimer.setSingleShot(true);
-    connect(&m_reconnectTimer, &QTimer::timeout, this, &RelayClient::connectToRelay);
-
-    // Retry timer for failed sends
-    m_retryTimer.setSingleShot(true);
-    connect(&m_retryTimer, &QTimer::timeout, this, &RelayClient::processRetryQueue);
-
-    // DAITA: cover traffic timer (disabled by default)
-    connect(&m_coverTimer, &QTimer::timeout, this, &RelayClient::sendCoverEnvelope);
+    m_reconnectTimer = m_timers.create();
+    m_retryTimer     = m_timers.create();
+    m_coverTimer     = m_timers.create();
 }
 
 RelayClient::~RelayClient()
@@ -38,10 +82,7 @@ RelayClient::~RelayClient()
     m_ws.close();
 }
 
-void RelayClient::setRelayUrl(const QUrl& url)
-{
-    m_relayUrl = url;
-}
+void RelayClient::setRelayUrl(const std::string& url) { m_relayUrl = url; }
 
 bool RelayClient::isConnected() const
 {
@@ -57,23 +98,17 @@ void RelayClient::connectToRelay()
     m_intentionalDisconnect = false;
     m_authenticated = false;
 
-    // Build the WebSocket URL: wss://host:port/v1/receive
-    QUrl wsUrl = m_relayUrl;
-    if (wsUrl.scheme() == "https") wsUrl.setScheme("wss");
-    else if (wsUrl.scheme() == "http") wsUrl.setScheme("ws");
-    wsUrl.setPath("/v1/receive");
-
+    const std::string wsU = wsUrl(m_relayUrl, "/v1/receive");
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Relay] Connecting to" << wsUrl.toString();
+    qDebug() << "[Relay] Connecting to" << QString::fromStdString(wsU);
 #endif
-
-    m_ws.open(wsUrl);
+    m_ws.open(wsU);
 }
 
 void RelayClient::disconnectFromRelay()
 {
     m_intentionalDisconnect = true;
-    m_reconnectTimer.stop();
+    m_reconnectTimer->stop();
     m_ws.close();
 }
 
@@ -90,33 +125,31 @@ void RelayClient::authenticate()
 {
     if (!m_crypto) return;
 
-    const QString peerId = CryptoEngine::toBase64Url(m_crypto->identityPub());
-    const qint64 ts = QDateTime::currentMSecsSinceEpoch();
-    const QString message = QString("RELAY1|%1|%2").arg(peerId).arg(ts);
-    const QString sig = m_crypto->signB64u(message.toUtf8());
+    const std::string peerId  = CryptoEngine::toBase64Url(m_crypto->identityPub());
+    const int64_t     ts      = nowMs();
+    const std::string message = "RELAY1|" + peerId + "|" + std::to_string(ts);
+    const Bytes       msgBytes(message.begin(), message.end());
+    const std::string sig     = m_crypto->signB64u(msgBytes);
 
-    QJsonObject auth;
+    json auth;
     auth["peer_id"] = peerId;
     auth["ts"]      = ts;
     auth["sig"]     = sig;
 
-    m_ws.sendTextMessage(
-        QString::fromUtf8(QJsonDocument(auth).toJson(QJsonDocument::Compact)));
+    m_ws.sendTextMessage(auth.dump());
 }
 
 void RelayClient::onWsDisconnected()
 {
     m_authenticated = false;
-    m_coverTimer.stop();  // DAITA: stop cover traffic on disconnect
-    // Fix #14: online-peer set is ws-session-scoped; clear so we don't use
-    // stale presence after a reconnect lands fresh subscriptions.
+    m_coverTimer->stop();
     m_onlinePeers.clear();
 
 #ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Relay] WebSocket disconnected";
 #endif
 
-    emit disconnected();
+    if (onDisconnected) onDisconnected();
 
     if (!m_intentionalDisconnect)
         scheduleReconnect();
@@ -124,135 +157,105 @@ void RelayClient::onWsDisconnected()
 
 void RelayClient::scheduleReconnect()
 {
-    // Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 60s
-    int delaySec = qMin(1 << m_reconnectAttempt, kMaxReconnectDelaySec);
+    const int delaySec = std::min(1 << m_reconnectAttempt, kMaxReconnectDelaySec);
     m_reconnectAttempt++;
 
 #ifndef QT_NO_DEBUG_OUTPUT
     qDebug() << "[Relay] Reconnecting in" << delaySec << "seconds...";
 #endif
-
-    m_reconnectTimer.start(delaySec * 1000);
+    m_reconnectTimer->startSingleShot(delaySec * 1000,
+                                       [this] { connectToRelay(); });
 }
 
 // ── Incoming messages ────────────────────────────────────────────────────────
 
-void RelayClient::onWsBinaryMessage(const QByteArray& data)
+void RelayClient::onWsBinaryMessage(const Bytes& data)
 {
-    // DAITA: discard relay cover traffic (dummy envelopes with version 0x00)
-    if (!data.isEmpty() && static_cast<quint8>(data.at(0)) == kDummyVersion)
+    if (!data.empty() && data[0] == kDummyVersion)
         return;
 
-    // DAITA: real receive resets cover traffic timer — mimics reading + replying
     onRealActivity();
 
-    // Binary messages are sealed envelopes pushed by the relay
-    emit envelopeReceived(data);
+    if (onEnvelopeReceived) onEnvelopeReceived(data);
 }
 
-void RelayClient::onWsTextMessage(const QString& message)
+void RelayClient::onWsTextMessage(const std::string& message)
 {
-    const QJsonDocument doc = QJsonDocument::fromJson(message.toUtf8());
-    if (!doc.isObject()) return;
-    const QJsonObject obj = doc.object();
-    const QString type = obj.value("type").toString();
+    json obj;
+    try { obj = json::parse(message); } catch (...) { return; }
+    if (!obj.is_object()) return;
+    const std::string type = obj.value("type", "");
 
     if (type == "auth_ok") {
         m_authenticated = true;
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[Relay] Authenticated as" << obj.value("peer_id").toString().left(8) + "…";
+        const std::string authedAs = obj.value("peer_id", "");
+        qDebug() << "[Relay] Authenticated as" << peerPrefix(authedAs);
 #endif
-        // DAITA: start cover traffic if configured
-        if (m_coverIntervalSec > 0)
-            scheduleCoverTimer();
-        // Fix #7: fetch relay X25519 pubkeys so multi-hop forwards upgrade
-        // from single-layer /v1/forward to proper onion /v1/forward-onion.
+        if (m_coverIntervalSec > 0) scheduleCoverTimer();
         refreshRelayInfo();
-        emit connected();
+        if (onConnected) onConnected();
         return;
     }
 
     if (type == "presence" || type == "presence_result") {
-        // Single peer presence push: { "type": "presence", "peer_id": "...", "online": true }
         if (obj.contains("peer_id")) {
-            const QString pid = obj.value("peer_id").toString();
-            const bool online = obj.value("online").toBool();
-            // Fix #14: track online state so cover traffic can target only
-            // currently-connected contacts.  Filling an offline contact's
-            // mailbox with cover not only wastes their quota but also lets
-            // the relay distinguish cover (goes to offline peers too) from
-            // real traffic (almost never offline peers).
+            const std::string pid = obj.value("peer_id", "");
+            const bool online     = obj.value("online", false);
             if (online) m_onlinePeers.insert(pid);
-            else        m_onlinePeers.remove(pid);
-            emit presenceChanged(pid, online);
+            else        m_onlinePeers.erase(pid);
+            if (onPresenceChanged) onPresenceChanged(pid, online);
             return;
         }
 
-        // Batch presence result: { "type": "presence_result", "peers": { "id": true, ... } }
-        if (obj.contains("peers")) {
-            const QJsonObject peers = obj.value("peers").toObject();
-            for (auto it = peers.begin(); it != peers.end(); ++it) {
-                const bool online = it.value().toBool();
+        if (obj.contains("peers") && obj["peers"].is_object()) {
+            for (auto it = obj["peers"].begin(); it != obj["peers"].end(); ++it) {
+                const bool online = it.value().get<bool>();
                 if (online) m_onlinePeers.insert(it.key());
-                else        m_onlinePeers.remove(it.key());
-                emit presenceChanged(it.key(), online);
+                else        m_onlinePeers.erase(it.key());
+                if (onPresenceChanged) onPresenceChanged(it.key(), online);
             }
             return;
         }
     }
 
-    if (type == "pong") {
-        // Keepalive response — nothing to do
-        return;
-    }
+    if (type == "pong") return;
 }
 
 // ── Sending envelopes ────────────────────────────────────────────────────────
-//
-// Sends are always anonymous HTTP POST to /v1/send — no authentication,
-// no sender identity. The relay reads the recipient from envelope bytes 1-32.
 
-void RelayClient::sendEnvelope(const QByteArray& sealedEnvelope)
+void RelayClient::sendEnvelope(const Bytes& sealedEnvelope)
 {
-    // DAITA: if cover traffic is active, send 1-2 cover envelopes BEFORE the real
-    // one so the real message isn't always the first after idle. An open-source
-    // attacker reading this code still can't tell which envelope is real — they're
-    // all version 0x01, same size, to real contacts, random ciphertext.
     if (m_coverIntervalSec > 0 && m_burstRemaining <= 0 && isConnected()) {
-        const int precover = 1 + QRandomGenerator::global()->bounded(2); // 1-2
+        const int precover = 1 + int(randombytes_uniform(2));
         for (int i = 0; i < precover; i++)
             sendCoverEnvelope();
     }
     onRealActivity();
 
-    // Pick which relay to send through (round-robin if multi-relay configured)
-    const QUrl relay = pickSendRelay();
+    const std::string relay = pickSendRelay();
 
     auto retryCb = [this, sealedEnvelope](const IHttpClient::Response& r) {
-        if (r.error.isEmpty()) return;  // success
+        if (r.error.empty()) return;
 
-        // Permanent failure — don't retry
         if (r.status == 413) {
-            emit status("Envelope too large for relay — rejected.");
+            emitStatus("Envelope too large for relay — rejected.");
             return;
         }
 
-        // Transient failure — queue for retry
-        if (m_retryQueue.size() < kMaxRetryQueue)
-            m_retryQueue.append({ sealedEnvelope, 0 });
-        if (!m_retryTimer.isActive())
+        if (static_cast<int>(m_retryQueue.size()) < kMaxRetryQueue)
+            m_retryQueue.push_back({ sealedEnvelope, 0 });
+        if (!m_retryTimer->isActive())
             scheduleRetry();
 
         if (r.status != 429)
-            emit status(QString("relay send error: %1 — will retry").arg(r.error));
+            emitStatus("relay send error: " + r.error + " — will retry");
     };
 
-    // Route: multi-hop sends through an intermediate relay, single-hop sends direct
     if (m_multiHop && m_sendRelays.size() >= 2) {
-        // Pick two different relays: send to first, forward to second (which delivers)
-        const QUrl via = pickSendRelay();
-        QUrl to = pickSendRelay();
-        if (to == via) to = m_relayUrl; // fallback to main relay if pool is small
+        const std::string via = pickSendRelay();
+        std::string to        = pickSendRelay();
+        if (to == via) to = m_relayUrl;
         forwardEnvelope(via, to, sealedEnvelope, std::move(retryCb));
     } else {
         postEnvelope(relay, sealedEnvelope, std::move(retryCb));
@@ -261,97 +264,101 @@ void RelayClient::sendEnvelope(const QByteArray& sealedEnvelope)
 
 // ── Presence ─────────────────────────────────────────────────────────────────
 
-void RelayClient::subscribePresence(const QStringList& peerIds)
+void RelayClient::subscribePresence(const std::vector<std::string>& peerIds)
 {
-    // DAITA: update known peers for realistic cover traffic targeting
     m_knownPeers = peerIds;
-
     if (!isConnected()) return;
 
-    QJsonArray ids;
-    for (const QString& id : peerIds)
-        if (!id.trimmed().isEmpty()) ids.append(id.trimmed());
+    json ids = json::array();
+    for (const std::string& id : peerIds) {
+        const auto first = id.find_first_not_of(" \t\r\n");
+        const auto last  = id.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        ids.push_back(id.substr(first, last - first + 1));
+    }
 
-    QJsonObject msg;
+    json msg;
     msg["type"]     = "presence_subscribe";
-    msg["peer_ids"] = ids;
-
-    m_ws.sendTextMessage(
-        QString::fromUtf8(QJsonDocument(msg).toJson(QJsonDocument::Compact)));
+    msg["peer_ids"] = std::move(ids);
+    m_ws.sendTextMessage(msg.dump());
 }
 
-void RelayClient::queryPresence(const QStringList& peerIds)
+void RelayClient::queryPresence(const std::vector<std::string>& peerIds)
 {
     if (!isConnected()) return;
 
-    QJsonArray ids;
-    for (const QString& id : peerIds)
-        if (!id.trimmed().isEmpty()) ids.append(id.trimmed());
+    json ids = json::array();
+    for (const std::string& id : peerIds) {
+        const auto first = id.find_first_not_of(" \t\r\n");
+        const auto last  = id.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        ids.push_back(id.substr(first, last - first + 1));
+    }
 
-    QJsonObject msg;
+    json msg;
     msg["type"]     = "presence_query";
-    msg["peer_ids"] = ids;
-
-    m_ws.sendTextMessage(
-        QString::fromUtf8(QJsonDocument(msg).toJson(QJsonDocument::Compact)));
+    msg["peer_ids"] = std::move(ids);
+    m_ws.sendTextMessage(msg.dump());
 }
 
 // ── Retry queue ──────────────────────────────────────────────────────────────
 
 void RelayClient::scheduleRetry()
 {
-    if (m_retryQueue.isEmpty()) return;
-    const int attempt = m_retryQueue.first().retryCount;
-    const int delaySec = qMin(1 << attempt, 60);
-    m_retryTimer.start(delaySec * 1000);
+    if (m_retryQueue.empty()) return;
+    const int attempt = m_retryQueue.front().retryCount;
+    const int delaySec = std::min(1 << attempt, 60);
+    m_retryTimer->startSingleShot(delaySec * 1000,
+                                   [this] { processRetryQueue(); });
 }
 
 void RelayClient::processRetryQueue()
 {
-    if (m_retryQueue.isEmpty() || m_retryInFlight) return;
+    if (m_retryQueue.empty() || m_retryInFlight) return;
     m_retryInFlight = true;
 
-    PendingEnvelope pe = m_retryQueue.takeFirst();
+    PendingEnvelope pe = std::move(m_retryQueue.front());
+    m_retryQueue.erase(m_retryQueue.begin());
 
-    QUrl sendUrl = m_relayUrl;
-    sendUrl.setPath("/v1/send");
+    const std::string sendUrl = urlWithPath(m_relayUrl, "/v1/send");
 
-    m_http.post(sendUrl, pe.data, {}, [this, pe](const IHttpClient::Response& r) {
+    m_http.post(sendUrl, pe.data, {},
+                [this, pe](const IHttpClient::Response& r) {
         m_retryInFlight = false;
 
-        if (r.error.isEmpty()) {
-            if (!m_retryQueue.isEmpty()) scheduleRetry();
+        if (r.error.empty()) {
+            if (!m_retryQueue.empty()) scheduleRetry();
             return;
         }
 
         if (r.status == 413) {
-            if (!m_retryQueue.isEmpty()) scheduleRetry();
+            if (!m_retryQueue.empty()) scheduleRetry();
             return;
         }
 
         PendingEnvelope next = pe;
         next.retryCount++;
         if (next.retryCount < kMaxRetries) {
-            m_retryQueue.prepend(next);
+            m_retryQueue.insert(m_retryQueue.begin(), std::move(next));
             scheduleRetry();
         } else {
-            emit status("Gave up delivering envelope after max retries.");
+            emitStatus("Gave up delivering envelope after max retries.");
         }
     });
 }
 
-// ── DAITA: client-side traffic analysis defense ─────────────────────────────
+// ── DAITA ────────────────────────────────────────────────────────────────────
 
 void RelayClient::setJitterRange(int minMs, int maxMs)
 {
-    m_jitterMinMs = qMax(0, minMs);
-    m_jitterMaxMs = qMax(m_jitterMinMs, maxMs);
+    m_jitterMinMs = std::max(0, minMs);
+    m_jitterMaxMs = std::max(m_jitterMinMs, maxMs);
 }
 
 void RelayClient::setCoverTrafficInterval(int seconds)
 {
-    m_coverIntervalSec = qMax(0, seconds);
-    m_coverTimer.stop();
+    m_coverIntervalSec = std::max(0, seconds);
+    m_coverTimer->stop();
     m_burstRemaining = 0;
     if (m_coverIntervalSec > 0 && isConnected())
         scheduleCoverTimer();
@@ -359,25 +366,15 @@ void RelayClient::setCoverTrafficInterval(int seconds)
 
 void RelayClient::onRealActivity()
 {
-    // A real message was sent or received — blend it into the cover pattern.
-    //
-    // If we're mid-burst: the real message counts as one of the burst messages.
-    // Reset the timer so the next cover envelope comes at natural conversation pace.
-    //
-    // If we're idle: real activity starts a new burst — the user is now "in a
-    // conversation" and cover traffic should match that pace.
     if (m_coverIntervalSec <= 0) return;
 
     if (m_burstRemaining > 0) {
-        // Real message counts as part of the burst
         --m_burstRemaining;
     } else {
-        // Real activity during idle → start a new burst (2-4 more cover messages)
-        m_burstRemaining = 2 + QRandomGenerator::global()->bounded(3);
+        m_burstRemaining = 2 + int(randombytes_uniform(3));
     }
 
-    // Reset timer — next cover envelope comes at burst pace (1-5s)
-    m_coverTimer.stop();
+    m_coverTimer->stop();
     scheduleCoverTimer();
 }
 
@@ -385,23 +382,18 @@ void RelayClient::scheduleCoverTimer()
 {
     if (m_coverIntervalSec <= 0) return;
 
-    // Bursty timing: mimic real conversation patterns.
-    // Real chats = rapid burst of 3-8 messages (1-5s apart), then idle (1-5 min).
     if (m_burstRemaining > 0) {
-        // Mid-burst: next envelope in 1-5 seconds (mimics typing + sending)
-        const int delayMs = 1000 + QRandomGenerator::global()->bounded(4000);
-        m_coverTimer.start(delayMs);
+        const int delayMs = 1000 + int(randombytes_uniform(4000));
+        m_coverTimer->startSingleShot(delayMs, [this] { sendCoverEnvelope(); });
     } else {
-        // Between bursts: idle for 1-5x the configured interval
         const int idleMs = m_coverIntervalSec * 1000
-            + QRandomGenerator::global()->bounded(m_coverIntervalSec * 4000);
-        m_coverTimer.start(idleMs);
-        // Next timer fire starts a new burst of 2-6 envelopes
-        m_burstRemaining = 2 + QRandomGenerator::global()->bounded(5);
+            + int(randombytes_uniform(uint32_t(m_coverIntervalSec * 4000)));
+        m_coverTimer->startSingleShot(idleMs, [this] { sendCoverEnvelope(); });
+        m_burstRemaining = 2 + int(randombytes_uniform(5));
     }
 }
 
-void RelayClient::setKnownPeers(const QStringList& peerIds)
+void RelayClient::setKnownPeers(const std::vector<std::string>& peerIds)
 {
     m_knownPeers = peerIds;
 }
@@ -410,82 +402,49 @@ void RelayClient::sendCoverEnvelope()
 {
     if (!isConnected()) return;
 
-    // Cover traffic must be INDISTINGUISHABLE from real envelopes on the wire.
-    //
-    // Fix #13: previously cover envelopes were formatted as
-    //   [0x01][recipientPub(32)][random bytes...]
-    // but real envelopes use the wrap-for-relay framing:
-    //   [0x01][recipientPub(32)][innerLen(4 BE)][sealedBytes][random pad]
-    // where innerLen is a BE uint32 well below 256 KiB (typically 200–60000).
-    // Bytes 33–36 of a real envelope are a small number; cover envelopes had
-    // uniform random there. A relay operator could filter cover with 3 lines
-    // of Python. This rewrite generates cover using the SAME wrap-for-relay
-    // path and a plausible inner sealed body.
-    //
-    // Fix #14: recipients are chosen from currently-online contacts only.
-    // Sending cover to offline peers filled their mailbox quotas AND let the
-    // relay distinguish cover (often goes to offline peers) from real
-    // traffic (rarely goes to offline peers, since you'd ratchet-encrypt
-    // for them only after an accept). Online-only targets match real
-    // messaging distribution. The relay already learns our online-contact
-    // set via the presence subscription, so this doesn't leak new info.
-
-    // Build the candidate list: known peers ∩ currently online.
-    QStringList onlinePool;
+    std::vector<std::string> onlinePool;
     onlinePool.reserve(m_knownPeers.size());
-    for (const QString& pid : m_knownPeers) {
-        if (m_onlinePeers.contains(pid)) onlinePool << pid;
-    }
-    if (onlinePool.isEmpty()) {
-        // No online contacts — skip this tick rather than send cover to an
-        // offline peer.  Reschedule so timing remains bursty.
+    for (const std::string& pid : m_knownPeers)
+        if (m_onlinePeers.count(pid)) onlinePool.push_back(pid);
+    if (onlinePool.empty()) {
         if (m_burstRemaining > 0) --m_burstRemaining;
         scheduleCoverTimer();
         return;
     }
-    const QString& peerId = onlinePool[int(randombytes_uniform(quint32(onlinePool.size())))];
-    QByteArray recipientPub = CryptoEngine::fromBase64Url(peerId);
+    const std::string& peerId = onlinePool[randombytes_uniform(uint32_t(onlinePool.size()))];
+    Bytes recipientPub = CryptoEngine::fromBase64Url(peerId);
     if (recipientPub.size() != 32) {
         if (m_burstRemaining > 0) --m_burstRemaining;
         scheduleCoverTimer();
         return;
     }
 
-    // Synthesize a sealed-envelope body that passes structural checks:
-    //   [version 0x02 or 0x03][ephPub(32)][optional kemCt(1088)][AEAD blob]
-    // Then wrap it with the routing layer so bytes 33–36 carry a plausible
-    // innerLen BE uint32.
-    const bool hybrid = randombytes_uniform(10) == 0;  // ~10% hybrid
+    const bool hybrid = randombytes_uniform(10) == 0;
     const int baseMin = hybrid
-        ? (1 + 32 + 1088 + 24 + 16)   // version + ephPub + kemCt + nonce + tag
-        : (1 + 32 + 24 + 16);         // version + ephPub + nonce + tag
+        ? (1 + 32 + 1088 + 24 + 16)
+        : (1 + 32 + 24 + 16);
 
-    // Size distribution: mostly short message envelopes (200–1500B after min),
-    // occasionally file-chunk-sized to match real file-transfer traffic.
-    int innerSize;
+    size_t innerSize;
     if (randombytes_uniform(20) == 0) {
-        // ~5% file-chunk-sized (240KB chunks produce ~245KB sealed envelopes)
-        innerSize = baseMin + 244000 + int(randombytes_uniform(8000));
+        innerSize = baseMin + 244000 + size_t(randombytes_uniform(8000));
     } else {
-        innerSize = baseMin + int(randombytes_uniform(1400));
+        innerSize = baseMin + size_t(randombytes_uniform(1400));
     }
-    QByteArray body(innerSize, Qt::Uninitialized);
-    randombytes_buf(reinterpret_cast<unsigned char*>(body.data()),
-                    static_cast<size_t>(innerSize));
-    body[0] = hybrid ? char(0x03) : char(0x02);  // version byte matches real sealed v2
+    Bytes body(innerSize);
+    randombytes_buf(body.data(), innerSize);
+    body[0] = hybrid ? uint8_t(0x03) : uint8_t(0x02);
 
-    QByteArray env = SealedEnvelope::wrapForRelay(recipientPub, body);
-    if (env.isEmpty()) {
+    Bytes env = SealedEnvelope::wrapForRelay(recipientPub, body);
+    if (env.empty()) {
         if (m_burstRemaining > 0) --m_burstRemaining;
         scheduleCoverTimer();
         return;
     }
 
-    // Route cover traffic the same way as real traffic — indistinguishable.
     auto noop = [](const IHttpClient::Response&) {};
     if (m_multiHop && m_sendRelays.size() >= 2) {
-        const QUrl via = pickSendRelay();
-        QUrl to = pickSendRelay();
+        const std::string via = pickSendRelay();
+        std::string to        = pickSendRelay();
         if (to == via) to = m_relayUrl;
         forwardEnvelope(via, to, env, noop);
     } else {
@@ -498,50 +457,34 @@ void RelayClient::sendCoverEnvelope()
 
 // ── Multi-relay routing ─────────────────────────────────────────────────────
 
-void RelayClient::addSendRelay(const QUrl& url)
+void RelayClient::addSendRelay(const std::string& url)
 {
-    if (!url.isEmpty() && !m_sendRelays.contains(url))
-        m_sendRelays.append(url);
+    if (url.empty()) return;
+    if (std::find(m_sendRelays.begin(), m_sendRelays.end(), url) == m_sendRelays.end())
+        m_sendRelays.push_back(url);
 }
 
-void RelayClient::setMultiHopEnabled(bool enabled)
-{
-    m_multiHop = enabled;
-}
+void RelayClient::setMultiHopEnabled(bool enabled) { m_multiHop = enabled; }
 
-QUrl RelayClient::pickSendRelay()
+std::string RelayClient::pickSendRelay()
 {
-    if (m_sendRelays.isEmpty()) return m_relayUrl;
+    if (m_sendRelays.empty()) return m_relayUrl;
     m_sendRelayIdx = (m_sendRelayIdx + 1) % m_sendRelays.size();
     return m_sendRelays[m_sendRelayIdx];
 }
 
-// Fix #9: honor the jitter range set by setPrivacyLevel.  Previously
-// m_jitterMinMs/m_jitterMaxMs were stored but never read — every send went
-// out the instant the caller invoked it, turning "Enhanced/Maximum privacy"
-// timing protection into a no-op that a relay operator could trivially
-// correlate to user typing.
-//
-// Random jitter ∈ [m_jitterMinMs, m_jitterMaxMs] is scheduled per-send via
-// QTimer::singleShot.  When both bounds are 0 (Privacy Level 0), we skip
-// the timer and post synchronously to preserve ordering invariants.
 int RelayClient::pickJitterMs() const
 {
     if (m_jitterMaxMs <= 0) return 0;
     const int span = m_jitterMaxMs - m_jitterMinMs;
     if (span <= 0) return m_jitterMinMs;
-    // Fix #25: jitter is a timing-correlation defense; use a cryptographic
-    // source so an observer who watches many samples can't build a
-    // statistical predictor for the next delay.  randombytes_uniform is
-    // unbiased and CSPRNG-backed from libsodium.
-    return m_jitterMinMs + int(randombytes_uniform(quint32(span + 1)));
+    return m_jitterMinMs + int(randombytes_uniform(uint32_t(span + 1)));
 }
 
-void RelayClient::postEnvelope(const QUrl& relayUrl, const QByteArray& envelope,
+void RelayClient::postEnvelope(const std::string& relayUrl, const Bytes& envelope,
                                 IHttpClient::Callback cb)
 {
-    QUrl sendUrl = relayUrl;
-    sendUrl.setPath("/v1/send");
+    const std::string sendUrl = urlWithPath(relayUrl, "/v1/send");
 
     const int jitterMs = pickJitterMs();
     if (jitterMs <= 0) {
@@ -549,115 +492,99 @@ void RelayClient::postEnvelope(const QUrl& relayUrl, const QByteArray& envelope,
         return;
     }
 
-    QTimer::singleShot(jitterMs, this,
+    m_timers.singleShot(jitterMs,
         [this, sendUrl, envelope, cb = std::move(cb)]() mutable {
             m_http.post(sendUrl, envelope, {}, std::move(cb));
         });
 }
 
-void RelayClient::forwardEnvelope(const QUrl& viaRelay, const QUrl& toRelay,
-                                   const QByteArray& envelope,
+void RelayClient::forwardEnvelope(const std::string& viaRelay, const std::string& toRelay,
+                                   const Bytes& envelope,
                                    IHttpClient::Callback cb)
 {
-    // Fix #7: if we have the entry-hop's X25519 pubkey cached, wrap the
-    // envelope as an onion layer.  The entry hop sees only
-    //   (ephPub, opaque ciphertext with authenticated nextHopUrl inside)
-    // and posts the inner blob to the next hop's /v1/send.  Crucially, the
-    // entry hop does NOT learn the final recipient pubkey that sits inside
-    // the inner wrap-for-relay header.  Only the exit hop does.
-    const QString relayKey = viaRelay.toString(
-        QUrl::RemovePath | QUrl::RemoveQuery | QUrl::RemoveFragment);
-    const QByteArray viaPub = m_relayX25519Pubs.value(relayKey);
+    const std::string relayKey = baseOf(viaRelay);
+    const auto pubIt = m_relayX25519Pubs.find(relayKey);
+    const bool havePub = (pubIt != m_relayX25519Pubs.end() && pubIt->second.size() == 32);
 
-    if (viaPub.size() == 32) {
-        // Target URL the entry hop forwards TO — the exit relay's /v1/send.
-        QUrl exitUrl = toRelay;
-        exitUrl.setPath("/v1/send");
-        const QString nextHop = exitUrl.toString();
+    if (havePub) {
+        const std::string nextHop = urlWithPath(toRelay, "/v1/send");
+        const Bytes onion = OnionWrap::wrap(pubIt->second, nextHop, envelope);
 
-        const QByteArray onion = OnionWrap::wrap(viaPub, nextHop, envelope);
-        if (!onion.isEmpty()) {
-            QUrl fwdUrl = viaRelay;
-            fwdUrl.setPath("/v1/forward-onion");
+        if (!onion.empty()) {
+            const std::string fwdUrl = urlWithPath(viaRelay, "/v1/forward-onion");
 
             const int jitterMs = pickJitterMs();
             if (jitterMs <= 0) {
                 m_http.post(fwdUrl, onion, {}, std::move(cb));
             } else {
-                QTimer::singleShot(jitterMs, this,
+                m_timers.singleShot(jitterMs,
                     [this, fwdUrl, onion, cb = std::move(cb)]() mutable {
                         m_http.post(fwdUrl, onion, {}, std::move(cb));
                     });
             }
             return;
         }
-        // wrap failed (shouldn't happen) — fall through to legacy path.
     }
 
-    // Legacy path (no cached pubkey yet — entry hop sees final recipient).
-    // Triggers refreshRelayInfo() so the next send upgrades to onion.
-    QUrl fwdUrl = viaRelay;
-    fwdUrl.setPath("/v1/forward");
-    QMap<QString, QString> headers;
-    headers["X-Forward-To"] = toRelay.host()
-        + (toRelay.port() > 0 ? ":" + QString::number(toRelay.port()) : "");
+    // Legacy path
+    const std::string fwdUrl = urlWithPath(viaRelay, "/v1/forward");
+    IHttpClient::Headers headers;
+    headers["X-Forward-To"] = hostPort(toRelay);
 
     const int jitterMs = pickJitterMs();
     if (jitterMs <= 0) {
         m_http.post(fwdUrl, envelope, headers, std::move(cb));
     } else {
-        QTimer::singleShot(jitterMs, this,
+        m_timers.singleShot(jitterMs,
             [this, fwdUrl, envelope, headers, cb = std::move(cb)]() mutable {
                 m_http.post(fwdUrl, envelope, headers, std::move(cb));
             });
     }
-    // Async: fetch the pubkey so next send onions properly.
     const_cast<RelayClient*>(this)->refreshRelayInfo();
 }
 
 void RelayClient::refreshRelayInfo()
 {
-    // Fetch /v1/relay_info from every configured relay and cache the X25519
-    // pubkey so forwardEnvelope() can use onion layering.  Idempotent — a
-    // relay that already has a cached key is re-fetched (in case it rolled).
-    auto fetchOne = [this](const QUrl& base) {
-        QUrl infoUrl = base;
-        infoUrl.setPath("/v1/relay_info");
-        const QString cacheKey = base.toString(
-            QUrl::RemovePath | QUrl::RemoveQuery | QUrl::RemoveFragment);
-        m_http.get(infoUrl, {}, [this, cacheKey](const IHttpClient::Response& r) {
-            if (!r.error.isEmpty() || r.status != 200) return;
-            QJsonParseError pe{};
-            const QJsonDocument doc = QJsonDocument::fromJson(r.body, &pe);
-            if (pe.error != QJsonParseError::NoError) return;
-            const QString pubB64u = doc.object().value("x25519_pub").toString();
-            const QByteArray pub = CryptoEngine::fromBase64Url(pubB64u);
+    auto fetchOne = [this](const std::string& base) {
+        const std::string infoUrl  = urlWithPath(base, "/v1/relay_info");
+        const std::string cacheKey = baseOf(base);
+        m_http.get(infoUrl, {},
+                   [this, cacheKey](const IHttpClient::Response& r) {
+            if (!r.error.empty() || r.status != 200) return;
+            json doc;
+            try {
+                doc = json::parse(std::string(r.body.begin(), r.body.end()));
+            } catch (...) { return; }
+            if (!doc.is_object()) return;
+            const std::string pubB64u = doc.value("x25519_pub", "");
+            const Bytes pub = CryptoEngine::fromBase64Url(pubB64u);
             if (pub.size() != 32) return;
             m_relayX25519Pubs[cacheKey] = pub;
 #ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[Relay] cached X25519 pub for onion routing:" << cacheKey;
+            qDebug() << "[Relay] cached X25519 pub for onion routing:"
+                     << QString::fromStdString(cacheKey);
 #endif
         });
     };
-    if (!m_relayUrl.isEmpty()) fetchOne(m_relayUrl);
-    for (const QUrl& url : m_sendRelays) fetchOne(url);
+    if (!m_relayUrl.empty()) fetchOne(m_relayUrl);
+    for (const std::string& url : m_sendRelays) fetchOne(url);
 }
 
 void RelayClient::setPrivacyLevel(int level)
 {
     switch (level) {
-    case 0: // Standard: padding only (already always on)
+    case 0:
         setJitterRange(0, 0);
         setCoverTrafficInterval(0);
         m_sendRelays.clear();
         setMultiHopEnabled(false);
         break;
-    case 1: // Enhanced: + jitter + cover + multi-relay rotation
+    case 1:
         setJitterRange(50, 300);
         setCoverTrafficInterval(30);
         setMultiHopEnabled(false);
         break;
-    case 2: // Maximum: + multi-hop + high-frequency cover
+    case 2:
         setJitterRange(100, 500);
         setCoverTrafficInterval(10);
         setMultiHopEnabled(true);

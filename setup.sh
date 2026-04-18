@@ -151,8 +151,9 @@ echo
 
 # ── vcpkg (manifest mode via vcpkg.json) ─────────────────────────────────────
 #
-# vcpkg.json declares libsodium, liboqs, msquic, libnice, glib.  The toolchain
-# file (set in CMakeLists.txt) triggers auto-install on first CMake configure.
+# vcpkg.json declares libsodium, liboqs, nlohmann-json, and (feature "p2p")
+# msquic, libnice, glib.  The toolchain file (set in CMakeLists.txt) triggers
+# auto-install on first CMake configure — no manual `vcpkg install` needed.
 
 if [ ! -d vcpkg ]; then
     echo "Cloning vcpkg..."
@@ -180,4 +181,5 @@ echo "        cmake -B build -S . -G Ninja"
 echo "        cmake --build build"
 echo
 echo "The first CMake configure will take several minutes — vcpkg builds"
-echo "libsodium, liboqs, msquic, libnice, and glib from source."
+echo "libsodium, liboqs, nlohmann-json, and (if PEER2PEAR_P2P=ON) msquic,"
+echo "libnice, and glib from source."

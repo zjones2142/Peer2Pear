@@ -5,6 +5,10 @@
     "libsodium",
     "liboqs",
     {
+      "name": "nlohmann-json",
+      "$comment": "Header-only JSON used by core/ (replaces QJsonDocument/QJsonObject). Cross-platform, tiny."
+    },
+    {
       "name": "sqlcipher",
       "platform": "windows",
       "$comment": "On macOS/Linux sqlcipher comes from brew/apt; on Windows vcpkg supplies it."

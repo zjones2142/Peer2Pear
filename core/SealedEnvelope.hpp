@@ -1,5 +1,7 @@
 #pragma once
-#include <QByteArray>
+
+#include <cstdint>
+#include <vector>
 
 /*
  * Sealed Sender Envelope — hybrid X25519 + ML-KEM-768
@@ -21,13 +23,18 @@
  * Binding recipientEdPub into the AEAD AAD prevents a malicious relay from
  * re-routing the sealed blob to a different recipient.
  * The envelopeId is 16 random bytes that the receiver uses for replay detection.
+ *
+ * Types: std::vector<uint8_t> for all binary buffers (migrated off Qt 2026-04).
+ * See REFACTOR_PLAN.md.
  */
 
+using Bytes = std::vector<uint8_t>;
+
 struct UnsealResult {
-    QByteArray senderEdPub;   // 32 bytes — sender's Ed25519 public key
-    QByteArray innerPayload;  // decrypted inner ciphertext
-    QByteArray envelopeId;    // 16 bytes — unique per-envelope id, for replay dedup
-    bool       valid = false;
+    Bytes senderEdPub;   // 32 bytes — sender's Ed25519 public key
+    Bytes innerPayload;  // decrypted inner ciphertext
+    Bytes envelopeId;    // 16 bytes — unique per-envelope id, for replay dedup
+    bool  valid = false;
 };
 
 class SealedEnvelope {
@@ -49,27 +56,27 @@ public:
     // recipientKemPub:   recipient's ML-KEM-768 public key (1184, optional)
     // senderDsaPub:      sender's ML-DSA-65 public key (1952, optional)
     // senderDsaPriv:     sender's ML-DSA-65 private key (4032, optional)
-    static QByteArray seal(const QByteArray& recipientCurvePub,
-                           const QByteArray& recipientEdPub,
-                           const QByteArray& senderEdPub,
-                           const QByteArray& senderEdPriv,
-                           const QByteArray& innerPayload,
-                           const QByteArray& recipientKemPub = {},
-                           const QByteArray& senderDsaPub = {},
-                           const QByteArray& senderDsaPriv = {});
+    static Bytes seal(const Bytes& recipientCurvePub,
+                      const Bytes& recipientEdPub,
+                      const Bytes& senderEdPub,
+                      const Bytes& senderEdPriv,
+                      const Bytes& innerPayload,
+                      const Bytes& recipientKemPub = {},
+                      const Bytes& senderDsaPub = {},
+                      const Bytes& senderDsaPriv = {});
 
     // Wrap a sealed envelope with a routing header + padding for relay transport.
     // Format: 0x01 || recipientEdPub(32) || innerLen(4 BE) || sealedBytes || randomPadding
     // Padded to fixed bucket sizes (2/16/256 KiB) so the relay can't distinguish
     // message types by size. The relay reads bytes 0-32 for routing only.
-    static QByteArray wrapForRelay(const QByteArray& recipientEdPub,
-                                    const QByteArray& sealedBytes);
+    static Bytes wrapForRelay(const Bytes& recipientEdPub,
+                              const Bytes& sealedBytes);
 
     // Strip the routing header and padding, returning the inner sealed envelope.
     // Also extracts the recipientEdPub if non-null.
     // Returns empty if the header is malformed.
-    static QByteArray unwrapFromRelay(const QByteArray& relayEnvelope,
-                                      QByteArray* recipientEdPub = nullptr);
+    static Bytes unwrapFromRelay(const Bytes& relayEnvelope,
+                                 Bytes* recipientEdPub = nullptr);
 
     // Unseal an envelope using the recipient's keys.
     //
@@ -79,8 +86,8 @@ public:
     // sealedBytes:        the sealed envelope (classical v2 or hybrid v2)
     // recipientKemPriv:   recipient's ML-KEM-768 private key (2400, optional)
     //                     Required for hybrid envelopes (version 0x03).
-    static UnsealResult unseal(const QByteArray& recipientCurvePriv,
-                                const QByteArray& recipientEdPub,
-                                const QByteArray& sealedBytes,
-                                const QByteArray& recipientKemPriv = {});
+    static UnsealResult unseal(const Bytes& recipientCurvePriv,
+                               const Bytes& recipientEdPub,
+                               const Bytes& sealedBytes,
+                               const Bytes& recipientKemPriv = {});
 };

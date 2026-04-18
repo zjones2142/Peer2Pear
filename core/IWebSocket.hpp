@@ -1,9 +1,9 @@
 #pragma once
 
-#include <QByteArray>
-#include <QString>
-#include <QUrl>
+#include <cstdint>
 #include <functional>
+#include <string>
+#include <vector>
 
 /*
  * IWebSocket — platform abstraction for WebSocket transport.
@@ -15,13 +15,18 @@
  *
  * RelayClient depends only on this interface — no QWebSocket, no platform
  * networking headers. Each platform provides ~50-80 lines of glue.
+ *
+ * Types: std::string for text/URLs (UTF-8), std::vector<uint8_t> for binary
+ * frames.  Migrated off Qt 2026-04.
  */
 class IWebSocket {
 public:
+    using Bytes = std::vector<uint8_t>;
+
     virtual ~IWebSocket() = default;
 
     /// Open a WebSocket connection to the given URL.
-    virtual void open(const QUrl& url) = 0;
+    virtual void open(const std::string& url) = 0;
 
     /// Close the connection gracefully.
     virtual void close() = 0;
@@ -33,7 +38,7 @@ public:
     virtual bool isIdle() const = 0;
 
     /// Send a UTF-8 text frame (used for auth and presence JSON messages).
-    virtual void sendTextMessage(const QString& message) = 0;
+    virtual void sendTextMessage(const std::string& message) = 0;
 
     // ── Callbacks (set by RelayClient before open()) ────────────────────────
 
@@ -44,8 +49,8 @@ public:
     std::function<void()> onDisconnected;
 
     /// Called for each binary frame received (sealed envelopes).
-    std::function<void(const QByteArray&)> onBinaryMessage;
+    std::function<void(const Bytes&)> onBinaryMessage;
 
     /// Called for each text frame received (auth response, presence updates).
-    std::function<void(const QString&)> onTextMessage;
+    std::function<void(const std::string&)> onTextMessage;
 };

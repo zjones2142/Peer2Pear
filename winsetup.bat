@@ -186,7 +186,7 @@ setx CMAKE_PREFIX_PATH "%QT_DIR%" >nul
 
 REM ---- vcpkg -----------------------------------------------------------
 REM vcpkg.json lists everything the build needs:
-REM   - core:          libsodium, liboqs
+REM   - core:          libsodium, liboqs, nlohmann-json
 REM   - windows-only:  sqlcipher, pkgconf
 REM   - feature "p2p": msquic, libnice, glib  (default ON)
 REM

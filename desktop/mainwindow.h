@@ -2,6 +2,7 @@
 #include "ChatController.hpp"
 #include "QtWebSocket.hpp"
 #include "QtHttpClient.hpp"
+#include "QtTimer.hpp"
 #include <QMainWindow>
 #include <QResizeEvent>
 #include <QStackedWidget>
@@ -37,6 +38,7 @@ private:
     DatabaseManager  m_db;
     QtWebSocket      m_webSocket;
     QtHttpClient     m_httpClient;
+    QtTimerFactory   m_timerFactory;
     ChatController   m_controller;
     ChatView        *m_chatView      = nullptr;
     ChatNotifier    *m_notifier      = nullptr;

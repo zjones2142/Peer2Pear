@@ -1,19 +1,24 @@
 #include "OnionWrap.hpp"
 
-#include <QtEndian>
 #include <sodium.h>
 #include <cstring>
 
-static constexpr quint8 kOnionVersion = 0x01;
+static constexpr uint8_t kOnionVersion = 0x01;
 
-QByteArray OnionWrap::wrap(const QByteArray& relayX25519Pub,
-                            const QString&    nextHopUrl,
-                            const QByteArray& innerBlob)
+// Big-endian 2-byte write helper — avoids pulling in QtEndian for one use.
+static inline void write_u16_be(uint8_t* dst, uint16_t v)
+{
+    dst[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    dst[1] = static_cast<uint8_t>( v       & 0xFF);
+}
+
+std::vector<uint8_t> OnionWrap::wrap(const std::vector<uint8_t>& relayX25519Pub,
+                                      const std::string&          nextHopUrl,
+                                      const std::vector<uint8_t>& innerBlob)
 {
     if (relayX25519Pub.size() != 32) return {};
-    const QByteArray urlUtf8 = nextHopUrl.toUtf8();
-    if (urlUtf8.size() == 0 || urlUtf8.size() > 0xFFFF) return {};
-    if (innerBlob.isEmpty()) return {};
+    if (nextHopUrl.empty() || nextHopUrl.size() > 0xFFFF) return {};
+    if (innerBlob.empty()) return {};
 
     // 1. Generate ephemeral X25519 keypair for this layer.
     unsigned char ephPub[crypto_box_PUBLICKEYBYTES];
@@ -21,37 +26,36 @@ QByteArray OnionWrap::wrap(const QByteArray& relayX25519Pub,
     crypto_box_keypair(ephPub, ephPriv);
 
     // 2. Build plaintext: [nextHopUrlLen(2 BE)][nextHopUrl][innerBlob]
-    QByteArray plaintext;
-    plaintext.reserve(2 + urlUtf8.size() + innerBlob.size());
-    quint16 lenBE = qToBigEndian(static_cast<quint16>(urlUtf8.size()));
-    plaintext.append(reinterpret_cast<const char*>(&lenBE), 2);
-    plaintext.append(urlUtf8);
-    plaintext.append(innerBlob);
+    std::vector<uint8_t> plaintext;
+    plaintext.reserve(2 + nextHopUrl.size() + innerBlob.size());
+    plaintext.resize(2);
+    write_u16_be(plaintext.data(), static_cast<uint16_t>(nextHopUrl.size()));
+    plaintext.insert(plaintext.end(), nextHopUrl.begin(), nextHopUrl.end());
+    plaintext.insert(plaintext.end(), innerBlob.begin(), innerBlob.end());
 
     // 3. Random nonce.
     unsigned char nonce[crypto_box_NONCEBYTES];
     randombytes_buf(nonce, sizeof(nonce));
 
     // 4. crypto_box_easy — authenticated public-key encryption.
-    QByteArray ct;
-    ct.resize(plaintext.size() + crypto_box_MACBYTES);
+    std::vector<uint8_t> ct(plaintext.size() + crypto_box_MACBYTES);
     const int rc = crypto_box_easy(
-        reinterpret_cast<unsigned char*>(ct.data()),
-        reinterpret_cast<const unsigned char*>(plaintext.constData()),
+        ct.data(),
+        plaintext.data(),
         static_cast<unsigned long long>(plaintext.size()),
         nonce,
-        reinterpret_cast<const unsigned char*>(relayX25519Pub.constData()),
+        relayX25519Pub.data(),
         ephPriv);
     // Wipe ephemeral priv before any return path.
     sodium_memzero(ephPriv, sizeof(ephPriv));
     if (rc != 0) return {};
 
     // 5. Assemble: version(1) || ephPub(32) || nonce(24) || ct
-    QByteArray out;
-    out.reserve(1 + 32 + int(sizeof(nonce)) + ct.size());
-    out.append(static_cast<char>(kOnionVersion));
-    out.append(reinterpret_cast<const char*>(ephPub), 32);
-    out.append(reinterpret_cast<const char*>(nonce), sizeof(nonce));
-    out.append(ct);
+    std::vector<uint8_t> out;
+    out.reserve(1 + 32 + sizeof(nonce) + ct.size());
+    out.push_back(kOnionVersion);
+    out.insert(out.end(), ephPub, ephPub + 32);
+    out.insert(out.end(), nonce, nonce + sizeof(nonce));
+    out.insert(out.end(), ct.begin(), ct.end());
     return out;
 }

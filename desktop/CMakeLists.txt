@@ -7,6 +7,8 @@ set(DESKTOP_SOURCES
     main.cpp
     mainwindow.cpp      mainwindow.h        mainwindow.ui
     chatview.cpp         chatview.h
+    chattypes.h
+    filetransfer.h
     settingspanel.cpp    settingspanel.h
     onboardingdialog.cpp onboardingdialog.h
     ChatNotifier.h

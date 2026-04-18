@@ -640,10 +640,12 @@ bool ChatView::eventFilter(QObject *obj, QEvent *event)
 void ChatView::startPresencePolling(int /*intervalMs*/)
 {
     // Subscribe to presence updates via the relay (push-based, not polling).
-    // Re-subscribe on every relay reconnect since subscriptions are per-session.
-    connect(m_controller, &ChatController::relayConnected, this, [this]() {
+    // ChatController is no longer a QObject; we assign its onRelayConnected
+    // callback directly.  Assignment replaces any prior handler — that's fine
+    // because only ChatView registers for this event.
+    m_controller->onRelayConnected = [this]() {
         subscribeAllPresence();
-    });
+    };
 
     // Initial subscription (if relay is already connected)
     QTimer::singleShot(500, this, [this]() {

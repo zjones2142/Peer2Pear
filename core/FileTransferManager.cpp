@@ -1,81 +1,150 @@
 #include "FileTransferManager.hpp"
 #include "CryptoEngine.hpp"
 #include "SqlCipherDb.hpp"
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QDateTime>
-#include <QTimeZone>
-#include <QUuid>
-#include <QFile>
-#include <QFileInfo>
-#include <QDir>
-#include <QStandardPaths>
-#include <QDebug>
+#include "qt_bridge_temp.hpp"  // TEMP: bridge for SqlCipherDb (still on Qt, Phase 6)
+
 #include <sodium.h>
+#include <nlohmann/json.hpp>
 
-// ── Wire helpers ─────────────────────────────────────────────────────────────
+#include <QDebug>       // TEMP: logging parity with the rest of core/.
 
-static const QByteArray kFilePrefix = "FROMFC:";
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <iomanip>
+#include <sstream>
+#include <utility>
 
-static QByteArray pack32(quint32 v)
-{
-    QByteArray b(4, 0);
-    b[0] = char((v >> 24) & 0xFF);
-    b[1] = char((v >> 16) & 0xFF);
-    b[2] = char((v >>  8) & 0xFF);
-    b[3] = char( v        & 0xFF);
-    return b;
+using json = nlohmann::json;
+namespace fs = std::filesystem;
+
+// ── Downloads-dir default ──────────────────────────────────────────────────
+//
+// Desktop looks up QStandardPaths::DownloadLocation; mobile hosts must set
+// the partial directory explicitly via setPartialFileDir().  Wrapped in
+// #ifdef QT_CORE_LIB so iOS builds don't pick up Qt here.
+#ifdef QT_CORE_LIB
+#include <QStandardPaths>
+namespace {
+std::string defaultDownloadsDir() {
+    const QString dl = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    return dl.toStdString();
+}
+}
+#else
+namespace {
+std::string defaultDownloadsDir() { return {}; }
+}
+#endif
+
+// ── Wire helpers ────────────────────────────────────────────────────────────
+
+static const char kFilePrefix[] = "FROMFC:";
+
+namespace {
+
+inline void appendBE32(FileTransferManager::Bytes& dst, uint32_t v) {
+    dst.push_back(uint8_t((v >> 24) & 0xFF));
+    dst.push_back(uint8_t((v >> 16) & 0xFF));
+    dst.push_back(uint8_t((v >>  8) & 0xFF));
+    dst.push_back(uint8_t( v        & 0xFF));
 }
 
-static quint32 unpack32(const QByteArray& b, int offset = 0)
-{
-    if (b.size() < offset + 4) return 0;
-    return (quint8(b[offset])     << 24)
-         | (quint8(b[offset + 1]) << 16)
-         | (quint8(b[offset + 2]) <<  8)
-         |  quint8(b[offset + 3]);
+inline uint32_t readBE32(const FileTransferManager::Bytes& b, size_t off = 0) {
+    if (b.size() < off + 4) return 0;
+    return (uint32_t(b[off])     << 24)
+         | (uint32_t(b[off + 1]) << 16)
+         | (uint32_t(b[off + 2]) <<  8)
+         |  uint32_t(b[off + 3]);
 }
 
-static QDateTime tsFromSecs(qint64 secs)
-{
-    return secs > 0
-               ? QDateTime::fromSecsSinceEpoch(secs, QTimeZone::utc()).toLocalTime()
-               : QDateTime::currentDateTime();
+inline int64_t nowSecs() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
+// Slice out a sub-range of Bytes.  Safe for out-of-range; returns empty.
+FileTransferManager::Bytes slice(const FileTransferManager::Bytes& b,
+                                  size_t off, size_t len) {
+    if (off > b.size()) return {};
+    const size_t n = std::min(len, b.size() - off);
+    return FileTransferManager::Bytes(b.begin() + off, b.begin() + off + n);
+}
+
+FileTransferManager::Bytes tail(const FileTransferManager::Bytes& b, size_t off) {
+    if (off >= b.size()) return {};
+    return FileTransferManager::Bytes(b.begin() + off, b.end());
+}
+
+// First 8 chars of a peer/transfer ID plus ellipsis (logging only).
+QString idPrefix(const std::string& id) {
+    const size_t n = std::min<size_t>(8, id.size());
+    return QString::fromStdString(id.substr(0, n));
+}
+
+// Derive a safe filename — strip any directory components.
+std::string safeBasename(const std::string& fileName) {
+    fs::path p(fileName);
+    std::string base = p.filename().string();
+    if (base.empty()) base = "file";
+    return base;
+}
+
+// Generate a UUID-like identifier (32 hex chars + 4 hyphens) via libsodium.
+std::string makeUuid() {
+    uint8_t bytes[16];
+    randombytes_buf(bytes, sizeof(bytes));
+    // RFC 4122 v4 bits (high nibble of byte 6 = 4; high bits of byte 8 = 10)
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    char buf[37];
+    std::snprintf(buf, sizeof(buf),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        bytes[0], bytes[1], bytes[2],  bytes[3],
+        bytes[4], bytes[5], bytes[6],  bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15]);
+    return std::string(buf);
+}
+
+}  // anonymous namespace
 
 // ── FileTransferManager ──────────────────────────────────────────────────────
 
-FileTransferManager::FileTransferManager(CryptoEngine& crypto, QObject* parent)
-    : QObject(parent)
-    , m_crypto(crypto)
+FileTransferManager::FileTransferManager(CryptoEngine& crypto)
+    : m_crypto(crypto)
 {
     // Default partial-file directory: <DownloadLocation>/Peer2Pear/.partial/
-    const QString dl = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
-    m_partialDir = dl + "/Peer2Pear/.partial";
+    const std::string dl = defaultDownloadsDir();
+    m_partialDir = dl.empty() ? std::string(".partial") : dl + "/Peer2Pear/.partial";
 }
 
-void FileTransferManager::setPartialFileDir(const QString& dir)
+void FileTransferManager::setPartialFileDir(const std::string& dir)
 {
     m_partialDir = dir;
 }
 
 // ── BLAKE2b-256 helpers ─────────────────────────────────────────────────────
 
-QByteArray FileTransferManager::blake2b256(const QByteArray& data)
+FileTransferManager::Bytes FileTransferManager::blake2b256(const Bytes& data)
 {
-    QByteArray hash(32, 0);
-    crypto_generichash(reinterpret_cast<unsigned char*>(hash.data()), 32,
-                       reinterpret_cast<const unsigned char*>(data.constData()),
-                       static_cast<unsigned long long>(data.size()),
+    Bytes hash(32, 0);
+    crypto_generichash(hash.data(), 32,
+                       data.data(),
+                       data.size(),
                        nullptr, 0);
     return hash;
 }
 
-QByteArray FileTransferManager::blake2b256File(const QString& filePath)
+FileTransferManager::Bytes FileTransferManager::blake2b256File(const std::string& filePath)
 {
-    QFile f(filePath);
-    if (!f.open(QIODevice::ReadOnly)) {
-        qWarning() << "[FileTransfer] blake2b256File: cannot open" << filePath;
+    std::ifstream f(filePath, std::ios::binary);
+    if (!f.is_open()) {
+        qWarning() << "[FileTransfer] blake2b256File: cannot open"
+                   << QString::fromStdString(filePath);
         return {};
     }
 
@@ -83,50 +152,53 @@ QByteArray FileTransferManager::blake2b256File(const QString& filePath)
     crypto_generichash_init(&st, nullptr, 0, 32);
 
     // 64 KB read buffer — bounded RAM regardless of file size.
-    QByteArray buf(64 * 1024, Qt::Uninitialized);
-    while (!f.atEnd()) {
-        const qint64 n = f.read(buf.data(), buf.size());
-        if (n < 0) {
-            qWarning() << "[FileTransfer] blake2b256File: read error on" << filePath;
-            return {};
-        }
-        if (n == 0) break;
+    std::vector<char> buf(64 * 1024);
+    while (f.good() && !f.eof()) {
+        f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        const std::streamsize n = f.gcount();
+        if (n <= 0) break;
         crypto_generichash_update(&st,
-            reinterpret_cast<const unsigned char*>(buf.constData()),
+            reinterpret_cast<const unsigned char*>(buf.data()),
             static_cast<unsigned long long>(n));
     }
-    f.close();
+    if (f.bad()) {
+        qWarning() << "[FileTransfer] blake2b256File: read error on"
+                   << QString::fromStdString(filePath);
+        return {};
+    }
 
-    QByteArray hash(32, 0);
-    crypto_generichash_final(&st, reinterpret_cast<unsigned char*>(hash.data()), 32);
+    Bytes hash(32, 0);
+    crypto_generichash_final(&st, hash.data(), 32);
     return hash;
 }
 
 // ── Partial-file path helpers ───────────────────────────────────────────────
 
-QString FileTransferManager::partialPathFor(const QString& transferId)
+std::string FileTransferManager::partialPathFor(const std::string& transferId)
 {
-    QDir().mkpath(m_partialDir);
+    std::error_code ec;
+    fs::create_directories(m_partialDir, ec);
     return m_partialDir + "/" + transferId + ".partial";
 }
 
-QString FileTransferManager::finalPathFor(const QString& fileName, const QString& transferId)
+std::string FileTransferManager::finalPathFor(const std::string& fileName,
+                                               const std::string& transferId)
 {
-    // Strip path separators to prevent directory traversal.
-    QString safe = QFileInfo(fileName).fileName();
-    if (safe.isEmpty()) safe = "file";
+    const std::string safe = safeBasename(fileName);
 
-    const QString baseDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)
-                            + "/Peer2Pear/" + transferId;
-    QDir().mkpath(baseDir);
+    const std::string dl = defaultDownloadsDir();
+    const std::string baseDir = (dl.empty() ? m_partialDir : dl)
+                                + "/Peer2Pear/" + transferId;
+    std::error_code ec;
+    fs::create_directories(baseDir, ec);
     return baseDir + "/" + safe;
 }
 
 // ── Send one chunk with routing mode ────────────────────────────────────────
 
-bool FileTransferManager::dispatchChunk(const QString& senderIdB64u,
-                                         const QString& peerIdB64u,
-                                         const QByteArray& innerPayload,
+bool FileTransferManager::dispatchChunk(const std::string& senderIdB64u,
+                                         const std::string& peerIdB64u,
+                                         const Bytes& innerPayload,
                                          RoutingMode mode)
 {
     // 1. Try P2P QUIC file stream (reliable, framed, congestion-controlled).
@@ -139,8 +211,8 @@ bool FileTransferManager::dispatchChunk(const QString& senderIdB64u,
 
     // 2. Sealed relay envelope (metadata privacy).
     if (m_sealFn) {
-        QByteArray sealedEnv = m_sealFn(peerIdB64u, innerPayload);
-        if (!sealedEnv.isEmpty()) {
+        Bytes sealedEnv = m_sealFn(peerIdB64u, innerPayload);
+        if (!sealedEnv.empty()) {
             if (m_sendFn) m_sendFn(peerIdB64u, sealedEnv);
             return true;
         }
@@ -149,80 +221,76 @@ bool FileTransferManager::dispatchChunk(const QString& senderIdB64u,
     }
 
     // 3. Legacy fallback (no seal callback set).
-    const QByteArray env = kFilePrefix + senderIdB64u.toUtf8() + "\n" + innerPayload;
+    Bytes env;
+    env.reserve(sizeof(kFilePrefix) - 1 + senderIdB64u.size() + 1 + innerPayload.size());
+    env.insert(env.end(),
+               reinterpret_cast<const uint8_t*>(kFilePrefix),
+               reinterpret_cast<const uint8_t*>(kFilePrefix) + sizeof(kFilePrefix) - 1);
+    env.insert(env.end(), senderIdB64u.begin(), senderIdB64u.end());
+    env.push_back('\n');
+    env.insert(env.end(), innerPayload.begin(), innerPayload.end());
     if (m_sendFn) m_sendFn(peerIdB64u, env);
     return true;
 }
 
 // ── Stream chunks from disk ─────────────────────────────────────────────────
-//
-// This is the memory-critical path. We NEVER hold the entire file in RAM.
-// Open the source file once, seek+read one chunk at a time, encrypt, dispatch,
-// let the chunk go out of scope before reading the next.
 
-void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
-                                              const QString& peerIdB64u,
-                                              const QByteArray& key32,
-                                              const QString& filePath,
-                                              qint64 fileSize,
-                                              const QString& transferId,
-                                              const QString& fileName,
-                                              const QString& fileHashB64u,
-                                              qint64 ts,
+void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
+                                              const std::string& peerIdB64u,
+                                              const Bytes& key32,
+                                              const std::string& filePath,
+                                              int64_t fileSize,
+                                              const std::string& transferId,
+                                              const std::string& fileName,
+                                              const std::string& fileHashB64u,
+                                              int64_t ts,
                                               RoutingMode mode,
-                                              const QString& groupId,
-                                              const QString& groupName)
+                                              const std::string& groupId,
+                                              const std::string& groupName)
 {
-    QFile src(filePath);
-    if (!src.open(QIODevice::ReadOnly)) {
-        qWarning() << "[FileTransfer] Cannot open" << filePath << "for streaming";
-        emit status(QString("Cannot read file: %1").arg(fileName));
+    std::ifstream src(filePath, std::ios::binary);
+    if (!src.is_open()) {
+        qWarning() << "[FileTransfer] Cannot open"
+                   << QString::fromStdString(filePath) << "for streaming";
+        if (onStatus) onStatus(std::string("Cannot read file: ") + fileName);
         return;
     }
 
     const int totalChunks = int((fileSize + kChunkBytes - 1) / kChunkBytes);
 
-    QByteArray chunk;  // reused buffer — one allocation for the whole loop
-    chunk.reserve(int(kChunkBytes));
+    Bytes chunk;  // reused buffer — one allocation for the whole loop
+    chunk.reserve(size_t(kChunkBytes));
 
     for (int i = 0; i < totalChunks; ++i) {
-        // Fix #12: sender-side cancel check.  forgetSentTransfer() / cancel
-        // inserts transferId into m_abortedTransfers — without this the
-        // synchronous loop just keeps streaming to a peer who no longer wants
-        // the file.
-        if (m_abortedTransfers.contains(transferId)) {
+        // Fix #12: sender-side cancel check.
+        if (m_abortedTransfers.count(transferId)) {
             qDebug() << "[FileTransfer] aborted mid-stream at chunk" << i
-                     << "of" << transferId.left(8);
-            src.close();
-            m_abortedTransfers.remove(transferId);
+                     << "of" << idPrefix(transferId);
+            m_abortedTransfers.erase(transferId);
             return;
         }
 
-        // Fix #16: live privacy-level upgrade.  If the user flipped the
-        // "require direct connection" toggle mid-stream, every subsequent
-        // chunk falls under P2POnly routing.  If P2P isn't available, the
-        // next dispatchChunk() drops the chunk and aborts the transfer
-        // rather than leaking via relay.
+        // Fix #16: live privacy-level upgrade.
         const RoutingMode effectiveMode =
             (mode == RoutingMode::P2POnly || m_senderRequiresP2PLive)
                 ? RoutingMode::P2POnly
                 : mode;
 
-        const qint64 offset = qint64(i) * kChunkBytes;
-        const qint64 remaining = fileSize - offset;
-        const qint64 toRead = qMin<qint64>(kChunkBytes, remaining);
+        const int64_t offset    = int64_t(i) * kChunkBytes;
+        const int64_t remaining = fileSize - offset;
+        const int64_t toRead    = std::min<int64_t>(kChunkBytes, remaining);
 
-        // Seek + read this chunk only. Prior chunks are freed.
-        src.seek(offset);
-        chunk.resize(int(toRead));
-        const qint64 n = src.read(chunk.data(), toRead);
-        if (n != toRead) {
+        // Seek + read this chunk only.
+        src.seekg(offset);
+        chunk.assign(size_t(toRead), 0);
+        src.read(reinterpret_cast<char*>(chunk.data()), std::streamsize(toRead));
+        if (src.gcount() != toRead) {
             qWarning() << "[FileTransfer] Short read at chunk" << i
-                       << "of" << transferId.left(8);
+                       << "of" << idPrefix(transferId);
             break;
         }
 
-        QJsonObject meta;
+        json meta;
         meta["from"]        = senderIdB64u;
         meta["type"]        = "file_chunk";
         meta["transferId"]  = transferId;
@@ -232,155 +300,148 @@ void FileTransferManager::sendChunkEnvelopes(const QString& senderIdB64u,
         meta["fileSize"]    = fileSize;
         meta["ts"]          = ts;
         meta["fileHash"]    = fileHashB64u;
-        if (!groupId.isEmpty()) {
+        if (!groupId.empty()) {
             meta["groupId"]   = groupId;
             meta["groupName"] = groupName;
         }
 
-        const QByteArray metaJson = QJsonDocument(meta).toJson(QJsonDocument::Compact);
-        const QByteArray encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
-        const QByteArray encChunk = m_crypto.aeadEncrypt(key32, chunk);
+        const std::string metaJsonStr = meta.dump();
+        const Bytes metaJson(metaJsonStr.begin(), metaJsonStr.end());
+        const Bytes encMeta  = m_crypto.aeadEncrypt(key32, metaJson);
+        const Bytes encChunk = m_crypto.aeadEncrypt(key32, chunk);
 
         // Inner payload: <4-byte metaLen><encMeta><encChunk>
-        const QByteArray innerPayload = pack32(quint32(encMeta.size()))
-                                        + encMeta
-                                        + encChunk;
+        Bytes innerPayload;
+        innerPayload.reserve(4 + encMeta.size() + encChunk.size());
+        appendBE32(innerPayload, uint32_t(encMeta.size()));
+        innerPayload.insert(innerPayload.end(), encMeta.begin(), encMeta.end());
+        innerPayload.insert(innerPayload.end(), encChunk.begin(), encChunk.end());
 
         if (!dispatchChunk(senderIdB64u, peerIdB64u, innerPayload, effectiveMode)) {
-            // P2POnly mode and P2P went away mid-stream. Abandon the transfer —
-            // partial delivery with missing chunks would be confusing.
             qWarning() << "[FileTransfer] P2P lost mid-stream at chunk" << i
-                       << "— aborting transfer" << transferId.left(8);
-            src.close();
-            emit status(QString("Transfer interrupted: direct connection lost."));
+                       << "— aborting transfer" << idPrefix(transferId);
+            if (onStatus) onStatus(std::string("Transfer interrupted: direct connection lost."));
             return;
         }
     }
 
-    src.close();
-
     // Kick off P2P for future messages
-    emit wantP2PConnection(peerIdB64u);
+    if (onWantP2PConnection) onWantP2PConnection(peerIdB64u);
 }
 
 // ── Send file with ratchet-derived key ──────────────────────────────────────
 
-QString FileTransferManager::sendFileWithKey(const QString& senderIdB64u,
-                                              const QString& peerIdB64u,
-                                              const QByteArray& fileKey,
-                                              const QString& transferId,
-                                              const QString& fileName,
-                                              const QString& filePath,
-                                              qint64 fileSize,
-                                              const QByteArray& fileHash,
-                                              const QString& groupId,
-                                              const QString& groupName)
+std::string FileTransferManager::sendFileWithKey(const std::string& senderIdB64u,
+                                                  const std::string& peerIdB64u,
+                                                  const Bytes& fileKey,
+                                                  const std::string& transferId,
+                                                  const std::string& fileName,
+                                                  const std::string& filePath,
+                                                  int64_t fileSize,
+                                                  const Bytes& fileHash,
+                                                  const std::string& groupId,
+                                                  const std::string& groupName)
 {
     if (fileSize > kMaxFileBytes) {
-        emit status(QString("File too large (max %1 MB).")
-                        .arg(kMaxFileBytes / (1024 * 1024)));
+        if (onStatus) onStatus(std::string("File too large (max ")
+                    + std::to_string(kMaxFileBytes / (1024 * 1024)) + " MB).");
         return {};
     }
     if (fileKey.size() != 32) {
-        emit status("Invalid file encryption key.");
+        if (onStatus) onStatus(std::string("Invalid file encryption key."));
         return {};
     }
     if (fileHash.size() != 32) {
-        emit status("Invalid file hash (must be 32 bytes).");
+        if (onStatus) onStatus(std::string("Invalid file hash (must be 32 bytes)."));
         return {};
     }
-    if (!QFileInfo::exists(filePath)) {
-        emit status(QString("File not found: %1").arg(filePath));
+    if (!fs::exists(filePath)) {
+        if (onStatus) onStatus(std::string("File not found: ") + filePath);
         return {};
     }
 
-    const qint64  ts           = QDateTime::currentSecsSinceEpoch();
-    const QString fileHashB64u = CryptoEngine::toBase64Url(fileHash);
-    const int     totalChunks  = int((fileSize + kChunkBytes - 1) / kChunkBytes);
+    const int64_t     ts           = nowSecs();
+    const std::string fileHashB64u = CryptoEngine::toBase64Url(fileHash);
+    const int         totalChunks  = int((fileSize + kChunkBytes - 1) / kChunkBytes);
 
     sendChunkEnvelopes(senderIdB64u, peerIdB64u, fileKey, filePath, fileSize,
                        transferId, fileName, fileHashB64u, ts,
                        RoutingMode::Auto,
                        groupId, groupName);
 
-    if (groupId.isEmpty()) {
-        emit status(QString("'%1' streamed in %2 chunk(s) -> %3")
-                        .arg(fileName).arg(totalChunks).arg(peerIdB64u));
+    if (groupId.empty()) {
+        if (onStatus) onStatus("'" + fileName + "' streamed in " + std::to_string(totalChunks)
+                    + " chunk(s) -> " + peerIdB64u);
     }
     return transferId;
 }
 
 // ── Announce-first: lock metadata at file_key time (Fix #3) ─────────────────
 
-bool FileTransferManager::announceIncoming(const QString& fromId,
-                                            const QString& transferId,
-                                            const QString& fileName,
-                                            qint64 fileSize,
+bool FileTransferManager::announceIncoming(const std::string& fromId,
+                                            const std::string& transferId,
+                                            const std::string& fileName,
+                                            int64_t fileSize,
                                             int totalChunks,
-                                            const QByteArray& fileHash,
-                                            const QByteArray& fileKey,
-                                            qint64 announcedTsSecs,
-                                            const QString& groupId,
-                                            const QString& groupName)
+                                            const Bytes& fileHash,
+                                            const Bytes& fileKey,
+                                            int64_t announcedTsSecs,
+                                            const std::string& groupId,
+                                            const std::string& groupName)
 {
-    // Reject obviously-bad inputs up front.
-    if (transferId.isEmpty() || totalChunks <= 0 ||
+    if (transferId.empty() || totalChunks <= 0 ||
         fileSize <= 0 || fileSize > kMaxFileBytes ||
         fileHash.size() != 32 || fileKey.size() != 32) {
         qWarning() << "[FileTransfer] announceIncoming: invalid args for"
-                   << transferId.left(8);
+                   << idPrefix(transferId);
         return false;
     }
 
-    // Cross-check fileSize against totalChunks.
     const int expectedChunks = int((fileSize + kChunkBytes - 1) / kChunkBytes);
     if (totalChunks != expectedChunks) {
         qWarning() << "[FileTransfer] announceIncoming: totalChunks"
                    << totalChunks << "doesn't match fileSize"
-                   << fileSize << "(expected" << expectedChunks << ")";
+                   << qint64(fileSize) << "(expected" << expectedChunks << ")";
         return false;
     }
 
-    // Idempotent: if already announced (e.g., duplicate file_key delivery),
-    // leave the existing record alone.
-    if (m_incomingTransfers.contains(transferId)) {
+    if (m_incomingTransfers.count(transferId)) {
         return true;
     }
 
-    // Enforce concurrent-transfer cap.
-    if (m_incomingTransfers.size() >= kMaxConcurrentTransfers) {
-        emit status("Too many concurrent incoming transfers — dropping announce.");
+    if (static_cast<int>(m_incomingTransfers.size()) >= kMaxConcurrentTransfers) {
+        if (onStatus) onStatus(std::string("Too many concurrent incoming transfers — dropping announce."));
         return false;
     }
 
     auto xferPtr = std::make_shared<IncomingTransfer>();
     IncomingTransfer& xfer = *xferPtr;
-    // Strip path separators defensively even though it came from a trusted path.
-    QString safeName = QFileInfo(fileName).fileName();
-    if (safeName.isEmpty()) safeName = "file";
+
+    const std::string safeName = safeBasename(fileName);
 
     xfer.fromId       = fromId;
     xfer.fileName     = safeName;
     xfer.fileSize     = fileSize;
     xfer.totalChunks  = totalChunks;
-    xfer.ts           = tsFromSecs(announcedTsSecs);
+    xfer.tsSecs       = announcedTsSecs > 0 ? announcedTsSecs : nowSecs();
     xfer.fileHash     = fileHash;
     xfer.groupId      = groupId;
     xfer.groupName    = groupName;
-    xfer.createdSecs  = QDateTime::currentSecsSinceEpoch();
+    xfer.createdSecs  = nowSecs();
     xfer.partialPath  = partialPathFor(transferId);
     xfer.finalPath    = finalPathFor(xfer.fileName, transferId);
-    xfer.receivedChunks = QBitArray(totalChunks);  // all false
+    xfer.receivedChunks.assign(size_t(totalChunks), false);
 
-    xfer.partialFile = std::make_unique<QFile>(xfer.partialPath);
-    if (!xfer.partialFile->open(QIODevice::ReadWrite | QIODevice::Truncate)) {
+    xfer.partialFile = std::make_unique<std::fstream>(xfer.partialPath,
+        std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!xfer.partialFile->is_open()) {
         qWarning() << "[FileTransfer] announceIncoming: cannot open partial file"
-                   << xfer.partialPath << "—" << xfer.partialFile->errorString();
-        emit status(QString("Cannot write to disk: %1").arg(xfer.fileName));
+                   << QString::fromStdString(xfer.partialPath);
+        if (onStatus) onStatus(std::string("Cannot write to disk: ") + xfer.fileName);
         return false;
     }
 
-    m_incomingTransfers.insert(transferId, xferPtr);
+    m_incomingTransfers[transferId] = xferPtr;
 
     // Phase 4: persist so we can resume after a crash before any chunk arrives.
     persistIncomingFull(transferId, xfer, fileKey);
@@ -389,125 +450,129 @@ bool FileTransferManager::announceIncoming(const QString& fromId,
 
 // ── Handle incoming file chunk ───────────────────────────────────────────────
 
-bool FileTransferManager::handleFileEnvelope(const QString& fromId,
-                                              const QByteArray& payload,
-                                              std::function<bool(const QString&)> markSeen,
-                                              const QMap<QString, QByteArray>& fileKeys)
+bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
+                                              const Bytes& payload,
+                                              std::function<bool(const std::string&)> markSeen,
+                                              const std::map<std::string, Bytes>& fileKeys)
 {
     if (payload.size() < 4) return false;
 
-    const quint32 metaLen = unpack32(payload, 0);
-    if (payload.size() - 4 < int(metaLen)) return false;
+    const uint32_t metaLen = readBE32(payload, 0);
+    if (payload.size() - 4 < size_t(metaLen)) return false;
 
-    const QByteArray encMeta  = payload.mid(4, int(metaLen));
-    const QByteArray encChunk = payload.mid(4 + int(metaLen));
+    const Bytes encMeta  = slice(payload, 4, metaLen);
+    const Bytes encChunk = tail (payload, 4 + size_t(metaLen));
 
     // ── Key selection: ratchet keys only (L8 fix) ──────────────────────────
-    QByteArray metaJson;
-    QByteArray key32;
+    Bytes metaJson;
+    Bytes key32;
 
-    for (auto it = fileKeys.begin(); it != fileKeys.end(); ++it) {
-        if (it.value().size() != 32) continue;
-        metaJson = m_crypto.aeadDecrypt(it.value(), encMeta);
-        if (!metaJson.isEmpty()) {
-            key32 = it.value();
+    for (const auto& [peer, key] : fileKeys) {
+        (void)peer;
+        if (key.size() != 32) continue;
+        metaJson = m_crypto.aeadDecrypt(key, encMeta);
+        if (!metaJson.empty()) {
+            key32 = key;
             break;
         }
     }
-    if (metaJson.isEmpty()) {
+    if (metaJson.empty()) {
         qWarning() << "[FileTransfer] No ratchet key found for file chunk from"
-                   << fromId.left(8) + "...";
+                   << idPrefix(fromId) + "...";
         return false;
     }
 
-    const QJsonObject meta   = QJsonDocument::fromJson(metaJson).object();
-    const QString transferId = meta.value("transferId").toString();
-    const int chunkIndex     = meta.value("chunkIndex").toInt(-1);
-    const int claimedTotal   = meta.value("totalChunks").toInt(0);
-    if (transferId.isEmpty()
+    json meta;
+    try {
+        meta = json::parse(std::string(metaJson.begin(), metaJson.end()));
+    } catch (...) { return false; }
+    if (!meta.is_object()) return false;
+
+    const std::string transferId = meta.value("transferId", "");
+    const int chunkIndex         = meta.value("chunkIndex",  -1);
+    const int claimedTotal       = meta.value("totalChunks",  0);
+    if (transferId.empty()
         || claimedTotal <= 0
         || chunkIndex < 0
         || chunkIndex >= claimedTotal) return false;
 
-    // Fix #3: require a prior announceIncoming() for this transferId. Chunks
-    // arriving without announce are dropped — no more silent lazy-create that
-    // trusted the chunk's own metadata. And every arriving chunk's metadata
-    // must agree with what was announced.
     auto itXfer = m_incomingTransfers.find(transferId);
-    if (itXfer == m_incomingTransfers.end() || !itXfer.value()) {
+    if (itXfer == m_incomingTransfers.end() || !itXfer->second) {
         qWarning() << "[FileTransfer] chunk for unannounced transfer"
-                   << transferId.left(8) << "from" << fromId.left(8) + "... — dropped";
+                   << idPrefix(transferId) << "from" << idPrefix(fromId) + "... — dropped";
         return true;
     }
 
-    IncomingTransfer& xfer = *itXfer.value();
+    IncomingTransfer& xfer = *itXfer->second;
 
     // Metadata must match the locked announcement.
-    const qint64 claimedSize   = meta.value("fileSize").toVariant().toLongLong();
-    const QByteArray claimedHash = CryptoEngine::fromBase64Url(meta.value("fileHash").toString());
+    const int64_t claimedSize = meta.value("fileSize", int64_t(0));
+    const Bytes   claimedHash = CryptoEngine::fromBase64Url(
+        meta.value("fileHash", std::string()));
     if (claimedTotal != xfer.totalChunks ||
         claimedSize  != xfer.fileSize ||
-        (xfer.fileHash.size() == 32 && !claimedHash.isEmpty() && claimedHash != xfer.fileHash)) {
+        (xfer.fileHash.size() == 32 && !claimedHash.empty() && claimedHash != xfer.fileHash)) {
         qWarning() << "[FileTransfer] chunk metadata disagrees with announce for"
-                   << transferId.left(8) << "— dropped."
-                   << "claimed(size/chunks)=" << claimedSize << "/" << claimedTotal
-                   << "vs announced=" << xfer.fileSize << "/" << xfer.totalChunks;
+                   << idPrefix(transferId) << "— dropped."
+                   << "claimed(size/chunks)=" << qint64(claimedSize) << "/" << claimedTotal
+                   << "vs announced=" << qint64(xfer.fileSize) << "/" << xfer.totalChunks;
         return true;
     }
 
     // Per-chunk dedup: "<transferId>:<chunkIndex>"
-    if (!markSeen(transferId + ":" + QString::number(chunkIndex))) return true;
+    const std::string dedupKey = transferId + ":" + std::to_string(chunkIndex);
+    if (!markSeen(dedupKey)) return true;
 
-    const QByteArray chunkData = m_crypto.aeadDecrypt(key32, encChunk);
-    if (chunkData.isEmpty()) return true;
+    const Bytes chunkData = m_crypto.aeadDecrypt(key32, encChunk);
+    if (chunkData.empty()) return true;
 
     // Each plaintext chunk except possibly the last must equal kChunkBytes.
-    const qint64 expectedLen =
+    const int64_t expectedLen =
         (chunkIndex == xfer.totalChunks - 1)
-            ? (xfer.fileSize - qint64(chunkIndex) * kChunkBytes)
+            ? (xfer.fileSize - int64_t(chunkIndex) * kChunkBytes)
             : kChunkBytes;
-    if (chunkData.size() != expectedLen) {
+    if (int64_t(chunkData.size()) != expectedLen) {
         qWarning() << "[FileTransfer] chunk" << chunkIndex << "has wrong plaintext size"
-                   << chunkData.size() << "(expected" << expectedLen << ")";
+                   << qint64(chunkData.size()) << "(expected" << qint64(expectedLen) << ")";
         return true;
     }
 
     // Guard against the partial file being closed (e.g., after completion).
-    if (!xfer.partialFile || !xfer.partialFile->isOpen()) {
+    if (!xfer.partialFile || !xfer.partialFile->is_open()) {
         qWarning() << "[FileTransfer] chunk for closed partial file"
-                   << transferId.left(8) << "— dropped";
+                   << idPrefix(transferId) << "— dropped";
         return true;
     }
 
-    // Already received this chunk? (dedup above should have caught it, but
-    // double-check the bitmap in case of an out-of-band retry.)
-    if (chunkIndex < xfer.receivedChunks.size() && xfer.receivedChunks.testBit(chunkIndex)) {
+    // Already received? (dedup above should have caught it, but double-check.)
+    if (chunkIndex < int(xfer.receivedChunks.size()) && xfer.receivedChunks[chunkIndex]) {
         return true;
     }
 
     // Write chunk at its correct offset — no RAM accumulation.
-    const qint64 offset = qint64(chunkIndex) * kChunkBytes;
-    if (!xfer.partialFile->seek(offset) ||
-        xfer.partialFile->write(chunkData) != chunkData.size()) {
+    const int64_t offset = int64_t(chunkIndex) * kChunkBytes;
+    xfer.partialFile->seekp(std::streamoff(offset));
+    xfer.partialFile->write(reinterpret_cast<const char*>(chunkData.data()),
+                             std::streamsize(chunkData.size()));
+    if (!xfer.partialFile->good()) {
         qWarning() << "[FileTransfer] Write failed for chunk" << chunkIndex
-                   << "of" << transferId.left(8);
+                   << "of" << idPrefix(transferId);
         return true;
     }
     xfer.partialFile->flush();
-    xfer.receivedChunks.setBit(chunkIndex);
+    xfer.receivedChunks[chunkIndex] = true;
     xfer.chunksReceivedCount++;
 
-    // Phase 4: update DB bitmap after each successful write so we can resume
-    // after a crash with at worst one chunk of lost work.
+    // Phase 4: update DB bitmap after each successful write so we can resume.
     persistIncomingFull(transferId, xfer, key32);
 
-    const int received      = xfer.chunksReceivedCount;
-    const int totalOfXfer   = xfer.totalChunks;
+    const int received    = xfer.chunksReceivedCount;
+    const int totalOfXfer = xfer.totalChunks;
 
     if (received < totalOfXfer) {
-        emit fileChunkReceived(fromId, transferId, xfer.fileName,
+        if (onFileChunkReceived) onFileChunkReceived(fromId, transferId, xfer.fileName,
                                xfer.fileSize, received, totalOfXfer,
-                               QString{}, xfer.ts,
+                               std::string{}, xfer.tsSecs,
                                xfer.groupId, xfer.groupName);
         return true;
     }
@@ -516,47 +581,50 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
     xfer.partialFile->close();
 
     // Capture values we need before removing the entry.
-    const QString fileName    = xfer.fileName;
-    const qint64  fileSize    = xfer.fileSize;
-    const QString groupId     = xfer.groupId;
-    const QString groupName   = xfer.groupName;
-    const QDateTime tsCopy    = xfer.ts;
-    const QByteArray expected = xfer.fileHash;
-    const QString partialPath = xfer.partialPath;
-    const QString finalPath   = xfer.finalPath;
+    const std::string fileName    = xfer.fileName;
+    const int64_t     fileSize    = xfer.fileSize;
+    const std::string groupId     = xfer.groupId;
+    const std::string groupName   = xfer.groupName;
+    const int64_t     tsCopy      = xfer.tsSecs;
+    const Bytes       expected    = xfer.fileHash;
+    const std::string partialPath = xfer.partialPath;
+    const std::string finalPath   = xfer.finalPath;
 
-    m_incomingTransfers.remove(transferId);
-    emit transferCompleted(transferId);  // M1: let ChatController zero the key
+    m_incomingTransfers.erase(itXfer);
+    if (onTransferCompleted) onTransferCompleted(transferId);  // M1: let ChatController zero the key
 
     // Verify integrity by streaming the completed file from disk.
-    if (!expected.isEmpty()) {
-        const QByteArray actual = blake2b256File(partialPath);
+    if (!expected.empty()) {
+        const Bytes actual = blake2b256File(partialPath);
         if (actual != expected) {
-            QFile::remove(partialPath);
-            // Phase 4: hash failure → drop the DB row. No resumption of
-            // a corrupted transfer.
+            std::error_code ec;
+            fs::remove(partialPath, ec);
             deleteIncomingRow(transferId);
-            emit status(QString("File '%1' integrity check FAILED — discarded.").arg(fileName));
-            emit fileChunkReceived(fromId, transferId, fileName,
+            if (onStatus) onStatus("File '" + fileName + "' integrity check FAILED — discarded.");
+            if (onFileChunkReceived) onFileChunkReceived(fromId, transferId, fileName,
                                    fileSize, totalOfXfer, totalOfXfer,
-                                   QString{}, tsCopy, groupId, groupName);
+                                   std::string{}, tsCopy, groupId, groupName);
             return true;
         }
     }
 
     // Move partial → final. If target exists, overwrite.
-    QFile::remove(finalPath);
-    if (!QFile::rename(partialPath, finalPath)) {
+    std::error_code ec;
+    fs::remove(finalPath, ec);
+    ec.clear();
+    fs::rename(partialPath, finalPath, ec);
+    if (ec) {
         qWarning() << "[FileTransfer] Rename failed"
-                   << partialPath << "->" << finalPath;
-        emit status(QString("Could not save file: %1").arg(fileName));
+                   << QString::fromStdString(partialPath) << "->"
+                   << QString::fromStdString(finalPath);
+        if (onStatus) onStatus(std::string("Could not save file: ") + fileName);
         return true;
     }
 
     // Phase 4: transfer done + hash verified — drop persistent state.
     deleteIncomingRow(transferId);
 
-    emit fileChunkReceived(fromId, transferId, fileName,
+    if (onFileChunkReceived) onFileChunkReceived(fromId, transferId, fileName,
                            fileSize, totalOfXfer, totalOfXfer,
                            finalPath, tsCopy, groupId, groupName);
     return true;
@@ -566,33 +634,29 @@ bool FileTransferManager::handleFileEnvelope(const QString& fromId,
 
 void FileTransferManager::purgeStaleTransfers()
 {
-    // kMaxTransferAgeSecs now lives in the header next to the other lifecycle
-    // constants.  See the "Lifecycle timing" block at the top of the class.
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    auto it = m_incomingTransfers.begin();
-    while (it != m_incomingTransfers.end()) {
-        auto& xferPtr = it.value();
+    const int64_t now = nowSecs();
+    for (auto it = m_incomingTransfers.begin(); it != m_incomingTransfers.end(); ) {
+        auto& xferPtr = it->second;
         if (xferPtr && xferPtr->createdSecs > 0 &&
             (now - xferPtr->createdSecs) > kMaxTransferAgeSecs) {
-            const QString tid = it.key();
-            emit status(QString("Purged stale transfer '%1' (%2/%3 chunks) after 30 min.")
-                            .arg(xferPtr->fileName)
-                            .arg(xferPtr->chunksReceivedCount)
-                            .arg(xferPtr->totalChunks));
+            const std::string tid = it->first;
+            if (onStatus) onStatus("Purged stale transfer '" + xferPtr->fileName + "' ("
+                        + std::to_string(xferPtr->chunksReceivedCount) + "/"
+                        + std::to_string(xferPtr->totalChunks) + " chunks) after 30 min.");
 
-            // Close and delete the partial file — don't leak disk.
             if (xferPtr->partialFile) {
                 xferPtr->partialFile->close();
                 xferPtr->partialFile.reset();
             }
-            if (!xferPtr->partialPath.isEmpty())
-                QFile::remove(xferPtr->partialPath);
+            if (!xferPtr->partialPath.empty()) {
+                std::error_code ec;
+                fs::remove(xferPtr->partialPath, ec);
+            }
 
-            // Phase 4: also drop the DB row — no resumption of a stale transfer.
             deleteIncomingRow(tid);
 
             it = m_incomingTransfers.erase(it);
-            emit transferCompleted(tid);  // M1: key cleanup on purge
+            if (onTransferCompleted) onTransferCompleted(tid);
         } else {
             ++it;
         }
@@ -601,16 +665,16 @@ void FileTransferManager::purgeStaleTransfers()
 
 // ── Phase 2: outbound consent gate ──────────────────────────────────────────
 
-void FileTransferManager::queueOutboundFile(const QString& senderIdB64u,
-                                             const QString& peerIdB64u,
-                                             const QByteArray& fileKey,
-                                             const QString& transferId,
-                                             const QString& fileName,
-                                             const QString& filePath,
-                                             qint64 fileSize,
-                                             const QByteArray& fileHash,
-                                             const QString& groupId,
-                                             const QString& groupName)
+void FileTransferManager::queueOutboundFile(const std::string& senderIdB64u,
+                                             const std::string& peerIdB64u,
+                                             const Bytes& fileKey,
+                                             const std::string& transferId,
+                                             const std::string& fileName,
+                                             const std::string& filePath,
+                                             int64_t fileSize,
+                                             const Bytes& fileHash,
+                                             const std::string& groupId,
+                                             const std::string& groupName)
 {
     if (fileKey.size() != 32 || fileHash.size() != 32) {
         qWarning() << "[FileTransfer] queueOutboundFile: bad key/hash length";
@@ -619,18 +683,18 @@ void FileTransferManager::queueOutboundFile(const QString& senderIdB64u,
     OutboundTransfer out;
     out.senderId   = senderIdB64u;
     out.peerId     = peerIdB64u;
-    out.fileKey    = QByteArray(fileKey.constData(), fileKey.size()); // owned copy
+    out.fileKey    = fileKey;         // owned copy
     out.fileName   = fileName;
     out.filePath   = filePath;
     out.fileSize   = fileSize;
     out.fileHash   = fileHash;
     out.groupId    = groupId;
     out.groupName  = groupName;
-    out.queuedSecs = QDateTime::currentSecsSinceEpoch();
-    m_outboundPending.insert(transferId, out);
+    out.queuedSecs = nowSecs();
+    m_outboundPending[transferId] = std::move(out);
 }
 
-bool FileTransferManager::startOutboundStream(const QString& transferId,
+bool FileTransferManager::startOutboundStream(const std::string& transferId,
                                                 bool requireP2P,
                                                 bool senderRequiresP2P,
                                                 bool p2pReadyNow)
@@ -638,42 +702,31 @@ bool FileTransferManager::startOutboundStream(const QString& transferId,
     auto it = m_outboundPending.find(transferId);
     if (it == m_outboundPending.end()) {
         qWarning() << "[FileTransfer] startOutboundStream: unknown transferId"
-                   << transferId.left(8);
+                   << idPrefix(transferId);
         return false;
     }
 
-    // Re-check the file still exists.
-    if (!QFileInfo::exists(it->filePath)) {
-        const QString name = it->fileName;
-        const QString peer = it->peerId;
-        emit status(QString("File vanished before accept: %1").arg(name));
-        sodium_memzero(it->fileKey.data(), it->fileKey.size());
+    if (!fs::exists(it->second.filePath)) {
+        const std::string name = it->second.fileName;
+        const std::string peer = it->second.peerId;
+        if (onStatus) onStatus(std::string("File vanished before accept: ") + name);
+        CryptoEngine::secureZero(it->second.fileKey);
         m_outboundPending.erase(it);
-        emit outboundAbandoned(transferId, peer);
+        if (onOutboundAbandoned) onOutboundAbandoned(transferId, peer);
         return false;
     }
 
     const bool requiresP2P = requireP2P || senderRequiresP2P;
-    const bool isLarge     = it->fileSize > kLargeFileBytes;
-
-    // ── Decision matrix ────────────────────────────────────────────────────
-    //
-    // Small file:      stream immediately with relay fallback (Auto mode).
-    // Large + P2P up:  stream via P2P now.
-    // Large + no P2P + neither requires P2P: stream via sealed relay (Auto).
-    // Large + no P2P + someone requires P2P: park waiting for P2P; abort after
-    //                                         kP2PReadyWaitSecs if still no P2P.
+    const bool isLarge     = it->second.fileSize > kLargeFileBytes;
 
     if (!isLarge) {
-        // Small file — current behavior: dispatch now, per-chunk fallback.
-        OutboundTransfer out = *it;
+        OutboundTransfer out = std::move(it->second);
         m_outboundPending.erase(it);
 
-        const qint64  ts           = QDateTime::currentSecsSinceEpoch();
-        const QString fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
-        const int     totalChunks  = int((out.fileSize + kChunkBytes - 1) / kChunkBytes);
+        const int64_t     ts           = nowSecs();
+        const std::string fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
+        const int         totalChunks  = int((out.fileSize + kChunkBytes - 1) / kChunkBytes);
 
-        // Phase 4: record the sent transfer for resumption before chunks fly.
         registerSentTransfer(out.senderId, out.peerId, transferId, out.fileName,
                              out.filePath, out.fileSize, out.fileHash, out.fileKey,
                              out.groupId, out.groupName);
@@ -684,32 +737,28 @@ bool FileTransferManager::startOutboundStream(const QString& transferId,
                            RoutingMode::Auto,
                            out.groupId, out.groupName);
 
-        if (out.groupId.isEmpty()) {
-            emit status(QString("'%1' streamed in %2 chunk(s) -> %3")
-                            .arg(out.fileName).arg(totalChunks).arg(out.peerId));
+        if (out.groupId.empty()) {
+            if (onStatus) onStatus("'" + out.fileName + "' streamed in "
+                        + std::to_string(totalChunks) + " chunk(s) -> " + out.peerId);
         }
-        sodium_memzero(out.fileKey.data(), out.fileKey.size());
+        CryptoEngine::secureZero(out.fileKey);
         return true;
     }
 
     // Large file path — record the transport policy first.
-    it->receiverRequiresP2P = requireP2P;
-    it->senderRequiresP2P   = senderRequiresP2P;
+    it->second.receiverRequiresP2P = requireP2P;
+    it->second.senderRequiresP2P   = senderRequiresP2P;
 
     if (p2pReadyNow) {
-        // Stream via P2P now. If either side required P2P, use P2POnly to
-        // refuse mid-stream relay fallback.
-        OutboundTransfer out = *it;
+        OutboundTransfer out = std::move(it->second);
         m_outboundPending.erase(it);
 
-        const qint64  ts           = QDateTime::currentSecsSinceEpoch();
-        const QString fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
-        const int     totalChunks  = int((out.fileSize + kChunkBytes - 1) / kChunkBytes);
+        const int64_t     ts           = nowSecs();
+        const std::string fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
+        const int         totalChunks  = int((out.fileSize + kChunkBytes - 1) / kChunkBytes);
 
-        const RoutingMode mode = requiresP2P ? RoutingMode::P2POnly
-                                             : RoutingMode::Auto;
+        const RoutingMode mode = requiresP2P ? RoutingMode::P2POnly : RoutingMode::Auto;
 
-        // Phase 4: record the sent transfer for resumption before chunks fly.
         registerSentTransfer(out.senderId, out.peerId, transferId, out.fileName,
                              out.filePath, out.fileSize, out.fileHash, out.fileKey,
                              out.groupId, out.groupName);
@@ -720,50 +769,47 @@ bool FileTransferManager::startOutboundStream(const QString& transferId,
                            mode,
                            out.groupId, out.groupName);
 
-        if (out.groupId.isEmpty()) {
-            emit status(QString("'%1' streamed in %2 chunk(s) -> %3 (P2P)")
-                            .arg(out.fileName).arg(totalChunks).arg(out.peerId));
+        if (out.groupId.empty()) {
+            if (onStatus) onStatus("'" + out.fileName + "' streamed in "
+                        + std::to_string(totalChunks) + " chunk(s) -> " + out.peerId + " (P2P)");
         }
-        sodium_memzero(out.fileKey.data(), out.fileKey.size());
+        CryptoEngine::secureZero(out.fileKey);
         return true;
     }
 
     // Large file + no P2P yet → park in WaitingForP2P state.
-    it->stage            = OutboundStage::WaitingForP2P;
-    it->waitStartedSecs  = QDateTime::currentSecsSinceEpoch();
+    it->second.stage           = OutboundStage::WaitingForP2P;
+    it->second.waitStartedSecs = nowSecs();
 
-    emit status(QString("Waiting for direct connection to send '%1'...")
-                    .arg(it->fileName));
+    if (onStatus) onStatus("Waiting for direct connection to send '" + it->second.fileName + "'...");
     return true;
 }
 
-QList<QString> FileTransferManager::notifyP2PReady(const QString& peerIdB64u)
+std::vector<std::string>
+FileTransferManager::notifyP2PReady(const std::string& peerIdB64u)
 {
-    QList<QString> flushed;
-    // Iterate collecting first — we'll flush after, since streaming mutates the map.
-    QList<QString> toFlush;
-    for (auto it = m_outboundPending.begin(); it != m_outboundPending.end(); ++it) {
-        if (it->stage == OutboundStage::WaitingForP2P && it->peerId == peerIdB64u) {
-            toFlush << it.key();
+    std::vector<std::string> flushed;
+    std::vector<std::string> toFlush;
+    for (auto& [tid, out] : m_outboundPending) {
+        if (out.stage == OutboundStage::WaitingForP2P && out.peerId == peerIdB64u) {
+            toFlush.push_back(tid);
         }
     }
 
-    for (const QString& tid : toFlush) {
+    for (const std::string& tid : toFlush) {
         auto it = m_outboundPending.find(tid);
         if (it == m_outboundPending.end()) continue;
 
-        OutboundTransfer out = *it;
+        OutboundTransfer out = std::move(it->second);
         m_outboundPending.erase(it);
 
-        const qint64  ts           = QDateTime::currentSecsSinceEpoch();
-        const QString fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
-        const int     totalChunks  = int((out.fileSize + kChunkBytes - 1) / kChunkBytes);
+        const int64_t     ts           = nowSecs();
+        const std::string fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
+        const int         totalChunks  = int((out.fileSize + kChunkBytes - 1) / kChunkBytes);
 
         const bool requiresP2P = out.receiverRequiresP2P || out.senderRequiresP2P;
-        const RoutingMode mode = requiresP2P ? RoutingMode::P2POnly
-                                             : RoutingMode::Auto;
+        const RoutingMode mode = requiresP2P ? RoutingMode::P2POnly : RoutingMode::Auto;
 
-        // Phase 4: record the sent transfer for resumption before chunks fly.
         registerSentTransfer(out.senderId, out.peerId, tid, out.fileName,
                              out.filePath, out.fileSize, out.fileHash, out.fileKey,
                              out.groupId, out.groupName);
@@ -774,108 +820,101 @@ QList<QString> FileTransferManager::notifyP2PReady(const QString& peerIdB64u)
                            mode,
                            out.groupId, out.groupName);
 
-        if (out.groupId.isEmpty()) {
-            emit status(QString("'%1' streamed in %2 chunk(s) -> %3 (P2P ready)")
-                            .arg(out.fileName).arg(totalChunks).arg(out.peerId));
+        if (out.groupId.empty()) {
+            if (onStatus) onStatus("'" + out.fileName + "' streamed in "
+                        + std::to_string(totalChunks) + " chunk(s) -> "
+                        + out.peerId + " (P2P ready)");
         }
-        sodium_memzero(out.fileKey.data(), out.fileKey.size());
-        flushed << tid;
+        CryptoEngine::secureZero(out.fileKey);
+        flushed.push_back(tid);
     }
 
     return flushed;
 }
 
-void FileTransferManager::abandonOutboundTransfer(const QString& transferId)
+void FileTransferManager::abandonOutboundTransfer(const std::string& transferId)
 {
     auto it = m_outboundPending.find(transferId);
     if (it != m_outboundPending.end()) {
-        const QString peerId = it->peerId;
-        sodium_memzero(it->fileKey.data(), it->fileKey.size());
+        const std::string peerId = it->second.peerId;
+        CryptoEngine::secureZero(it->second.fileKey);
         m_outboundPending.erase(it);
-        emit outboundAbandoned(transferId, peerId);
+        if (onOutboundAbandoned) onOutboundAbandoned(transferId, peerId);
     }
-    // Fix #12: also signal any in-flight stream to stop, even if the
-    // pre-stream state was already erased.
     m_abortedTransfers.insert(transferId);
 }
 
-void FileTransferManager::cancelInboundTransfer(const QString& transferId)
+void FileTransferManager::cancelInboundTransfer(const std::string& transferId)
 {
     auto it = m_incomingTransfers.find(transferId);
     if (it == m_incomingTransfers.end()) return;
 
-    auto& xferPtr = it.value();
-    const QString peerId = xferPtr ? xferPtr->fromId : QString();
+    auto& xferPtr = it->second;
+    const std::string peerId = xferPtr ? xferPtr->fromId : std::string();
 
     if (xferPtr && xferPtr->partialFile) {
         xferPtr->partialFile->close();
         xferPtr->partialFile.reset();
     }
-    if (xferPtr && !xferPtr->partialPath.isEmpty())
-        QFile::remove(xferPtr->partialPath);
+    if (xferPtr && !xferPtr->partialPath.empty()) {
+        std::error_code ec;
+        fs::remove(xferPtr->partialPath, ec);
+    }
 
-    // Phase 4: drop the DB row immediately — canceled transfers leave no trail.
     deleteIncomingRow(transferId);
 
     m_incomingTransfers.erase(it);
-    emit inboundCanceled(transferId, peerId);
-    emit transferCompleted(transferId);  // M1: let ChatController zero the key
+    if (onInboundCanceled) onInboundCanceled(transferId, peerId);
+    if (onTransferCompleted) onTransferCompleted(transferId);
 }
 
-QString FileTransferManager::outboundPeerFor(const QString& transferId) const
+std::string FileTransferManager::outboundPeerFor(const std::string& transferId) const
 {
     auto it = m_outboundPending.find(transferId);
-    return (it == m_outboundPending.end()) ? QString() : it->peerId;
+    return (it == m_outboundPending.end()) ? std::string() : it->second.peerId;
 }
 
-QString FileTransferManager::inboundPeerFor(const QString& transferId) const
+std::string FileTransferManager::inboundPeerFor(const std::string& transferId) const
 {
     auto it = m_incomingTransfers.find(transferId);
-    if (it == m_incomingTransfers.end() || !it.value()) return {};
-    return it.value()->fromId;
+    if (it == m_incomingTransfers.end() || !it->second) return {};
+    return it->second->fromId;
 }
 
 void FileTransferManager::purgeStaleOutbound()
 {
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    auto it = m_outboundPending.begin();
-    while (it != m_outboundPending.end()) {
+    const int64_t now = nowSecs();
+    for (auto it = m_outboundPending.begin(); it != m_outboundPending.end(); ) {
         // Phase 3: WaitingForP2P entries have their own shorter deadline.
-        if (it->stage == OutboundStage::WaitingForP2P &&
-            it->waitStartedSecs > 0 &&
-            (now - it->waitStartedSecs) > kP2PReadyWaitSecs) {
+        if (it->second.stage == OutboundStage::WaitingForP2P &&
+            it->second.waitStartedSecs > 0 &&
+            (now - it->second.waitStartedSecs) > kP2PReadyWaitSecs) {
 
-            const QString tid       = it.key();
-            const QString peerId    = it->peerId;
-            const QString name      = it->fileName;
-            const bool receiverReq  = it->receiverRequiresP2P;
-            const bool senderReq    = it->senderRequiresP2P;
-            const bool requiresP2P  = receiverReq || senderReq;
+            const std::string tid       = it->first;
+            const std::string peerId    = it->second.peerId;
+            const std::string name      = it->second.fileName;
+            const bool receiverReq      = it->second.receiverRequiresP2P;
+            const bool senderReq        = it->second.senderRequiresP2P;
+            const bool requiresP2P      = receiverReq || senderReq;
 
             if (requiresP2P) {
-                // No relay fallback — abort with transport policy error.
-                emit status(QString("Direct connection unavailable for '%1' — "
-                                    "transfer aborted (privacy level blocks relay fallback).")
-                                .arg(name));
-                sodium_memzero(it->fileKey.data(), it->fileKey.size());
-                // Capture enough to emit after erase.
+                if (onStatus) onStatus("Direct connection unavailable for '" + name
+                            + "' — transfer aborted (privacy level blocks relay fallback).");
+                CryptoEngine::secureZero(it->second.fileKey);
                 const bool byReceiver = receiverReq && !senderReq;
                 it = m_outboundPending.erase(it);
-                emit outboundBlockedByPolicy(tid, peerId, byReceiver);
+                if (onOutboundBlockedByPolicy) onOutboundBlockedByPolicy(tid, peerId, byReceiver);
                 continue;
             }
 
-            // Neither side requires P2P — fall back to sealed relay.
-            OutboundTransfer out = *it;
+            OutboundTransfer out = std::move(it->second);
             it = m_outboundPending.erase(it);
 
-            emit status(QString("Direct connection timed out for '%1' — streaming via relay.")
-                            .arg(name));
+            if (onStatus) onStatus("Direct connection timed out for '" + name + "' — streaming via relay.");
 
-            const qint64  ts           = QDateTime::currentSecsSinceEpoch();
-            const QString fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
+            const int64_t     ts           = nowSecs();
+            const std::string fileHashB64u = CryptoEngine::toBase64Url(out.fileHash);
 
-            // Phase 4: record the sent transfer for resumption before chunks fly.
             registerSentTransfer(out.senderId, out.peerId, tid, out.fileName,
                                  out.filePath, out.fileSize, out.fileHash, out.fileKey,
                                  out.groupId, out.groupName);
@@ -885,21 +924,21 @@ void FileTransferManager::purgeStaleOutbound()
                                tid, out.fileName, fileHashB64u, ts,
                                RoutingMode::Auto,
                                out.groupId, out.groupName);
-            sodium_memzero(out.fileKey.data(), out.fileKey.size());
+            CryptoEngine::secureZero(out.fileKey);
             continue;
         }
 
         // Plain outbound-pending (no file_accept yet): older 10-minute timeout.
-        if (it->stage == OutboundStage::Queued &&
-            it->queuedSecs > 0 &&
-            (now - it->queuedSecs) > kOutboundPendingTimeoutSecs) {
-            const QString tid = it.key();
-            const QString peerId = it->peerId;
-            emit status(QString("Outbound file '%1' timed out — peer didn't respond.")
-                            .arg(it->fileName));
-            sodium_memzero(it->fileKey.data(), it->fileKey.size());
+        if (it->second.stage == OutboundStage::Queued &&
+            it->second.queuedSecs > 0 &&
+            (now - it->second.queuedSecs) > kOutboundPendingTimeoutSecs) {
+            const std::string tid = it->first;
+            const std::string peerId = it->second.peerId;
+            if (onStatus) onStatus("Outbound file '" + it->second.fileName
+                        + "' timed out — peer didn't respond.");
+            CryptoEngine::secureZero(it->second.fileKey);
             it = m_outboundPending.erase(it);
-            emit outboundAbandoned(tid, peerId);
+            if (onOutboundAbandoned) onOutboundAbandoned(tid, peerId);
             continue;
         }
 
@@ -922,7 +961,6 @@ void FileTransferManager::ensurePhase4Tables()
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
     SqlCipherQuery q(*m_dbPtr);
 
-    // Incoming partial transfers: survives app restart so receiver can resume.
     q.exec(
         "CREATE TABLE IF NOT EXISTS file_transfers_in ("
         "  transfer_id     TEXT PRIMARY KEY,"
@@ -931,19 +969,17 @@ void FileTransferManager::ensurePhase4Tables()
         "  file_size       INTEGER NOT NULL,"
         "  total_chunks    INTEGER NOT NULL,"
         "  file_hash       BLOB,"
-        "  file_key        BLOB NOT NULL,"      // 32 bytes
+        "  file_key        BLOB NOT NULL,"
         "  group_id        TEXT,"
         "  group_name      TEXT,"
         "  partial_path    TEXT NOT NULL,"
         "  final_path      TEXT NOT NULL,"
-        "  received_bitmap BLOB NOT NULL,"      // QBitArray serialized
+        "  received_bitmap BLOB NOT NULL,"
         "  created_secs    INTEGER NOT NULL,"
         "  ts_secs         INTEGER"
         ");"
     );
 
-    // Outbound transfers in flight: kept so we can answer file_request calls
-    // for resumption when the receiver reconnects.
     q.exec(
         "CREATE TABLE IF NOT EXISTS file_transfers_out ("
         "  transfer_id   TEXT PRIMARY KEY,"
@@ -961,51 +997,45 @@ void FileTransferManager::ensurePhase4Tables()
     );
 }
 
-// Serialize a QBitArray to a compact blob.  Format: [4-byte bit count BE][packed bytes].
-static QByteArray bitArrayToBlob(const QBitArray& bits)
+// Serialize a std::vector<bool> to a compact blob.  Format:
+//   [4-byte bit count BE][packed bytes].  Byte-compatible with the prior
+//   QBitArray-based format so existing DB rows decode cleanly.
+static FileTransferManager::Bytes bitArrayToBlob(const std::vector<bool>& bits)
 {
-    QByteArray blob;
-    const quint32 n = quint32(bits.size());
-    blob.resize(4);
-    blob[0] = char((n >> 24) & 0xFF);
-    blob[1] = char((n >> 16) & 0xFF);
-    blob[2] = char((n >>  8) & 0xFF);
-    blob[3] = char( n        & 0xFF);
-    const int nbytes = (int(n) + 7) / 8;
-    QByteArray packed(nbytes, 0);
-    for (int i = 0; i < int(n); ++i) {
-        if (bits.testBit(i)) {
-            packed[i / 8] = char(quint8(packed[i / 8]) | (1u << (i % 8)));
-        }
+    FileTransferManager::Bytes blob(4 + (bits.size() + 7) / 8, 0);
+    const uint32_t n = uint32_t(bits.size());
+    blob[0] = uint8_t((n >> 24) & 0xFF);
+    blob[1] = uint8_t((n >> 16) & 0xFF);
+    blob[2] = uint8_t((n >>  8) & 0xFF);
+    blob[3] = uint8_t( n        & 0xFF);
+    for (size_t i = 0; i < bits.size(); ++i) {
+        if (bits[i])
+            blob[4 + i / 8] = uint8_t(blob[4 + i / 8] | (1u << (i % 8)));
     }
-    blob.append(packed);
     return blob;
 }
 
-static QBitArray blobToBitArray(const QByteArray& blob)
+static std::vector<bool> blobToBitArray(const FileTransferManager::Bytes& blob)
 {
     if (blob.size() < 4) return {};
-    const quint32 n = (quint32(quint8(blob[0])) << 24) |
-                      (quint32(quint8(blob[1])) << 16) |
-                      (quint32(quint8(blob[2])) <<  8) |
-                       quint32(quint8(blob[3]));
-    if (blob.size() < 4 + int((n + 7) / 8)) return {};
-    // Use int(n) so this compiles under both Qt 5 (QBitArray takes int) and
-    // Qt 6 (takes qsizetype = long long; int widens implicitly).
-    QBitArray bits{int(n)};
-    const char* packed = blob.constData() + 4;
-    for (int i = 0; i < int(n); ++i) {
-        if (quint8(packed[i / 8]) & (1u << (i % 8))) bits.setBit(i);
+    const uint32_t n = (uint32_t(blob[0]) << 24) |
+                       (uint32_t(blob[1]) << 16) |
+                       (uint32_t(blob[2]) <<  8) |
+                        uint32_t(blob[3]);
+    if (blob.size() < 4 + size_t((n + 7) / 8)) return {};
+    std::vector<bool> bits(n, false);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (blob[4 + i / 8] & (1u << (i % 8))) bits[i] = true;
     }
     return bits;
 }
 
-void FileTransferManager::persistIncomingFull(const QString& transferId,
+void FileTransferManager::persistIncomingFull(const std::string& transferId,
                                                 const IncomingTransfer& xfer,
-                                                const QByteArray& fileKey) const
+                                                const Bytes& fileKey) const
 {
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
-    if (fileKey.size() != 32) return;   // guard against empty-key probing
+    if (fileKey.size() != 32) return;
 
     SqlCipherQuery q(*m_dbPtr);
     if (!q.prepare(
@@ -1018,7 +1048,7 @@ void FileTransferManager::persistIncomingFull(const QString& transferId,
     q.bindValue(":tid",     transferId);
     q.bindValue(":peer",    xfer.fromId);
     q.bindValue(":name",    xfer.fileName);
-    q.bindValue(":size",    xfer.fileSize);
+    q.bindValue(":size",    int64_t(xfer.fileSize));
     q.bindValue(":chunks",  xfer.totalChunks);
     q.bindValue(":hash",    xfer.fileHash);
     q.bindValue(":key",     fileKey);
@@ -1027,12 +1057,12 @@ void FileTransferManager::persistIncomingFull(const QString& transferId,
     q.bindValue(":ppath",   xfer.partialPath);
     q.bindValue(":fpath",   xfer.finalPath);
     q.bindValue(":bmap",    bitArrayToBlob(xfer.receivedChunks));
-    q.bindValue(":created", xfer.createdSecs);
-    q.bindValue(":ts",      xfer.ts.toSecsSinceEpoch());
+    q.bindValue(":created", int64_t(xfer.createdSecs));
+    q.bindValue(":ts",      int64_t(xfer.tsSecs));
     q.exec();
 }
 
-void FileTransferManager::deleteIncomingRow(const QString& transferId) const
+void FileTransferManager::deleteIncomingRow(const std::string& transferId) const
 {
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
     SqlCipherQuery q(*m_dbPtr);
@@ -1041,7 +1071,7 @@ void FileTransferManager::deleteIncomingRow(const QString& transferId) const
     q.exec();
 }
 
-void FileTransferManager::deleteSentRow(const QString& transferId) const
+void FileTransferManager::deleteSentRow(const std::string& transferId) const
 {
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
     SqlCipherQuery q(*m_dbPtr);
@@ -1050,17 +1080,15 @@ void FileTransferManager::deleteSentRow(const QString& transferId) const
     q.exec();
 }
 
-void FileTransferManager::forgetSentTransfer(const QString& transferId)
+void FileTransferManager::forgetSentTransfer(const std::string& transferId)
 {
     auto it = m_sentTransfers.find(transferId);
     if (it != m_sentTransfers.end()) {
-        if (!it->fileKey.isEmpty())
-            sodium_memzero(it->fileKey.data(), it->fileKey.size());
+        CryptoEngine::secureZero(it->second.fileKey);
         m_sentTransfers.erase(it);
     }
     deleteSentRow(transferId);
 
-    // Fix #12: if a stream is still flying, tell it to stop at the next chunk.
     m_abortedTransfers.insert(transferId);
 }
 
@@ -1069,16 +1097,16 @@ void FileTransferManager::setSenderRequiresP2P(bool require)
     m_senderRequiresP2PLive = require;
 }
 
-void FileTransferManager::registerSentTransfer(const QString& senderIdB64u,
-                                                 const QString& peerIdB64u,
-                                                 const QString& transferId,
-                                                 const QString& fileName,
-                                                 const QString& filePath,
-                                                 qint64 fileSize,
-                                                 const QByteArray& fileHash,
-                                                 const QByteArray& fileKey,
-                                                 const QString& groupId,
-                                                 const QString& groupName)
+void FileTransferManager::registerSentTransfer(const std::string& senderIdB64u,
+                                                 const std::string& peerIdB64u,
+                                                 const std::string& transferId,
+                                                 const std::string& fileName,
+                                                 const std::string& filePath,
+                                                 int64_t fileSize,
+                                                 const Bytes& fileHash,
+                                                 const Bytes& fileKey,
+                                                 const std::string& groupId,
+                                                 const std::string& groupName)
 {
     SentTransfer s;
     s.senderId     = senderIdB64u;
@@ -1087,11 +1115,11 @@ void FileTransferManager::registerSentTransfer(const QString& senderIdB64u,
     s.filePath     = filePath;
     s.fileSize     = fileSize;
     s.fileHash     = fileHash;
-    s.fileKey      = QByteArray(fileKey.constData(), fileKey.size());
+    s.fileKey      = fileKey;
     s.groupId      = groupId;
     s.groupName    = groupName;
-    s.createdSecs  = QDateTime::currentSecsSinceEpoch();
-    m_sentTransfers.insert(transferId, s);
+    s.createdSecs  = nowSecs();
+    m_sentTransfers[transferId] = s;
 
     if (m_dbPtr && m_dbPtr->isOpen()) {
         SqlCipherQuery q(*m_dbPtr);
@@ -1106,12 +1134,12 @@ void FileTransferManager::registerSentTransfer(const QString& senderIdB64u,
             q.bindValue(":peer",    peerIdB64u);
             q.bindValue(":name",    fileName);
             q.bindValue(":path",    filePath);
-            q.bindValue(":size",    fileSize);
+            q.bindValue(":size",    int64_t(fileSize));
             q.bindValue(":hash",    fileHash);
-            q.bindValue(":key",     s.fileKey);
+            q.bindValue(":key",     fileKey);
             q.bindValue(":gid",     groupId);
             q.bindValue(":gname",   groupName);
-            q.bindValue(":created", s.createdSecs);
+            q.bindValue(":created", int64_t(s.createdSecs));
             q.exec();
         }
     }
@@ -1129,63 +1157,59 @@ void FileTransferManager::loadPersistedTransfers()
                       "       final_path, received_bitmap, created_secs, ts_secs "
                       "FROM file_transfers_in;") && q.exec()) {
             while (q.next()) {
-                const QString tid      = q.value(0).toString();
-                const QString peerId   = q.value(1).toString();
-                const QString fname    = q.value(2).toString();
-                const qint64  fsize    = q.value(3).toLongLong();
-                const int     chunks   = q.value(4).toInt();
-                const QByteArray fhash = q.value(5).toByteArray();
-                const QByteArray fkey  = q.value(6).toByteArray();
-                const QString gid      = q.value(7).toString();
-                const QString gname    = q.value(8).toString();
-                const QString ppath    = q.value(9).toString();
-                const QString fpath    = q.value(10).toString();
-                const QByteArray bmap  = q.value(11).toByteArray();
-                const qint64 created   = q.value(12).toLongLong();
-                const qint64 tsSecs    = q.value(13).toLongLong();
+                const std::string tid      = q.valueText(0);
+                const std::string peerId   = q.valueText(1);
+                const std::string fname    = q.valueText(2);
+                const int64_t     fsize    = q.valueInt64(3);
+                const int         chunks   = q.valueInt(4);
+                const Bytes       fhash    = q.valueBlob(5);
+                const Bytes       fkey     = q.valueBlob(6);
+                const std::string gid      = q.valueText(7);
+                const std::string gname    = q.valueText(8);
+                const std::string ppath    = q.valueText(9);
+                const std::string fpath    = q.valueText(10);
+                const Bytes       bmap     = q.valueBlob(11);
+                const int64_t     created  = q.valueInt64(12);
+                const int64_t     tsSecs   = q.valueInt64(13);
 
-                // Partial file must still exist on disk. If user deleted it
-                // out of band, drop the row and move on.
-                if (!QFileInfo::exists(ppath)) {
+                if (!fs::exists(ppath)) {
                     deleteIncomingRow(tid);
                     continue;
                 }
 
                 auto xferPtr = std::make_shared<IncomingTransfer>();
-                xferPtr->fromId       = peerId;
-                xferPtr->fileName     = fname;
-                xferPtr->fileSize     = fsize;
-                xferPtr->totalChunks  = chunks;
-                xferPtr->fileHash     = fhash;
-                xferPtr->groupId      = gid;
-                xferPtr->groupName    = gname;
-                xferPtr->partialPath  = ppath;
-                xferPtr->finalPath    = fpath;
+                xferPtr->fromId         = peerId;
+                xferPtr->fileName       = fname;
+                xferPtr->fileSize       = fsize;
+                xferPtr->totalChunks    = chunks;
+                xferPtr->fileHash       = fhash;
+                xferPtr->groupId        = gid;
+                xferPtr->groupName      = gname;
+                xferPtr->partialPath    = ppath;
+                xferPtr->finalPath      = fpath;
                 xferPtr->receivedChunks = blobToBitArray(bmap);
-                xferPtr->createdSecs  = created;
-                xferPtr->ts           = tsFromSecs(tsSecs);
+                xferPtr->createdSecs    = created;
+                xferPtr->tsSecs         = tsSecs;
 
-                // Count bits set.
                 int set = 0;
-                for (int i = 0; i < xferPtr->receivedChunks.size(); ++i)
-                    if (xferPtr->receivedChunks.testBit(i)) ++set;
+                for (bool b : xferPtr->receivedChunks) if (b) ++set;
                 xferPtr->chunksReceivedCount = set;
 
-                // Re-open partial file (preserve contents — no truncate).
-                xferPtr->partialFile = std::make_unique<QFile>(ppath);
-                if (!xferPtr->partialFile->open(QIODevice::ReadWrite)) {
+                // Re-open partial file R/W without truncation.
+                xferPtr->partialFile = std::make_unique<std::fstream>(ppath,
+                    std::ios::in | std::ios::out | std::ios::binary);
+                if (!xferPtr->partialFile->is_open()) {
                     qWarning() << "[FileTransfer] loadPersisted: cannot reopen"
-                               << ppath << "—" << xferPtr->partialFile->errorString();
+                               << QString::fromStdString(ppath);
                     deleteIncomingRow(tid);
                     continue;
                 }
 
-                m_incomingTransfers.insert(tid, xferPtr);
+                m_incomingTransfers[tid] = xferPtr;
 
-                // Fix #5: hand the restored fileKey back to ChatController so
-                // resumption chunks can actually decrypt after restart.
+                // Fix #5: hand the restored fileKey back to ChatController.
                 if (fkey.size() == 32) {
-                    emit incomingFileKeyRestored(peerId, tid, fkey);
+                    if (onIncomingFileKeyRestored) onIncomingFileKeyRestored(peerId, tid, fkey);
                 }
             }
         }
@@ -1198,94 +1222,94 @@ void FileTransferManager::loadPersistedTransfers()
                       "       file_size, file_hash, file_key, group_id, group_name, "
                       "       created_secs FROM file_transfers_out;") && q.exec()) {
             while (q.next()) {
-                const QString tid   = q.value(0).toString();
+                const std::string tid = q.valueText(0);
                 SentTransfer s;
-                s.senderId    = q.value(1).toString();
-                s.peerId      = q.value(2).toString();
-                s.fileName    = q.value(3).toString();
-                s.filePath    = q.value(4).toString();
-                s.fileSize    = q.value(5).toLongLong();
-                s.fileHash    = q.value(6).toByteArray();
-                s.fileKey     = q.value(7).toByteArray();
-                s.groupId     = q.value(8).toString();
-                s.groupName   = q.value(9).toString();
-                s.createdSecs = q.value(10).toLongLong();
+                s.senderId    = q.valueText(1);
+                s.peerId      = q.valueText(2);
+                s.fileName    = q.valueText(3);
+                s.filePath    = q.valueText(4);
+                s.fileSize    = q.valueInt64(5);
+                s.fileHash    = q.valueBlob(6);
+                s.fileKey     = q.valueBlob(7);
+                s.groupId     = q.valueText(8);
+                s.groupName   = q.valueText(9);
+                s.createdSecs = q.valueInt64(10);
 
-                // If the original file is gone or the key got corrupted, drop it.
-                if (!QFileInfo::exists(s.filePath) || s.fileKey.size() != 32) {
+                if (!fs::exists(s.filePath) || s.fileKey.size() != 32) {
                     deleteSentRow(tid);
                     continue;
                 }
-                m_sentTransfers.insert(tid, s);
+                m_sentTransfers[tid] = std::move(s);
             }
         }
     }
 }
 
-QList<FileTransferManager::PendingResumption>
+std::vector<FileTransferManager::PendingResumption>
 FileTransferManager::pendingResumptions() const
 {
-    QList<PendingResumption> out;
-    for (auto it = m_incomingTransfers.begin(); it != m_incomingTransfers.end(); ++it) {
-        const auto& xferPtr = it.value();
+    std::vector<PendingResumption> out;
+    for (const auto& [tid, xferPtr] : m_incomingTransfers) {
         if (!xferPtr || xferPtr->chunksReceivedCount >= xferPtr->totalChunks) continue;
 
         PendingResumption pr;
-        pr.transferId = it.key();
+        pr.transferId = tid;
         pr.peerId     = xferPtr->fromId;
-        for (int i = 0; i < xferPtr->receivedChunks.size(); ++i) {
-            if (!xferPtr->receivedChunks.testBit(i))
-                pr.missingChunks << quint32(i);
+        for (size_t i = 0; i < xferPtr->receivedChunks.size(); ++i) {
+            if (!xferPtr->receivedChunks[i])
+                pr.missingChunks.push_back(uint32_t(i));
         }
-        if (!pr.missingChunks.isEmpty()) out << pr;
+        if (!pr.missingChunks.empty()) out.push_back(std::move(pr));
     }
     return out;
 }
 
-bool FileTransferManager::resendChunks(const QString& transferId,
-                                        const QList<quint32>& chunkIndices)
+bool FileTransferManager::resendChunks(const std::string& transferId,
+                                        const std::vector<uint32_t>& chunkIndices)
 {
     auto itSent = m_sentTransfers.find(transferId);
     if (itSent == m_sentTransfers.end()) {
         qWarning() << "[FileTransfer] resendChunks: no sender record for"
-                   << transferId.left(8);
+                   << idPrefix(transferId);
         return false;
     }
-    SentTransfer& s = itSent.value();
-    if (!QFileInfo::exists(s.filePath)) {
+    SentTransfer& s = itSent->second;
+    if (!fs::exists(s.filePath)) {
         qWarning() << "[FileTransfer] resendChunks: source file gone"
-                   << s.filePath;
+                   << QString::fromStdString(s.filePath);
         return false;
     }
 
-    QFile src(s.filePath);
-    if (!src.open(QIODevice::ReadOnly)) {
-        qWarning() << "[FileTransfer] resendChunks: cannot open" << s.filePath;
+    std::ifstream src(s.filePath, std::ios::binary);
+    if (!src.is_open()) {
+        qWarning() << "[FileTransfer] resendChunks: cannot open"
+                   << QString::fromStdString(s.filePath);
         return false;
     }
 
     const int totalChunks = int((s.fileSize + kChunkBytes - 1) / kChunkBytes);
-    const QString fileHashB64u = CryptoEngine::toBase64Url(s.fileHash);
-    const qint64  ts = QDateTime::currentSecsSinceEpoch();
+    const std::string fileHashB64u = CryptoEngine::toBase64Url(s.fileHash);
+    const int64_t ts = nowSecs();
 
-    QByteArray chunk;
-    chunk.reserve(int(kChunkBytes));
+    Bytes chunk;
+    chunk.reserve(size_t(kChunkBytes));
 
-    for (quint32 i : chunkIndices) {
-        if (int(i) >= totalChunks) continue;  // bogus index — ignore
+    for (uint32_t i : chunkIndices) {
+        if (int(i) >= totalChunks) continue;
 
-        const qint64 offset    = qint64(i) * kChunkBytes;
-        const qint64 remaining = s.fileSize - offset;
-        const qint64 toRead    = qMin<qint64>(kChunkBytes, remaining);
+        const int64_t offset    = int64_t(i) * kChunkBytes;
+        const int64_t remaining = s.fileSize - offset;
+        const int64_t toRead    = std::min<int64_t>(kChunkBytes, remaining);
 
-        src.seek(offset);
-        chunk.resize(int(toRead));
-        if (src.read(chunk.data(), toRead) != toRead) {
+        src.seekg(offset);
+        chunk.assign(size_t(toRead), 0);
+        src.read(reinterpret_cast<char*>(chunk.data()), std::streamsize(toRead));
+        if (src.gcount() != toRead) {
             qWarning() << "[FileTransfer] resendChunks: short read at chunk" << i;
             break;
         }
 
-        QJsonObject meta;
+        json meta;
         meta["from"]        = s.senderId;
         meta["type"]        = "file_chunk";
         meta["transferId"]  = transferId;
@@ -1295,64 +1319,64 @@ bool FileTransferManager::resendChunks(const QString& transferId,
         meta["fileSize"]    = s.fileSize;
         meta["ts"]          = ts;
         meta["fileHash"]    = fileHashB64u;
-        if (!s.groupId.isEmpty()) {
+        if (!s.groupId.empty()) {
             meta["groupId"]   = s.groupId;
             meta["groupName"] = s.groupName;
         }
 
-        const QByteArray metaJson = QJsonDocument(meta).toJson(QJsonDocument::Compact);
-        const QByteArray encMeta  = m_crypto.aeadEncrypt(s.fileKey, metaJson);
-        const QByteArray encChunk = m_crypto.aeadEncrypt(s.fileKey, chunk);
-        const QByteArray inner    = pack32(quint32(encMeta.size())) + encMeta + encChunk;
+        const std::string metaJsonStr = meta.dump();
+        const Bytes metaJson(metaJsonStr.begin(), metaJsonStr.end());
+        const Bytes encMeta  = m_crypto.aeadEncrypt(s.fileKey, metaJson);
+        const Bytes encChunk = m_crypto.aeadEncrypt(s.fileKey, chunk);
+
+        Bytes inner;
+        inner.reserve(4 + encMeta.size() + encChunk.size());
+        appendBE32(inner, uint32_t(encMeta.size()));
+        inner.insert(inner.end(), encMeta.begin(), encMeta.end());
+        inner.insert(inner.end(), encChunk.begin(), encChunk.end());
 
         dispatchChunk(s.senderId, s.peerId, inner, RoutingMode::Auto);
     }
 
-    src.close();
     return true;
 }
 
 void FileTransferManager::purgeStalePartialFiles()
 {
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    const qint64 cutoffIn  = now - kPartialFileMaxAgeSecs;   // 7 days for receiver
-    const qint64 cutoffOut = now - kSentTransferMaxAgeSecs;  // Fix #15: 24h for sender
+    const int64_t now = nowSecs();
+    const int64_t cutoffIn  = now - kPartialFileMaxAgeSecs;   // 7 days for receiver
+    const int64_t cutoffOut = now - kSentTransferMaxAgeSecs;  // Fix #15: 24h for sender
 
     SqlCipherQuery qSel(*m_dbPtr);
-    QStringList toDelete;
-    QStringList pathsToRemove;
+    std::vector<std::string> toDelete;
+    std::vector<std::string> pathsToRemove;
     if (qSel.prepare("SELECT transfer_id, partial_path, created_secs "
                       "FROM file_transfers_in WHERE created_secs < :cutoff;")) {
-        qSel.bindValue(":cutoff", cutoffIn);
+        qSel.bindValue(":cutoff", int64_t(cutoffIn));
         if (qSel.exec()) {
             while (qSel.next()) {
-                toDelete << qSel.value(0).toString();
-                pathsToRemove << qSel.value(1).toString();
+                toDelete.push_back(qSel.valueText(0));
+                pathsToRemove.push_back(qSel.valueText(1));
             }
         }
     }
-    for (int i = 0; i < toDelete.size(); ++i) {
-        QFile::remove(pathsToRemove[i]);
+    for (size_t i = 0; i < toDelete.size(); ++i) {
+        std::error_code ec;
+        fs::remove(pathsToRemove[i], ec);
         deleteIncomingRow(toDelete[i]);
     }
 
-    // Fix #15: sender-side records containing a plaintext fileKey get a much
-    // shorter window.  SQLCipher encrypts them at rest, but a device
-    // compromise still leaks in-flight file keys — so we don't keep them
-    // around past a typical reconnect gap.
     SqlCipherQuery qDel(*m_dbPtr);
     if (qDel.prepare("DELETE FROM file_transfers_out WHERE created_secs < :cutoff;")) {
-        qDel.bindValue(":cutoff", cutoffOut);
+        qDel.bindValue(":cutoff", int64_t(cutoffOut));
         qDel.exec();
     }
-    // Also drop in-memory sent-transfer records that got purged from DB.
-    const qint64 memCutoff = cutoffOut;
-    auto it = m_sentTransfers.begin();
-    while (it != m_sentTransfers.end()) {
-        if (it->createdSecs > 0 && it->createdSecs < memCutoff) {
-            if (!it->fileKey.isEmpty())
-                sodium_memzero(it->fileKey.data(), it->fileKey.size());
+
+    const int64_t memCutoff = cutoffOut;
+    for (auto it = m_sentTransfers.begin(); it != m_sentTransfers.end(); ) {
+        if (it->second.createdSecs > 0 && it->second.createdSecs < memCutoff) {
+            CryptoEngine::secureZero(it->second.fileKey);
             it = m_sentTransfers.erase(it);
         } else {
             ++it;

@@ -1,10 +1,20 @@
 #include "SessionStore.hpp"
-#include <QDateTime>
-#include <QDebug>
 #include <sodium.h>
+#include <chrono>
 #include <cstring>
 
-SessionStore::SessionStore(SqlCipherDb& db, QByteArray storeKey)
+#include <QDebug>  // TEMP: logging parity with rest of core/; Phase 7 replaces.
+
+namespace {
+
+inline int64_t nowSecs() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+}  // anonymous namespace
+
+SessionStore::SessionStore(SqlCipherDb& db, Bytes storeKey)
     : m_db(db)
     , m_storeKey(std::move(storeKey))
 {
@@ -13,8 +23,8 @@ SessionStore::SessionStore(SqlCipherDb& db, QByteArray storeKey)
 }
 
 SessionStore::~SessionStore() {
-    if (!m_storeKey.isEmpty())
-        sodium_memzero(m_storeKey.data(), static_cast<size_t>(m_storeKey.size()));
+    if (!m_storeKey.empty())
+        sodium_memzero(m_storeKey.data(), m_storeKey.size());
 }
 
 void SessionStore::createTables() {
@@ -31,7 +41,6 @@ void SessionStore::createTables() {
 
     // B4 fix: skipped_message_keys table removed — RatchetSession manages
     // skipped keys in its own serialized blob (in-memory map).
-    // Drop the unused table if it exists from prior versions.
     q.exec("DROP TABLE IF EXISTS skipped_message_keys;");
 
     q.exec(
@@ -48,50 +57,46 @@ void SessionStore::createTables() {
 // Blob encryption helpers
 // ---------------------------
 
-QByteArray SessionStore::encryptBlob(const QByteArray& plaintext) const {
+SessionStore::Bytes SessionStore::encryptBlob(const Bytes& plaintext) const {
     if (m_storeKey.size() != 32) return {};  // no valid key — refuse to store plaintext
 
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
     randombytes_buf(nonce, sizeof(nonce));
 
-    QByteArray out;
-    out.resize(static_cast<int>(sizeof(nonce)) + plaintext.size() +
-               static_cast<int>(crypto_aead_xchacha20poly1305_ietf_ABYTES));
+    Bytes out(sizeof(nonce) + plaintext.size() +
+              crypto_aead_xchacha20poly1305_ietf_ABYTES);
     unsigned long long clen = 0;
     crypto_aead_xchacha20poly1305_ietf_encrypt(
-        reinterpret_cast<unsigned char*>(out.data()) + sizeof(nonce), &clen,
-        reinterpret_cast<const unsigned char*>(plaintext.constData()),
+        out.data() + sizeof(nonce), &clen,
+        plaintext.data(),
         static_cast<unsigned long long>(plaintext.size()),
         nullptr, 0, nullptr, nonce,
-        reinterpret_cast<const unsigned char*>(m_storeKey.constData()));
-    memcpy(out.data(), nonce, sizeof(nonce));
-    out.resize(static_cast<int>(sizeof(nonce) + clen));
+        m_storeKey.data());
+    std::memcpy(out.data(), nonce, sizeof(nonce));
+    out.resize(sizeof(nonce) + clen);
     return out;
 }
 
-QByteArray SessionStore::decryptBlob(const QByteArray& ciphertext) const {
-    const int kMinSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-                         crypto_aead_xchacha20poly1305_ietf_ABYTES;
-    if (m_storeKey.size() != 32) return {};  // no valid key — fail safe
-    if (ciphertext.size() < kMinSize) return {};   // too short — treat as invalid
+SessionStore::Bytes SessionStore::decryptBlob(const Bytes& ciphertext) const {
+    const size_t kMinSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
+                            crypto_aead_xchacha20poly1305_ietf_ABYTES;
+    if (m_storeKey.size() != 32) return {};     // no valid key — fail safe
+    if (ciphertext.size() < kMinSize) return {}; // too short — treat as invalid
 
-    const unsigned char* nonce =
-        reinterpret_cast<const unsigned char*>(ciphertext.constData());
-    const int ctLen = ciphertext.size() - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
-    QByteArray pt;
-    pt.resize(ctLen - static_cast<int>(crypto_aead_xchacha20poly1305_ietf_ABYTES));
+    const unsigned char* nonce = ciphertext.data();
+    const size_t ctLen = ciphertext.size() - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    Bytes pt(ctLen - crypto_aead_xchacha20poly1305_ietf_ABYTES);
     unsigned long long plen = 0;
     if (crypto_aead_xchacha20poly1305_ietf_decrypt(
-            reinterpret_cast<unsigned char*>(pt.data()), &plen,
+            pt.data(), &plen,
             nullptr,
-            reinterpret_cast<const unsigned char*>(ciphertext.constData()) +
-                crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
+            ciphertext.data() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
             static_cast<unsigned long long>(ctLen),
             nullptr, 0, nonce,
-            reinterpret_cast<const unsigned char*>(m_storeKey.constData())) != 0) {
+            m_storeKey.data()) != 0) {
         return {}; // authentication failed — invalid or old plaintext blob
     }
-    pt.resize(static_cast<int>(plen));
+    pt.resize(plen);
     return pt;
 }
 
@@ -99,8 +104,8 @@ QByteArray SessionStore::decryptBlob(const QByteArray& ciphertext) const {
 // Ratchet sessions
 // ---------------------------
 
-void SessionStore::saveSession(const QString& peerId, const QByteArray& stateBlob) {
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
+void SessionStore::saveSession(const std::string& peerId, const Bytes& stateBlob) {
+    const int64_t now = nowSecs();
     SqlCipherQuery q(m_db);
     q.prepare(
         "INSERT INTO ratchet_sessions (peer_id, state_blob, created_at, updated_at)"
@@ -110,18 +115,19 @@ void SessionStore::saveSession(const QString& peerId, const QByteArray& stateBlo
     q.bindValue(":pid", peerId);
     q.bindValue(":blob", encryptBlob(stateBlob));
     q.bindValue(":now", now);
-    if (!q.exec()) qWarning() << "SessionStore::saveSession:" << q.lastError();
+    if (!q.exec())
+        qWarning() << "SessionStore::saveSession:" << QString::fromStdString(q.lastError());
 }
 
-QByteArray SessionStore::loadSession(const QString& peerId) const {
+SessionStore::Bytes SessionStore::loadSession(const std::string& peerId) const {
     SqlCipherQuery q(m_db.handle());
     q.prepare("SELECT state_blob FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
-    if (q.exec() && q.next()) return decryptBlob(q.value(0).toByteArray());
+    if (q.exec() && q.next()) return decryptBlob(q.valueBlob(0));
     return {};
 }
 
-void SessionStore::deleteSession(const QString& peerId) {
+void SessionStore::deleteSession(const std::string& peerId) {
     SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
@@ -146,9 +152,9 @@ void SessionStore::clearAll() {
 // Pending handshakes
 // ---------------------------
 
-void SessionStore::savePendingHandshake(const QString& peerId, int role,
-                                         const QByteArray& handshakeBlob) {
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
+void SessionStore::savePendingHandshake(const std::string& peerId, int role,
+                                        const Bytes& handshakeBlob) {
+    const int64_t now = nowSecs();
     SqlCipherQuery q(m_db);
     q.prepare(
         "INSERT INTO pending_handshakes (peer_id, role, handshake_blob, created_at)"
@@ -160,49 +166,51 @@ void SessionStore::savePendingHandshake(const QString& peerId, int role,
     q.bindValue(":role", role);
     q.bindValue(":blob", encryptBlob(handshakeBlob));
     q.bindValue(":now", now);
-    if (!q.exec()) qWarning() << "SessionStore::savePendingHandshake:" << q.lastError();
+    if (!q.exec())
+        qWarning() << "SessionStore::savePendingHandshake:" << QString::fromStdString(q.lastError());
 }
 
-QByteArray SessionStore::loadPendingHandshake(const QString& peerId, int& roleOut) const {
+SessionStore::Bytes SessionStore::loadPendingHandshake(const std::string& peerId,
+                                                       int& roleOut) const {
     SqlCipherQuery q(m_db.handle());
     q.prepare("SELECT role, handshake_blob FROM pending_handshakes WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     if (q.exec() && q.next()) {
-        roleOut = q.value(0).toInt();
-        return decryptBlob(q.value(1).toByteArray());
+        roleOut = q.valueInt(0);
+        return decryptBlob(q.valueBlob(1));
     }
     return {};
 }
 
-void SessionStore::deletePendingHandshake(const QString& peerId) {
+void SessionStore::deletePendingHandshake(const std::string& peerId) {
     SqlCipherQuery q(m_db);
     q.prepare("DELETE FROM pending_handshakes WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
     q.exec();
 }
 
-QStringList SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
-    const qint64 cutoff = QDateTime::currentSecsSinceEpoch() - maxAgeSecs;
-    QStringList pruned;
+std::vector<std::string> SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
+    const int64_t cutoff = nowSecs() - maxAgeSecs;
+    std::vector<std::string> pruned;
 
-    // SEC9: collect peer IDs before deleting so we can report them
+    // SEC9: collect peer IDs before deleting so we can report them.
     {
         SqlCipherQuery sel(m_db.handle());
         sel.prepare("SELECT peer_id FROM pending_handshakes WHERE created_at < :cutoff;");
         sel.bindValue(":cutoff", cutoff);
         if (sel.exec()) {
             while (sel.next())
-                pruned << sel.value(0).toString();
+                pruned.push_back(sel.valueText(0));
         }
     }
 
-    if (!pruned.isEmpty()) {
+    if (!pruned.empty()) {
         SqlCipherQuery q(m_db);
         q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
         q.bindValue(":cutoff", cutoff);
         q.exec();
 #ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionStore] Pruned" << pruned.size() << "stale pending handshakes";
+        qDebug() << "[SessionStore] Pruned" << int(pruned.size()) << "stale pending handshakes";
 #endif
     }
     return pruned;

@@ -1,12 +1,27 @@
 #pragma once
-#include <QByteArray>
-#include <QString>
+
+#include <cstdint>
+#include <string>
 #include <utility>
+#include <vector>
+
+/*
+ * CryptoEngine — identity keys + crypto primitives.
+ *
+ * Owns the local Ed25519 identity, derived X25519 keys, ML-KEM-768 (PQ KEM),
+ * and ML-DSA-65 (PQ signatures).  Handles encrypted persistence of the
+ * private-key material via identity.json in the app data directory.
+ *
+ * Types: std::vector<uint8_t> for bytes, std::string (UTF-8) for text.
+ * Migrated off Qt on 2026-04-18.
+ */
+
+using Bytes = std::vector<uint8_t>;
 
 // ML-KEM-768 encapsulation result
 struct KemEncapsResult {
-    QByteArray ciphertext;   // KEM ciphertext (1088 bytes for ML-KEM-768)
-    QByteArray sharedSecret; // 32-byte shared secret
+    Bytes ciphertext;    // KEM ciphertext (1088 bytes for ML-KEM-768)
+    Bytes sharedSecret;  // 32-byte shared secret
 };
 
 class CryptoEngine {
@@ -18,119 +33,128 @@ public:
     CryptoEngine(const CryptoEngine&) = delete;
     CryptoEngine& operator=(const CryptoEngine&) = delete;
 
+    // Set the app data directory (where identity.json lives).
+    // If unset, falls back to the platform's default via the host-provided helper.
+    // Must be called before ensureIdentity() on hosts that don't provide a default
+    // (iOS, Android).  On desktop with Qt, a sensible default is computed.
+    void setDataDir(std::string dir) { m_dataDir = std::move(dir); }
+
     void ensureIdentity();
 
     // Unified path: caller supplies a pre-derived 32-byte key for identity
     // file encryption (from HKDF(masterKey, "identity-unlock")).
     // Falls back to legacy per-salt Argon2 for v4 files, then re-encrypts as v5.
-    void ensureIdentity(const QByteArray& identityKey);
+    void ensureIdentity(const Bytes& identityKey);
 
-    void setPassphrase(const QString& pass);
+    void setPassphrase(const std::string& pass);
     bool hasPassphrase() const;
 
-    const QByteArray& identityPub() const { return m_edPub; }
-    const QByteArray& identityPriv() const { return m_edPriv; }
+    const Bytes& identityPub()  const { return m_edPub;  }
+    const Bytes& identityPriv() const { return m_edPriv; }
 
     // base64url helpers (no padding)
-    static QString toBase64Url(const QByteArray& data);
-    static QByteArray fromBase64Url(const QString& s);
+    static std::string toBase64Url(const Bytes& data);
+    static Bytes       fromBase64Url(const std::string& s);
 
-    // mailbox auth signing
-    QString signB64u(const QByteArray& msgUtf8) const;
+    // mailbox auth signing — returns base64url-encoded Ed25519 signature
+    std::string signB64u(const Bytes& msgUtf8) const;
 
     // X25519 key accessors (derived from Ed25519 identity)
-    const QByteArray& curvePub()  const { return m_curvePub;  }
-    const QByteArray& curvePriv() const { return m_curvePriv; }
+    const Bytes& curvePub()  const { return m_curvePub;  }
+    const Bytes& curvePriv() const { return m_curvePriv; }
 
     // ML-KEM-768 key accessors (generated alongside Ed25519 identity)
     // Empty if PQ keys haven't been generated yet (legacy identity file)
-    const QByteArray& kemPub()  const { return m_kemPub;  }
-    const QByteArray& kemPriv() const { return m_kemPriv; }
-    bool hasPQKeys() const { return !m_kemPub.isEmpty(); }
+    const Bytes& kemPub()  const { return m_kemPub;  }
+    const Bytes& kemPriv() const { return m_kemPriv; }
+    bool hasPQKeys() const { return !m_kemPub.empty(); }
 
     // ML-DSA-65 signature key accessors (generated alongside identity)
-    const QByteArray& dsaPub()  const { return m_dsaPub;  }
-    const QByteArray& dsaPriv() const { return m_dsaPriv; }
-    bool hasDSAKeys() const { return !m_dsaPub.isEmpty(); }
+    const Bytes& dsaPub()  const { return m_dsaPub;  }
+    const Bytes& dsaPriv() const { return m_dsaPriv; }
+    bool hasDSAKeys() const { return !m_dsaPub.empty(); }
 
     // ML-KEM-768 operations (static — work with any keys, not just ours)
     // Returns (pub, priv) keypair. pub=1184 bytes, priv=2400 bytes.
-    static std::pair<QByteArray, QByteArray> generateKemKeypair();
+    static std::pair<Bytes, Bytes> generateKemKeypair();
 
     // Encapsulate: generate shared secret and ciphertext for a recipient's KEM pub.
-    // Returns empty on failure.
-    static KemEncapsResult kemEncaps(const QByteArray& recipientKemPub);
+    // Returns empty fields on failure.
+    static KemEncapsResult kemEncaps(const Bytes& recipientKemPub);
 
     // Decapsulate: recover shared secret from ciphertext using our KEM private key.
-    // Returns empty 0-byte array on failure.
-    static QByteArray kemDecaps(const QByteArray& ciphertext, const QByteArray& kemPriv);
+    // Returns empty on failure.
+    static Bytes kemDecaps(const Bytes& ciphertext, const Bytes& kemPriv);
 
     // Generate a fresh ephemeral X25519 keypair (pub, priv)
-    static std::pair<QByteArray, QByteArray> generateEphemeralX25519();
+    static std::pair<Bytes, Bytes> generateEphemeralX25519();
 
     // HKDF using BLAKE2b: derive outputLen bytes from input key material
-    static QByteArray hkdf(const QByteArray& ikm, const QByteArray& salt,
-                           const QByteArray& info, int outputLen = 32);
+    static Bytes hkdf(const Bytes& ikm, const Bytes& salt,
+                      const Bytes& info, int outputLen = 32);
 
     // derive per-peer shared 32-byte key using X25519 from Ed25519 keys
-    QByteArray deriveSharedKey32(const QByteArray& peerEd25519Pub) const;
+    Bytes deriveSharedKey32(const Bytes& peerEd25519Pub) const;
 
     // AEAD (XChaCha20-Poly1305). Output = nonce(24) || ciphertext
-    QByteArray aeadEncrypt(const QByteArray& key32, const QByteArray& plaintext,
-                           const QByteArray& aad = {}) const;
+    Bytes aeadEncrypt(const Bytes& key32, const Bytes& plaintext,
+                      const Bytes& aad = {}) const;
 
-    QByteArray aeadDecrypt(const QByteArray& key32, const QByteArray& nonceAndCiphertext,
-                           const QByteArray& aad = {}) const;
+    Bytes aeadDecrypt(const Bytes& key32, const Bytes& nonceAndCiphertext,
+                      const Bytes& aad = {}) const;
 
     // Ed25519 signature verification (static — any key, not just ours)
-    static bool verifySignature(const QByteArray& sig, const QByteArray& message,
-                                const QByteArray& edPub);
+    static bool verifySignature(const Bytes& sig, const Bytes& message,
+                                const Bytes& edPub);
 
     // ML-DSA-65 operations (static)
-    static std::pair<QByteArray, QByteArray> generateDsaKeypair();  // (pub, priv)
-    static QByteArray dsaSign(const QByteArray& message, const QByteArray& dsaPriv);
-    static bool dsaVerify(const QByteArray& sig, const QByteArray& message,
-                          const QByteArray& dsaPub);
+    static std::pair<Bytes, Bytes> generateDsaKeypair();  // (pub, priv)
+    static Bytes dsaSign(const Bytes& message, const Bytes& dsaPriv);
+    static bool  dsaVerify(const Bytes& sig, const Bytes& message,
+                           const Bytes& dsaPub);
 
     // Derive a master key from a passphrase using Argon2id.
     // Salt must be 16 bytes (use loadOrCreateSalt() to manage it).
-    static QByteArray deriveMasterKey(const QString& passphrase, const QByteArray& salt);
+    static Bytes deriveMasterKey(const std::string& passphrase, const Bytes& salt);
 
     // Derive a purpose-specific subkey from a master key via HKDF.
-    static QByteArray deriveSubkey(const QByteArray& masterKey,
-                                   const QByteArray& info, int len = 32);
+    static Bytes deriveSubkey(const Bytes& masterKey, const Bytes& info, int len = 32);
 
     // Load a salt file from disk, or create a new random 16-byte one.
-    static QByteArray loadOrCreateSalt(const QString& path);
+    static Bytes loadOrCreateSalt(const std::string& path);
 
-    // Securely zero a QByteArray's backing buffer in-place.
-    static void secureZero(QByteArray& buf);
+    // Securely zero a Bytes buffer in-place.
+    static void secureZero(Bytes& buf);
 
-    // Securely zero a QString's UTF-16 backing buffer in-place.
-    static void secureZero(QString& str);
+    // Securely zero a std::string's buffer in-place.
+    static void secureZero(std::string& str);
 
 private:
     // Encrypted persistence helpers
     bool loadIdentityFromDisk();
-    bool loadIdentityFromDisk(const QByteArray& identityKey);  // v5 unified key path
+    bool loadIdentityFromDisk(const Bytes& identityKey);  // v5 unified key path
     bool saveIdentityToDisk() const;
-    bool saveIdentityToDisk(const QByteArray& identityKey) const;  // v5 unified key path
+    bool saveIdentityToDisk(const Bytes& identityKey) const;  // v5 unified key path
     void deriveCurveKeysFromEd();
-    void ensurePQKeys();  // generate + persist ML-KEM/ML-DSA keys if missing
-    void ensurePQKeys(const QByteArray& identityKey);  // v5 unified key path
+    void ensurePQKeys();
+    void ensurePQKeys(const Bytes& identityKey);
 
-    QString m_passphrase;       // zeroed after ensureIdentity() completes
-    QByteArray m_identityKey;   // v5: 32-byte key from HKDF(masterKey, "identity-unlock")
+    // Resolve identity.json path — uses m_dataDir, or a platform default.
+    std::string identityPath() const;
 
-    QByteArray m_edPub;     // 32  (public — not secret, but zeroed for hygiene)
-    QByteArray m_edPriv;    // 64  (secret — zeroed in destructor)
+    std::string m_dataDir;       // app data dir; "" = use platform default
+    std::string m_passphrase;    // zeroed after ensureIdentity() completes
+    Bytes       m_identityKey;   // v5: 32-byte key from HKDF(masterKey, "identity-unlock")
 
-    QByteArray m_curvePub;  // 32
-    QByteArray m_curvePriv; // 32  (secret — zeroed in destructor)
+    Bytes m_edPub;     // 32
+    Bytes m_edPriv;    // 64
 
-    QByteArray m_kemPub;    // 1184 (ML-KEM-768 public key)
-    QByteArray m_kemPriv;   // 2400 (ML-KEM-768 secret key — zeroed in destructor)
+    Bytes m_curvePub;  // 32
+    Bytes m_curvePriv; // 32
 
-    QByteArray m_dsaPub;    // 1952 (ML-DSA-65 public key)
-    QByteArray m_dsaPriv;   // 4032 (ML-DSA-65 secret key — zeroed in destructor)
+    Bytes m_kemPub;    // 1184
+    Bytes m_kemPriv;   // 2400
+
+    Bytes m_dsaPub;    // 1952
+    Bytes m_dsaPriv;   // 4032
 };

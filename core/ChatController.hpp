@@ -3,25 +3,43 @@
 #ifdef PEER2PEAR_P2P
 class QuicConnection;  // forward declaration — full include in .cpp
 #endif
-#include <QObject>
-#include <QTimer>
+
+// Qt types retained in the callback signatures for this phase so the
+// desktop UI doesn't have to migrate lambda adapters all at once — the
+// actual Qt::Core drop happens after signatures convert to std in a later
+// pass.  QObject is already gone (Phase 7b).
+#include <QString>
+#include <QStringList>
+#include <QByteArray>
+#include <QDateTime>
+#include <QJsonObject>
 #include <QSet>
 #include <QMap>
+#include <QUrl>
 
 #include "CryptoEngine.hpp"
 #include "RelayClient.hpp"
 #include "SessionManager.hpp"
 #include "SealedEnvelope.hpp"
 #include "FileTransferManager.hpp"
+#include "ITimer.hpp"
+#include "qt_bridge_temp.hpp"   // TEMP: inline bridge for blake2b256 wrapper
 
 #include "SqlCipherDb.hpp"
+#include <functional>
 #include <memory>
 
 
-class ChatController : public QObject {
-    Q_OBJECT
+class ChatController {
 public:
-    explicit ChatController(IWebSocket& ws, IHttpClient& http, QObject* parent = nullptr);
+    explicit ChatController(IWebSocket& ws, IHttpClient& http,
+                            ITimerFactory& timers);
+
+    // Set the app data directory (where identity.json + per-user DB live).
+    // Must be called before setPassphrase() on hosts that don't have a
+    // platform default (iOS, Android).  Desktop builds pick up
+    // QStandardPaths::AppDataLocation via CryptoEngine if this is unset.
+    void setDataDir(const QString& dir) { m_crypto.setDataDir(dir.toStdString()); }
 
     void setPassphrase(const QString& pass);
     // Unified path: pass the pre-derived identity key from HKDF(masterKey, "identity-unlock")
@@ -29,7 +47,7 @@ public:
     void setRelayUrl(const QUrl& url);
     void setDatabase(SqlCipherDb& db);
     QString myIdB64u() const;
-    const QByteArray& identityPub() const { return m_crypto.identityPub(); }
+    const Bytes& identityPub() const { return m_crypto.identityPub(); }
 
     // Send encrypted text to a peer
     void sendText(const QString& peerIdB64u, const QString& text);
@@ -51,7 +69,10 @@ public:
     static constexpr qint64 maxFileBytes() { return FileTransferManager::kMaxFileBytes; }
 
     // Compute BLAKE2b-256 hash of data (used for integrity checks).
-    static QByteArray blake2b256(const QByteArray& data) { return FileTransferManager::blake2b256(data); }
+    static QByteArray blake2b256(const QByteArray& data) {
+        return p2p::bridge::toQByteArray(
+            FileTransferManager::blake2b256(p2p::bridge::toBytes(data)));
+    }
 
     FileTransferManager& fileTransferMgr() { return m_fileMgr; }
     RelayClient& relay() { return m_relay; }
@@ -132,85 +153,67 @@ public:
     int  fileHardMaxMB() const          { return m_fileHardMaxMB; }
     bool fileRequireP2P() const         { return m_fileRequireP2P; }
 
-signals:
-    void status(const QString& s);
-    void relayConnected();
-    void presenceChanged(const QString& peerIdB64u, bool online);
+    // ── Event callbacks — plain class, no signals ──────────────────────────
+    //
+    // Each replaces a former Qt signal.  Assign directly:
+    //   controller.onMessageReceived = [this](auto&&... args){ ... };
 
-    void messageReceived(const QString& fromPeerIdB64u,
-                         const QString& text,
-                         const QDateTime& timestamp,
-                         const QString& msgId);
+    std::function<void(const QString&)> onStatus;
+    std::function<void()>               onRelayConnected;
+    std::function<void(const QString&, bool)> onPresenceChanged;
 
-    void groupMessageReceived(const QString& fromPeerIdB64u,
-                              const QString& groupId,
-                              const QString& groupName,
-                              const QStringList& memberKeys,
-                              const QString& text,
-                              const QDateTime& ts,
-                              const QString& msgId);
-    void groupMemberLeft(const QString& fromPeerIdB64u,
-                         const QString& groupId,
-                         const QString& groupName,
-                         const QStringList& memberKeys,
-                         const QDateTime& ts,
-                         const QString& msgId);
+    std::function<void(const QString& from, const QString& text,
+                       const QDateTime& ts, const QString& msgId)>
+        onMessageReceived;
 
-    void avatarReceived(const QString& peerIdB64u, const QString& displayName, const QString& avatarB64);
-    void groupRenamed(const QString& groupId, const QString& newName);
-    void groupAvatarReceived(const QString& groupId, const QString& avatarB64);
+    std::function<void(const QString& from, const QString& groupId,
+                       const QString& groupName, const QStringList& members,
+                       const QString& text, const QDateTime& ts,
+                       const QString& msgId)>
+        onGroupMessageReceived;
 
-    // SEC9: emitted when a handshake with a peer is pruned (timed out) more
-    // than once — likely means the peer is running an older client that
-    // doesn't understand hybrid PQ Noise messages.
-    void peerMayNeedUpgrade(const QString& peerIdB64u);
+    std::function<void(const QString& from, const QString& groupId,
+                       const QString& groupName, const QStringList& members,
+                       const QDateTime& ts, const QString& msgId)>
+        onGroupMemberLeft;
 
-    // ── Phase 2: file consent / cancellation signals ────────────────────────
+    std::function<void(const QString& peerId, const QString& displayName,
+                       const QString& avatarB64)>
+        onAvatarReceived;
 
-    /// Receiver-side: an incoming file transfer needs user consent.
-    /// UI should prompt Accept / Decline (with optional "require direct connection").
-    void fileAcceptRequested(const QString& fromPeerIdB64u,
-                             const QString& transferId,
-                             const QString& fileName,
-                             qint64 fileSize);
+    std::function<void(const QString& groupId, const QString& newName)>
+        onGroupRenamed;
+    std::function<void(const QString& groupId, const QString& avatarB64)>
+        onGroupAvatarReceived;
 
-    /// Either direction: transfer was canceled, declined, or abandoned.
-    /// byReceiver = true  → sender lost the race (receiver declined/canceled)
-    /// byReceiver = false → receiver lost the race (sender canceled/gave up)
-    void fileTransferCanceled(const QString& transferId, bool byReceiver);
+    /// SEC9: peer may be running an older client that doesn't support our
+    /// current hybrid-PQ Noise messages.
+    std::function<void(const QString& peerId)> onPeerMayNeedUpgrade;
 
-    /// Phase 3: receiver confirmed the full file arrived with a valid hash.
-    /// Sender-side UI should flip the record to Delivered.
-    void fileTransferDelivered(const QString& transferId);
+    // ── Phase 2: file consent / cancellation callbacks ──────────────────────
+    std::function<void(const QString& from, const QString& transferId,
+                       const QString& fileName, qint64 fileSize)>
+        onFileAcceptRequested;
+    std::function<void(const QString& transferId, bool byReceiver)>
+        onFileTransferCanceled;
+    std::function<void(const QString& transferId)>
+        onFileTransferDelivered;
+    std::function<void(const QString& transferId, bool byReceiver)>
+        onFileTransferBlocked;
 
-    /// Phase 3: the transport policy (Privacy Level 2 or fileRequireP2P)
-    /// blocked the transfer after P2P failed to come up in time.
-    /// byReceiver = true → receiver's requireP2P refused relay fallback
-    /// byReceiver = false → our own privacy setting refused relay fallback
-    void fileTransferBlocked(const QString& transferId, bool byReceiver);
+    std::function<void(const QString& from, const QString& transferId,
+                       const QString& fileName, qint64 fileSize,
+                       int chunksReceived, int chunksTotal,
+                       const QString& savedPath, const QDateTime& ts,
+                       const QString& groupId, const QString& groupName)>
+        onFileChunkReceived;
 
-    // Emitted each time a chunk of an incoming transfer arrives.
-    // chunksReceived == chunksTotal signals completion; savedPath is the
-    // on-disk location of the received file (non-empty only when complete).
-    // Files are streamed to disk — no full-file buffer is ever held in RAM.
-    // groupId is non-empty when this file was sent to a group chat.
-    void fileChunkReceived(const QString& fromPeerIdB64u,
-                           const QString& transferId,
-                           const QString& fileName,
-                           qint64         fileSize,
-                           int            chunksReceived,
-                           int            chunksTotal,
-                           const QString& savedPath,     // non-empty only when complete
-                           const QDateTime& timestamp,
-                           const QString& groupId = {},
-                           const QString& groupName = {});
-
-private slots:
+private:
     void onEnvelope(const QByteArray& body);
 #ifdef PEER2PEAR_P2P
     void onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data);
 #endif
-    void onRelayConnected();
+    void handleRelayConnected();
 
 private:
     QByteArray sealForPeer(const QString& peerIdB64u, const QByteArray& plaintext);
@@ -330,5 +333,8 @@ private:
 #endif
 
     // Periodic maintenance (handshake pruning, file key cleanup)
-    QTimer m_maintenanceTimer;
+    ITimerFactory*          m_timerFactory = nullptr;
+    std::unique_ptr<ITimer> m_maintenanceTimer;
+    void scheduleMaintenance();
+    void runMaintenance();
 };

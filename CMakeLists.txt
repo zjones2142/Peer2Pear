@@ -43,6 +43,7 @@ endif()
 # ── vcpkg Dependencies ────────────────────────────────────────────────────────
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(liboqs CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 # P2P-only deps: msquic needs MSVC on Windows; libnice + GLib aren't needed

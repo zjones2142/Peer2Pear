@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "./ui_mainwindow.h"
 #include "onboardingdialog.h"
+#include "qt_bridge_temp.hpp"  // TEMP: bridge for CryptoEngine calls
 
 #include <QPixmap>
 #include <QHBoxLayout>
@@ -21,7 +22,7 @@
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
-    , m_controller(m_webSocket, m_httpClient)
+    , m_controller(m_webSocket, m_httpClient, m_timerFactory)
 {
     ui->setupUi(this);
 
@@ -68,65 +69,71 @@ MainWindow::MainWindow(QWidget *parent)
                 "Re-enter the passphrase to confirm:",
                 QLineEdit::Password, "", &ok);
             if (!ok) {
-                CryptoEngine::secureZero(pass);
+                p2p::bridge::secureZeroQ(pass);
                 QTimer::singleShot(0, qApp, &QCoreApplication::quit);
                 return;
             }
             if (confirm != pass) {
                 QMessageBox::warning(this, "Passphrases Don't Match",
                     "The two passphrases didn't match. Please try again.");
-                CryptoEngine::secureZero(pass);
-                CryptoEngine::secureZero(confirm);
+                p2p::bridge::secureZeroQ(pass);
+                p2p::bridge::secureZeroQ(confirm);
                 continue;
             }
-            CryptoEngine::secureZero(confirm);
+            p2p::bridge::secureZeroQ(confirm);
         }
         try {
             // ── Unified key derivation (single Argon2id call) ────────────────
             const QString keysDir = QStandardPaths::writableLocation(
                 QStandardPaths::AppDataLocation) + "/keys";
-            QByteArray salt = CryptoEngine::loadOrCreateSalt(keysDir + "/db_salt.bin");
+            QByteArray salt = p2p::bridge::toQByteArray(CryptoEngine::loadOrCreateSalt(
+                (keysDir + "/db_salt.bin").toStdString()));
             if (salt.isEmpty()) {
                 QMessageBox::critical(this, "Salt File Error",
                     "The encryption salt file is corrupt and no backup exists.\n"
                     "Your database cannot be decrypted.\n\n"
                     "Contact support or delete the app data directory to start fresh.");
-                CryptoEngine::secureZero(pass);
+                p2p::bridge::secureZeroQ(pass);
                 QTimer::singleShot(0, qApp, &QCoreApplication::quit);
                 return;
             }
-            QByteArray masterKey = CryptoEngine::deriveMasterKey(pass, salt);
+            QByteArray masterKey = p2p::bridge::toQByteArray(CryptoEngine::deriveMasterKey(
+                pass.toStdString(), p2p::bridge::toBytes(salt)));
             if (masterKey.isEmpty()) {
                 QMessageBox::critical(this, "Key Derivation Failed",
                                       "Could not derive encryption key from passphrase.");
-                CryptoEngine::secureZero(pass);
+                p2p::bridge::secureZeroQ(pass);
                 continue;
             }
 
             // Derive all purpose-specific subkeys from one master key
-            QByteArray identityKey = CryptoEngine::deriveSubkey(masterKey, "identity-unlock");
-            QByteArray dbKey       = CryptoEngine::deriveSubkey(masterKey, "sqlcipher-db-key");
-            QByteArray fieldKey    = CryptoEngine::deriveSubkey(masterKey, "field-encryption");
-            CryptoEngine::secureZero(masterKey);
+            using namespace p2p::bridge;
+            QByteArray identityKey = toQByteArray(CryptoEngine::deriveSubkey(
+                toBytes(masterKey), strBytes("identity-unlock")));
+            QByteArray dbKey       = toQByteArray(CryptoEngine::deriveSubkey(
+                toBytes(masterKey), strBytes("sqlcipher-db-key")));
+            QByteArray fieldKey    = toQByteArray(CryptoEngine::deriveSubkey(
+                toBytes(masterKey), strBytes("field-encryption")));
+            p2p::bridge::secureZeroQ(masterKey);
 
             // ── Identity unlock (uses identityKey instead of separate Argon2) ─
             // setPassphrase(pass, identityKey) still needs pass for legacy v4
             // migration (deriveKeyFromPassphrase inside loadIdentityFromDisk).
             // Once migrated to v5, the passphrase is never used for identity.
             m_controller.setPassphrase(pass, identityKey);
-            CryptoEngine::secureZero(identityKey);
+            p2p::bridge::secureZeroQ(identityKey);
 
             // ── Open DB with SQLCipher encryption ────────────────────────────
             if (!m_db.open(dbKey)) {
                 QMessageBox::critical(this, "Database Error",
                                       "Could not open the local chat database.\n"
                                       "The passphrase may be incorrect.");
-                CryptoEngine::secureZero(dbKey);
-                CryptoEngine::secureZero(fieldKey);
-                CryptoEngine::secureZero(pass);
+                p2p::bridge::secureZeroQ(dbKey);
+                p2p::bridge::secureZeroQ(fieldKey);
+                p2p::bridge::secureZeroQ(pass);
                 continue;
             }
-            CryptoEngine::secureZero(dbKey);
+            p2p::bridge::secureZeroQ(dbKey);
 
             // Set per-field encryption key (backward compat with ENC: fields).
             // Legacy keys cover all previous key derivation generations:
@@ -139,9 +146,9 @@ MainWindow::MainWindow(QWidget *parent)
             QByteArray legacyGen2 = ChatController::blake2b256(
                 pass.toUtf8() + QByteArray("peer2pear-dbkey"));
             m_db.setEncryptionKey(fieldKey, {legacyGen2, legacyGen1});
-            CryptoEngine::secureZero(fieldKey);
-            CryptoEngine::secureZero(legacyGen1);
-            CryptoEngine::secureZero(legacyGen2);
+            p2p::bridge::secureZeroQ(fieldKey);
+            p2p::bridge::secureZeroQ(legacyGen1);
+            p2p::bridge::secureZeroQ(legacyGen2);
 
             // Wire DB to ChatController for Noise/Ratchet session persistence
             m_controller.setDatabase(m_db.database());
@@ -150,7 +157,7 @@ MainWindow::MainWindow(QWidget *parent)
             m_controller.setGroupSeqCounters(m_db.loadGroupSeqOut(),
                                               m_db.loadGroupSeqIn());
 
-            CryptoEngine::secureZero(pass);
+            p2p::bridge::secureZeroQ(pass);
             break;
         } catch (const std::exception &e) {
             QMessageBox::warning(this, "Identity Unlock Failed", e.what());
@@ -267,25 +274,56 @@ MainWindow::MainWindow(QWidget *parent)
         return isMinimized() || !isVisible() || !isActiveWindow();
     });
 
-    // ── Wire signals ──────────────────────────────────────────────────────────
-    connect(&m_controller, &ChatController::messageReceived,
-            m_chatView,    &ChatView::onIncomingMessage);
-    connect(&m_controller, &ChatController::status,
-            m_chatView,    &ChatView::onStatus);
-    connect(&m_controller, &ChatController::groupMessageReceived,
-            m_chatView,    &ChatView::onIncomingGroupMessage);
-    connect(&m_controller, &ChatController::groupMemberLeft,
-            m_chatView,    &ChatView::onGroupMemberLeft);
-    connect(&m_controller, &ChatController::fileChunkReceived,
-            m_chatView,    &ChatView::onFileChunkReceived);
-    connect(&m_controller, &ChatController::presenceChanged,
-            m_chatView,    &ChatView::onPresenceChanged);
-    connect(&m_controller, &ChatController::avatarReceived,
-            m_chatView,    &ChatView::onAvatarReceived);
-    connect(&m_controller, &ChatController::groupRenamed,
-            m_chatView,    &ChatView::onGroupRenamed);
-    connect(&m_controller, &ChatController::groupAvatarReceived,
-            m_chatView,    &ChatView::onGroupAvatarReceived);
+    // ── Wire callbacks ────────────────────────────────────────────────────────
+    // ChatController is a plain class (Phase 7b); direct assignment replaces
+    // QObject::connect.  The lambdas just bounce into ChatView's slots on
+    // the main thread — MainWindow owns both halves so lifetimes match.
+    m_controller.onMessageReceived =
+        [cv = m_chatView](const QString& from, const QString& text,
+                          const QDateTime& ts, const QString& msgId) {
+            cv->onIncomingMessage(from, text, ts, msgId);
+        };
+    m_controller.onStatus =
+        [cv = m_chatView](const QString& s) { cv->onStatus(s); };
+    m_controller.onGroupMessageReceived =
+        [cv = m_chatView](const QString& from, const QString& gid,
+                          const QString& gn, const QStringList& members,
+                          const QString& text, const QDateTime& ts,
+                          const QString& msgId) {
+            cv->onIncomingGroupMessage(from, gid, gn, members, text, ts, msgId);
+        };
+    m_controller.onGroupMemberLeft =
+        [cv = m_chatView](const QString& from, const QString& gid,
+                          const QString& gn, const QStringList& members,
+                          const QDateTime& ts, const QString& msgId) {
+            cv->onGroupMemberLeft(from, gid, gn, members, ts, msgId);
+        };
+    m_controller.onFileChunkReceived =
+        [cv = m_chatView](const QString& from, const QString& tid,
+                          const QString& fn, qint64 fsize,
+                          int rcvd, int total, const QString& saved,
+                          const QDateTime& ts, const QString& gid,
+                          const QString& gn) {
+            cv->onFileChunkReceived(from, tid, fn, fsize, rcvd, total,
+                                     saved, ts, gid, gn);
+        };
+    m_controller.onPresenceChanged =
+        [cv = m_chatView](const QString& peerId, bool online) {
+            cv->onPresenceChanged(peerId, online);
+        };
+    m_controller.onAvatarReceived =
+        [cv = m_chatView](const QString& peerId, const QString& name,
+                          const QString& b64) {
+            cv->onAvatarReceived(peerId, name, b64);
+        };
+    m_controller.onGroupRenamed =
+        [cv = m_chatView](const QString& gid, const QString& newName) {
+            cv->onGroupRenamed(gid, newName);
+        };
+    m_controller.onGroupAvatarReceived =
+        [cv = m_chatView](const QString& gid, const QString& b64) {
+            cv->onGroupAvatarReceived(gid, b64);
+        };
 
     // ── Notifier ──────────────────────────────────────────────────────────────
     m_notifier = new ChatNotifier(this);
@@ -307,12 +345,14 @@ MainWindow::MainWindow(QWidget *parent)
     m_notifier->setEnabled(m_settingsPanel->notificationsEnabled());
 
     // Phase 2: file transfer consent settings → ChatController
+    // ChatController isn't a QObject anymore, so route the SettingsPanel
+    // signals through small lambdas that invoke the regular methods.
     connect(m_settingsPanel, &SettingsPanel::fileAutoAcceptMaxChanged,
-            &m_controller,   &ChatController::setFileAutoAcceptMaxMB);
+            this, [this](int mb) { m_controller.setFileAutoAcceptMaxMB(mb); });
     connect(m_settingsPanel, &SettingsPanel::fileHardMaxChanged,
-            &m_controller,   &ChatController::setFileHardMaxMB);
+            this, [this](int mb) { m_controller.setFileHardMaxMB(mb); });
     connect(m_settingsPanel, &SettingsPanel::fileRequireP2PToggled,
-            &m_controller,   &ChatController::setFileRequireP2P);
+            this, [this](bool on) { m_controller.setFileRequireP2P(on); });
 
     // Relay URL — settings UI can live-switch which relay we're connected
     // to.  Drop the existing WS, point the RelayClient at the new URL, and
@@ -334,16 +374,25 @@ MainWindow::MainWindow(QWidget *parent)
     });
 
     // Phase 2: file accept/decline prompt + cancel notifications → ChatView
-    connect(&m_controller, &ChatController::fileAcceptRequested,
-            m_chatView,    &ChatView::onFileAcceptRequested);
-    connect(&m_controller, &ChatController::fileTransferCanceled,
-            m_chatView,    &ChatView::onFileTransferCanceled);
+    m_controller.onFileAcceptRequested =
+        [cv = m_chatView](const QString& from, const QString& tid,
+                          const QString& fn, qint64 size) {
+            cv->onFileAcceptRequested(from, tid, fn, size);
+        };
+    m_controller.onFileTransferCanceled =
+        [cv = m_chatView](const QString& tid, bool byReceiver) {
+            cv->onFileTransferCanceled(tid, byReceiver);
+        };
 
     // Phase 3: delivery confirmation + transport-policy block
-    connect(&m_controller, &ChatController::fileTransferDelivered,
-            m_chatView,    &ChatView::onFileTransferDelivered);
-    connect(&m_controller, &ChatController::fileTransferBlocked,
-            m_chatView,    &ChatView::onFileTransferBlocked);
+    m_controller.onFileTransferDelivered =
+        [cv = m_chatView](const QString& tid) {
+            cv->onFileTransferDelivered(tid);
+        };
+    m_controller.onFileTransferBlocked =
+        [cv = m_chatView](const QString& tid, bool byReceiver) {
+            cv->onFileTransferBlocked(tid, byReceiver);
+        };
 
     // ── Resize debounce ───────────────────────────────────────────────────────
     m_resizeDebounce.setSingleShot(true);

@@ -4,12 +4,15 @@
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QNetworkReply>
+#include <QUrl>
+#include <QString>
+#include <QByteArray>
 
 /*
  * QtHttpClient — IHttpClient implementation using QNetworkAccessManager.
  *
- * Thin wrapper that translates QNetworkReply signals into IHttpClient
- * callbacks. This is the desktop platform adapter for HTTP sends.
+ * Thin wrapper that translates QNetworkReply signals into std-typed
+ * IHttpClient callbacks.
  */
 class QtHttpClient : public QObject, public IHttpClient {
     Q_OBJECT
@@ -17,45 +20,51 @@ public:
     explicit QtHttpClient(QObject* parent = nullptr)
         : QObject(parent) {}
 
-    void post(const QUrl& url,
-              const QByteArray& body,
-              const QMap<QString, QString>& headers,
+    void post(const std::string& url,
+              const Bytes& body,
+              const Headers& headers,
               Callback cb) override
     {
-        QNetworkRequest req(url);
+        QNetworkRequest req((QUrl(QString::fromStdString(url))));
         req.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
-        for (auto it = headers.cbegin(); it != headers.cend(); ++it)
-            req.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
+        for (const auto& [k, v] : headers)
+            req.setRawHeader(QByteArray::fromStdString(k), QByteArray::fromStdString(v));
 
-        auto* reply = m_nam.post(req, body);
+        const QByteArray qBody(reinterpret_cast<const char*>(body.data()),
+                               static_cast<int>(body.size()));
+        auto* reply = m_nam.post(req, qBody);
         connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
             Response resp;
             resp.status = reply->attribute(
                 QNetworkRequest::HttpStatusCodeAttribute).toInt();
-            resp.body = reply->readAll();
+            const QByteArray b = reply->readAll();
+            resp.body.assign(reinterpret_cast<const uint8_t*>(b.constData()),
+                             reinterpret_cast<const uint8_t*>(b.constData()) + b.size());
             if (reply->error() != QNetworkReply::NoError)
-                resp.error = reply->errorString();
+                resp.error = reply->errorString().toStdString();
             reply->deleteLater();
             if (cb) cb(resp);
         });
     }
 
-    void get(const QUrl& url,
-             const QMap<QString, QString>& headers,
+    void get(const std::string& url,
+             const Headers& headers,
              Callback cb) override
     {
-        QNetworkRequest req(url);
-        for (auto it = headers.cbegin(); it != headers.cend(); ++it)
-            req.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
+        QNetworkRequest req((QUrl(QString::fromStdString(url))));
+        for (const auto& [k, v] : headers)
+            req.setRawHeader(QByteArray::fromStdString(k), QByteArray::fromStdString(v));
 
         auto* reply = m_nam.get(req);
         connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
             Response resp;
             resp.status = reply->attribute(
                 QNetworkRequest::HttpStatusCodeAttribute).toInt();
-            resp.body = reply->readAll();
+            const QByteArray b = reply->readAll();
+            resp.body.assign(reinterpret_cast<const uint8_t*>(b.constData()),
+                             reinterpret_cast<const uint8_t*>(b.constData()) + b.size());
             if (reply->error() != QNetworkReply::NoError)
-                resp.error = reply->errorString();
+                resp.error = reply->errorString().toStdString();
             reply->deleteLater();
             if (cb) cb(resp);
         });
