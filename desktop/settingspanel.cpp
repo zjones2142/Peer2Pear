@@ -89,6 +89,9 @@ void SettingsPanel::buildUI()
     // ── File transfer settings ──────────────────────────────────────────────
     bodyLayout->addWidget(makeFileTransferSection());
 
+    // ── Relay (network) settings ───────────────────────────────────────────
+    bodyLayout->addWidget(makeRelaySection());
+
     // ── About section ─────────────────────────────────────────────────────────
     // Version    = app version (matches project(Peer2Pear VERSION ...) in CMakeLists.txt)
     // Protocol   = wire-protocol version (matches the relay's /healthz "version" field
@@ -241,6 +244,18 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
     emit fileAutoAcceptMaxChanged(softMB);
     emit fileHardMaxChanged(hardMB);
     emit fileRequireP2PToggled(m_requireP2PEnabled);
+
+    // Relay URL — load whatever's stored (the mainwindow startup path is
+    // the source of truth for the default; here we just reflect what's
+    // actually in the DB so what the user sees matches what the client
+    // is connected to).
+    if (m_relayUrlEdit) {
+        const QString url = m_db->loadSetting("relayUrl", "https://peer2pear.com");
+        QSignalBlocker blocker(m_relayUrlEdit);
+        m_relayUrlEdit->setText(url);
+        m_lastAppliedRelayUrl = url;
+        if (m_relayApplyBtn) m_relayApplyBtn->setEnabled(false);
+    }
 }
 
 void SettingsPanel::applyNotificationState()
@@ -992,4 +1007,181 @@ void SettingsPanel::applyRequireP2PState()
             "QPushButton:hover { background-color: #203020; }"
             );
     }
+}
+
+// ── Relay URL ────────────────────────────────────────────────────────────────
+//
+// Card with a single QLineEdit for the relay URL, an Apply button (enabled
+// only when the field differs from what's stored), and a Reset link to
+// restore the default `https://peer2pear.com`.
+//
+// On Apply we persist to the DB and emit `relayUrlChanged` -- MainWindow
+// hooks that and drops the current WS connection + reconnects at the new
+// URL.  We don't validate the URL beyond "non-empty"; if it's malformed the
+// RelayClient will fail to connect and the user will see a status message.
+
+QWidget *SettingsPanel::makeRelaySection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    // Heading
+    QLabel *heading = new QLabel("RELAY");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    // URL row: label + input + Apply button
+    QWidget *urlRow = new QWidget();
+    urlRow->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *urlLayout = new QVBoxLayout(urlRow);
+    urlLayout->setContentsMargins(16, 10, 16, 4);
+    urlLayout->setSpacing(6);
+
+    QLabel *urlLabel = new QLabel("Server URL");
+    urlLabel->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+    urlLayout->addWidget(urlLabel);
+
+    QHBoxLayout *inputRow = new QHBoxLayout();
+    inputRow->setSpacing(8);
+
+    m_relayUrlEdit = new QLineEdit();
+    m_relayUrlEdit->setText("https://peer2pear.com");
+    m_relayUrlEdit->setPlaceholderText("https://your-relay.example.com");
+    m_relayUrlEdit->setStyleSheet(
+        "QLineEdit {"
+        "  background-color: #1a1a1a;"
+        "  color: #e0e0e0;"
+        "  border: 1px solid #2a2a2a;"
+        "  border-radius: 6px;"
+        "  padding: 5px 8px;"
+        "  font-size: 13px;"
+        "}"
+        "QLineEdit:focus { border: 1px solid #4caf50; }"
+        );
+
+    m_relayApplyBtn = new QPushButton("Apply");
+    m_relayApplyBtn->setEnabled(false);
+    m_relayApplyBtn->setFixedWidth(78);
+    m_relayApplyBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #1e2e1e;"
+        "  color: #cccccc;"
+        "  border: 1px solid #2e4e2e;"
+        "  border-radius: 6px;"
+        "  padding: 5px 12px;"
+        "  font-size: 12px;"
+        "}"
+        "QPushButton:hover:enabled { background-color: #203020; color: #4caf50; }"
+        "QPushButton:disabled {"
+        "  background-color: #151515; color: #555555; border-color: #222222;"
+        "}"
+        );
+
+    inputRow->addWidget(m_relayUrlEdit, 1);
+    inputRow->addWidget(m_relayApplyBtn);
+    urlLayout->addLayout(inputRow);
+
+    // Sub-text / reset link
+    QHBoxLayout *subRow = new QHBoxLayout();
+    subRow->setSpacing(8);
+    subRow->setContentsMargins(0, 0, 0, 0);
+
+    QLabel *helpLbl = new QLabel(
+        "Server used for encrypted message delivery. "
+        "Change only if you run your own relay."
+        );
+    helpLbl->setWordWrap(true);
+    helpLbl->setStyleSheet(
+        "color: #777777; font-size: 11px; background: transparent; border: none;"
+        );
+
+    QPushButton *resetBtn = new QPushButton("Reset to default");
+    resetBtn->setFlat(true);
+    resetBtn->setCursor(Qt::PointingHandCursor);
+    resetBtn->setStyleSheet(
+        "QPushButton {"
+        "  background: transparent; border: none; color: #4caf50;"
+        "  font-size: 11px; text-align: right;"
+        "}"
+        "QPushButton:hover { color: #6ac96a; text-decoration: underline; }"
+        );
+
+    subRow->addWidget(helpLbl, 1);
+    subRow->addWidget(resetBtn);
+    urlLayout->addLayout(subRow);
+
+    cardLayout->addWidget(urlRow);
+
+    // Bottom padding / optional status area
+    m_relayStatusLabel = new QLabel("");
+    m_relayStatusLabel->setStyleSheet(
+        "color: #777777; font-size: 11px; padding: 4px 16px 12px 16px;"
+        "background: transparent; border: none;"
+        );
+    m_relayStatusLabel->setWordWrap(true);
+    cardLayout->addWidget(m_relayStatusLabel);
+
+    // Enable/disable Apply as the user edits.
+    connect(m_relayUrlEdit, &QLineEdit::textChanged, this,
+            [this](const QString &text) {
+        const bool changed  = text.trimmed() != m_lastAppliedRelayUrl;
+        const bool nonEmpty = !text.trimmed().isEmpty();
+        if (m_relayApplyBtn)
+            m_relayApplyBtn->setEnabled(changed && nonEmpty);
+    });
+    connect(m_relayUrlEdit, &QLineEdit::returnPressed,
+            this, &SettingsPanel::onApplyRelayUrl);
+    connect(m_relayApplyBtn, &QPushButton::clicked,
+            this, &SettingsPanel::onApplyRelayUrl);
+    connect(resetBtn, &QPushButton::clicked,
+            this, &SettingsPanel::onResetRelayUrl);
+
+    return card;
+}
+
+void SettingsPanel::onApplyRelayUrl()
+{
+    if (!m_relayUrlEdit) return;
+    const QString url = m_relayUrlEdit->text().trimmed();
+    if (url.isEmpty()) return;
+
+    if (m_db) m_db->saveSetting("relayUrl", url);
+    m_lastAppliedRelayUrl = url;
+    if (m_relayApplyBtn) m_relayApplyBtn->setEnabled(false);
+
+    if (m_relayStatusLabel) {
+        m_relayStatusLabel->setText("Reconnecting to " + url + " ...");
+        // Clear the status after a few seconds — ChatController's own
+        // status signal carries the actual outcome.
+        QTimer::singleShot(4000, m_relayStatusLabel, [this]() {
+            if (m_relayStatusLabel) m_relayStatusLabel->setText("");
+        });
+    }
+
+    emit relayUrlChanged(url);
+}
+
+void SettingsPanel::onResetRelayUrl()
+{
+    if (!m_relayUrlEdit) return;
+    m_relayUrlEdit->setText("https://peer2pear.com");
+    // textChanged handler enabled the Apply button; user still has to press it
+    // to actually commit -- nothing is persisted by the reset alone.
 }

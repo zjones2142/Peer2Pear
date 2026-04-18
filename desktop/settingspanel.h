@@ -3,6 +3,7 @@
 
 #include <QWidget>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -38,12 +39,18 @@ signals:
     void fileHardMaxChanged(int mb);
     void fileRequireP2PToggled(bool on);
 
+    // Relay URL the client should connect to.  MainWindow hooks this and
+    // drops the existing WS connection + reconnects with the new URL.
+    void relayUrlChanged(const QString &url);
+
 private slots:
     void onToggleNotifications();
     void onToggleDnd();
     void onFileAutoAcceptSpin(int mb);
     void onFileHardMaxSpin(int mb);
     void onToggleRequireP2P();
+    void onApplyRelayUrl();
+    void onResetRelayUrl();
 
 private:
     void buildUI();
@@ -55,6 +62,7 @@ private:
     QWidget *makeNotificationsSection();
     QWidget *makeDataSection();
     QWidget *makeFileTransferSection();
+    QWidget *makeRelaySection();
     QWidget *makeAboutHelpSection();
 
     // Profile
@@ -82,6 +90,12 @@ private:
     bool         m_requireP2PEnabled    = false;
     QPushButton *m_requireP2PToggleBtn  = nullptr;
     QLabel      *m_requireP2PStatusLbl  = nullptr;
+
+    // Relay URL
+    QLineEdit   *m_relayUrlEdit         = nullptr;
+    QPushButton *m_relayApplyBtn        = nullptr;
+    QLabel      *m_relayStatusLabel     = nullptr;
+    QString      m_lastAppliedRelayUrl;
 };
 
 #endif // SETTINGSPANEL_H

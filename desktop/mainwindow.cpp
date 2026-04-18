@@ -196,15 +196,25 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // ── Relay connection ─────────────────────────────────────────────────────
-    // One-time migration: move existing users from the old HTTP IP to the new HTTPS domain
+    // One-time migrations: rewrite stored relayUrl for users still pointing at
+    // obsolete endpoints so they land on the current production relay without
+    // having to wipe their local DB.
     {
         const QString old = m_db.loadSetting("relayUrl",
                                 m_db.loadSetting("serverUrl")); // fallback to old key
-        if (old == "http://3.141.14.234" || old == "http://3.141.14.234/") {
+        const bool staleIp      = (old == "http://3.141.14.234" ||
+                                   old == "http://3.141.14.234/");
+        const bool staleLocal   = (old == "http://localhost:8443" ||
+                                   old == "http://localhost:8443/");
+        if (staleIp || staleLocal) {
             m_db.saveSetting("relayUrl", "https://peer2pear.com");
         }
     }
-    const QString relayUrl = m_db.loadSetting("relayUrl", "http://localhost:8443");
+    // Default for a fresh install: the production relay on peer2pear.com.
+    // Users who self-host can override this via the settings table (no UI
+    // yet — edit `SELECT value FROM settings WHERE key='relayUrl';` via
+    // SQLCipher, or plumb in a Settings field).
+    const QString relayUrl = m_db.loadSetting("relayUrl", "https://peer2pear.com");
     m_controller.setRelayUrl(QUrl(relayUrl));
 
 #ifdef PEER2PEAR_P2P
@@ -303,6 +313,18 @@ MainWindow::MainWindow(QWidget *parent)
             &m_controller,   &ChatController::setFileHardMaxMB);
     connect(m_settingsPanel, &SettingsPanel::fileRequireP2PToggled,
             &m_controller,   &ChatController::setFileRequireP2P);
+
+    // Relay URL — settings UI can live-switch which relay we're connected
+    // to.  Drop the existing WS, point the RelayClient at the new URL, and
+    // kick off a fresh connect.  Presence is implicit in the WS so that
+    // re-announces too; any pending envelopes the new relay has for us
+    // arrive on reconnect via the server's deliver-on-auth path.
+    connect(m_settingsPanel, &SettingsPanel::relayUrlChanged,
+            this, [this](const QString &url) {
+        m_controller.disconnectFromRelay();
+        m_controller.setRelayUrl(QUrl(url));
+        m_controller.connectToRelay();
+    });
 
     // Phase 2: file accept/decline prompt + cancel notifications → ChatView
     connect(&m_controller, &ChatController::fileAcceptRequested,
