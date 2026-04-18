@@ -1074,6 +1074,13 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         // First genuine contact = had no avatar and now receiving one
         const bool firstTime = m_chats[i].avatarData.isEmpty() && !avatarB64.isEmpty();
 
+        // If this was previously an auto-created "Unknown contact" (text
+        // arrived before any avatar), upgrade the name now that we know it.
+        if (!displayName.isEmpty() && m_chats[i].name == "Unknown contact") {
+            m_chats[i].name = displayName;
+            if (m_db) m_db->saveContact(m_chats[i]);
+        }
+
         // Empty avatarB64 means the sender reset to default — clear so the UI
         // falls back to initials derived from our locally saved name for them
         m_chats[i].avatarData = avatarB64;
@@ -1110,12 +1117,55 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
                     renderInitialsAvatar(ch, avatarColorForName(m_chats[i].name), 44));
                 m_ui->chatAvatarLabel->setText("");
             }
+            m_ui->chatTitleLabel->setText(m_chats[i].name);
         }
 
         if (firstTime)
             showToast(m_chats[i].name + "'s profile has been updated");
         return;
     }
+
+    // ── Bug #1 fix: first-contact avatar from unknown peer ──────────────────
+    //
+    // If we fall through, no matching contact exists.  Previously the avatar
+    // was silently dropped, so when the follow-up text message arrived
+    // onIncomingMessage would create an "Unknown contact" entry with no name
+    // and no avatar.  Instead, create the contact here using the peer's
+    // announced display name + avatar so the chat list shows them correctly
+    // from the first message.
+    ChatData nc;
+    nc.name        = displayName.isEmpty() ? "Unknown contact" : displayName;
+    nc.subtitle    = "Secure chat";
+    nc.peerIdB64u  = peerIdB64u;
+    nc.keys.append(peerIdB64u);
+    nc.avatarData  = avatarB64;
+    nc.lastActive  = QDateTime::currentDateTimeUtc();
+
+    m_chats.prepend(nc);
+    if (m_db) {
+        m_db->saveContact(nc);
+        if (!avatarB64.isEmpty()) m_db->saveContactAvatar(peerIdB64u, avatarB64);
+    }
+
+    ensureUnreadSize();
+    m_unread.prepend(0);
+    if (m_currentChat >= 0) m_currentChat += 1;
+
+    rebuildChatList();
+
+    // Reciprocate with our own avatar so the peer also gets our display
+    // name / picture.  Only done on first-contact creation to avoid loops.
+    if (m_db) {
+        const QString myName   = m_db->loadSetting("displayName");
+        if (!myName.isEmpty()) {
+            const QString myAvatar        = m_db->loadSetting("avatarData");
+            const QString myAvatarIsPhoto = m_db->loadSetting("avatarIsPhoto");
+            const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
+            m_controller->sendAvatar(peerIdB64u, myName, broadcastAvatar);
+        }
+    }
+
+    showToast("New contact: " + nc.name);
 }
 
 void ChatView::onGroupRenamed(const QString &groupId, const QString &newName)

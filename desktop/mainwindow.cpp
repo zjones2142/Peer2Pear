@@ -326,6 +326,13 @@ MainWindow::MainWindow(QWidget *parent)
         m_controller.connectToRelay();
     });
 
+    // Privacy level — forwards to RelayClient, which toggles jitter,
+    // cover traffic, and multi-hop onion routing accordingly.
+    connect(m_settingsPanel, &SettingsPanel::privacyLevelChanged,
+            this, [this](int level) {
+        m_controller.relay().setPrivacyLevel(level);
+    });
+
     // Phase 2: file accept/decline prompt + cancel notifications → ChatView
     connect(&m_controller, &ChatController::fileAcceptRequested,
             m_chatView,    &ChatView::onFileAcceptRequested);

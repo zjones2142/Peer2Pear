@@ -92,6 +92,9 @@ void SettingsPanel::buildUI()
     // ── Relay (network) settings ───────────────────────────────────────────
     bodyLayout->addWidget(makeRelaySection());
 
+    // ── Privacy level ───────────────────────────────────────────────────────
+    bodyLayout->addWidget(makePrivacySection());
+
     // ── About section ─────────────────────────────────────────────────────────
     // Version    = app version (matches project(Peer2Pear VERSION ...) in CMakeLists.txt)
     // Protocol   = wire-protocol version (matches the relay's /healthz "version" field
@@ -255,6 +258,14 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
         m_relayUrlEdit->setText(url);
         m_lastAppliedRelayUrl = url;
         if (m_relayApplyBtn) m_relayApplyBtn->setEnabled(false);
+    }
+
+    // Privacy level — 0 (Standard), 1 (Enhanced), 2 (Maximum).
+    {
+        const int lvl = m_db->loadSetting("privacyLevel", "0").toInt();
+        // Triggers the slot which updates the visual + persists again +
+        // emits privacyLevelChanged so MainWindow syncs RelayClient on load.
+        onPrivacyLevelChanged(lvl);
     }
 }
 
@@ -1184,4 +1195,159 @@ void SettingsPanel::onResetRelayUrl()
     m_relayUrlEdit->setText("https://peer2pear.com");
     // textChanged handler enabled the Apply button; user still has to press it
     // to actually commit -- nothing is persisted by the reset alone.
+}
+
+// ── Privacy level ────────────────────────────────────────────────────────────
+//
+// Three selectable buttons (a "segmented control" pattern) plus a
+// description block that changes text based on the selected level.
+// This is the user-facing knob that turns on jitter + cover traffic +
+// onion routing — features that already exist in RelayClient but
+// default to off.
+
+QWidget *SettingsPanel::makePrivacySection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    // Heading
+    QLabel *heading = new QLabel("PRIVACY");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    // Segmented button row
+    QWidget *segRow = new QWidget();
+    segRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *segLayout = new QHBoxLayout(segRow);
+    segLayout->setContentsMargins(16, 8, 16, 4);
+    segLayout->setSpacing(8);
+
+    auto makeLevelButton = [](const QString &text) -> QPushButton * {
+        QPushButton *btn = new QPushButton(text);
+        btn->setCheckable(true);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1a1a1a;"
+            "  color: #999999;"
+            "  border: 1px solid #2a2a2a;"
+            "  border-radius: 6px;"
+            "  padding: 8px 14px;"
+            "  font-size: 13px;"
+            "}"
+            "QPushButton:hover { background-color: #1e1e1e; color: #cccccc; }"
+            "QPushButton:checked {"
+            "  background-color: #1f2e1f;"
+            "  color: #4caf50;"
+            "  border: 1px solid #4caf50;"
+            "  font-weight: bold;"
+            "}"
+            );
+        return btn;
+    };
+
+    m_privacyBtn0 = makeLevelButton("Standard");
+    m_privacyBtn1 = makeLevelButton("Enhanced");
+    m_privacyBtn2 = makeLevelButton("Maximum");
+
+    segLayout->addWidget(m_privacyBtn0, 1);
+    segLayout->addWidget(m_privacyBtn1, 1);
+    segLayout->addWidget(m_privacyBtn2, 1);
+    cardLayout->addWidget(segRow);
+
+    // Description area — text changes based on selected level.
+    m_privacyDescLabel = new QLabel();
+    m_privacyDescLabel->setWordWrap(true);
+    m_privacyDescLabel->setTextFormat(Qt::RichText);
+    m_privacyDescLabel->setStyleSheet(
+        "color: #999999; font-size: 12px;"
+        "padding: 6px 16px 14px 16px;"
+        "background: transparent; border: none; line-height: 1.5;"
+        );
+    cardLayout->addWidget(m_privacyDescLabel);
+
+    // Wire up the three buttons to the slot (pass the target level).
+    connect(m_privacyBtn0, &QPushButton::clicked, this,
+            [this]() { onPrivacyLevelChanged(0); });
+    connect(m_privacyBtn1, &QPushButton::clicked, this,
+            [this]() { onPrivacyLevelChanged(1); });
+    connect(m_privacyBtn2, &QPushButton::clicked, this,
+            [this]() { onPrivacyLevelChanged(2); });
+
+    return card;
+}
+
+void SettingsPanel::onPrivacyLevelChanged(int level)
+{
+    if (level < 0 || level > 2) level = 0;
+    m_privacyLevel = level;
+
+    // Update the button visuals (exactly one checked).  Blocking signals
+    // while calling setChecked() prevents a re-entry loop.
+    if (m_privacyBtn0 && m_privacyBtn1 && m_privacyBtn2) {
+        QSignalBlocker b0(m_privacyBtn0), b1(m_privacyBtn1), b2(m_privacyBtn2);
+        m_privacyBtn0->setChecked(level == 0);
+        m_privacyBtn1->setChecked(level == 1);
+        m_privacyBtn2->setChecked(level == 2);
+    }
+
+    // Description text is rich-formatted so the per-level bullets render.
+    if (m_privacyDescLabel) {
+        QString desc;
+        switch (level) {
+        case 0:
+            desc =
+                "<b style='color:#cccccc;'>Standard</b> &mdash; baseline privacy.<br>"
+                "&bull; Envelope size padding (hides message size from the relay)<br>"
+                "&bull; Sealed sender (hides your identity from the relay)<br>"
+                "&bull; End-to-end encryption (no operator can read content)<br>"
+                "<br>"
+                "Recommended for most users.";
+            break;
+        case 1:
+            desc =
+                "<b style='color:#cccccc;'>Enhanced</b> &mdash; defends against a single "
+                "malicious relay doing timing analysis.<br>"
+                "&bull; All Standard protections<br>"
+                "&bull; Send jitter (50&ndash;300&thinsp;ms random delay per message)<br>"
+                "&bull; Cover traffic (periodic indistinguishable dummy envelopes)<br>"
+                "&bull; Send and receive through different relays when configured<br>"
+                "<br>"
+                "Slight latency cost; small bandwidth overhead.";
+            break;
+        case 2:
+            desc =
+                "<b style='color:#cccccc;'>Maximum</b> &mdash; defends against colluding "
+                "relay operators.<br>"
+                "&bull; All Enhanced protections<br>"
+                "&bull; Multi-hop onion routing (no single relay learns both your "
+                "identity and your recipient)<br>"
+                "&bull; Higher-frequency cover traffic<br>"
+                "&bull; Longer jitter (100&ndash;500&thinsp;ms)<br>"
+                "<br>"
+                "Highest latency; higher bandwidth. Use when privacy requirements "
+                "outweigh responsiveness.";
+            break;
+        }
+        m_privacyDescLabel->setText(desc);
+    }
+
+    // Persist and notify.
+    if (m_db) m_db->saveSetting("privacyLevel", QString::number(level));
+    emit privacyLevelChanged(level);
 }

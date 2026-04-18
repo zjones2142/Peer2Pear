@@ -43,6 +43,11 @@ signals:
     // drops the existing WS connection + reconnects with the new URL.
     void relayUrlChanged(const QString &url);
 
+    // Privacy level (0 = Standard, 1 = Enhanced, 2 = Maximum).  Controls
+    // send jitter, cover traffic, and multi-hop onion routing in the
+    // RelayClient.  MainWindow forwards to m_controller.relay().setPrivacyLevel.
+    void privacyLevelChanged(int level);
+
 private slots:
     void onToggleNotifications();
     void onToggleDnd();
@@ -51,6 +56,7 @@ private slots:
     void onToggleRequireP2P();
     void onApplyRelayUrl();
     void onResetRelayUrl();
+    void onPrivacyLevelChanged(int level);
 
 private:
     void buildUI();
@@ -63,6 +69,7 @@ private:
     QWidget *makeDataSection();
     QWidget *makeFileTransferSection();
     QWidget *makeRelaySection();
+    QWidget *makePrivacySection();
     QWidget *makeAboutHelpSection();
 
     // Profile
@@ -96,6 +103,13 @@ private:
     QPushButton *m_relayApplyBtn        = nullptr;
     QLabel      *m_relayStatusLabel     = nullptr;
     QString      m_lastAppliedRelayUrl;
+
+    // Privacy level (0/1/2) — three selectable buttons.
+    int          m_privacyLevel         = 0;
+    QPushButton *m_privacyBtn0          = nullptr;
+    QPushButton *m_privacyBtn1          = nullptr;
+    QPushButton *m_privacyBtn2          = nullptr;
+    QLabel      *m_privacyDescLabel     = nullptr;
 };
 
 #endif // SETTINGSPANEL_H
