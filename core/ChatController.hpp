@@ -246,6 +246,16 @@ private:
 
 #ifdef PEER2PEAR_P2P
     QMap<QString, QuicConnection*> m_p2pConnections;
+    // Per-peer P2P connection creation timestamp, used by the maintenance
+    // timer's cleanup pass to give in-progress ICE negotiations a grace
+    // period before pruning.  Without this, a connection that takes >30s
+    // to complete ICE (common on real networks behind NAT) would get
+    // killed mid-handshake by the default cleanup.
+    QMap<QString, qint64> m_p2pCreatedSecs;
+    // Do not prune a P2P connection until it's been alive at least this
+    // long without reaching isReady().  ICE + QUIC handshake on cellular
+    // or corporate networks routinely takes 30-60s.
+    static constexpr qint64 kP2PCleanupGraceSecs = 120;
 #endif
 
     // G5 fix: per-group outbound sequence counter (monotonic, not persisted)

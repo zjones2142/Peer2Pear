@@ -169,18 +169,27 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http, QObject* paren
         // key gets zeroed via the connect() in the constructor.
 
 #ifdef PEER2PEAR_P2P
-        // G4 fix: clean up failed ICE connections
+        // Clean up failed P2P connections, but only after they've had a
+        // fair grace period to complete ICE + QUIC handshake.  Real-world
+        // NATed networks routinely take 30-60s; the old unconditional
+        // 30s-interval prune killed in-progress negotiations, sending the
+        // connection straight into the FAILED state with no recovery.
+        const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
         QStringList toRemove;
         for (auto it = m_p2pConnections.begin(); it != m_p2pConnections.end(); ++it) {
-            if (!it.value()->isReady())
-                toRemove << it.key();
+            if (it.value()->isReady()) continue;              // still negotiating or already good
+            const qint64 created = m_p2pCreatedSecs.value(it.key(), nowSecs);
+            if ((nowSecs - created) < kP2PCleanupGraceSecs) continue; // still within grace
+            toRemove << it.key();
         }
         for (const QString &key : toRemove) {
 #ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[ICE] Cleaning up stale connection to" << key.left(8) + "...";
+            qDebug() << "[ICE] Cleaning up stale connection to" << key.left(8) + "..."
+                     << "(exceeded" << kP2PCleanupGraceSecs << "s grace)";
 #endif
             m_p2pConnections[key]->deleteLater();
             m_p2pConnections.remove(key);
+            m_p2pCreatedSecs.remove(key);
         }
 #endif
     });
@@ -859,6 +868,9 @@ QuicConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bo
     if (!m_turnHost.isEmpty())
         conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
     m_p2pConnections[peerIdB64u] = conn;
+    // Record creation time so the maintenance-timer cleanup respects the
+    // grace period before pruning an in-progress handshake.
+    m_p2pCreatedSecs[peerIdB64u] = QDateTime::currentSecsSinceEpoch();
 
     const QString iceType = controlling ? "ice_offer" : "ice_answer";
     connect(conn, &QuicConnection::localSdpReady, this, [this, peerIdB64u, iceType, conn](const QString& sdp) {
