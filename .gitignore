@@ -85,6 +85,7 @@ vcpkg/
 vcpkg_installed/
 .vcpkg/
 tests/
+!core/tests/
 Peer2Pear_QtProj/
 
 # ── Xcode / iOS ─────────────────────────────────────────────────────────────

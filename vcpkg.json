@@ -21,6 +21,12 @@
         "libnice",
         "glib"
       ]
+    },
+    "tests": {
+      "description": "Unit + integration tests for core/. Pulls GoogleTest. Enabled when -DBUILD_TESTS=ON (default for desktop, OFF for iOS).",
+      "dependencies": [
+        "gtest"
+      ]
     }
   }
 }

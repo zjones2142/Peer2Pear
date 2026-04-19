@@ -112,6 +112,13 @@ public:
     // Must be called before readMessage2() if this is an initiator.
     void setStaticPrivateKey(const Bytes& curvePriv) { m_sk = curvePriv; }
 
+    // Re-inject the ML-KEM-768 private key after deserialization.
+    // Companion to setStaticPrivateKey() for the hybrid PQ path: m_kemPriv
+    // is not persisted (same zero-on-disk policy as m_sk), so a hybrid
+    // initiator that reloads its pending handshake needs this call before
+    // readMessage2() can decapsulate the KEM ciphertext the responder sent.
+    void setKemPrivateKey(const Bytes& kemPriv) { m_kemPriv = kemPriv; }
+
     Role role() const { return m_role; }
     bool isComplete() const { return m_complete; }
 

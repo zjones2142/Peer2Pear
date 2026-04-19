@@ -272,9 +272,7 @@ private:
     // Used to authorize group_member_update / group_leave / group_rename /
     // group_avatar — messages from peers not in this set are dropped.
     std::map<std::string, std::set<std::string>> m_groupMembers;
-    // True for groups we have no prior knowledge of — the first sender of a
-    // group_msg bootstraps the roster.  Once populated, entry is removed.
-    std::set<std::string> m_groupBootstrapNeeded;
+    // (m_groupBootstrapNeeded removed in LC5 cleanup — was never populated.)
 
     // SEC9: count consecutive handshake timeouts per peer — 2+ suggests legacy client
     std::map<std::string, int> m_handshakeFailCount;

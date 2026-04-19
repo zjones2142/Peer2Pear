@@ -204,6 +204,14 @@ RatchetSession RatchetSession::initAsInitiator(const Bytes& rootKey,
     s.m_rootKey      = newRoot;
     s.m_sendChainKey = sendChain;
 
+    // H3 fix (2026-04-19): wipe the DH shared-secret and the chain-key
+    // intermediates now that they've been copied into the RatchetSession.
+    // Under std::vector value semantics the copy is a real buffer copy, so
+    // zeroing the locals doesn't touch the stored members.
+    zeroBytes(dhOutput);
+    zeroBytes(newRoot);
+    zeroBytes(sendChain);
+
 #ifndef QT_NO_DEBUG_OUTPUT
     P2P_LOG("[Ratchet] initAsInitiator: session created " << (hybrid ? "(hybrid PQ)" : ""));
 #endif
@@ -233,6 +241,10 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     auto [rk1, recvChain] = kdfRootKey(rootKey, dhOutput);
     s.m_rootKey      = rk1;
     s.m_recvChainKey = recvChain;
+    // H3 fix: wipe intermediates post-copy.
+    zeroBytes(dhOutput);
+    zeroBytes(rk1);
+    zeroBytes(recvChain);
 
     // Step 2: Generate new DH keypair and derive sending chain
     {
@@ -259,6 +271,10 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     auto [rk2, sendChain] = kdfRootKey(s.m_rootKey, dhOutput);
     s.m_rootKey      = rk2;
     s.m_sendChainKey = sendChain;
+    // H3 fix: wipe intermediates post-copy.
+    zeroBytes(dhOutput);
+    zeroBytes(rk2);
+    zeroBytes(sendChain);
 
 #ifndef QT_NO_DEBUG_OUTPUT
     P2P_LOG("[Ratchet] initAsResponder: session created " << (hybrid ? "(hybrid PQ)" : ""));
@@ -299,6 +315,9 @@ void RatchetSession::dhRatchetStep(const Bytes& remoteDhPub,
     zeroBytes(dhOutput);
     m_rootKey      = rk1;
     m_recvChainKey = recvChain;
+    // H3 fix: wipe chain-key intermediates post-copy.
+    zeroBytes(rk1);
+    zeroBytes(recvChain);
 
     // Generate new DH keypair for sending
     {
@@ -346,6 +365,9 @@ void RatchetSession::dhRatchetStep(const Bytes& remoteDhPub,
     zeroBytes(dhOutput);
     m_rootKey      = rk2;
     m_sendChainKey = sendChain;
+    // H3 fix: wipe chain-key intermediates post-copy.
+    zeroBytes(rk2);
+    zeroBytes(sendChain);
 }
 
 // ---------------------------

@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-SQLCIPHER_VERSION="${1:-4.6.1}"
+SQLCIPHER_VERSION="${1:-4.14.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 WORKDIR="$(mktemp -d -t sqlcipher-fetch)"
@@ -92,10 +92,10 @@ SIZE=$(wc -c < "${SCRIPT_DIR}/sqlite3.c")
 LINES=$(wc -l < "${SCRIPT_DIR}/sqlite3.c")
 
 echo
-echo "  [ok] sqlite3.c    ($(printf "%'d" "${SIZE}") bytes, $(printf "%'d" "${LINES}") lines)"
+echo "  [ok] sqlite3.c               ($(printf "%'d" "${SIZE}") bytes, $(printf "%'d" "${LINES}") lines)"
 echo "  [ok] sqlite3.h"
 echo "  [ok] LICENSE"
-echo "  [ok] VERSION      (${SQLCIPHER_VERSION})"
+echo "  [ok] SQLCIPHER_VERSION.txt   (${SQLCIPHER_VERSION})"
 echo
 echo "Commit these alongside this script.  Consumers don't need tclsh or"
 echo "autoconf — they just compile sqlite3.c against OpenSSL."

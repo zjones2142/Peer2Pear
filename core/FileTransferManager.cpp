@@ -41,7 +41,9 @@ std::string defaultDownloadsDir() { return {}; }
 
 // ── Wire helpers ────────────────────────────────────────────────────────────
 
-static const char kFilePrefix[] = "FROMFC:";
+// kFilePrefix (FROMFC:) was removed in the H1 fix (2026-04-19).  FTM
+// only emits sealed chunks now — the ChatController-provided m_sealFn
+// wraps them in SEALEDFC: envelopes before handing them to m_sendFn.
 
 namespace {
 
@@ -195,7 +197,7 @@ std::string FileTransferManager::finalPathFor(const std::string& fileName,
 
 // ── Send one chunk with routing mode ────────────────────────────────────────
 
-bool FileTransferManager::dispatchChunk(const std::string& senderIdB64u,
+bool FileTransferManager::dispatchChunk(const std::string& /*senderIdB64u*/,
                                          const std::string& peerIdB64u,
                                          const Bytes& innerPayload,
                                          RoutingMode mode)
@@ -208,27 +210,24 @@ bool FileTransferManager::dispatchChunk(const std::string& senderIdB64u,
     if (mode == RoutingMode::P2POnly)
         return false;
 
-    // 2. Sealed relay envelope (metadata privacy).
-    if (m_sealFn) {
-        Bytes sealedEnv = m_sealFn(peerIdB64u, innerPayload);
-        if (!sealedEnv.empty()) {
-            if (m_sendFn) m_sendFn(peerIdB64u, sealedEnv);
-            return true;
-        }
-        P2P_WARN("[FileTransfer] Seal failed — chunk BLOCKED");
+    // 2. Sealed relay envelope (metadata privacy + sender anonymity).
+    //
+    // The H1 fix (2026-04-19) removed the "legacy FROMFC: plaintext-prefix
+    // fallback" that used to live below this block.  If no seal callback is
+    // installed, we now refuse to send rather than emit a FROMFC: envelope
+    // that leaks the sender's pubkey on the wire.  ChatController installs
+    // m_sealFn as part of setDatabase(), so this is normally always set.
+    if (!m_sealFn) {
+        P2P_WARN("[FileTransfer] No seal callback set — chunk BLOCKED (H1 fix: sealed-only)");
         return false;
     }
 
-    // 3. Legacy fallback (no seal callback set).
-    Bytes env;
-    env.reserve(sizeof(kFilePrefix) - 1 + senderIdB64u.size() + 1 + innerPayload.size());
-    env.insert(env.end(),
-               reinterpret_cast<const uint8_t*>(kFilePrefix),
-               reinterpret_cast<const uint8_t*>(kFilePrefix) + sizeof(kFilePrefix) - 1);
-    env.insert(env.end(), senderIdB64u.begin(), senderIdB64u.end());
-    env.push_back('\n');
-    env.insert(env.end(), innerPayload.begin(), innerPayload.end());
-    if (m_sendFn) m_sendFn(peerIdB64u, env);
+    Bytes sealedEnv = m_sealFn(peerIdB64u, innerPayload);
+    if (sealedEnv.empty()) {
+        P2P_WARN("[FileTransfer] Seal failed — chunk BLOCKED");
+        return false;
+    }
+    if (m_sendFn) m_sendFn(peerIdB64u, sealedEnv);
     return true;
 }
 

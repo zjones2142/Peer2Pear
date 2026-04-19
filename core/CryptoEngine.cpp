@@ -906,25 +906,12 @@ std::string CryptoEngine::signB64u(const Bytes& msgUtf8) const {
     return toBase64Url(s);
 }
 
-Bytes CryptoEngine::deriveSharedKey32(const Bytes& peerEd25519Pub) const {
-    if (peerEd25519Pub.size() != crypto_sign_PUBLICKEYBYTES) return {};
-
-    unsigned char peerCurvePk[crypto_box_PUBLICKEYBYTES];
-    if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePk, peerEd25519Pub.data()) != 0) return {};
-
-    unsigned char shared[crypto_scalarmult_BYTES];
-    if (crypto_scalarmult(shared, m_curvePriv.data(), peerCurvePk) != 0) return {};
-
-    unsigned char key[32];
-    if (crypto_generichash(key, sizeof(key), shared, sizeof(shared), nullptr, 0) != 0) {
-        sodium_memzero(shared, sizeof(shared));
-        return {};
-    }
-    sodium_memzero(shared, sizeof(shared));
-    Bytes result(key, key + sizeof(key));
-    sodium_memzero(key, sizeof(key));
-    return result;
-}
+// CryptoEngine::deriveSharedKey32 was removed in the H1 fix (2026-04-19).
+// It computed a static X25519 shared secret from the peer's long-term
+// Ed25519 identity key, which the legacy FROM: and P2P-fallback paths
+// used to AEAD-encrypt messages with no forward secrecy.  Every sender
+// now routes through the Noise IK + Double Ratchet session, so the
+// static-ECDH helper is no longer reachable from anywhere in the tree.
 
 Bytes CryptoEngine::aeadEncrypt(const Bytes& key32,
                                 const Bytes& plaintext,

@@ -406,6 +406,11 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         NoiseState noise = NoiseState::deserialize(hsBlob);
         // C3 fix: re-inject static private key (not persisted since v3)
         noise.setStaticPrivateKey(m_crypto.curvePriv());
+        // Hybrid twin of C3: KEM priv isn't persisted either, so readMessage2
+        // would fail kemDecaps against an empty m_kemPriv.  Inject it when
+        // the reloaded Noise state declares itself hybrid.
+        if (noise.isHybrid() && m_crypto.hasPQKeys())
+            noise.setKemPrivateKey(m_crypto.kemPriv());
         Bytes responsePayload;
         if (!noise.readMessage2(noiseMsg2, responsePayload)) {
             P2P_WARN("[SessionManager] Failed to process Noise msg2 from " << peerPrefix(senderIdB64u));

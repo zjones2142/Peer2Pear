@@ -34,6 +34,10 @@ target_compile_definitions(sqlcipher PUBLIC
     SQLITE_ENABLE_FTS5
     SQLITE_ENABLE_JSON1
     HAVE_USLEEP=1
+    # SQLCipher 4.14.0+ requires these to be set at compile time so its init
+    # hooks run during sqlite3_initialize() and don't silently no-op.
+    SQLITE_EXTRA_INIT=sqlcipher_extra_init
+    SQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown
 )
 
 # The amalgamation has known unused-function / strict-aliasing warnings

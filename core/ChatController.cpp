@@ -22,9 +22,10 @@
 
 using nlohmann::json;
 
-// Envelope header prefixes (legacy + sealed)
-static const char kMsgPrefix[]      = "FROM:";
-static const char kFilePrefix[]     = "FROMFC:";
+// Envelope header prefixes.  Both legacy prefixes (FROM: for text, FROMFC:
+// for file chunks) were removed in the H1 fix (2026-04-19) — every outbound
+// frame is now a sealed envelope and every inbound frame that isn't sealed
+// is dropped by onEnvelope / onP2PDataReceived.
 static const char kSealedPrefix[]   = "SEALED:";
 static const char kSealedFCPrefix[] = "SEALEDFC:";
 
@@ -972,57 +973,18 @@ void ChatController::onP2PDataReceived(const std::string& peerIdB64u, const Byte
     if (onPresenceChanged) onPresenceChanged(peerIdB64u, true);
 
     // ── Sealed envelope over P2P ─────────────────────────────────────────────
+    // Only sealed envelopes are accepted on the P2P transport.  The historical
+    // static-ECDH fallback (H1 in the 2026-04 audit) was removed — it had no
+    // forward secrecy and let a compromised identity key retroactively decrypt
+    // every prior P2P text message.  Unsealed P2P frames are now dropped.
     if (bytesStartsWith(data, kSealedPrefix) || bytesStartsWith(data, kSealedFCPrefix)) {
         P2P_LOG("[RECV P2P] sealed envelope from " << peerIdB64u.substr(0, 8) << "...");
         onEnvelope(data);
         return;
     }
 
-    // ── File chunk received over P2P (legacy) ────────────────────────────────
-    if (bytesStartsWith(data, kFilePrefix)) {
-        P2P_LOG("[RECV P2P] file chunk from " << peerIdB64u.substr(0, 8) << "...");
-        onEnvelope(data);
-        return;
-    }
-
-    // ── Try ratchet decrypt first (P2P with session) ─────────────────────────
-    if (m_sessionMgr && m_sessionMgr->hasSession(peerIdB64u)) {
-        Bytes pt = m_sessionMgr->decryptFromPeer(peerIdB64u, data);
-        if (!pt.empty()) {
-            const json o = json::parse(pt.begin(), pt.end(),
-                                       /*cb=*/nullptr, /*allow_exceptions=*/false);
-            if (o.is_object() && o.value("type", std::string()) == "text") {
-                P2P_LOG("[RECV P2P] ratchet text from " << peerIdB64u.substr(0, 8) << "...");
-                const std::string msgId = o.value("msgId", std::string());
-                if (!msgId.empty() && !markSeen(msgId)) return;
-                if (onMessageReceived) onMessageReceived(peerIdB64u,
-                                     o.value("text", std::string()),
-                                     o.value("ts", int64_t(0)), msgId);
-            }
-            return;
-        }
-    }
-
-    // ── Legacy encrypted JSON message ────────────────────────────────────────
-    // SEC3: This path uses a static ECDH key with NO forward secrecy.
-    // It exists for backward compatibility but should be disabled once
-    // all peers support sealed/ratchet messaging.
-    P2P_WARN("[RECV P2P] legacy path (no forward secrecy) from "
-               << peerIdB64u.substr(0, 8) << "... — peer should upgrade");
-    const Bytes peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    const Bytes pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
-    if (pt.empty()) return;
-
-    const json o = json::parse(pt.begin(), pt.end(),
-                               /*cb=*/nullptr, /*allow_exceptions=*/false);
-    if (!o.is_object() || o.value("type", std::string()) != "text") return;
-
-    const std::string msgId = o.value("msgId", std::string());
-    if (!msgId.empty() && !markSeen(msgId)) return;
-
-    if (onMessageReceived) onMessageReceived(peerIdB64u,
-                         o.value("text", std::string()),
-                         o.value("ts", int64_t(0)), msgId);
+    P2P_WARN("[RECV P2P] dropping unsealed frame from " << peerIdB64u.substr(0, 8)
+             << " (" << data.size() << "B) \u2014 sealed envelopes required (H1 fix)");
 }
 #endif // PEER2PEAR_P2P
 
@@ -1274,19 +1236,20 @@ void ChatController::onEnvelope(const Bytes& body)
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
 
             if (!gid.empty()) {
-                const bool bootstrap = m_groupBootstrapNeeded.count(gid)
-                                       || !m_groupMembers.count(gid);
+                // LC5 cleanup (2026-04-19): m_groupBootstrapNeeded was never
+                // populated anywhere in the code — the check was equivalent
+                // to "is the group unknown".  Simplified accordingly.
+                const bool bootstrap = !m_groupMembers.count(gid);
                 if (bootstrap) {
                     // Sender must include themselves in the proposed list.
                     const bool senderInList = std::find(memberKeys.begin(), memberKeys.end(), senderId) != memberKeys.end();
                     if (!senderInList) {
                         P2P_WARN("[GROUP] rejecting bootstrap group_member_update"
                                    << " from " << senderId.substr(0, 8) << "..."
-                                   << " — sender not in proposed member list");
+                                   << " \u2014 sender not in proposed member list");
                         return;
                     }
                     m_groupMembers[gid] = std::set<std::string>(memberKeys.begin(), memberKeys.end());
-                    m_groupBootstrapNeeded.erase(gid);
                 } else if (!m_groupMembers[gid].count(senderId)) {
                     P2P_WARN("[GROUP] dropping group_member_update from non-member "
                                << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
@@ -1582,95 +1545,21 @@ void ChatController::onEnvelope(const Bytes& body)
         return;
     }
 
-    // ── File chunk envelope ─────────────────────────────────────────────────
-    if (bytesStartsWith(header, kFilePrefix)) {
-        const size_t pfx = std::strlen(kFilePrefix);
-        std::string fromId(reinterpret_cast<const char*>(header.data() + pfx),
-                           header.size() - pfx);
-        fromId = trimmed(fromId);
-        P2P_LOG("[RECV " << via << "] file chunk from " << fromId.substr(0, 8) << "...");
-        m_fileMgr.handleFileEnvelope(fromId, rest,
-            [this](const std::string& id) { return markSeen(id); },
-            m_fileKeys);
-        return;
-    }
-
-    // ── Message envelope ──────────────────────────────────────────────────────
-    if (!bytesStartsWith(header, kMsgPrefix)) return;
-
-    const size_t msgPfx = std::strlen(kMsgPrefix);
-    std::string fromId(reinterpret_cast<const char*>(header.data() + msgPfx),
-                       header.size() - msgPfx);
-    fromId = trimmed(fromId);
-    const Bytes peerPub = CryptoEngine::fromBase64Url(fromId);
-    const Bytes pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), rest);
-    if (pt.empty()) return;
-
-    const json o = json::parse(pt.begin(), pt.end(),
-                               /*cb=*/nullptr, /*allow_exceptions=*/false);
-    if (!o.is_object()) return;
-    const std::string type = o.value("type", std::string());
-
-    // S9 fix: Legacy receive path — only accept ICE signaling and text.
-    // ICE is needed for P2P bootstrapping before a sealed session exists.
-    // Text is accepted (with warning) for backward compat with older peers.
-    // All other types (group_msg, avatar, group_rename, etc.) are rejected —
-    // they must come through the sealed path where sender identity is verified.
-#ifdef PEER2PEAR_P2P
-    if (type != "ice_offer" && type != "ice_answer" && type != "text") {
-#else
-    if (type != "text") {
-#endif
-        P2P_WARN("[RECV " << via << "] REJECTED legacy " << type
-                   << " from " << fromId.substr(0, 8) << "..."
-                   << " — must use sealed path");
-        return;
-    }
-
-    P2P_LOG("[RECV " << via << "] legacy type: " << type << " from " << fromId.substr(0, 8) << "...");
-
-    if (type == "text") {
-        const int64_t tsSecs = o.value("ts", int64_t(0));
-        // L3 fix: Only emit "online" if message is fresh (< 2 min old) or via P2P
-        if (via == "P2P" ||
-            (tsSecs > 0 && nowSecs() - tsSecs < 120))
-            if (onPresenceChanged) onPresenceChanged(fromId, true);
-        const std::string msgId = o.value("msgId", std::string());
-        if (!msgId.empty() && !markSeen(msgId)) return;
-        if (onMessageReceived) onMessageReceived(fromId,
-                             o.value("text", std::string()), tsSecs, msgId);
-    }
-#ifdef PEER2PEAR_P2P
-    else if (type == "ice_offer") {
-        auto it = m_p2pConnections.find(fromId);
-        if (it != m_p2pConnections.end() && it->second->isReady()) {
-            P2P_LOG("[ICE] Already connected to " << fromId.substr(0, 8) << "... — ignoring ice_offer");
-        } else {
-            if (it == m_p2pConnections.end()) {
-                setupP2PConnection(fromId, false);
-                it = m_p2pConnections.find(fromId);
-            }
-            if (it != m_p2pConnections.end()) {
-                if (o.value("quic", false)) {
-                    it->second->setPeerSupportsQuic(
-                        true, o.value("quic_fingerprint", std::string()));
-                }
-                it->second->setRemoteSdp(
-                    o.value("sdp", std::string()));
-            }
-        }
-    } else if (type == "ice_answer") {
-        auto it = m_p2pConnections.find(fromId);
-        if (it != m_p2pConnections.end() && !it->second->isReady()) {
-            if (o.value("quic", false)) {
-                it->second->setPeerSupportsQuic(
-                    true, o.value("quic_fingerprint", std::string()));
-            }
-            it->second->setRemoteSdp(
-                o.value("sdp", std::string()));
-        }
-    }
-#endif // PEER2PEAR_P2P
+    // Any frame that isn't a SEALED: / SEALEDFC: envelope is dropped.
+    //
+    // H1 fix (2026-04-19): the legacy FROM: text path and the legacy FROMFC:
+    // file-chunk path used to live here.  FROM: decrypted with a STATIC ECDH
+    // key derived from the sender's long-term Ed25519 → Curve25519 pubkey, so
+    // every message was retroactively readable by anyone who later stole
+    // either party's identity key — no forward secrecy at all.  FROMFC: was
+    // less bad (chunks still used the ratchet-derived file key) but it meant
+    // file chunks bypassed the sealed-sender layer, leaking the sender's
+    // pubkey to the relay in plaintext.  Both paths are now removed; the
+    // sealed handler above covers every message type the app emits, and
+    // clients that still expect the legacy wire format will be told off by
+    // this log and will need to upgrade.
+    P2P_WARN("[RECV " << via << "] dropping non-sealed envelope ("
+             << header.size() << " header bytes) \u2014 sealed envelopes required (H1 fix)");
 }
 
 void ChatController::sendGroupRename(const std::string& groupId,
@@ -1764,7 +1653,6 @@ void ChatController::setKnownGroupMembers(const std::string& groupId,
 {
     if (groupId.empty()) return;
     m_groupMembers[groupId] = std::set<std::string>(members.begin(), members.end());
-    m_groupBootstrapNeeded.erase(groupId);
 }
 
 bool ChatController::isAuthorizedGroupSender(const std::string& gid,
@@ -1773,12 +1661,22 @@ bool ChatController::isAuthorizedGroupSender(const std::string& gid,
     if (gid.empty() || peerId.empty()) return false;
     auto it = m_groupMembers.find(gid);
     if (it == m_groupMembers.end()) {
-        // First time we've seen this group — no persisted roster from the
-        // UI yet.  Permissive bootstrap: the next group_msg (which carries
-        // a members list) will populate m_groupMembers.  If we reject
-        // pre-bootstrap control messages here, a legit member whose
-        // group_msg races behind a group_rename will be silently dropped.
-        return true;
+        // H2 fix (2026-04-19): deny-by-default for unknown groups.
+        //
+        // Old behavior returned true here, which let any authenticated peer
+        // send group_rename / group_avatar / group_leave for a group ID that
+        // our roster hadn't yet loaded.  An attacker who guessed or observed
+        // a gid (e.g., via a shared link) could rename the group or inject
+        // a fake avatar before the legitimate roster arrived.
+        //
+        // Bootstrap is still possible: the group_msg handler does its own
+        // sender-in-declared-members check and populates m_groupMembers
+        // from that, so the first real group_msg admits everyone that
+        // follows.  Control messages (rename/avatar/leave) that arrive
+        // before any group_msg are now dropped — if a legitimate sender
+        // races a rename ahead of their own group_msg, they'll just need
+        // to retry after the roster establishes.
+        return false;
     }
     return it->second.count(peerId) != 0;
 }

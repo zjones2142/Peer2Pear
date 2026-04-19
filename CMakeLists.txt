@@ -16,14 +16,24 @@ option(BUILD_DESKTOP
     "Build the Qt Widgets desktop app (desktop/).  Turn OFF for iOS/Android cross-compiles."
     ON)
 
-# Forward the option into vcpkg's manifest feature selection so the extra
-# P2P deps only get pulled in when actually needed.  FORCE ensures a flip
-# from ON to OFF invalidates the previous cached value.
+# Unit + integration tests for core/.  Default ON when building the desktop
+# (CI + dev machines get coverage); OFF when cross-compiling for mobile (iOS
+# doesn't benefit from linking a test binary into its app bundle).
+option(BUILD_TESTS
+    "Build core/tests/ (GoogleTest).  Default ON for desktop, OFF for iOS/Android."
+    ${BUILD_DESKTOP})
+
+# Forward the options into vcpkg's manifest feature selection so the extra
+# deps only get pulled in when actually needed.  FORCE ensures a flip from
+# ON to OFF invalidates the previous cached value.
+set(_vcpkg_features "")
 if(PEER2PEAR_P2P)
-    set(VCPKG_MANIFEST_FEATURES "p2p" CACHE STRING "vcpkg manifest features" FORCE)
-else()
-    set(VCPKG_MANIFEST_FEATURES "" CACHE STRING "vcpkg manifest features" FORCE)
+    list(APPEND _vcpkg_features "p2p")
 endif()
+if(BUILD_TESTS)
+    list(APPEND _vcpkg_features "tests")
+endif()
+set(VCPKG_MANIFEST_FEATURES "${_vcpkg_features}" CACHE STRING "vcpkg manifest features" FORCE)
 
 # Force the vcpkg toolchain — must come BEFORE project()
 set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake"
@@ -91,4 +101,12 @@ message(STATUS "SQLCipher: vendored amalgamation "
 add_subdirectory(core)      # libpeer2pear-core (static library)
 if(BUILD_DESKTOP)
     add_subdirectory(desktop)   # Peer2Pear desktop executable
+endif()
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+# One GoogleTest binary per module under core/tests/.  Invoke the suite via
+# `cmake --build build --target test` or `ctest` from the build dir.
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(core/tests)
 endif()

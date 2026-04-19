@@ -93,8 +93,9 @@ public:
     static Bytes hkdf(const Bytes& ikm, const Bytes& salt,
                       const Bytes& info, int outputLen = 32);
 
-    // derive per-peer shared 32-byte key using X25519 from Ed25519 keys
-    Bytes deriveSharedKey32(const Bytes& peerEd25519Pub) const;
+    // (deriveSharedKey32 removed in H1 fix — it produced a static-ECDH key
+    // with no forward secrecy.  Use the Noise IK + Double Ratchet path in
+    // SessionManager instead.)
 
     // AEAD (XChaCha20-Poly1305). Output = nonce(24) || ciphertext
     Bytes aeadEncrypt(const Bytes& key32, const Bytes& plaintext,
