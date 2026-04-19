@@ -1,5 +1,8 @@
 #include "ChatController.hpp"
-#include "qt_bridge_temp.hpp"   // TEMP: Qt↔std while SealedEnvelope is migrated
+#include "bytes_util.hpp"  // strBytes helper (Qt-free)
+#ifdef QT_CORE_LIB
+#include "qt_bridge_temp.hpp"   // TEMP: Qt↔std bridge for desktop QuicConnection (QByteArray signals)
+#endif
 #ifdef PEER2PEAR_P2P
 // GLib's gio headers use a struct member named 'signals' which clashes
 // with Qt5's 'signals' macro. Include GLib first with the macro disabled,
@@ -11,40 +14,45 @@
 #define signals Q_SIGNALS
 #include "QuicConnection.hpp"
 #endif
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
-#include <QDateTime>
-#include <QTimeZone>
-#include <QUuid>
-#include <QFileInfo>
 // SqlCipherQuery is available via ChatController.hpp -> SqlCipherDb.hpp
 #include <sodium.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include "log.hpp"
+#include "uuid.hpp"
 
-// Build the std-typed fileKeys map the migrated FileTransferManager expects.
-// Copies each entry — callers invoke this once per chunk delivery which is
-// bounded by session count (low double digits even in chatty groups).
-static std::map<std::string, FileTransferManager::Bytes>
-toStdFileKeys(const QMap<QString, QByteArray>& qm) {
-    std::map<std::string, FileTransferManager::Bytes> out;
-    for (auto it = qm.cbegin(); it != qm.cend(); ++it)
-        out.emplace(it.key().toStdString(), p2p::bridge::toBytes(it.value()));
-    return out;
-}
+using nlohmann::json;
 
 // Envelope header prefixes (legacy + sealed)
-static const QByteArray kMsgPrefix      = "FROM:";
-static const QByteArray kFilePrefix     = "FROMFC:";
-static const QByteArray kSealedPrefix   = "SEALED:";
-static const QByteArray kSealedFCPrefix = "SEALEDFC:";
+static const char kMsgPrefix[]      = "FROM:";
+static const char kFilePrefix[]     = "FROMFC:";
+static const char kSealedPrefix[]   = "SEALED:";
+static const char kSealedFCPrefix[] = "SEALEDFC:";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-static QDateTime tsFromSecs(qint64 secs)
-{
-    return secs > 0
-               ? QDateTime::fromSecsSinceEpoch(secs, QTimeZone::utc()).toLocalTime()
-               : QDateTime::currentDateTime();
+// Current unix time in seconds.  Replaces QDateTime::currentSecsSinceEpoch().
+static int64_t nowSecs() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Byte range starts-with / utility — replaces QByteArray::startsWith.
+static bool bytesStartsWith(const Bytes& data, const char* prefix) {
+    const size_t n = std::strlen(prefix);
+    if (data.size() < n) return false;
+    return std::memcmp(data.data(), prefix, n) == 0;
+}
+
+// Byte range past the given prefix, trimmed of leading whitespace / newlines.
+// Replaces the QByteArray mid + trimmed idiom.
+static Bytes bytesAfterPrefix(const Bytes& data, const char* prefix) {
+    const size_t n = std::strlen(prefix);
+    if (data.size() < n) return {};
+    return Bytes(data.begin() + n, data.end());
 }
 
 // ── ChatController ────────────────────────────────────────────────────────────
@@ -58,13 +66,13 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
 {
     // RelayClient — plain class now; assign callbacks directly.
     m_relay.onStatus = [this](const std::string& s) {
-        if (onStatus) onStatus(QString::fromStdString(s));
+        if (onStatus) onStatus(s);
     };
     m_relay.onEnvelopeReceived = [this](const RelayClient::Bytes& b) {
-        onEnvelope(p2p::bridge::toQByteArray(b));
+        onEnvelope(b);
     };
     m_relay.onPresenceChanged = [this](const std::string& pid, bool online) {
-        if (onPresenceChanged) onPresenceChanged(QString::fromStdString(pid), online);
+        if (onPresenceChanged) onPresenceChanged(pid, online);
     };
     m_relay.onConnected = [this]() { handleRelayConnected(); };
 
@@ -74,7 +82,7 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
         m_relay.sendEnvelope(env);
     });
     m_fileMgr.onStatus = [this](const std::string& s) {
-        if (onStatus) onStatus(QString::fromStdString(s));
+        if (onStatus) onStatus(s);
     };
 
     // fileChunkReceived fires from TWO callsites in FTM — one for progress/save,
@@ -89,39 +97,36 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
                                             const std::string& groupId,
                                             const std::string& groupName) {
         if (onFileChunkReceived) onFileChunkReceived(
-            QString::fromStdString(fromPeerId),
-            QString::fromStdString(transferId),
-            QString::fromStdString(fileName),
-            qint64(fileSize),
+            fromPeerId, transferId, fileName, fileSize,
             chunksReceived, chunksTotal,
-            QString::fromStdString(savedPath),
-            QDateTime::fromSecsSinceEpoch(tsSecs, QTimeZone::utc()).toLocalTime(),
-            QString::fromStdString(groupId),
-            QString::fromStdString(groupName));
+            savedPath, tsSecs,
+            groupId, groupName);
 
         // Phase 3: receiver finished writing and verified — send file_ack.
         if (chunksReceived == chunksTotal && !savedPath.empty()) {
-            QJsonObject ack;
+            json ack = json::object();
             ack["type"]       = "file_ack";
-            ack["transferId"] = QString::fromStdString(transferId);
-            sendFileControlMessage(QString::fromStdString(fromPeerId), ack);
+            ack["transferId"] = transferId;
+            sendFileControlMessage(fromPeerId, ack);
         }
     };
 
 #ifdef PEER2PEAR_P2P
     m_fileMgr.onWantP2PConnection = [this](const std::string& peerId) {
-        initiateP2PConnection(QString::fromStdString(peerId));
+        initiateP2PConnection(peerId);
     };
 #endif
 
     // M1 fix: remove ratchet-derived file key when transfer completes.
-    m_fileMgr.onTransferCompleted = [this](const std::string& transferIdStd) {
-        const QString transferId = QString::fromStdString(transferIdStd);
-        const QString suffix = ":" + transferId;
+    m_fileMgr.onTransferCompleted = [this](const std::string& transferId) {
+        const std::string suffix = ":" + transferId;
         auto it = m_fileKeys.begin();
         while (it != m_fileKeys.end()) {
-            if (it.key().endsWith(suffix) || it.key() == transferId) {
-                sodium_memzero(it.value().data(), it.value().size());
+            const auto& k = it->first;
+            const bool ends = k.size() >= suffix.size() &&
+                              k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
+            if (ends || k == transferId) {
+                sodium_memzero(it->second.data(), it->second.size());
                 it = m_fileKeys.erase(it);
             } else {
                 ++it;
@@ -130,16 +135,16 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     };
 
     m_fileMgr.onOutboundAbandoned = [this](const std::string& transferId, const std::string&) {
-        if (onFileTransferCanceled) onFileTransferCanceled(QString::fromStdString(transferId), false);
+        if (onFileTransferCanceled) onFileTransferCanceled(transferId, false);
     };
 
     m_fileMgr.onInboundCanceled = [this](const std::string& transferId, const std::string&) {
-        if (onFileTransferCanceled) onFileTransferCanceled(QString::fromStdString(transferId), false);
+        if (onFileTransferCanceled) onFileTransferCanceled(transferId, false);
     };
 
     m_fileMgr.onOutboundBlockedByPolicy =
         [this](const std::string& transferId, const std::string&, bool byReceiver) {
-        if (onFileTransferBlocked) onFileTransferBlocked(QString::fromStdString(transferId), byReceiver);
+        if (onFileTransferBlocked) onFileTransferBlocked(transferId, byReceiver);
     };
 
     // Fix #5: rehydrate file keys from DB after loadPersistedTransfers().
@@ -148,13 +153,10 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
                const std::string& transferId,
                const FileTransferManager::Bytes& fileKey) {
         if (fileKey.size() != 32) return;
-        const QString compound = QString::fromStdString(fromPeerId) + ":"
-                                  + QString::fromStdString(transferId);
-        m_fileKeys[compound] = p2p::bridge::toQByteArray(fileKey);
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[FILE] restored file key for" << QString::fromStdString(transferId).left(8)
-                 << "from" << QString::fromStdString(fromPeerId).left(8) + "...";
-#endif
+        const std::string compound = fromPeerId + ":" + transferId;
+        m_fileKeys[compound] = fileKey;
+        P2P_LOG("[FILE] restored file key for " << transferId.substr(0, 8)
+                 << " from " << fromPeerId.substr(0, 8) << "...");
     };
 
     // Periodic maintenance — ITimer replaces the former QTimer.  Self-rearms.
@@ -183,8 +185,7 @@ void ChatController::runMaintenance()
     // H2/SEC9: prune stuck handshakes
     if (m_sessionStore) {
         const auto pruned = m_sessionStore->pruneStaleHandshakes();
-        for (const std::string& peerIdStd : pruned) {
-            const QString peerId = QString::fromStdString(peerIdStd);
+        for (const std::string& peerId : pruned) {
             int count = ++m_handshakeFailCount[peerId];
             if (count >= 2 && onPeerMayNeedUpgrade)
                 onPeerMayNeedUpgrade(peerId);
@@ -192,42 +193,40 @@ void ChatController::runMaintenance()
     }
 
 #ifdef PEER2PEAR_P2P
-    const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
-    QStringList toRemove;
+    const int64_t now = nowSecs();
+    std::vector<std::string> toRemove;
     for (auto it = m_p2pConnections.begin(); it != m_p2pConnections.end(); ++it) {
-        if (it.value()->isReady()) continue;
-        const qint64 created = m_p2pCreatedSecs.value(it.key(), nowSecs);
-        if ((nowSecs - created) < kP2PCleanupGraceSecs) continue;
-        toRemove << it.key();
+        if (it->second->isReady()) continue;
+        auto ts = m_p2pCreatedSecs.find(it->first);
+        const int64_t created = (ts != m_p2pCreatedSecs.end()) ? ts->second : now;
+        if ((now - created) < kP2PCleanupGraceSecs) continue;
+        toRemove.push_back(it->first);
     }
-    for (const QString &key : toRemove) {
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[ICE] Cleaning up stale connection to" << key.left(8) + "..."
-                 << "(exceeded" << kP2PCleanupGraceSecs << "s grace)";
-#endif
+    for (const std::string &key : toRemove) {
+        P2P_LOG("[ICE] Cleaning up stale connection to " << key.substr(0, 8) << "..."
+                 << " (exceeded " << kP2PCleanupGraceSecs << "s grace)");
         m_p2pConnections[key]->deleteLater();
-        m_p2pConnections.remove(key);
-        m_p2pCreatedSecs.remove(key);
+        m_p2pConnections.erase(key);
+        m_p2pCreatedSecs.erase(key);
     }
 #endif
 }
 
-void ChatController::setPassphrase(const QString& pass)
+void ChatController::setPassphrase(const std::string& pass)
 {
-    m_crypto.setPassphrase(pass.toStdString());
+    m_crypto.setPassphrase(pass);
     m_crypto.ensureIdentity();
 }
 
-void ChatController::setPassphrase(const QString& pass, const QByteArray& identityKey)
+void ChatController::setPassphrase(const std::string& pass, const Bytes& identityKey)
 {
-    using p2p::bridge::toBytes;
-    m_crypto.setPassphrase(pass.toStdString());
-    m_crypto.ensureIdentity(toBytes(identityKey));
+    m_crypto.setPassphrase(pass);
+    m_crypto.ensureIdentity(identityKey);
 }
 
-void ChatController::setRelayUrl(const QUrl& url)
+void ChatController::setRelayUrl(const std::string& url)
 {
-    m_relay.setRelayUrl(url.toString().toStdString());
+    m_relay.setRelayUrl(url);
 }
 
 void ChatController::setDatabase(SqlCipherDb& db)
@@ -267,61 +266,62 @@ void ChatController::setDatabase(SqlCipherDb& db)
     m_fileMgr.purgeStalePartialFiles();
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
-    m_sessionMgr->setSendResponseFn([this](const std::string& peerIdStd, const Bytes& blob) {
-        using namespace p2p::bridge;
-        const QString peerId = QString::fromStdString(peerIdStd);
+    m_sessionMgr->setSendResponseFn([this](const std::string& peerId, const Bytes& blob) {
         // Convert peer's Ed25519 pub to X25519 for sealing
-        Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdStd);
+        Bytes peerEdPub = CryptoEngine::fromBase64Url(peerId);
         unsigned char peerCurvePub[32];
         if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0) return;
 
         Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
-        QByteArray peerKemPub = lookupPeerKemPub(peerId);
-        QByteArray sealed = toQByteArray(SealedEnvelope::seal(
+        Bytes peerKemPub = lookupPeerKemPub(peerId);
+        Bytes sealed = SealedEnvelope::seal(
             recipientCurvePub, peerEdPub,
             m_crypto.identityPub(), m_crypto.identityPriv(),
-            blob, toBytes(peerKemPub),
-            m_crypto.dsaPub(), m_crypto.dsaPriv()));
-        if (sealed.isEmpty()) return;
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND MAILBOX] sealed handshake response to" << peerId.left(8) + "..."
-                 << (peerKemPub.isEmpty() ? "(classical)" : "(hybrid PQ)");
-#endif
+            blob, peerKemPub,
+            m_crypto.dsaPub(), m_crypto.dsaPriv());
+        if (sealed.empty()) return;
+        P2P_LOG("[SEND MAILBOX] sealed handshake response to " << peerId.substr(0, 8) << "..."
+                 << " " << (peerKemPub.empty() ? "(classical)" : "(hybrid PQ)"));
 
-        QByteArray inner = kSealedPrefix + "\n" + sealed;
-        QByteArray env = toQByteArray(
-            SealedEnvelope::wrapForRelay(peerEdPub, toBytes(inner)));
-        m_relay.sendEnvelope(p2p::bridge::toBytes(env));
+        // Inner wire: kSealedPrefix + "\n" + sealed
+        Bytes inner;
+        const size_t prefixLen = std::strlen(kSealedPrefix);
+        inner.reserve(prefixLen + 1 + sealed.size());
+        inner.insert(inner.end(),
+                     reinterpret_cast<const uint8_t*>(kSealedPrefix),
+                     reinterpret_cast<const uint8_t*>(kSealedPrefix) + prefixLen);
+        inner.push_back('\n');
+        inner.insert(inner.end(), sealed.begin(), sealed.end());
+
+        m_relay.sendEnvelope(SealedEnvelope::wrapForRelay(peerEdPub, inner));
     });
 
-    // M2 fix: Seal callback for file chunks — FTM now speaks std types.
-    m_fileMgr.setSealFn([this](const std::string& peerIdStd,
+    // M2 fix: Seal callback for file chunks — FTM speaks std types end-to-end.
+    m_fileMgr.setSealFn([this](const std::string& peerId,
                                const FileTransferManager::Bytes& payload)
                               -> FileTransferManager::Bytes {
-        using namespace p2p::bridge;
-        const QString peerId = QString::fromStdString(peerIdStd);
-        Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdStd);
+        Bytes peerEdPub = CryptoEngine::fromBase64Url(peerId);
         unsigned char peerCurvePub[32];
         if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0)
             return {};
 
         Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
         sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
-        QByteArray peerKemPub = lookupPeerKemPub(peerId);
+        Bytes peerKemPub = lookupPeerKemPub(peerId);
         Bytes sealed = SealedEnvelope::seal(
             recipientCurvePub, peerEdPub,
             m_crypto.identityPub(), m_crypto.identityPriv(),
-            payload, toBytes(peerKemPub),
+            payload, peerKemPub,
             m_crypto.dsaPub(), m_crypto.dsaPriv());
         if (sealed.empty()) return {};
 
         // Inner wire: kSealedFCPrefix + "\n" + sealed
         Bytes inner;
-        inner.reserve(kSealedFCPrefix.size() + 1 + sealed.size());
+        const size_t prefixLen = std::strlen(kSealedFCPrefix);
+        inner.reserve(prefixLen + 1 + sealed.size());
         inner.insert(inner.end(),
-                     reinterpret_cast<const uint8_t*>(kSealedFCPrefix.constData()),
-                     reinterpret_cast<const uint8_t*>(kSealedFCPrefix.constData())
-                        + kSealedFCPrefix.size());
+                     reinterpret_cast<const uint8_t*>(kSealedFCPrefix),
+                     reinterpret_cast<const uint8_t*>(kSealedFCPrefix) + prefixLen);
         inner.push_back('\n');
         inner.insert(inner.end(), sealed.begin(), sealed.end());
 
@@ -329,13 +329,13 @@ void ChatController::setDatabase(SqlCipherDb& db)
     });
 #ifdef PEER2PEAR_P2P
     // QUIC P2P file send callback: try sending file chunks directly via QUIC stream
-    m_fileMgr.setP2PFileSendFn([this](const std::string& peerIdStd,
+    m_fileMgr.setP2PFileSendFn([this](const std::string& peerId,
                                        const FileTransferManager::Bytes& data) -> bool {
-        const QString peerId = QString::fromStdString(peerIdStd);
-        if (m_p2pConnections.contains(peerId) &&
-            m_p2pConnections[peerId]->isReady() &&
-            m_p2pConnections[peerId]->quicActive()) {
-            m_p2pConnections[peerId]->sendFileData(p2p::bridge::toQByteArray(data));
+        auto it = m_p2pConnections.find(peerId);
+        if (it != m_p2pConnections.end() &&
+            it->second->isReady() &&
+            it->second->quicActive()) {
+            it->second->sendFileData(p2p::bridge::toQByteArray(data));
             return true;
         }
         return false;  // fall back to mailbox
@@ -344,55 +344,52 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
 }
 
-QString ChatController::myIdB64u() const
+std::string ChatController::myIdB64u() const
 {
-    return QString::fromStdString(CryptoEngine::toBase64Url(m_crypto.identityPub()));
+    return CryptoEngine::toBase64Url(m_crypto.identityPub());
 }
 
-void ChatController::sendText(const QString& peerIdB64u, const QString& text)
+void ChatController::sendText(const std::string& peerIdB64u, const std::string& text)
 {
-    QJsonObject payload;
+    json payload = json::object();
     payload["from"]  = myIdB64u();
     payload["type"]  = "text";
     payload["text"]  = text;
-    payload["ts"]    = QDateTime::currentSecsSinceEpoch();
-    payload["msgId"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    payload["ts"]    = nowSecs();
+    payload["msgId"] = p2p::makeUuid();
 
-    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const std::string ptStr = payload.dump();
+    const Bytes pt(ptStr.begin(), ptStr.end());
 
     // ── Sealed path (always required for text) ──────────────────────────────
-    QByteArray sealedEnv = sealForPeer(peerIdB64u, pt);
-    if (sealedEnv.isEmpty()) {
-        qWarning() << "[SEND] BLOCKED — cannot seal text to" << peerIdB64u.left(8) + "...";
+    Bytes sealedEnv = sealForPeer(peerIdB64u, pt);
+    if (sealedEnv.empty()) {
+        P2P_WARN("[SEND] BLOCKED — cannot seal text to " << peerIdB64u.substr(0, 8) << "...");
         if (onStatus) onStatus("Message not sent — encrypted session unavailable. Try again shortly.");
         return;
     }
 
 #ifdef PEER2PEAR_P2P
-    if (m_p2pConnections.contains(peerIdB64u) &&
-        m_p2pConnections[peerIdB64u]->isReady()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND P2P] sealed text to" << peerIdB64u.left(8) + "...";
-#endif
-        m_p2pConnections[peerIdB64u]->sendData(sealedEnv);
+    auto itConn = m_p2pConnections.find(peerIdB64u);
+    if (itConn != m_p2pConnections.end() && itConn->second->isReady()) {
+        P2P_LOG("[SEND P2P] sealed text to " << peerIdB64u.substr(0, 8) << "...");
+        itConn->second->sendData(p2p::bridge::toQByteArray(sealedEnv));
     } else
 #endif
     {
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND RELAY] sealed text to" << peerIdB64u.left(8) + "...";
-#endif
-        m_relay.sendEnvelope(p2p::bridge::toBytes(sealedEnv));
+        P2P_LOG("[SEND RELAY] sealed text to " << peerIdB64u.substr(0, 8) << "...");
+        m_relay.sendEnvelope(sealedEnv);
 #ifdef PEER2PEAR_P2P
         initiateP2PConnection(peerIdB64u);
 #endif
     }
 }
 
-void ChatController::sendAvatar(const QString& peerIdB64u,
-                                const QString& displayName,
-                                const QString& avatarB64)
+void ChatController::sendAvatar(const std::string& peerIdB64u,
+                                const std::string& displayName,
+                                const std::string& avatarB64)
 {
-    QJsonObject payload;
+    json payload = json::object();
     payload["from"]   = myIdB64u();
     payload["type"]   = "avatar";
     payload["name"]   = displayName;
@@ -402,158 +399,152 @@ void ChatController::sendAvatar(const QString& peerIdB64u,
 
 // ── File transfer delegation ─────────────────────────────────────────────────
 
-QString ChatController::sendFile(const QString& peerIdB64u,
-                                 const QString& fileName,
-                                 const QString& filePath)
+std::string ChatController::sendFile(const std::string& peerIdB64u,
+                                     const std::string& fileName,
+                                     const std::string& filePath)
 {
-    QFileInfo finfo(filePath);
-    if (!finfo.exists() || !finfo.isFile()) {
-        if (onStatus) onStatus(QString("File not found: %1").arg(filePath));
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_regular_file(filePath, ec)) {
+        if (onStatus) onStatus("File not found: " + filePath);
         return {};
     }
-    const qint64 fileSize = finfo.size();
-    if (fileSize > FileTransferManager::kMaxFileBytes) {
-        if (onStatus) onStatus(QString("File too large (max %1 MB).")
-                        .arg(FileTransferManager::kMaxFileBytes / (1024 * 1024)));
+    const int64_t fileSize = int64_t(fs::file_size(filePath, ec));
+    if (ec || fileSize > FileTransferManager::kMaxFileBytes) {
+        if (onStatus) onStatus("File too large (max "
+                               + std::to_string(FileTransferManager::kMaxFileBytes / (1024 * 1024))
+                               + " MB).");
         return {};
     }
 
     // Streaming hash — one pass over the file, bounded RAM.
-    const QByteArray fileHash = p2p::bridge::toQByteArray(
-        FileTransferManager::blake2b256File(filePath.toStdString()));
+    const Bytes fileHash = FileTransferManager::blake2b256File(filePath);
     if (fileHash.size() != 32) {
-        if (onStatus) onStatus(QString("Could not hash file: %1").arg(fileName));
+        if (onStatus) onStatus("Could not hash file: " + fileName);
         return {};
     }
     const int chunkCount = int((fileSize + FileTransferManager::kChunkBytes - 1)
                                 / FileTransferManager::kChunkBytes);
 
-    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const std::string transferId = p2p::makeUuid();
 
     // Send file_key announcement through the ratchet to derive a forward-secret key.
     // The announcement now includes fileHash + chunkCount so the receiver can allocate
     // its partial-file bitmap and verify the final hash without waiting for every chunk's metadata.
-    QJsonObject announce;
+    json announce = json::object();
     announce["from"]        = myIdB64u();
     announce["type"]        = "file_key";
     announce["transferId"]  = transferId;
     announce["fileName"]    = fileName;
     announce["fileSize"]    = fileSize;
-    announce["fileHash"]    = QString::fromStdString(CryptoEngine::toBase64Url(p2p::bridge::toBytes(fileHash)));
+    announce["fileHash"]    = CryptoEngine::toBase64Url(fileHash);
     announce["chunkCount"]  = chunkCount;
-    announce["ts"]          = QDateTime::currentSecsSinceEpoch();
+    announce["ts"]          = nowSecs();
 
-    const QByteArray pt = QJsonDocument(announce).toJson(QJsonDocument::Compact);
-    QByteArray sealedEnv = sealForPeer(peerIdB64u, pt);
-    if (sealedEnv.isEmpty()) {
-        qWarning() << "[FILE] BLOCKED — cannot seal file_key for" << peerIdB64u.left(8) + "...";
+    const std::string ptStr = announce.dump();
+    const Bytes pt(ptStr.begin(), ptStr.end());
+    Bytes sealedEnv = sealForPeer(peerIdB64u, pt);
+    if (sealedEnv.empty()) {
+        P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerIdB64u.substr(0, 8) << "...");
         if (onStatus) onStatus("File not sent — encrypted session unavailable.");
         return {};
     }
 
-    m_relay.sendEnvelope(p2p::bridge::toBytes(sealedEnv));
+    m_relay.sendEnvelope(sealedEnv);
 
-    QByteArray fileKey = p2p::bridge::toQByteArray(m_sessionMgr->lastMessageKey());
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[FILE] file_key announced for" << transferId.left(8) + "..."
-             << "to" << peerIdB64u.left(8) + "..." << "size=" << fileSize;
-#endif
+    Bytes fileKey = m_sessionMgr->lastMessageKey();
+    P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
+             << " to " << peerIdB64u.substr(0, 8) << "... size=" << fileSize);
 
     // Phase 2: queue outbound state. Chunks don't fly until file_accept arrives.
-    using p2p::bridge::toBytes;
-    m_fileMgr.queueOutboundFile(myIdB64u().toStdString(),
-                                 peerIdB64u.toStdString(),
-                                 toBytes(fileKey),
-                                 transferId.toStdString(),
-                                 fileName.toStdString(),
-                                 filePath.toStdString(),
-                                 int64_t(fileSize),
-                                 toBytes(fileHash));
+    m_fileMgr.queueOutboundFile(myIdB64u(), peerIdB64u,
+                                 fileKey, transferId, fileName, filePath,
+                                 fileSize, fileHash);
     sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
     return transferId;
 }
 
-QString ChatController::sendGroupFile(const QString& groupId,
-                                      const QString& groupName,
-                                      const QStringList& memberPeerIds,
-                                      const QString& fileName,
-                                      const QString& filePath)
+std::string ChatController::sendGroupFile(const std::string& groupId,
+                                          const std::string& groupName,
+                                          const std::vector<std::string>& memberPeerIds,
+                                          const std::string& fileName,
+                                          const std::string& filePath)
 {
-    QFileInfo finfo(filePath);
-    if (!finfo.exists() || !finfo.isFile()) {
-        if (onStatus) onStatus(QString("File not found: %1").arg(filePath));
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_regular_file(filePath, ec)) {
+        if (onStatus) onStatus("File not found: " + filePath);
         return {};
     }
-    const qint64 fileSize = finfo.size();
-    if (fileSize > FileTransferManager::kMaxFileBytes) {
-        if (onStatus) onStatus(QString("File too large (max %1 MB).")
-                        .arg(FileTransferManager::kMaxFileBytes / (1024 * 1024)));
+    const int64_t fileSize = int64_t(fs::file_size(filePath, ec));
+    if (ec || fileSize > FileTransferManager::kMaxFileBytes) {
+        if (onStatus) onStatus("File too large (max "
+                               + std::to_string(FileTransferManager::kMaxFileBytes / (1024 * 1024))
+                               + " MB).");
         return {};
     }
 
     // Hash the file once up-front (streaming) and reuse for all members.
-    const QByteArray fileHash = p2p::bridge::toQByteArray(
-        FileTransferManager::blake2b256File(filePath.toStdString()));
+    const Bytes fileHash = FileTransferManager::blake2b256File(filePath);
     if (fileHash.size() != 32) {
-        if (onStatus) onStatus(QString("Could not hash file: %1").arg(fileName));
+        if (onStatus) onStatus("Could not hash file: " + fileName);
         return {};
     }
     const int chunkCount = int((fileSize + FileTransferManager::kChunkBytes - 1)
                                 / FileTransferManager::kChunkBytes);
 
-    const QString myId = myIdB64u();
-    const QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const std::string myId = myIdB64u();
+    const std::string transferId = p2p::makeUuid();
 
     // Per-member file_key announcement, then per-member streamed send.
-    for (const QString& peerId : memberPeerIds) {
-        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
+    for (const std::string& peerIdRaw : memberPeerIds) {
+        // Trim leading/trailing whitespace (was QString::trimmed()).
+        auto lb = peerIdRaw.find_first_not_of(" \t\r\n");
+        if (lb == std::string::npos) continue;
+        auto rb = peerIdRaw.find_last_not_of(" \t\r\n");
+        const std::string peerId = peerIdRaw.substr(lb, rb - lb + 1);
+        if (peerId.empty() || peerId == myId) continue;
 
-        QJsonObject announce;
+        json announce = json::object();
         announce["from"]        = myId;
         announce["type"]        = "file_key";
         announce["transferId"]  = transferId;
         announce["fileName"]    = fileName;
         announce["fileSize"]    = fileSize;
-        announce["fileHash"]    = QString::fromStdString(CryptoEngine::toBase64Url(p2p::bridge::toBytes(fileHash)));
+        announce["fileHash"]    = CryptoEngine::toBase64Url(fileHash);
         announce["chunkCount"]  = chunkCount;
-        announce["ts"]          = QDateTime::currentSecsSinceEpoch();
+        announce["ts"]          = nowSecs();
         announce["groupId"]     = groupId;
         announce["groupName"]   = groupName;
 
-        const QByteArray pt = QJsonDocument(announce).toJson(QJsonDocument::Compact);
-        QByteArray sealedEnv = sealForPeer(peerId, pt);
-        if (sealedEnv.isEmpty()) {
-            qWarning() << "[FILE] BLOCKED — cannot seal file_key for" << peerId.left(8) + "...";
+        const std::string ptStr = announce.dump();
+        const Bytes pt(ptStr.begin(), ptStr.end());
+        Bytes sealedEnv = sealForPeer(peerId, pt);
+        if (sealedEnv.empty()) {
+            P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerId.substr(0, 8) << "...");
             continue;
         }
 
-        m_relay.sendEnvelope(p2p::bridge::toBytes(sealedEnv));
+        m_relay.sendEnvelope(sealedEnv);
 
-        QByteArray fileKey = p2p::bridge::toQByteArray(m_sessionMgr->lastMessageKey());
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[FILE] file_key announced for" << transferId.left(8) + "..."
-                 << "to" << peerId.left(8) + "..." << "(group)";
-#endif
+        Bytes fileKey = m_sessionMgr->lastMessageKey();
+        P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
+                 << " to " << peerId.substr(0, 8) << "... (group)");
 
         // NOTE: Phase 2 intentionally does NOT gate group files on per-member
         // consent. Each group member would need an independent file_accept
         // roundtrip, which complicates the N-way announcement model. Group
         // files stream immediately (old behavior), 1:1 files use the consent
         // gate. Group-member consent is future work.
-        m_fileMgr.sendFileWithKey(myId.toStdString(), peerId.toStdString(),
-                                  p2p::bridge::toBytes(fileKey),
-                                  transferId.toStdString(),
-                                  fileName.toStdString(),
-                                  filePath.toStdString(),
-                                  int64_t(fileSize),
-                                  p2p::bridge::toBytes(fileHash),
-                                  groupId.toStdString(),
-                                  groupName.toStdString());
+        m_fileMgr.sendFileWithKey(myId, peerId, fileKey, transferId, fileName,
+                                  filePath, fileSize, fileHash,
+                                  groupId, groupName);
         sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
     }
 
-    if (onStatus) onStatus(QString("'%1' streamed in %2 chunk(s) -> group %3")
-                    .arg(fileName).arg(chunkCount).arg(groupName));
+    if (onStatus) onStatus("'" + fileName + "' streamed in "
+                           + std::to_string(chunkCount)
+                           + " chunk(s) -> group " + groupName);
     return transferId;
 }
 
@@ -571,120 +562,112 @@ void ChatController::handleRelayConnected()
 {
     // The relay delivers stored mailbox envelopes on WS connect automatically.
     // No need to poll — envelopes arrive via push.
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[ChatController] Relay connected, envelopes will be pushed.";
-#endif
+    P2P_LOG("[ChatController] Relay connected, envelopes will be pushed.");
     if (onRelayConnected) onRelayConnected();
 
     // Phase 4: for each incomplete incoming transfer, tell the sender which
     // chunks we still need so they can re-send them.
     const auto pendings = m_fileMgr.pendingResumptions();
     for (const auto& pr : pendings) {
-        QJsonArray chunks;
-        for (uint32_t idx : pr.missingChunks) chunks.append(int(idx));
-        QJsonObject msg;
+        json chunks = json::array();
+        for (uint32_t idx : pr.missingChunks) chunks.push_back(int(idx));
+        json msg = json::object();
         msg["type"]       = "file_request";
-        msg["transferId"] = QString::fromStdString(pr.transferId);
-        msg["chunks"]     = chunks;
-        sendFileControlMessage(QString::fromStdString(pr.peerId), msg);
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[FILE] requested resumption of"
-                 << QString::fromStdString(pr.transferId).left(8)
-                 << "from" << QString::fromStdString(pr.peerId).left(8) + "..."
-                 << "missing" << int(pr.missingChunks.size()) << "chunks";
-#endif
+        msg["transferId"] = pr.transferId;
+        msg["chunks"]     = std::move(chunks);
+        sendFileControlMessage(pr.peerId, msg);
+        P2P_LOG("[FILE] requested resumption of "
+                 << pr.transferId.substr(0, 8)
+                 << " from " << pr.peerId.substr(0, 8) << "..."
+                 << " missing " << int(pr.missingChunks.size()) << " chunks");
     }
 }
 
-void ChatController::subscribePresence(const QStringList& peerIds)
+void ChatController::subscribePresence(const std::vector<std::string>& peerIds)
 {
-    std::vector<std::string> ids;
-    ids.reserve(peerIds.size());
-    for (const QString& id : peerIds) ids.push_back(id.toStdString());
-    m_relay.subscribePresence(ids);
+    m_relay.subscribePresence(peerIds);
 }
 
-void ChatController::setSelfKeys(const QStringList& keys) { m_selfKeys = keys; }
+void ChatController::setSelfKeys(const std::vector<std::string>& keys) {
+    m_selfKeys = keys;
+}
 
 #ifdef PEER2PEAR_P2P
-void ChatController::setTurnServer(const QString& host, int port,
-                                    const QString& username, const QString& password)
+void ChatController::setTurnServer(const std::string& host, int port,
+                                    const std::string& username, const std::string& password)
 {
     m_turnHost = host;
     m_turnPort = port;
     m_turnUser = username;
     m_turnPass = password;
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[ChatController] TURN server set:" << host << ":" << port;
-#endif
+    P2P_LOG("[ChatController] TURN server set: " << host << ":" << port);
 }
 #endif
 
-void ChatController::checkPresence(const QStringList& peerIds)
+void ChatController::checkPresence(const std::vector<std::string>& peerIds)
 {
     std::vector<std::string> ids;
-    ids.reserve(peerIds.size());
-    for (const QString& id : peerIds) ids.push_back(id.toStdString());
-    m_relay.queryPresence(ids);
+    m_relay.queryPresence(peerIds);
 }
 
 // ── Phase 2: file-transfer consent / cancel ──────────────────────────────────
 
-void ChatController::sendFileControlMessage(const QString& peerIdB64u,
-                                             const QJsonObject& msg)
+void ChatController::sendFileControlMessage(const std::string& peerIdB64u,
+                                             const nlohmann::json& msg)
 {
     // Include a fresh msgId so the receiver can dedup any duplicated delivery.
-    QJsonObject payload = msg;
+    json payload = msg;
     payload["from"]  = myIdB64u();
-    payload["ts"]    = QDateTime::currentSecsSinceEpoch();
-    payload["msgId"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    payload["ts"]    = nowSecs();
+    payload["msgId"] = p2p::makeUuid();
 
-    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-    QByteArray sealed = sealForPeer(peerIdB64u, pt);
-    if (sealed.isEmpty()) {
-        qWarning() << "[FILE] BLOCKED — cannot seal" << msg.value("type").toString()
-                   << "for" << peerIdB64u.left(8) + "...";
+    const std::string ptStr = payload.dump();
+    const Bytes pt(ptStr.begin(), ptStr.end());
+    Bytes sealed = sealForPeer(peerIdB64u, pt);
+    if (sealed.empty()) {
+        P2P_WARN("[FILE] BLOCKED — cannot seal " << msg.value("type", std::string())
+                   << " for " << peerIdB64u.substr(0, 8) << "...");
         return;
     }
-    m_relay.sendEnvelope(p2p::bridge::toBytes(sealed));
+    m_relay.sendEnvelope(sealed);
 }
 
-void ChatController::acceptFileTransfer(const QString& transferId, bool requireP2P)
+void ChatController::acceptFileTransfer(const std::string& transferId, bool requireP2P)
 {
     auto it = m_pendingIncomingFiles.find(transferId);
     if (it == m_pendingIncomingFiles.end()) {
-        qWarning() << "[FILE] acceptFileTransfer: no pending transfer" << transferId.left(8);
+        P2P_WARN("[FILE] acceptFileTransfer: no pending transfer " << transferId.substr(0, 8));
         return;
     }
 
-    const QString peerId   = it->peerId;
-    const QString compound = peerId + ":" + transferId;
+    const std::string peerId   = it->second.peerId;
+    const std::string compound = peerId + ":" + transferId;
 
     // Fix #3: announce with the metadata locked from file_key time — NOT from
     // whatever the sender might put in later chunks.
-    if (!m_fileMgr.announceIncoming(peerId.toStdString(),
-                                      transferId.toStdString(),
-                                      it->fileName.toStdString(),
-                                      int64_t(it->fileSize), it->totalChunks,
-                                      p2p::bridge::toBytes(it->fileHash),
-                                      p2p::bridge::toBytes(it->fileKey),
-                                      int64_t(it->announcedTs),
-                                      it->groupId.toStdString(),
-                                      it->groupName.toStdString())) {
-        qWarning() << "[FILE] acceptFileTransfer: announceIncoming failed for"
-                   << transferId.left(8);
-        sodium_memzero(it->fileKey.data(), it->fileKey.size());
+    if (!m_fileMgr.announceIncoming(peerId,
+                                      transferId,
+                                      it->second.fileName,
+                                      it->second.fileSize, it->second.totalChunks,
+                                      it->second.fileHash,
+                                      it->second.fileKey,
+                                      it->second.announcedTs,
+                                      it->second.groupId,
+                                      it->second.groupName)) {
+        P2P_WARN("[FILE] acceptFileTransfer: announceIncoming failed for "
+                   << transferId.substr(0, 8));
+        sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
         m_pendingIncomingFiles.erase(it);
         return;
     }
 
     // Move the stashed key into the active file-keys map so chunks decrypt.
-    m_fileKeys[compound] = it->fileKey;           // copy
+    m_fileKeys[compound] = it->second.fileKey;           // copy
 
-    sodium_memzero(it->fileKey.data(), it->fileKey.size());
+    sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
     m_pendingIncomingFiles.erase(it);
 
-    QJsonObject msg;
+    json msg = json::object();
     msg["type"]       = "file_accept";
     msg["transferId"] = transferId;
     // Respect the receiver's global "no relay" preference, or the per-call override.
@@ -692,16 +675,16 @@ void ChatController::acceptFileTransfer(const QString& transferId, bool requireP
     sendFileControlMessage(peerId, msg);
 }
 
-void ChatController::declineFileTransfer(const QString& transferId)
+void ChatController::declineFileTransfer(const std::string& transferId)
 {
     auto it = m_pendingIncomingFiles.find(transferId);
     if (it == m_pendingIncomingFiles.end()) return;
 
-    const QString peerId = it->peerId;
-    sodium_memzero(it->fileKey.data(), it->fileKey.size());
+    const std::string peerId = it->second.peerId;
+    sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
     m_pendingIncomingFiles.erase(it);
 
-    QJsonObject msg;
+    json msg = json::object();
     msg["type"]       = "file_decline";
     msg["transferId"] = transferId;
     // NO reason field — see privacy mitigations §4 in the plan.
@@ -710,16 +693,15 @@ void ChatController::declineFileTransfer(const QString& transferId)
     if (onFileTransferCanceled) onFileTransferCanceled(transferId, true);  // receiver declined
 }
 
-void ChatController::cancelFileTransfer(const QString& transferId)
+void ChatController::cancelFileTransfer(const std::string& transferId)
 {
     // Figure out which role we hold for this transferId and clean up + notify.
 
     // Outbound pending (sender canceling a queued-but-unaccepted send)?
-    const QString outboundPeer = QString::fromStdString(
-        m_fileMgr.outboundPeerFor(transferId.toStdString()));
-    if (!outboundPeer.isEmpty()) {
-        m_fileMgr.abandonOutboundTransfer(transferId.toStdString());
-        QJsonObject msg;
+    const std::string outboundPeer = m_fileMgr.outboundPeerFor(transferId);
+    if (!outboundPeer.empty()) {
+        m_fileMgr.abandonOutboundTransfer(transferId);
+        json msg = json::object();
         msg["type"]       = "file_cancel";
         msg["transferId"] = transferId;
         sendFileControlMessage(outboundPeer, msg);
@@ -730,10 +712,10 @@ void ChatController::cancelFileTransfer(const QString& transferId)
     // Inbound, pre-accept (user changed mind before answering prompt)?
     auto itPending = m_pendingIncomingFiles.find(transferId);
     if (itPending != m_pendingIncomingFiles.end()) {
-        const QString peerId = itPending->peerId;
-        sodium_memzero(itPending->fileKey.data(), itPending->fileKey.size());
+        const std::string peerId = itPending->second.peerId;
+        sodium_memzero(itPending->second.fileKey.data(), itPending->second.fileKey.size());
         m_pendingIncomingFiles.erase(itPending);
-        QJsonObject msg;
+        json msg = json::object();
         msg["type"]       = "file_cancel";
         msg["transferId"] = transferId;
         sendFileControlMessage(peerId, msg);
@@ -742,11 +724,10 @@ void ChatController::cancelFileTransfer(const QString& transferId)
     }
 
     // Inbound, in-progress (user canceled mid-stream)?
-    const QString inboundPeer = QString::fromStdString(
-        m_fileMgr.inboundPeerFor(transferId.toStdString()));
-    if (!inboundPeer.isEmpty()) {
-        m_fileMgr.cancelInboundTransfer(transferId.toStdString());
-        QJsonObject msg;
+    const std::string inboundPeer = m_fileMgr.inboundPeerFor(transferId);
+    if (!inboundPeer.empty()) {
+        m_fileMgr.cancelInboundTransfer(transferId);
+        json msg = json::object();
         msg["type"]       = "file_cancel";
         msg["transferId"] = transferId;
         sendFileControlMessage(inboundPeer, msg);
@@ -754,28 +735,37 @@ void ChatController::cancelFileTransfer(const QString& transferId)
     }
 }
 
-void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
-                                                const QString& groupName,
-                                                const QStringList& memberPeerIds,
-                                                const QString& text)
-{
-    const QString myId  = myIdB64u();
-    const qint64  ts    = QDateTime::currentSecsSinceEpoch();
-    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+// Local helper: trim ASCII whitespace from both ends (replaces QString::trimmed).
+static std::string trimmed(const std::string& s) {
+    auto lb = s.find_first_not_of(" \t\r\n");
+    if (lb == std::string::npos) return {};
+    auto rb = s.find_last_not_of(" \t\r\n");
+    return s.substr(lb, rb - lb + 1);
+}
 
-    QJsonArray membersArray;
-    for (const QString &key : memberPeerIds) {
-        if (key.trimmed() == myId) continue;
-        membersArray.append(key);
+void ChatController::sendGroupMessageViaMailbox(const std::string& groupId,
+                                                const std::string& groupName,
+                                                const std::vector<std::string>& memberPeerIds,
+                                                const std::string& text)
+{
+    const std::string myId  = myIdB64u();
+    const int64_t     ts    = nowSecs();
+    const std::string msgId = p2p::makeUuid();
+
+    json membersArray = json::array();
+    for (const std::string& key : memberPeerIds) {
+        if (trimmed(key) == myId) continue;
+        membersArray.push_back(key);
     }
 
     // G5 fix: monotonic per-group sequence counter
-    const qint64 seq = ++m_groupSeqOut[groupId];
+    const int64_t seq = ++m_groupSeqOut[groupId];
 
-    for (const QString& peerId : memberPeerIds) {
-        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
+    for (const std::string& peerIdRaw : memberPeerIds) {
+        const std::string peerId = trimmed(peerIdRaw);
+        if (peerId.empty() || peerId == myId) continue;
 
-        QJsonObject payload;
+        json payload = json::object();
         payload["from"]      = myId;
         payload["type"]      = "group_msg";
         payload["groupId"]   = groupId;
@@ -786,37 +776,36 @@ void ChatController::sendGroupMessageViaMailbox(const QString& groupId,
         payload["msgId"]     = msgId;
         payload["seq"]       = seq;   // G5 fix
 
-        const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-        QByteArray env = sealForPeer(peerId, pt);
-        if (!env.isEmpty()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[SEND MAILBOX] sealed group_msg to" << peerId.left(8) + "...";
-#endif
-            m_relay.sendEnvelope(p2p::bridge::toBytes(env));
+        const std::string ptStr = payload.dump();
+        const Bytes pt(ptStr.begin(), ptStr.end());
+        Bytes env = sealForPeer(peerId, pt);
+        if (!env.empty()) {
+            P2P_LOG("[SEND MAILBOX] sealed group_msg to " << peerId.substr(0, 8) << "...");
+            m_relay.sendEnvelope(env);
         } else {
-            qWarning() << "[SEND] BLOCKED — cannot seal group_msg to" << peerId.left(8) + "...";
+            P2P_WARN("[SEND] BLOCKED — cannot seal group_msg to " << peerId.substr(0, 8) << "...");
         }
     }
 }
 
-void ChatController::sendGroupLeaveNotification(const QString& groupId,
-                                                const QString& groupName,
-                                                const QStringList& memberPeerIds)
+void ChatController::sendGroupLeaveNotification(const std::string& groupId,
+                                                const std::string& groupName,
+                                                const std::vector<std::string>& memberPeerIds)
 {
-    const QString myId = myIdB64u();
-    const qint64 ts = QDateTime::currentSecsSinceEpoch();
-    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const std::string myId  = myIdB64u();
+    const int64_t     ts    = nowSecs();
+    const std::string msgId = p2p::makeUuid();
 
     // Include member list so receivers can update their local group member list
-    QJsonArray membersArray;
-    for (const QString &key : memberPeerIds)
-        membersArray.append(key);
+    json membersArray = json::array();
+    for (const std::string& key : memberPeerIds)
+        membersArray.push_back(key);
 
-    for (const QString& peerId : memberPeerIds) {
-        if (peerId.trimmed().isEmpty()) continue;
-        if (peerId.trimmed() == myId) continue;
+    for (const std::string& peerIdRaw : memberPeerIds) {
+        const std::string peerId = trimmed(peerIdRaw);
+        if (peerId.empty() || peerId == myId) continue;
 
-        QJsonObject payload;
+        json payload = json::object();
         payload["from"]      = myId;
         payload["type"]      = "group_leave";
         payload["groupId"]   = groupId;
@@ -825,31 +814,31 @@ void ChatController::sendGroupLeaveNotification(const QString& groupId,
         payload["ts"]        = ts;
         payload["msgId"]     = msgId;  // B2 fix: include msgId for dedup
 
-        const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-        QByteArray env = sealForPeer(peerId, pt);
-        if (!env.isEmpty()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[SEND MAILBOX] sealed group_leave to" << peerId.left(8) + "...";
-#endif
-            m_relay.sendEnvelope(p2p::bridge::toBytes(env));
+        const std::string ptStr = payload.dump();
+        const Bytes pt(ptStr.begin(), ptStr.end());
+        Bytes env = sealForPeer(peerId, pt);
+        if (!env.empty()) {
+            P2P_LOG("[SEND MAILBOX] sealed group_leave to " << peerId.substr(0, 8) << "...");
+            m_relay.sendEnvelope(env);
         } else {
-            qWarning() << "[SEND] BLOCKED — cannot seal group_leave to" << peerId.left(8) + "...";
+            P2P_WARN("[SEND] BLOCKED — cannot seal group_leave to " << peerId.substr(0, 8) << "...");
         }
     }
 }
 
 // ── Private ───────────────────────────────────────────────────────────────────
 
-bool ChatController::markSeen(const QString& id)
+bool ChatController::markSeen(const std::string& id)
 {
-    if (m_seenIds.contains(id)) return false;
-    if (m_seenOrder.size() >= kSeenIdsCap) {
+    const std::string& idStd = id;
+    if (m_seenIds.count(idStd)) return false;
+    if (int(m_seenOrder.size()) >= kSeenIdsCap) {
         const int prune = kSeenIdsCap / 2;
-        for (int i = 0; i < prune; ++i) m_seenIds.remove(m_seenOrder[i]);
-        m_seenOrder.remove(0, prune);
+        for (int i = 0; i < prune; ++i) m_seenIds.erase(m_seenOrder[i]);
+        m_seenOrder.erase(m_seenOrder.begin(), m_seenOrder.begin() + prune);
     }
-    m_seenIds.insert(id);
-    m_seenOrder.append(id);
+    m_seenIds.insert(idStd);
+    m_seenOrder.push_back(idStd);
     return true;
 }
 
@@ -860,56 +849,58 @@ bool ChatController::markSeen(const QString& id)
 // Returns the sealed envelope bytes (SEALED:<version>\n<ciphertext>), or empty
 // on failure.  Every outbound path should call this instead of inlining the
 // encrypt→convert→seal→prefix logic.
-QByteArray ChatController::sealForPeer(const QString& peerIdB64u,
-                                       const QByteArray& plaintext)
+Bytes ChatController::sealForPeer(const std::string& peerIdB64u,
+                                  const Bytes& plaintext)
 {
     if (!m_sessionMgr) return {};
     // Pass peer's KEM pub so SessionManager can do hybrid Noise handshake if available
-    QByteArray peerKemPub = lookupPeerKemPub(peerIdB64u);
-    QByteArray sessionBlob = p2p::bridge::toQByteArray(m_sessionMgr->encryptForPeer(
-        peerIdB64u.toStdString(), p2p::bridge::toBytes(plaintext), p2p::bridge::toBytes(peerKemPub)));
-    if (sessionBlob.isEmpty()) return {};
+    Bytes peerKemPub = lookupPeerKemPub(peerIdB64u);
+    Bytes sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext, peerKemPub);
+    if (sessionBlob.empty()) return {};
 
-    using namespace p2p::bridge;
-    QByteArray peerEdPub = toQByteArray(CryptoEngine::fromBase64Url(peerIdB64u.toStdString()));
+    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
     unsigned char peerCurvePub[32];
-    if (crypto_sign_ed25519_pk_to_curve25519(
-            peerCurvePub,
-            reinterpret_cast<const unsigned char*>(peerEdPub.constData())) != 0)
+    if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0)
         return {};
 
-    QByteArray recipientCurvePub(reinterpret_cast<const char*>(peerCurvePub), 32);
+    Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
     sodium_memzero(peerCurvePub, sizeof(peerCurvePub));  // G11 fix
 
     // Use hybrid seal if we know the peer's ML-KEM-768 public key (already looked up above)
     // Include ML-DSA-65 signature if we have DSA keys.
-    // Bridge Qt ↔ std while SealedEnvelope is migrated (REFACTOR_PLAN.md).
-    QByteArray sealed = toQByteArray(SealedEnvelope::seal(
-        toBytes(recipientCurvePub), toBytes(peerEdPub),
+    Bytes sealed = SealedEnvelope::seal(
+        recipientCurvePub, peerEdPub,
         m_crypto.identityPub(), m_crypto.identityPriv(),
-        toBytes(sessionBlob), toBytes(peerKemPub),
-        m_crypto.dsaPub(), m_crypto.dsaPriv()));
-    if (sealed.isEmpty()) return {};
+        sessionBlob, peerKemPub,
+        m_crypto.dsaPub(), m_crypto.dsaPriv());
+    if (sealed.empty()) return {};
 
-    QByteArray inner = kSealedPrefix + "\n" + sealed;
+    // Inner wire: kSealedPrefix + "\n" + sealed
+    Bytes inner;
+    const size_t prefixLen = std::strlen(kSealedPrefix);
+    inner.reserve(prefixLen + 1 + sealed.size());
+    inner.insert(inner.end(),
+                 reinterpret_cast<const uint8_t*>(kSealedPrefix),
+                 reinterpret_cast<const uint8_t*>(kSealedPrefix) + prefixLen);
+    inner.push_back('\n');
+    inner.insert(inner.end(), sealed.begin(), sealed.end());
 
     // Wrap with relay routing header so /v1/send can route anonymously
-    return toQByteArray(SealedEnvelope::wrapForRelay(toBytes(peerEdPub), toBytes(inner)));
+    return SealedEnvelope::wrapForRelay(peerEdPub, inner);
 }
 
 // ── S3/S7/S8 fix: Sealed payload via mailbox, fail-closed ───────────────────
-void ChatController::sendSealedPayload(const QString& peerIdB64u,
-                                       const QJsonObject& payload)
+void ChatController::sendSealedPayload(const std::string& peerIdB64u,
+                                       const nlohmann::json& payload)
 {
-    const QByteArray pt = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-    const QString type = payload.value("type").toString();
+    const std::string ptStr = payload.dump();
+    const Bytes pt(ptStr.begin(), ptStr.end());
+    const std::string type = payload.value("type", std::string());
 
-    QByteArray env = sealForPeer(peerIdB64u, pt);
-    if (!env.isEmpty()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SEND MAILBOX]" << type << "to" << peerIdB64u.left(8) + "...";
-#endif
-        m_relay.sendEnvelope(p2p::bridge::toBytes(env));
+    Bytes env = sealForPeer(peerIdB64u, pt);
+    if (!env.empty()) {
+        P2P_LOG("[SEND MAILBOX] " << type << " to " << peerIdB64u.substr(0, 8) << "...");
+        m_relay.sendEnvelope(env);
         return;
     }
 
@@ -919,13 +910,13 @@ void ChatController::sendSealedPayload(const QString& peerIdB64u,
     // and the plaintext leak was always a privacy concern.  ICE messages
     // now go through the same sealed path as everything else; if the ratchet
     // can't seal, we defer the handshake instead of leaking SDP/IP candidates.
-    qWarning() << "[SEND] BLOCKED — cannot seal" << type
-               << "to" << peerIdB64u.left(8) + "...";
+    P2P_WARN("[SEND] BLOCKED — cannot seal " << type
+               << " to " << peerIdB64u.substr(0, 8) << "...");
 }
 
 #ifdef PEER2PEAR_P2P
 // ── QUIC + ICE connection setup ──────────────────────────────────────────────
-QuicConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bool controlling)
+QuicConnection* ChatController::setupP2PConnection(const std::string& peerIdB64u, bool controlling)
 {
     // ChatController isn't a QObject anymore (Phase 7b).  QuicConnection is
     // a QObject, so we pass nullptr for parent and lifetime-manage via
@@ -935,95 +926,90 @@ QuicConnection* ChatController::setupP2PConnection(const QString& peerIdB64u, bo
     // lifetime tracks the QuicConnection itself — when it's deleteLater'd,
     // all lambdas capturing `this` stop firing.
     QuicConnection* conn = new QuicConnection(nullptr);
-    if (!m_turnHost.isEmpty())
-        conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
+    if (!m_turnHost.empty())
+        conn->setTurnServer(QString::fromStdString(m_turnHost), m_turnPort,
+                             QString::fromStdString(m_turnUser),
+                             QString::fromStdString(m_turnPass));
     m_p2pConnections[peerIdB64u] = conn;
-    m_p2pCreatedSecs[peerIdB64u] = QDateTime::currentSecsSinceEpoch();
+    m_p2pCreatedSecs[peerIdB64u] = nowSecs();
 
-    const QString iceType = controlling ? "ice_offer" : "ice_answer";
+    const std::string iceType = controlling ? "ice_offer" : "ice_answer";
     QObject::connect(conn, &QuicConnection::localSdpReady, conn,
             [this, peerIdB64u, iceType, conn](const QString& sdp) {
-        QJsonObject p;
+        json p = json::object();
         p["type"] = iceType;
         p["from"] = myIdB64u();
-        p["sdp"]  = sdp;
+        p["sdp"]  = sdp.toStdString();
         p["quic"] = true;
-        p["quic_fingerprint"] = conn->localQuicFingerprint();
+        p["quic_fingerprint"] = conn->localQuicFingerprint().toStdString();
         sendSealedPayload(peerIdB64u, p);
     });
     QObject::connect(conn, &QuicConnection::stateChanged, conn,
             [this, peerIdB64u, conn](int state) {
         if (state == NICE_COMPONENT_STATE_READY) {
-            const QString mode = conn->quicActive() ? "QUIC" : "ICE";
+            const std::string mode = conn->quicActive() ? "QUIC" : "ICE";
             if (onStatus) onStatus("P2P ready (" + mode + ") with " + peerIdB64u);
-            m_fileMgr.notifyP2PReady(peerIdB64u.toStdString());
+            m_fileMgr.notifyP2PReady(peerIdB64u);
         } else if (state == NICE_COMPONENT_STATE_FAILED) {
             if (onStatus) onStatus("P2P failed for " + peerIdB64u);
         }
     });
     QObject::connect(conn, &QuicConnection::dataReceived, conn,
             [this, peerIdB64u](const QByteArray& d) {
-        onP2PDataReceived(peerIdB64u, d);
+        onP2PDataReceived(peerIdB64u, p2p::bridge::toBytes(d));
     });
     QObject::connect(conn, &QuicConnection::fileDataReceived, conn,
             [this, peerIdB64u](const QByteArray& d) {
-        m_fileMgr.handleFileEnvelope(peerIdB64u.toStdString(),
+        m_fileMgr.handleFileEnvelope(peerIdB64u,
             p2p::bridge::toBytes(d),
-            [this](const std::string& id) { return markSeen(QString::fromStdString(id)); },
-            toStdFileKeys(m_fileKeys));
+            [this](const std::string& id) { return markSeen(id); },
+            m_fileKeys);
     });
     conn->initIce(controlling);
     return conn;
 }
 
-void ChatController::initiateP2PConnection(const QString& peerIdB64u)
+void ChatController::initiateP2PConnection(const std::string& peerIdB64u)
 {
-    if (m_p2pConnections.contains(peerIdB64u)) return;
+    if (m_p2pConnections.count(peerIdB64u)) return;
     setupP2PConnection(peerIdB64u, true);
 }
 
-void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArray& data)
+void ChatController::onP2PDataReceived(const std::string& peerIdB64u, const Bytes& data)
 {
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[ChatController] P2P data received from" << peerIdB64u.left(8) + "..."
-             << "| size:" << data.size() << "B";
-#endif
+    P2P_LOG("[ChatController] P2P data received from " << peerIdB64u.substr(0, 8) << "..."
+             << " | size: " << data.size() << "B");
 
     // P2P data proves the peer is online right now
     if (onPresenceChanged) onPresenceChanged(peerIdB64u, true);
 
     // ── Sealed envelope over P2P ─────────────────────────────────────────────
-    if (data.startsWith(kSealedPrefix) || data.startsWith(kSealedFCPrefix)) {
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[RECV P2P] sealed envelope from" << peerIdB64u.left(8) + "...";
-#endif
+    if (bytesStartsWith(data, kSealedPrefix) || bytesStartsWith(data, kSealedFCPrefix)) {
+        P2P_LOG("[RECV P2P] sealed envelope from " << peerIdB64u.substr(0, 8) << "...");
         onEnvelope(data);
         return;
     }
 
     // ── File chunk received over P2P (legacy) ────────────────────────────────
-    if (data.startsWith(kFilePrefix)) {
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[RECV P2P] file chunk from" << peerIdB64u.left(8) + "...";
-#endif
+    if (bytesStartsWith(data, kFilePrefix)) {
+        P2P_LOG("[RECV P2P] file chunk from " << peerIdB64u.substr(0, 8) << "...");
         onEnvelope(data);
         return;
     }
 
     // ── Try ratchet decrypt first (P2P with session) ─────────────────────────
-    if (m_sessionMgr && m_sessionMgr->hasSession(peerIdB64u.toStdString())) {
-        QByteArray pt = p2p::bridge::toQByteArray(m_sessionMgr->decryptFromPeer(
-            peerIdB64u.toStdString(), p2p::bridge::toBytes(data)));
-        if (!pt.isEmpty()) {
-            const auto o = QJsonDocument::fromJson(pt).object();
-            if (o.value("type").toString() == "text") {
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[RECV P2P] ratchet text from" << peerIdB64u.left(8) + "...";
-#endif
-                const QString msgId = o.value("msgId").toString();
-                if (!msgId.isEmpty() && !markSeen(msgId)) return;
-                if (onMessageReceived) onMessageReceived(peerIdB64u, o.value("text").toString(),
-                                     tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
+    if (m_sessionMgr && m_sessionMgr->hasSession(peerIdB64u)) {
+        Bytes pt = m_sessionMgr->decryptFromPeer(peerIdB64u, data);
+        if (!pt.empty()) {
+            const json o = json::parse(pt.begin(), pt.end(),
+                                       /*cb=*/nullptr, /*allow_exceptions=*/false);
+            if (o.is_object() && o.value("type", std::string()) == "text") {
+                P2P_LOG("[RECV P2P] ratchet text from " << peerIdB64u.substr(0, 8) << "...");
+                const std::string msgId = o.value("msgId", std::string());
+                if (!msgId.empty() && !markSeen(msgId)) return;
+                if (onMessageReceived) onMessageReceived(peerIdB64u,
+                                     o.value("text", std::string()),
+                                     o.value("ts", int64_t(0)), msgId);
             }
             return;
         }
@@ -1033,75 +1019,65 @@ void ChatController::onP2PDataReceived(const QString& peerIdB64u, const QByteArr
     // SEC3: This path uses a static ECDH key with NO forward secrecy.
     // It exists for backward compatibility but should be disabled once
     // all peers support sealed/ratchet messaging.
-    qWarning() << "[RECV P2P] legacy path (no forward secrecy) from"
-               << peerIdB64u.left(8) + "... — peer should upgrade";
-    using namespace p2p::bridge;
-    const Bytes peerPub = CryptoEngine::fromBase64Url(peerIdB64u.toStdString());
-    const QByteArray pt = toQByteArray(
-        m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), toBytes(data)));
-    if (pt.isEmpty()) return;
+    P2P_WARN("[RECV P2P] legacy path (no forward secrecy) from "
+               << peerIdB64u.substr(0, 8) << "... — peer should upgrade");
+    const Bytes peerPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    const Bytes pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), data);
+    if (pt.empty()) return;
 
-    const auto o = QJsonDocument::fromJson(pt).object();
-    if (o.value("type").toString() != "text") return;
+    const json o = json::parse(pt.begin(), pt.end(),
+                               /*cb=*/nullptr, /*allow_exceptions=*/false);
+    if (!o.is_object() || o.value("type", std::string()) != "text") return;
 
-    const QString msgId = o.value("msgId").toString();
-    if (!msgId.isEmpty() && !markSeen(msgId)) return;
+    const std::string msgId = o.value("msgId", std::string());
+    if (!msgId.empty() && !markSeen(msgId)) return;
 
-    if (onMessageReceived) onMessageReceived(peerIdB64u, o.value("text").toString(),
-                         tsFromSecs(o.value("ts").toVariant().toLongLong()), msgId);
+    if (onMessageReceived) onMessageReceived(peerIdB64u,
+                         o.value("text", std::string()),
+                         o.value("ts", int64_t(0)), msgId);
 }
 #endif // PEER2PEAR_P2P
 
-void ChatController::onEnvelope(const QByteArray& body)
+void ChatController::onEnvelope(const Bytes& body)
 {
     // Envelopes arrive via WebSocket push — no ACK needed, the relay
     // deletes stored envelopes on delivery.
-    const QString via = QStringLiteral("RELAY");
+    const std::string via = "RELAY";
 
     // Strip relay routing header if present (0x01 || recipientEdPub(32) || inner)
-    // Bridge Qt ↔ std while SealedEnvelope is migrated (REFACTOR_PLAN.md).
-    const QByteArray data = [&]() -> QByteArray {
-        if (!body.isEmpty() && static_cast<quint8>(body[0]) == 0x01 && body.size() > 33) {
-            QByteArray inner = p2p::bridge::toQByteArray(
-                SealedEnvelope::unwrapFromRelay(p2p::bridge::toBytes(body)));
-            if (!inner.isEmpty()) return inner;
-        }
-        return body;
-    }();
+    Bytes data = body;
+    if (!body.empty() && body[0] == 0x01 && body.size() > 33) {
+        Bytes inner = SealedEnvelope::unwrapFromRelay(body);
+        if (!inner.empty()) data = std::move(inner);
+    }
 
-    const int nl = data.indexOf('\n');
-    if (nl < 0) return;
-
-    const QByteArray header = data.left(nl);
-    const QByteArray rest   = data.mid(nl + 1);
+    // Locate the newline delimiter separating header from the rest.
+    auto nlIt = std::find(data.begin(), data.end(), uint8_t('\n'));
+    if (nlIt == data.end()) return;
+    const Bytes header(data.begin(), nlIt);
+    const Bytes rest(nlIt + 1, data.end());
 
     // ── Sealed sender envelope ───────────────────────────────────────────────
-    if (header.startsWith(kSealedPrefix) || header.startsWith(kSealedFCPrefix)) {
-        const bool isFileChunk = header.startsWith(kSealedFCPrefix);
+    if (bytesStartsWith(header, kSealedPrefix) || bytesStartsWith(header, kSealedFCPrefix)) {
+        const bool isFileChunk = bytesStartsWith(header, kSealedFCPrefix);
 
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[RECV" << via << "] sealed envelope | size:" << rest.size() << "B"
-                 << (isFileChunk ? "(file chunk)" : "");
-#endif
+        P2P_LOG("[RECV " << via << "] sealed envelope | size: " << rest.size() << "B"
+                 << (isFileChunk ? " (file chunk)" : ""));
 
         // Unseal to learn sender identity (pass KEM priv for hybrid PQ envelopes).
         // Binding recipientEdPub (our own identity) into AEAD AAD — if a relay
         // rewrote the outer routing pubkey, AEAD fails.
-        using p2p::bridge::toBytes;
         UnsealResult unsealed = SealedEnvelope::unseal(
             m_crypto.curvePriv(), m_crypto.identityPub(),
-            toBytes(rest), m_crypto.kemPriv());
+            rest, m_crypto.kemPriv());
         if (!unsealed.valid) {
-            qWarning() << "[ChatController] Failed to unseal envelope";
+            P2P_WARN("[ChatController] Failed to unseal envelope");
             return;
         }
 
-        // Bridge unseal result fields back to QByteArray — see REFACTOR_PLAN.md.
-        // These wrappers disappear when the consumers (SessionManager /
-        // FileTransferManager / CryptoEngine) migrate off Qt.
-        const QByteArray unsealedSenderEdPub  = p2p::bridge::toQByteArray(unsealed.senderEdPub);
-        const QByteArray unsealedInnerPayload = p2p::bridge::toQByteArray(unsealed.innerPayload);
-        const QByteArray unsealedEnvelopeId   = p2p::bridge::toQByteArray(unsealed.envelopeId);
+        const Bytes& unsealedSenderEdPub  = unsealed.senderEdPub;
+        const Bytes& unsealedInnerPayload = unsealed.innerPayload;
+        const Bytes& unsealedEnvelopeId   = unsealed.envelopeId;
 
         // Envelope-level replay protection (Fix #2): dedup on envelopeId.
         // The ratchet dedups its own chain messages, but control messages
@@ -1109,30 +1085,24 @@ void ChatController::onEnvelope(const QByteArray& body)
         // protection. A malicious relay could redeliver the same sealed blob
         // and the receiver would happily reprocess it.
         if (unsealedEnvelopeId.size() == 16) {
-            const QString envKey = "env:" + QString::fromStdString(
-                CryptoEngine::toBase64Url(p2p::bridge::toBytes(unsealedEnvelopeId)));
+            const std::string envKey = "env:" + CryptoEngine::toBase64Url(unsealedEnvelopeId);
             if (!markSeen(envKey)) {
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[RECV" << via << "] dropping replayed envelope"
-                         << envKey.mid(4, 8) + "...";
-#endif
+                P2P_LOG("[RECV " << via << "] dropping replayed envelope "
+                         << envKey.substr(4, 8) << "...");
                 return;
             }
         }
 
-        QString senderId = QString::fromStdString(
-            CryptoEngine::toBase64Url(p2p::bridge::toBytes(unsealedSenderEdPub)));
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[RECV" << via << "] unsealed OK | sender:" << senderId.left(8) + "..."
-                 << "| inner:" << unsealedInnerPayload.size() << "B";
-#endif
+        std::string senderId = CryptoEngine::toBase64Url(unsealedSenderEdPub);
+        P2P_LOG("[RECV " << via << "] unsealed OK | sender: " << senderId.substr(0, 8) << "..."
+                 << " | inner: " << unsealedInnerPayload.size() << "B");
 
         // H3 fix: rate limit per sender to prevent CPU exhaustion via envelope flooding
         int& count = m_envelopeCount[senderId];
         if (++count > kMaxEnvelopesPerSenderPerPoll) {
             if (count == kMaxEnvelopesPerSenderPerPoll + 1)
-                qWarning() << "[RECV] rate limit hit for" << senderId.left(8) + "..."
-                           << "— dropping further envelopes this cycle";
+                P2P_WARN("[RECV] rate limit hit for " << senderId.substr(0, 8) << "..."
+                           << " — dropping further envelopes this cycle");
             return;
         }
 
@@ -1144,26 +1114,24 @@ void ChatController::onEnvelope(const QByteArray& body)
             // before allowing trial decryption. This prevents an attacker who can
             // craft valid sealed envelopes from causing unnecessary crypto work.
             bool hasKeyFromSender = false;
-            const QString senderPrefix = senderId + ":";
-            for (auto it = m_fileKeys.constBegin(); it != m_fileKeys.constEnd(); ++it) {
-                if (it.key().startsWith(senderPrefix)) {
+            const std::string senderPrefix = senderId + ":";
+            for (const auto& kv : m_fileKeys) {
+                if (kv.first.size() >= senderPrefix.size() &&
+                    kv.first.compare(0, senderPrefix.size(), senderPrefix) == 0) {
                     hasKeyFromSender = true;
                     break;
                 }
             }
             if (!hasKeyFromSender) {
-                qWarning() << "[RECV" << via << "] sealed file chunk from" << senderId.left(8) + "..."
-                           << "— no file_key on record, dropping";
+                P2P_WARN("[RECV " << via << "] sealed file chunk from " << senderId.substr(0, 8) << "..."
+                           << " — no file_key on record, dropping");
                 return;
             }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[RECV" << via << "] sealed file chunk from" << senderId.left(8) + "...";
-#endif
-            m_fileMgr.handleFileEnvelope(senderId.toStdString(),
-                p2p::bridge::toBytes(unsealedInnerPayload),
-                [this](const std::string& id) { return markSeen(QString::fromStdString(id)); },
-                toStdFileKeys(m_fileKeys));
+            P2P_LOG("[RECV " << via << "] sealed file chunk from " << senderId.substr(0, 8) << "...");
+            m_fileMgr.handleFileEnvelope(senderId, unsealedInnerPayload,
+                [this](const std::string& id) { return markSeen(id); },
+                m_fileKeys);
             return;
         }
 
@@ -1176,165 +1144,169 @@ void ChatController::onEnvelope(const QByteArray& body)
         if (via == "P2P") if (onPresenceChanged) onPresenceChanged(senderId, true);
 
         // Decrypt session layer (Noise handshake or ratchet message)
-        Bytes msgKeyB;  // M3 fix: capture message key directly from decrypt
-        Bytes ptB = m_sessionMgr->decryptFromPeer(senderId.toStdString(),
-            p2p::bridge::toBytes(unsealedInnerPayload), &msgKeyB);
-        QByteArray msgKey = p2p::bridge::toQByteArray(msgKeyB);
-        QByteArray pt     = p2p::bridge::toQByteArray(ptB);
-        if (pt.isEmpty()) {
+        Bytes msgKey;  // M3 fix: capture message key directly from decrypt
+        Bytes pt = m_sessionMgr->decryptFromPeer(senderId, unsealedInnerPayload, &msgKey);
+        if (pt.empty()) {
             // Pre-key response (0x02) completes the Noise IK handshake and creates
             // a ratchet session inside decryptFromPeer(), but returns no user payload.
             // This is expected — future messages will use the ratchet session.
-            const quint8 innerType = unsealedInnerPayload.isEmpty() ? 0 : static_cast<quint8>(unsealedInnerPayload[0]);
+            const uint8_t innerType = unsealedInnerPayload.empty() ? 0 : unsealedInnerPayload[0];
             if (innerType == SessionManager::kPreKeyResponse || innerType == SessionManager::kHybridPreKeyResp) {
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[RECV" << via << "] handshake COMPLETED with" << senderId.left(8) + "...";
-#endif
+                P2P_LOG("[RECV " << via << "] handshake COMPLETED with " << senderId.substr(0, 8) << "...");
                 // SEC9: handshake succeeded — clear failure counter
-                m_handshakeFailCount.remove(senderId);
+                m_handshakeFailCount.erase(senderId);
 
                 // Announce our PQ KEM pub now that we have an authenticated channel
                 announceKemPub(senderId);
 
             } else {
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[RECV" << via << "] session decrypt empty from" << senderId.left(8) + "...";
-#endif
+                P2P_LOG("[RECV " << via << "] session decrypt empty from " << senderId.substr(0, 8) << "...");
             }
             return;
         }
 
         // Dispatch based on the decrypted JSON payload
         // (same logic as legacy message handling below)
-        const auto o = QJsonDocument::fromJson(pt).object();
-        const QString type = o.value("type").toString();
+        const json o = json::parse(pt.begin(), pt.end(),
+                                   /*cb=*/nullptr, /*allow_exceptions=*/false);
+        if (!o.is_object()) return;
+        const std::string type = o.value("type", std::string());
 
-        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
-        const QDateTime ts = tsFromSecs(tsSecs);
-        const QString msgId = o.value("msgId").toString();
+        const int64_t tsSecs = o.value("ts", int64_t(0));
+        const std::string msgId = o.value("msgId", std::string());
 
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[RECV" << via << "] sealed type:" << type << "from" << senderId.left(8) + "...";
-#endif
+        P2P_LOG("[RECV " << via << "] sealed type: " << type << " from " << senderId.substr(0, 8) << "...");
 
         if (type == "text") {
-            if (!msgId.isEmpty() && !markSeen(msgId)) return;
-            if (onMessageReceived) onMessageReceived(senderId, o.value("text").toString(), ts, msgId);
+            if (!msgId.empty() && !markSeen(msgId)) return;
+            if (onMessageReceived) onMessageReceived(senderId,
+                                 o.value("text", std::string()), tsSecs, msgId);
         } else if (type == "group_msg") {
-            if (!msgId.isEmpty() && !markSeen(msgId)) return;
+            if (!msgId.empty() && !markSeen(msgId)) return;
 
             // G5 fix: sequence gap detection
-            const QString gid = o.value("groupId").toString();
+            const std::string gid = o.value("groupId", std::string());
             if (o.contains("seq")) {
-                const qint64 seq = o.value("seq").toVariant().toLongLong();
-                const QString seqKey = gid + ":" + senderId;
-                if (m_groupSeqIn.contains(seqKey)) {
-                    const qint64 expected = m_groupSeqIn[seqKey] + 1;
+                const int64_t seq = o.value("seq", int64_t(0));
+                const std::string seqKey = gid + ":" + senderId;
+                auto sit = m_groupSeqIn.find(seqKey);
+                if (sit != m_groupSeqIn.end()) {
+                    const int64_t expected = sit->second + 1;
                     if (seq > expected)
-                        qWarning() << "[GROUP] seq gap from" << senderId.left(8) + "..."
-                                   << "in" << gid.left(8) + "..."
-                                   << "expected" << expected << "got" << seq;
+                        P2P_WARN("[GROUP] seq gap from " << senderId.substr(0, 8) << "..."
+                                   << " in " << gid.substr(0, 8) << "..."
+                                   << " expected " << expected << " got " << seq);
                 }
                 m_groupSeqIn[seqKey] = seq;
             }
 
-            QStringList memberKeys;
-            for (const QJsonValue &v : o.value("members").toArray())
-                memberKeys << v.toString();
+            std::vector<std::string> memberKeys;
+            if (o.contains("members") && o["members"].is_array())
+                for (const auto& v : o["members"])
+                    if (v.is_string()) memberKeys.push_back(v.get<std::string>());
 
             // Fix #20: a valid sealed group_msg from X about group G adds X
             // (and the declared members) to our roster — this is ground
             // truth because the message is already authenticated.  We still
             // require sender ∈ members to avoid rogue "I'm messaging this
             // group but I'm not in it" bootstraps.
-            if (!gid.isEmpty() && !senderId.isEmpty()) {
-                if (!m_groupMembers.contains(gid)) {
+            if (!gid.empty() && !senderId.empty()) {
+                auto gmit = m_groupMembers.find(gid);
+                if (gmit == m_groupMembers.end()) {
                     // Bootstrap: accept only if sender includes themselves.
-                    if (memberKeys.contains(senderId)) {
-                        m_groupMembers[gid] =
-                            QSet<QString>(memberKeys.begin(), memberKeys.end());
+                    const bool senderInList = std::find(memberKeys.begin(), memberKeys.end(), senderId) != memberKeys.end();
+                    if (senderInList) {
+                        m_groupMembers[gid] = std::set<std::string>(memberKeys.begin(), memberKeys.end());
                     }
                 } else {
-                    m_groupMembers[gid].insert(senderId);
+                    gmit->second.insert(senderId);
                 }
             }
 
             if (onGroupMessageReceived) onGroupMessageReceived(senderId, gid,
-                                       o.value("groupName").toString(),
-                                       memberKeys, o.value("text").toString(), ts, msgId);
+                                       o.value("groupName", std::string()),
+                                       memberKeys,
+                                       o.value("text", std::string()), tsSecs, msgId);
         } else if (type == "group_leave") {
-            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B2 fix: dedup
-            const QString gid = o.value("groupId").toString();
+            if (!msgId.empty() && !markSeen(msgId)) return;  // B2 fix: dedup
+            const std::string gid = o.value("groupId", std::string());
             // Fix #20: a leave message may ONLY be self-leave — senders can't
             // announce that OTHER members left.  And the sender must have been
             // a known member of the group.
-            if (!gid.isEmpty() && !isAuthorizedGroupSender(gid, senderId)) {
-                qWarning() << "[GROUP] dropping group_leave from non-member"
-                           << senderId.left(8) + "... for" << gid.left(8);
+            if (!gid.empty() && !isAuthorizedGroupSender(gid, senderId)) {
+                P2P_WARN("[GROUP] dropping group_leave from non-member "
+                           << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
             }
-            QStringList memberKeys;
-            for (const QJsonValue &v : o.value("members").toArray())
-                memberKeys << v.toString();
+            std::vector<std::string> memberKeys;
+            if (o.contains("members") && o["members"].is_array())
+                for (const auto& v : o["members"])
+                    if (v.is_string()) memberKeys.push_back(v.get<std::string>());
             // The sender left — strike them from our roster so they can't push
             // further member-update / rename / avatar messages afterwards.
-            if (m_groupMembers.contains(gid))
-                m_groupMembers[gid].remove(senderId);
+            auto gmIt = m_groupMembers.find(gid);
+            if (gmIt != m_groupMembers.end())
+                gmIt->second.erase(senderId);
             if (onGroupMemberLeft) onGroupMemberLeft(senderId, gid,
-                                  o.value("groupName").toString(), memberKeys, ts, msgId);
+                                  o.value("groupName", std::string()),
+                                  memberKeys, tsSecs, msgId);
         } else if (type == "avatar") {
-            if (onAvatarReceived) onAvatarReceived(senderId, o.value("name").toString(), o.value("avatar").toString());
+            if (onAvatarReceived) onAvatarReceived(senderId,
+                                 o.value("name", std::string()),
+                                 o.value("avatar", std::string()));
         } else if (type == "group_rename") {
-            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B5 fix: dedup
-            const QString gid = o.value("groupId").toString();
-            if (!gid.isEmpty() && !isAuthorizedGroupSender(gid, senderId)) {
-                qWarning() << "[GROUP] dropping group_rename from non-member"
-                           << senderId.left(8) + "... for" << gid.left(8);
+            if (!msgId.empty() && !markSeen(msgId)) return;  // B5 fix: dedup
+            const std::string gid = o.value("groupId", std::string());
+            if (!gid.empty() && !isAuthorizedGroupSender(gid, senderId)) {
+                P2P_WARN("[GROUP] dropping group_rename from non-member "
+                           << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
             }
-            if (onGroupRenamed) onGroupRenamed(gid, o.value("newName").toString());
+            if (onGroupRenamed) onGroupRenamed(gid, o.value("newName", std::string()));
         } else if (type == "group_avatar") {
-            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B5 fix: dedup
-            const QString gid = o.value("groupId").toString();
-            if (!gid.isEmpty() && !isAuthorizedGroupSender(gid, senderId)) {
-                qWarning() << "[GROUP] dropping group_avatar from non-member"
-                           << senderId.left(8) + "... for" << gid.left(8);
+            if (!msgId.empty() && !markSeen(msgId)) return;  // B5 fix: dedup
+            const std::string gid = o.value("groupId", std::string());
+            if (!gid.empty() && !isAuthorizedGroupSender(gid, senderId)) {
+                P2P_WARN("[GROUP] dropping group_avatar from non-member "
+                           << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
             }
-            if (onGroupAvatarReceived) onGroupAvatarReceived(gid, o.value("avatar").toString());
+            if (onGroupAvatarReceived) onGroupAvatarReceived(gid, o.value("avatar", std::string()));
         } else if (type == "group_member_update") {
-            if (!msgId.isEmpty() && !markSeen(msgId)) return;  // B3 fix: dedup
-            const QString gid       = o.value("groupId").toString();
-            const QString gname     = o.value("groupName").toString();
+            if (!msgId.empty() && !markSeen(msgId)) return;  // B3 fix: dedup
+            const std::string gid   = o.value("groupId", std::string());
+            const std::string gname = o.value("groupName", std::string());
             // Fix #20: reject member-list updates from peers that aren't
             // currently in our roster.  First-sight of a new group bootstraps
             // from the sender's proposed list only if the sender names
             // themselves as a member.
-            QStringList memberKeys;
-            for (const QJsonValue &v : o.value("members").toArray())
-                memberKeys << v.toString();
+            std::vector<std::string> memberKeys;
+            if (o.contains("members") && o["members"].is_array())
+                for (const auto& v : o["members"])
+                    if (v.is_string()) memberKeys.push_back(v.get<std::string>());
 
-            if (!gid.isEmpty()) {
-                const bool bootstrap = m_groupBootstrapNeeded.contains(gid)
-                                       || !m_groupMembers.contains(gid);
+            if (!gid.empty()) {
+                const bool bootstrap = m_groupBootstrapNeeded.count(gid)
+                                       || !m_groupMembers.count(gid);
                 if (bootstrap) {
                     // Sender must include themselves in the proposed list.
-                    if (!memberKeys.contains(senderId)) {
-                        qWarning() << "[GROUP] rejecting bootstrap group_member_update"
-                                   << "from" << senderId.left(8) + "..."
-                                   << "— sender not in proposed member list";
+                    const bool senderInList = std::find(memberKeys.begin(), memberKeys.end(), senderId) != memberKeys.end();
+                    if (!senderInList) {
+                        P2P_WARN("[GROUP] rejecting bootstrap group_member_update"
+                                   << " from " << senderId.substr(0, 8) << "..."
+                                   << " — sender not in proposed member list");
                         return;
                     }
-                    m_groupMembers[gid] = QSet<QString>(memberKeys.begin(), memberKeys.end());
-                    m_groupBootstrapNeeded.remove(gid);
-                } else if (!m_groupMembers[gid].contains(senderId)) {
-                    qWarning() << "[GROUP] dropping group_member_update from non-member"
-                               << senderId.left(8) + "... for" << gid.left(8);
+                    m_groupMembers[gid] = std::set<std::string>(memberKeys.begin(), memberKeys.end());
+                    m_groupBootstrapNeeded.erase(gid);
+                } else if (!m_groupMembers[gid].count(senderId)) {
+                    P2P_WARN("[GROUP] dropping group_member_update from non-member "
+                               << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                     return;
                 } else {
                     // Authorized update: merge in new members (conservative —
                     // we don't accept REMOVALS via this message type, only adds).
-                    for (const QString& m : memberKeys)
+                    for (const std::string& m : memberKeys)
                         m_groupMembers[gid].insert(m);
                 }
             }
@@ -1344,79 +1316,77 @@ void ChatController::onEnvelope(const QByteArray& body)
             // member keys into the group's key list.
             // Empty text means no chat bubble appears, but the key merge still happens.
             if (onGroupMessageReceived) onGroupMessageReceived(senderId, gid, gname, memberKeys,
-                                      QString(), ts,
-                                      msgId.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : msgId);
+                                      std::string(), tsSecs,
+                                      msgId.empty() ? p2p::makeUuid() : msgId);
 #ifdef PEER2PEAR_P2P
         } else if (type == "ice_offer") {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[RECV" << via << "] ice_offer from" << senderId.left(8) + "...";
-#endif
+            P2P_LOG("[RECV " << via << "] ice_offer from " << senderId.substr(0, 8) << "...");
             // Skip if we already have a working P2P connection
-            if (m_p2pConnections.contains(senderId) &&
-                m_p2pConnections[senderId]->isReady()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[ICE] Already connected to" << senderId.left(8) + "... — ignoring ice_offer";
-#endif
+            auto connIt = m_p2pConnections.find(senderId);
+            if (connIt != m_p2pConnections.end() && connIt->second->isReady()) {
+                P2P_LOG("[ICE] Already connected to " << senderId.substr(0, 8) << "... — ignoring ice_offer");
             } else {
-                if (!m_p2pConnections.contains(senderId))
+                if (connIt == m_p2pConnections.end()) {
                     setupP2PConnection(senderId, false);
-                // Pass QUIC capability from signaling
-                if (o.value("quic").toBool()) {
-                    m_p2pConnections[senderId]->setPeerSupportsQuic(
-                        true, o.value("quic_fingerprint").toString());
+                    connIt = m_p2pConnections.find(senderId);
                 }
-                m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
+                if (connIt != m_p2pConnections.end()) {
+                    // Pass QUIC capability from signaling
+                    if (o.value("quic", false)) {
+                        connIt->second->setPeerSupportsQuic(
+                            true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
+                    }
+                    connIt->second->setRemoteSdp(
+                        QString::fromStdString(o.value("sdp", std::string())));
+                }
             }
         } else if (type == "ice_answer") {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[RECV" << via << "] ice_answer from" << senderId.left(8) + "...";
-#endif
-            if (m_p2pConnections.contains(senderId) &&
-                !m_p2pConnections[senderId]->isReady()) {
-                if (o.value("quic").toBool()) {
-                    m_p2pConnections[senderId]->setPeerSupportsQuic(
-                        true, o.value("quic_fingerprint").toString());
+            P2P_LOG("[RECV " << via << "] ice_answer from " << senderId.substr(0, 8) << "...");
+            auto connIt = m_p2pConnections.find(senderId);
+            if (connIt != m_p2pConnections.end() && !connIt->second->isReady()) {
+                if (o.value("quic", false)) {
+                    connIt->second->setPeerSupportsQuic(
+                        true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
                 }
-                m_p2pConnections[senderId]->setRemoteSdp(o.value("sdp").toString());
+                connIt->second->setRemoteSdp(
+                    QString::fromStdString(o.value("sdp", std::string())));
             }
 #endif // PEER2PEAR_P2P
         } else if (type == "file_key") {
             // File key announcement. Phase 2: evaluate consent policy BEFORE
             // installing the key. Chunks that arrive before the user accepts
             // will fail to find a matching key and be dropped silently.
-            const QString transferId = o.value("transferId").toString();
-            const QString fileName   = o.value("fileName").toString("file");
-            const qint64  fileSize   = o.value("fileSize").toVariant().toLongLong();
-            const QString gId        = o.value("groupId").toString();
-            const QString gName      = o.value("groupName").toString();
+            const std::string transferId = o.value("transferId", std::string());
+            const std::string fileName   = o.value("fileName", std::string("file"));
+            const int64_t     fileSize   = o.value("fileSize", int64_t(0));
+            const std::string gId        = o.value("groupId", std::string());
+            const std::string gName      = o.value("groupName", std::string());
 
-            if (transferId.isEmpty() || msgKey.size() != 32) {
+            if (transferId.empty() || msgKey.size() != 32) {
                 sodium_memzero(msgKey.data(), msgKey.size());
                 return;
             }
 
-            const QString compoundKey = senderId + ":" + transferId;
+            const std::string compoundKey = senderId + ":" + transferId;
 
             // Evaluate global size policy.  Fix #6: the same thresholds apply
             // whether the file is 1:1 or group-scoped — previously group files
             // auto-accepted regardless, which let any group member push up to
             // the hard-max bytes to disk without the user's consent.
             // (Per-contact policy will be layered on top in a follow-up.)
-            const qint64 fileSizeMB = fileSize / (1024 * 1024);
+            const int64_t fileSizeMB = fileSize / (1024 * 1024);
             bool autoAccept = false;
             bool autoDecline = false;
-            if (fileSize > qint64(m_fileHardMaxMB) * 1024 * 1024) {
+            if (fileSize > int64_t(m_fileHardMaxMB) * 1024 * 1024) {
                 autoDecline = true;
-            } else if (fileSize <= qint64(m_fileAutoAcceptMaxMB) * 1024 * 1024) {
+            } else if (fileSize <= int64_t(m_fileAutoAcceptMaxMB) * 1024 * 1024) {
                 autoAccept = true;
             }
 
             if (autoDecline) {
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[FILE] auto-decline" << fileName << "(" << fileSizeMB << "MB )"
-                         << "from" << senderId.left(8) + "... — exceeds hard max";
-#endif
-                QJsonObject declineMsg;
+                P2P_LOG("[FILE] auto-decline " << fileName << " (" << fileSizeMB << "MB)"
+                         << " from " << senderId.substr(0, 8) << "... — exceeds hard max");
+                json declineMsg = json::object();
                 declineMsg["type"]       = "file_decline";
                 declineMsg["transferId"] = transferId;
                 sendFileControlMessage(senderId, declineMsg);
@@ -1425,26 +1395,21 @@ void ChatController::onEnvelope(const QByteArray& body)
                 // Fix #3: announce the transfer to FileTransferManager FIRST so
                 // it locks the announced fileSize/totalChunks/fileHash. Chunks
                 // with mismatched metadata will be dropped.
-                const QByteArray announcedHash = p2p::bridge::toQByteArray(
-                    CryptoEngine::fromBase64Url(o.value("fileHash").toString().toStdString()));
-                const int announcedChunkCount = o.value("chunkCount").toInt(0);
-                const qint64 announcedTs      = o.value("ts").toVariant().toLongLong();
+                const Bytes announcedHash = CryptoEngine::fromBase64Url(o.value("fileHash", std::string()));
+                const int announcedChunkCount = o.value("chunkCount", 0);
+                const int64_t announcedTs     = o.value("ts", int64_t(0));
 
                 if (announcedHash.size() != 32 || announcedChunkCount <= 0) {
-                    qWarning() << "[FILE] missing fileHash/chunkCount on file_key for"
-                               << transferId.left(8) << "— dropping";
+                    P2P_WARN("[FILE] missing fileHash/chunkCount on file_key for "
+                               << transferId.substr(0, 8) << " — dropping");
                     sodium_memzero(msgKey.data(), msgKey.size());
                     return;
                 }
 
-                if (!m_fileMgr.announceIncoming(senderId.toStdString(),
-                                                  transferId.toStdString(),
-                                                  fileName.toStdString(),
-                                                  int64_t(fileSize), announcedChunkCount,
-                                                  p2p::bridge::toBytes(announcedHash),
-                                                  p2p::bridge::toBytes(msgKey),
-                                                  int64_t(announcedTs),
-                                                  gId.toStdString(), gName.toStdString())) {
+                if (!m_fileMgr.announceIncoming(senderId, transferId, fileName,
+                                                  fileSize, announcedChunkCount,
+                                                  announcedHash, msgKey,
+                                                  announcedTs, gId, gName)) {
                     sodium_memzero(msgKey.data(), msgKey.size());
                     return;
                 }
@@ -1453,27 +1418,24 @@ void ChatController::onEnvelope(const QByteArray& body)
                 m_fileKeys[compoundKey] = msgKey;  // M3+M4 fix
                 sodium_memzero(msgKey.data(), msgKey.size());
 
-                QJsonObject acceptMsg;
+                json acceptMsg = json::object();
                 acceptMsg["type"]       = "file_accept";
                 acceptMsg["transferId"] = transferId;
                 if (m_fileRequireP2P) acceptMsg["requireP2P"] = true;
                 sendFileControlMessage(senderId, acceptMsg);
 
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[FILE] auto-accept" << fileName << "(" << fileSizeMB << "MB)"
-                         << "from" << senderId.left(8) + "...";
-#endif
+                P2P_LOG("[FILE] auto-accept " << fileName << " (" << fileSizeMB << "MB)"
+                         << " from " << senderId.substr(0, 8) << "...");
             } else {
                 // Stash in pending — don't install key yet. User will accept/decline.
                 // Fix #3: lock announced hash/chunkCount/ts now so acceptFileTransfer
                 // can pass them to announceIncoming() unchanged.
-                const QByteArray announcedHash = p2p::bridge::toQByteArray(
-                    CryptoEngine::fromBase64Url(o.value("fileHash").toString().toStdString()));
-                const int announcedChunkCount = o.value("chunkCount").toInt(0);
-                const qint64 announcedTs      = o.value("ts").toVariant().toLongLong();
+                const Bytes announcedHash = CryptoEngine::fromBase64Url(o.value("fileHash", std::string()));
+                const int announcedChunkCount = o.value("chunkCount", 0);
+                const int64_t announcedTs     = o.value("ts", int64_t(0));
                 if (announcedHash.size() != 32 || announcedChunkCount <= 0) {
-                    qWarning() << "[FILE] missing fileHash/chunkCount on file_key for"
-                               << transferId.left(8) << "— dropping";
+                    P2P_WARN("[FILE] missing fileHash/chunkCount on file_key for "
+                               << transferId.substr(0, 8) << " — dropping");
                     sodium_memzero(msgKey.data(), msgKey.size());
                     return;
                 }
@@ -1482,28 +1444,26 @@ void ChatController::onEnvelope(const QByteArray& body)
                 p.peerId         = senderId;
                 p.fileName       = fileName;
                 p.fileSize       = fileSize;
-                p.fileKey        = QByteArray(msgKey.constData(), msgKey.size());
+                p.fileKey        = msgKey;
                 p.fileHash       = announcedHash;
                 p.totalChunks    = announcedChunkCount;
                 p.announcedTs    = announcedTs;
                 p.groupId        = gId;
                 p.groupName      = gName;
-                p.announcedSecs  = QDateTime::currentSecsSinceEpoch();
-                m_pendingIncomingFiles.insert(transferId, p);
+                p.announcedSecs  = nowSecs();
+                m_pendingIncomingFiles[transferId] = std::move(p);
                 sodium_memzero(msgKey.data(), msgKey.size());
 
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[FILE] prompt needed for" << fileName << "(" << fileSizeMB << "MB)"
-                         << "from" << senderId.left(8) + "...";
-#endif
+                P2P_LOG("[FILE] prompt needed for " << fileName << " (" << fileSizeMB << "MB)"
+                         << " from " << senderId.substr(0, 8) << "...");
                 if (onFileAcceptRequested) onFileAcceptRequested(senderId, transferId, fileName, fileSize);
             }
 
         } else if (type == "file_accept") {
             // Sender-side: receiver agreed to the transfer.
-            const QString transferId = o.value("transferId").toString();
-            const bool requireP2P    = o.value("requireP2P").toBool(false);
-            if (!transferId.isEmpty()) {
+            const std::string transferId = o.value("transferId", std::string());
+            const bool requireP2P        = o.value("requireP2P", false);
+            if (!transferId.empty()) {
                 // Sender's side of the "no relay" preference (global toggle).
                 // Desktop surfaces this via the "Require direct connection"
                 // setting too — not privacy-level yet; that can come later.
@@ -1512,16 +1472,17 @@ void ChatController::onEnvelope(const QByteArray& body)
                 // Is P2P ready for this peer right now?
                 bool p2pReady = false;
 #ifdef PEER2PEAR_P2P
-                if (m_p2pConnections.contains(senderId) &&
-                    m_p2pConnections[senderId]->isReady()) {
-                    p2pReady = true;
+                {
+                    auto it = m_p2pConnections.find(senderId);
+                    if (it != m_p2pConnections.end() && it->second->isReady())
+                        p2pReady = true;
                 }
 #endif
 
-                if (!m_fileMgr.startOutboundStream(transferId.toStdString(), requireP2P,
+                if (!m_fileMgr.startOutboundStream(transferId, requireP2P,
                                                     senderRequiresP2P, p2pReady)) {
-                    qWarning() << "[FILE] file_accept for unknown transferId"
-                               << transferId.left(8);
+                    P2P_WARN("[FILE] file_accept for unknown transferId "
+                               << transferId.substr(0, 8));
                     return;
                 }
 
@@ -1534,131 +1495,133 @@ void ChatController::onEnvelope(const QByteArray& body)
 
         } else if (type == "file_decline") {
             // Sender-side: receiver refused. Drop outbound state, notify UI.
-            const QString transferId = o.value("transferId").toString();
-            if (!transferId.isEmpty()) {
-                m_fileMgr.abandonOutboundTransfer(transferId.toStdString());
+            const std::string transferId = o.value("transferId", std::string());
+            if (!transferId.empty()) {
+                m_fileMgr.abandonOutboundTransfer(transferId);
                 if (onFileTransferCanceled) onFileTransferCanceled(transferId, true); // byReceiver
                 if (onStatus) onStatus("File transfer declined by recipient.");
             }
 
         } else if (type == "file_ack") {
             // Sender-side: receiver confirmed delivery + hash ok.
-            const QString transferId = o.value("transferId").toString();
-            if (!transferId.isEmpty()) {
+            const std::string transferId = o.value("transferId", std::string());
+            if (!transferId.empty()) {
                 if (onFileTransferDelivered) onFileTransferDelivered(transferId);
                 // Phase 4: drop sender-side state now that the transfer is acked.
-                m_fileMgr.forgetSentTransfer(transferId.toStdString());
+                m_fileMgr.forgetSentTransfer(transferId);
             }
 
         } else if (type == "file_request") {
             // Receiver is asking us (sender) to re-send these chunk indices.
             // Phase 4 resumption path.
-            const QString transferId = o.value("transferId").toString();
-            const QJsonArray chunksArr = o.value("chunks").toArray();
-            if (transferId.isEmpty() || chunksArr.isEmpty()) return;
+            const std::string transferId = o.value("transferId", std::string());
+            const bool hasChunks = o.contains("chunks") && o["chunks"].is_array();
+            if (transferId.empty() || !hasChunks || o["chunks"].empty()) return;
             std::vector<uint32_t> indices;
-            indices.reserve(size_t(chunksArr.size()));
-            for (const QJsonValue& v : chunksArr) {
-                const int i = v.toInt(-1);
-                if (i >= 0) indices.push_back(uint32_t(i));
+            indices.reserve(o["chunks"].size());
+            for (const auto& v : o["chunks"]) {
+                if (v.is_number_integer()) {
+                    const int i = v.get<int>();
+                    if (i >= 0) indices.push_back(uint32_t(i));
+                }
             }
-            if (!m_fileMgr.resendChunks(transferId.toStdString(), indices)) {
-                qWarning() << "[FILE] file_request for unknown transferId"
-                           << transferId.left(8) + "...";
+            if (!m_fileMgr.resendChunks(transferId, indices)) {
+                P2P_WARN("[FILE] file_request for unknown transferId "
+                           << transferId.substr(0, 8) << "...");
             }
 
         } else if (type == "file_cancel") {
             // Either side: the peer canceled. Figure out which role we're in.
-            const QString transferId = o.value("transferId").toString();
-            if (transferId.isEmpty()) return;
+            const std::string transferId = o.value("transferId", std::string());
+            if (transferId.empty()) return;
 
             // Outbound (we're the sender)?
-            if (!m_fileMgr.outboundPeerFor(transferId.toStdString()).empty()) {
-                m_fileMgr.abandonOutboundTransfer(transferId.toStdString());
+            if (!m_fileMgr.outboundPeerFor(transferId).empty()) {
+                m_fileMgr.abandonOutboundTransfer(transferId);
                 // Phase 4: also drop the sent-transfer DB row in case we were mid-stream.
-                m_fileMgr.forgetSentTransfer(transferId.toStdString());
+                m_fileMgr.forgetSentTransfer(transferId);
                 if (onFileTransferCanceled) onFileTransferCanceled(transferId, true); // canceled by receiver
                 return;
             }
             // Also handle "sender was already streaming when receiver canceled":
             // m_outboundPending is empty, but m_sentTransfers has the record.
-            m_fileMgr.forgetSentTransfer(transferId.toStdString());
+            m_fileMgr.forgetSentTransfer(transferId);
 
             // Inbound pending (we were about to prompt)?
             auto itPending = m_pendingIncomingFiles.find(transferId);
             if (itPending != m_pendingIncomingFiles.end()) {
-                sodium_memzero(itPending->fileKey.data(), itPending->fileKey.size());
+                sodium_memzero(itPending->second.fileKey.data(), itPending->second.fileKey.size());
                 m_pendingIncomingFiles.erase(itPending);
                 if (onFileTransferCanceled) onFileTransferCanceled(transferId, false); // sender canceled
                 return;
             }
             // Inbound in-progress (sender pulled the plug mid-stream)?
-            if (!m_fileMgr.inboundPeerFor(transferId.toStdString()).empty()) {
-                m_fileMgr.cancelInboundTransfer(transferId.toStdString());
+            if (!m_fileMgr.inboundPeerFor(transferId).empty()) {
+                m_fileMgr.cancelInboundTransfer(transferId);
                 if (onFileTransferCanceled) onFileTransferCanceled(transferId, false);
             }
 
         } else if (type == "kem_pub_announce") {
             // Post-quantum KEM public key exchange — store the peer's ML-KEM-768 pub
-            QByteArray kemPub = p2p::bridge::toQByteArray(
-                CryptoEngine::fromBase64Url(o.value("kem_pub_b64u").toString().toStdString()));
+            Bytes kemPub = CryptoEngine::fromBase64Url(o.value("kem_pub_b64u", std::string()));
             if (kemPub.size() == 1184) {  // ML-KEM-768 pub key size
                 m_peerKemPubs[senderId] = kemPub;
                 // Persist to DB
                 if (m_dbPtr && m_dbPtr->isOpen()) {
                     SqlCipherQuery q(*m_dbPtr);
                     q.prepare("UPDATE contacts SET kem_pub=:kp WHERE peer_id=:pid;");
-                    q.bindValue(":kp",  p2p::bridge::toBytes(kemPub));
-                    q.bindValue(":pid", senderId.toStdString());
+                    q.bindValue(":kp",  kemPub);
+                    q.bindValue(":pid", senderId);
                     q.exec();
                 }
-#ifndef QT_NO_DEBUG_OUTPUT
-                qDebug() << "[PQ] Stored ML-KEM-768 pub from" << senderId.left(8) + "..."
-                         << "| hybrid sealing now active for this peer";
-#endif
+                P2P_LOG("[PQ] Stored ML-KEM-768 pub from " << senderId.substr(0, 8) << "..."
+                         << " | hybrid sealing now active for this peer");
                 // Reciprocate: send our KEM pub back if we haven't already
-                if (m_crypto.hasPQKeys() && !lookupPeerKemPub(senderId).isEmpty()) {
+                if (m_crypto.hasPQKeys() && !lookupPeerKemPub(senderId).empty()) {
                     // They sent theirs, we have theirs — send ours if they might not have it
                     announceKemPub(senderId);
                 }
             } else {
-                qWarning() << "[PQ] Invalid kem_pub_announce from" << senderId.left(8) + "..."
-                           << "| size:" << kemPub.size() << "(expected 1184)";
+                P2P_WARN("[PQ] Invalid kem_pub_announce from " << senderId.substr(0, 8) << "..."
+                           << " | size: " << kemPub.size() << " (expected 1184)");
             }
         } else if (type == "file_chunk") {
             // Sealed file_chunk in JSON payload shouldn't happen — file chunks
             // use SEALEDFC: prefix and are handled above before session decrypt.
-            qWarning() << "[RECV" << via << "] unexpected file_chunk in session payload from"
-                       << senderId.left(8) + "...";
+            P2P_WARN("[RECV " << via << "] unexpected file_chunk in session payload from "
+                       << senderId.substr(0, 8) << "...");
         }
         return;
     }
 
     // ── File chunk envelope ─────────────────────────────────────────────────
-    if (header.startsWith(kFilePrefix)) {
-        const QString fromId = QString::fromUtf8(header.mid(kFilePrefix.size())).trimmed();
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[RECV" << via << "] file chunk from" << fromId.left(8) + "...";
-#endif
-        m_fileMgr.handleFileEnvelope(fromId.toStdString(),
-            p2p::bridge::toBytes(rest),
-            [this](const std::string& id) { return markSeen(QString::fromStdString(id)); },
-            toStdFileKeys(m_fileKeys));
+    if (bytesStartsWith(header, kFilePrefix)) {
+        const size_t pfx = std::strlen(kFilePrefix);
+        std::string fromId(reinterpret_cast<const char*>(header.data() + pfx),
+                           header.size() - pfx);
+        fromId = trimmed(fromId);
+        P2P_LOG("[RECV " << via << "] file chunk from " << fromId.substr(0, 8) << "...");
+        m_fileMgr.handleFileEnvelope(fromId, rest,
+            [this](const std::string& id) { return markSeen(id); },
+            m_fileKeys);
         return;
     }
 
     // ── Message envelope ──────────────────────────────────────────────────────
-    if (!header.startsWith(kMsgPrefix)) return;
+    if (!bytesStartsWith(header, kMsgPrefix)) return;
 
-    const QString fromId = QString::fromUtf8(header.mid(kMsgPrefix.size())).trimmed();
-    using namespace p2p::bridge;
-    const Bytes peerPub = CryptoEngine::fromBase64Url(fromId.toStdString());
-    const QByteArray pt = toQByteArray(
-        m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), toBytes(rest)));
-    if (pt.isEmpty()) return;
+    const size_t msgPfx = std::strlen(kMsgPrefix);
+    std::string fromId(reinterpret_cast<const char*>(header.data() + msgPfx),
+                       header.size() - msgPfx);
+    fromId = trimmed(fromId);
+    const Bytes peerPub = CryptoEngine::fromBase64Url(fromId);
+    const Bytes pt = m_crypto.aeadDecrypt(m_crypto.deriveSharedKey32(peerPub), rest);
+    if (pt.empty()) return;
 
-    const auto    o    = QJsonDocument::fromJson(pt).object();
-    const QString type = o.value("type").toString();
+    const json o = json::parse(pt.begin(), pt.end(),
+                               /*cb=*/nullptr, /*allow_exceptions=*/false);
+    if (!o.is_object()) return;
+    const std::string type = o.value("type", std::string());
 
     // S9 fix: Legacy receive path — only accept ICE signaling and text.
     // ICE is needed for P2P bootstrapping before a sealed session exists.
@@ -1670,136 +1633,137 @@ void ChatController::onEnvelope(const QByteArray& body)
 #else
     if (type != "text") {
 #endif
-        qWarning() << "[RECV" << via << "] REJECTED legacy" << type
-                   << "from" << fromId.left(8) + "..."
-                   << "— must use sealed path";
+        P2P_WARN("[RECV " << via << "] REJECTED legacy " << type
+                   << " from " << fromId.substr(0, 8) << "..."
+                   << " — must use sealed path");
         return;
     }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[RECV" << via << "] legacy type:" << type << "from" << fromId.left(8) + "...";
-#endif
+    P2P_LOG("[RECV " << via << "] legacy type: " << type << " from " << fromId.substr(0, 8) << "...");
 
     if (type == "text") {
-        const qint64 tsSecs = o.value("ts").toVariant().toLongLong();
+        const int64_t tsSecs = o.value("ts", int64_t(0));
         // L3 fix: Only emit "online" if message is fresh (< 2 min old) or via P2P
         if (via == "P2P" ||
-            (tsSecs > 0 && QDateTime::currentSecsSinceEpoch() - tsSecs < 120))
+            (tsSecs > 0 && nowSecs() - tsSecs < 120))
             if (onPresenceChanged) onPresenceChanged(fromId, true);
-        const QString msgId = o.value("msgId").toString();
-        if (!msgId.isEmpty() && !markSeen(msgId)) return;
-        if (onMessageReceived) onMessageReceived(fromId, o.value("text").toString(),
-                             tsFromSecs(tsSecs), msgId);
+        const std::string msgId = o.value("msgId", std::string());
+        if (!msgId.empty() && !markSeen(msgId)) return;
+        if (onMessageReceived) onMessageReceived(fromId,
+                             o.value("text", std::string()), tsSecs, msgId);
     }
 #ifdef PEER2PEAR_P2P
     else if (type == "ice_offer") {
-        if (m_p2pConnections.contains(fromId) &&
-            m_p2pConnections[fromId]->isReady()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[ICE] Already connected to" << fromId.left(8) + "... — ignoring ice_offer";
-#endif
+        auto it = m_p2pConnections.find(fromId);
+        if (it != m_p2pConnections.end() && it->second->isReady()) {
+            P2P_LOG("[ICE] Already connected to " << fromId.substr(0, 8) << "... — ignoring ice_offer");
         } else {
-            if (!m_p2pConnections.contains(fromId))
+            if (it == m_p2pConnections.end()) {
                 setupP2PConnection(fromId, false);
-            if (o.value("quic").toBool()) {
-                m_p2pConnections[fromId]->setPeerSupportsQuic(
-                    true, o.value("quic_fingerprint").toString());
+                it = m_p2pConnections.find(fromId);
             }
-            m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
+            if (it != m_p2pConnections.end()) {
+                if (o.value("quic", false)) {
+                    it->second->setPeerSupportsQuic(
+                        true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
+                }
+                it->second->setRemoteSdp(
+                    QString::fromStdString(o.value("sdp", std::string())));
+            }
         }
     } else if (type == "ice_answer") {
-        if (m_p2pConnections.contains(fromId) &&
-            !m_p2pConnections[fromId]->isReady()) {
-            if (o.value("quic").toBool()) {
-                m_p2pConnections[fromId]->setPeerSupportsQuic(
-                    true, o.value("quic_fingerprint").toString());
+        auto it = m_p2pConnections.find(fromId);
+        if (it != m_p2pConnections.end() && !it->second->isReady()) {
+            if (o.value("quic", false)) {
+                it->second->setPeerSupportsQuic(
+                    true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
             }
-            m_p2pConnections[fromId]->setRemoteSdp(o.value("sdp").toString());
+            it->second->setRemoteSdp(
+                QString::fromStdString(o.value("sdp", std::string())));
         }
     }
 #endif // PEER2PEAR_P2P
 }
 
-void ChatController::sendGroupRename(const QString& groupId,
-                                     const QString& newName,
-                                     const QStringList& memberKeys)
+void ChatController::sendGroupRename(const std::string& groupId,
+                                     const std::string& newName,
+                                     const std::vector<std::string>& memberKeys)
 {
-    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);  // B5 fix
-    QJsonObject payload;
+    const std::string msgId = p2p::makeUuid();  // B5 fix
+    json payload = json::object();
     payload["from"]    = myIdB64u();
     payload["type"]    = "group_rename";
     payload["groupId"] = groupId;
     payload["newName"] = newName;
-    payload["msgId"]   = msgId;                                   // B5 fix
-    payload["ts"]      = QDateTime::currentSecsSinceEpoch();      // B5 fix
-    for (const QString &key : memberKeys)
+    payload["msgId"]   = msgId;                              // B5 fix
+    payload["ts"]      = nowSecs();                           // B5 fix
+    for (const std::string& key : memberKeys)
         sendSealedPayload(key, payload);   // S7 fix
 }
 
-void ChatController::sendGroupAvatar(const QString& groupId,
-                                     const QString& avatarB64,
-                                     const QStringList& memberKeys)
+void ChatController::sendGroupAvatar(const std::string& groupId,
+                                     const std::string& avatarB64,
+                                     const std::vector<std::string>& memberKeys)
 {
-    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);  // B5 fix
-    QJsonObject payload;
+    const std::string msgId = p2p::makeUuid();  // B5 fix
+    json payload = json::object();
     payload["from"]    = myIdB64u();
     payload["type"]    = "group_avatar";
     payload["groupId"] = groupId;
     payload["avatar"]  = avatarB64;
-    payload["msgId"]   = msgId;                                   // B5 fix
-    payload["ts"]      = QDateTime::currentSecsSinceEpoch();      // B5 fix
-    for (const QString &key : memberKeys)
+    payload["msgId"]   = msgId;                              // B5 fix
+    payload["ts"]      = nowSecs();                          // B5 fix
+    for (const std::string& key : memberKeys)
         sendSealedPayload(key, payload);   // S7 fix
 }
 
-void ChatController::sendGroupMemberUpdate(const QString& groupId,
-                                           const QString& groupName,
-                                           const QStringList& memberKeys)
+void ChatController::sendGroupMemberUpdate(const std::string& groupId,
+                                           const std::string& groupName,
+                                           const std::vector<std::string>& memberKeys)
 {
-    const QString myId = myIdB64u();
-    const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);  // B5 fix
+    const std::string myId = myIdB64u();
+    const std::string msgId = p2p::makeUuid();  // B5 fix
 
     // Build the member array (excluding self, matching group_msg format)
-    QJsonArray membersArray;
-    for (const QString &key : memberKeys) {
-        if (key.trimmed() == myId) continue;
-        membersArray.append(key);
+    json membersArray = json::array();
+    for (const std::string& key : memberKeys) {
+        if (trimmed(key) == myId) continue;
+        membersArray.push_back(key);
     }
 
     // Send to ALL members (including newly added ones) so everyone gets
     // the updated member list and new members discover the group.
-    for (const QString &peerId : memberKeys) {
-        if (peerId.trimmed().isEmpty() || peerId.trimmed() == myId) continue;
+    for (const std::string& peerIdRaw : memberKeys) {
+        const std::string peerId = trimmed(peerIdRaw);
+        if (peerId.empty() || peerId == myId) continue;
 
-        QJsonObject payload;
+        json payload = json::object();
         payload["from"]      = myId;
         payload["type"]      = "group_member_update";
         payload["groupId"]   = groupId;
         payload["groupName"] = groupName;
         payload["members"]   = membersArray;
-        payload["msgId"]     = msgId;                              // B5 fix
-        payload["ts"]        = QDateTime::currentSecsSinceEpoch();
+        payload["msgId"]     = msgId;                       // B5 fix
+        payload["ts"]        = nowSecs();
 
         sendSealedPayload(peerId, payload);
     }
 }
 
 // ── G3: Reset encrypted session ──────────────────────────────────────────────
-void ChatController::resetSession(const QString& peerIdB64u)
+void ChatController::resetSession(const std::string& peerIdB64u)
 {
     if (m_sessionMgr) {
-        m_sessionMgr->deleteSession(peerIdB64u.toStdString());
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SESSION] Reset ratchet session for" << peerIdB64u.left(8) + "...";
-#endif
+        m_sessionMgr->deleteSession(peerIdB64u);
+        P2P_LOG("[SESSION] Reset ratchet session for " << peerIdB64u.substr(0, 8) << "...");
         if (onStatus) onStatus("Session reset — next message will establish a fresh handshake.");
     }
 }
 
 // ── GAP5: Group sequence counter persistence ────────────────────────────────
 
-void ChatController::setGroupSeqCounters(const QMap<QString, qint64>& seqOut,
-                                          const QMap<QString, qint64>& seqIn)
+void ChatController::setGroupSeqCounters(const std::map<std::string, int64_t>& seqOut,
+                                          const std::map<std::string, int64_t>& seqIn)
 {
     m_groupSeqOut = seqOut;
     m_groupSeqIn  = seqIn;
@@ -1807,18 +1771,18 @@ void ChatController::setGroupSeqCounters(const QMap<QString, qint64>& seqOut,
 
 // ── Fix #20: group-membership authorization ──────────────────────────────────
 
-void ChatController::setKnownGroupMembers(const QString& groupId,
-                                           const QStringList& members)
+void ChatController::setKnownGroupMembers(const std::string& groupId,
+                                           const std::vector<std::string>& members)
 {
-    if (groupId.isEmpty()) return;
-    m_groupMembers[groupId] = QSet<QString>(members.begin(), members.end());
-    m_groupBootstrapNeeded.remove(groupId);
+    if (groupId.empty()) return;
+    m_groupMembers[groupId] = std::set<std::string>(members.begin(), members.end());
+    m_groupBootstrapNeeded.erase(groupId);
 }
 
-bool ChatController::isAuthorizedGroupSender(const QString& gid,
-                                              const QString& peerId) const
+bool ChatController::isAuthorizedGroupSender(const std::string& gid,
+                                              const std::string& peerId) const
 {
-    if (gid.isEmpty() || peerId.isEmpty()) return false;
+    if (gid.empty() || peerId.empty()) return false;
     auto it = m_groupMembers.find(gid);
     if (it == m_groupMembers.end()) {
         // First time we've seen this group — no persisted roster from the
@@ -1828,27 +1792,27 @@ bool ChatController::isAuthorizedGroupSender(const QString& gid,
         // group_msg races behind a group_rename will be silently dropped.
         return true;
     }
-    return it->contains(peerId);
+    return it->second.count(peerId) != 0;
 }
 
 // ---------------------------
 // Post-Quantum KEM pub exchange
 // ---------------------------
 
-QByteArray ChatController::lookupPeerKemPub(const QString& peerIdB64u)
+Bytes ChatController::lookupPeerKemPub(const std::string& peerIdB64u)
 {
     // Check in-memory cache first
     auto it = m_peerKemPubs.find(peerIdB64u);
-    if (it != m_peerKemPubs.end()) return it.value();
+    if (it != m_peerKemPubs.end()) return it->second;
 
     // Load from DB
     if (!m_dbPtr || !m_dbPtr->isOpen()) return {};
     SqlCipherQuery q(m_dbPtr->handle());
     q.prepare("SELECT kem_pub FROM contacts WHERE peer_id=:pid;");
-    q.bindValue(":pid", peerIdB64u.toStdString());
+    q.bindValue(":pid", peerIdB64u);
     if (q.exec() && q.next()) {
-        QByteArray pub = p2p::bridge::toQByteArray(q.valueBlob(0));
-        if (!pub.isEmpty()) {
+        Bytes pub = q.valueBlob(0);
+        if (!pub.empty()) {
             m_peerKemPubs[peerIdB64u] = pub;
             return pub;
         }
@@ -1856,22 +1820,20 @@ QByteArray ChatController::lookupPeerKemPub(const QString& peerIdB64u)
     return {};
 }
 
-void ChatController::announceKemPub(const QString& peerIdB64u)
+void ChatController::announceKemPub(const std::string& peerIdB64u)
 {
     if (!m_crypto.hasPQKeys()) return;
     if (!m_sessionMgr) return;
-    if (m_kemPubAnnounced.contains(peerIdB64u)) return;  // already sent this session
+    if (m_kemPubAnnounced.count(peerIdB64u)) return;  // already sent this session
 
     m_kemPubAnnounced.insert(peerIdB64u);
 
-    QJsonObject payload;
+    json payload = json::object();
     payload["from"] = myIdB64u();
     payload["type"] = "kem_pub_announce";
-    payload["kem_pub_b64u"] = QString::fromStdString(CryptoEngine::toBase64Url(m_crypto.kemPub()));
-    payload["ts"] = QDateTime::currentSecsSinceEpoch();
+    payload["kem_pub_b64u"] = CryptoEngine::toBase64Url(m_crypto.kemPub());
+    payload["ts"] = nowSecs();
 
     sendSealedPayload(peerIdB64u, payload);
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[PQ] Announced ML-KEM-768 pub to" << peerIdB64u.left(8) + "...";
-#endif
+    P2P_LOG("[PQ] Announced ML-KEM-768 pub to " << peerIdB64u.substr(0, 8) << "...");
 }

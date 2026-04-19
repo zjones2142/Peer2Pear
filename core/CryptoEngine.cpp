@@ -12,7 +12,7 @@
 
 // QDebug is kept temporarily for logging parity with the rest of core/.
 // Will be replaced by a tiny logging abstraction in a later phase.
-#include <QDebug>
+#include "log.hpp"
 
 // Platform-default data directory resolution.
 // On desktop builds we use QStandardPaths to match prior behavior; mobile
@@ -302,11 +302,9 @@ bool CryptoEngine::loadIdentityFromDisk() {
         }
     }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[CryptoEngine] Identity loaded from:" << QString::fromStdString(path)
+    P2P_LOG("[CryptoEngine] Identity loaded from:" << path
              << "| KEM:" << (hasPQKeys() ? "yes" : "no")
-             << "| DSA:" << (hasDSAKeys() ? "yes" : "no");
-#endif
+             << "| DSA:" << (hasDSAKeys() ? "yes" : "no"));
 
     return true;
 }
@@ -350,8 +348,8 @@ bool CryptoEngine::loadIdentityFromDisk(const Bytes& identityKey) {
                 fromBase64Url(jstr(kemEnc, "nonce_b64u")),
                 fromBase64Url(jstr(kemEnc, "ct_b64u")));
             if (m_kemPriv.empty() && !m_kemPub.empty())
-                qWarning() << "[CryptoEngine] v5 ML-KEM-768 private key decryption failed"
-                           << "— falling back to classical-only crypto";
+                P2P_WARN("[CryptoEngine] v5 ML-KEM-768 private key decryption failed"
+                           << "— falling back to classical-only crypto");
         }
         // DSA
         if (doc.contains("dsa_pub_b64u")) {
@@ -361,15 +359,13 @@ bool CryptoEngine::loadIdentityFromDisk(const Bytes& identityKey) {
                 fromBase64Url(jstr(dsaEnc, "nonce_b64u")),
                 fromBase64Url(jstr(dsaEnc, "ct_b64u")));
             if (m_dsaPriv.empty() && !m_dsaPub.empty())
-                qWarning() << "[CryptoEngine] v5 ML-DSA-65 private key decryption failed"
-                           << "— signatures will use Ed25519 only";
+                P2P_WARN("[CryptoEngine] v5 ML-DSA-65 private key decryption failed"
+                           << "— signatures will use Ed25519 only");
         }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[CryptoEngine] Identity v5 loaded from:" << QString::fromStdString(path)
+        P2P_LOG("[CryptoEngine] Identity v5 loaded from:" << path
                  << "| KEM:" << (hasPQKeys() ? "yes" : "no")
-                 << "| DSA:" << (hasDSAKeys() ? "yes" : "no");
-#endif
+                 << "| DSA:" << (hasDSAKeys() ? "yes" : "no"));
         return true;
     }
 
@@ -379,10 +375,10 @@ bool CryptoEngine::loadIdentityFromDisk(const Bytes& identityKey) {
     secureZero(m_passphrase);
 
     if (saveIdentityToDisk(identityKey)) {
-        qDebug() << "[CryptoEngine] Migrated identity.json v" << version << "→ v5";
+        P2P_LOG("[CryptoEngine] Migrated identity.json v" << version << "→ v5");
     } else {
-        qWarning() << "[CryptoEngine] identity.json migration to v5 failed"
-                    << "— will retry next launch";
+        P2P_WARN("[CryptoEngine] identity.json migration to v5 failed"
+                    << "— will retry next launch");
     }
     return true;
 }
@@ -463,9 +459,7 @@ bool CryptoEngine::saveIdentityToDisk() const {
     f.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
     f.close();
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[CryptoEngine] Identity saved to:" << QString::fromStdString(path);
-#endif
+    P2P_LOG("[CryptoEngine] Identity saved to:" << path);
     return true;
 }
 
@@ -553,9 +547,7 @@ bool CryptoEngine::saveIdentityToDisk(const Bytes& identityKey) const {
     f.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
     f.close();
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[CryptoEngine] Identity v5 saved to:" << QString::fromStdString(path);
-#endif
+    P2P_LOG("[CryptoEngine] Identity v5 saved to:" << path);
     return true;
 }
 
@@ -764,7 +756,7 @@ void CryptoEngine::ensurePQKeys() {
     if (!hasPQKeys()) {
         auto [pub, priv] = generateKemKeypair();
         if (pub.empty()) {
-            qWarning() << "[CryptoEngine] Failed to generate ML-KEM-768 keypair";
+            P2P_WARN("[CryptoEngine] Failed to generate ML-KEM-768 keypair");
             return;
         }
         m_kemPub  = pub;
@@ -776,7 +768,7 @@ void CryptoEngine::ensurePQKeys() {
     if (!hasDSAKeys()) {
         auto [pub, priv] = generateDsaKeypair();
         if (pub.empty()) {
-            qWarning() << "[CryptoEngine] Failed to generate ML-DSA-65 keypair";
+            P2P_WARN("[CryptoEngine] Failed to generate ML-DSA-65 keypair");
         } else {
             m_dsaPub  = pub;
             m_dsaPriv = priv;
@@ -787,12 +779,10 @@ void CryptoEngine::ensurePQKeys() {
 
     if (changed) {
         if (saveIdentityToDisk()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[CryptoEngine] PQ keys generated and persisted"
-                     << "| KEM:" << hasPQKeys() << "| DSA:" << hasDSAKeys();
-#endif
+            P2P_LOG("[CryptoEngine] PQ keys generated and persisted"
+                     << "| KEM:" << hasPQKeys() << "| DSA:" << hasDSAKeys());
         } else {
-            qWarning() << "[CryptoEngine] Failed to persist PQ keys";
+            P2P_WARN("[CryptoEngine] Failed to persist PQ keys");
         }
     }
 }
@@ -805,7 +795,7 @@ void CryptoEngine::ensurePQKeys(const Bytes& identityKey) {
     if (!hasPQKeys()) {
         auto [pub, priv] = generateKemKeypair();
         if (pub.empty()) {
-            qWarning() << "[CryptoEngine] Failed to generate ML-KEM-768 keypair";
+            P2P_WARN("[CryptoEngine] Failed to generate ML-KEM-768 keypair");
             return;
         }
         m_kemPub  = pub;
@@ -817,7 +807,7 @@ void CryptoEngine::ensurePQKeys(const Bytes& identityKey) {
     if (!hasDSAKeys()) {
         auto [pub, priv] = generateDsaKeypair();
         if (pub.empty()) {
-            qWarning() << "[CryptoEngine] Failed to generate ML-DSA-65 keypair";
+            P2P_WARN("[CryptoEngine] Failed to generate ML-DSA-65 keypair");
         } else {
             m_dsaPub  = pub;
             m_dsaPriv = priv;
@@ -828,12 +818,10 @@ void CryptoEngine::ensurePQKeys(const Bytes& identityKey) {
 
     if (changed) {
         if (saveIdentityToDisk(identityKey)) {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[CryptoEngine] PQ keys generated and persisted (v5)"
-                     << "| KEM:" << hasPQKeys() << "| DSA:" << hasDSAKeys();
-#endif
+            P2P_LOG("[CryptoEngine] PQ keys generated and persisted (v5)"
+                     << "| KEM:" << hasPQKeys() << "| DSA:" << hasDSAKeys());
         } else {
-            qWarning() << "[CryptoEngine] Failed to persist PQ keys (v5)";
+            P2P_WARN("[CryptoEngine] Failed to persist PQ keys (v5)");
         }
     }
 }
@@ -1061,7 +1049,7 @@ bool CryptoEngine::verifySignature(const Bytes& sig, const Bytes& message,
 
 Bytes CryptoEngine::deriveMasterKey(const std::string& passphrase, const Bytes& salt) {
     if (salt.size() != crypto_pwhash_SALTBYTES) {
-        qWarning() << "deriveMasterKey: invalid salt size" << int(salt.size());
+        P2P_WARN("deriveMasterKey: invalid salt size" << int(salt.size()));
         return {};
     }
 
@@ -1089,7 +1077,7 @@ Bytes CryptoEngine::deriveMasterKey(const std::string& passphrase, const Bytes& 
             crypto_pwhash_ALG_ARGON2ID13) != 0) {
         secureZero(passCopy);
         secureZero(masterKey);
-        qWarning() << "deriveMasterKey: Argon2id failed (out of memory?)";
+        P2P_WARN("deriveMasterKey: Argon2id failed (out of memory?)");
         return {};
     }
 
@@ -1125,15 +1113,15 @@ Bytes CryptoEngine::loadOrCreateSalt(const std::string& path) {
     if (fs::exists(path)) {
         Bytes salt = readAll(path);
         if (salt.size() == expectedSize) return salt;
-        qWarning() << "loadOrCreateSalt: primary salt file corrupt (size"
-                    << int(salt.size()) << "expected" << int(expectedSize) << ")";
+        P2P_WARN("loadOrCreateSalt: primary salt file corrupt (size"
+                    << int(salt.size()) << "expected" << int(expectedSize) << ")");
     }
 
     // Try backup salt file (recovery from corruption)
     if (fs::exists(backupPath)) {
         Bytes salt = readAll(backupPath);
         if (salt.size() == expectedSize) {
-            qWarning() << "loadOrCreateSalt: recovered salt from backup";
+            P2P_WARN("loadOrCreateSalt: recovered salt from backup");
             writeAll(path, salt);
             return salt;
         }
@@ -1141,10 +1129,10 @@ Bytes CryptoEngine::loadOrCreateSalt(const std::string& path) {
 
     // Both files missing-or-corrupt?
     if (fs::exists(path)) {
-        qCritical() << "loadOrCreateSalt: salt file corrupt with no backup!"
+        P2P_CRITICAL("loadOrCreateSalt: salt file corrupt with no backup!"
                      << "Cannot derive the correct encryption key."
-                     << "Delete" << QString::fromStdString(path)
-                     << "and the database to start fresh.";
+                     << "Delete" << path
+                     << "and the database to start fresh.");
         return {};
     }
 
@@ -1157,7 +1145,7 @@ Bytes CryptoEngine::loadOrCreateSalt(const std::string& path) {
     fs::create_directories(fs::path(path).parent_path(), ec);
 
     if (!writeAll(path, salt))
-        qWarning() << "loadOrCreateSalt: failed to write salt file:" << QString::fromStdString(path);
+        P2P_WARN("loadOrCreateSalt: failed to write salt file:" << path);
     writeAll(backupPath, salt);
 
     return salt;

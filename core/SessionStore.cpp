@@ -3,7 +3,7 @@
 #include <chrono>
 #include <cstring>
 
-#include <QDebug>  // TEMP: logging parity with rest of core/; Phase 7 replaces.
+#include "log.hpp"
 
 namespace {
 
@@ -116,7 +116,7 @@ void SessionStore::saveSession(const std::string& peerId, const Bytes& stateBlob
     q.bindValue(":blob", encryptBlob(stateBlob));
     q.bindValue(":now", now);
     if (!q.exec())
-        qWarning() << "SessionStore::saveSession:" << QString::fromStdString(q.lastError());
+        P2P_WARN("SessionStore::saveSession: " << q.lastError());
 }
 
 SessionStore::Bytes SessionStore::loadSession(const std::string& peerId) const {
@@ -143,9 +143,7 @@ void SessionStore::clearAll() {
     SqlCipherQuery q(m_db);
     q.exec("DELETE FROM ratchet_sessions;");
     q.exec("DELETE FROM pending_handshakes;");
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[SessionStore] Cleared all sessions, skipped keys, and pending handshakes";
-#endif
+    P2P_LOG("[SessionStore] Cleared all sessions, skipped keys, and pending handshakes");
 }
 
 // ---------------------------
@@ -167,7 +165,7 @@ void SessionStore::savePendingHandshake(const std::string& peerId, int role,
     q.bindValue(":blob", encryptBlob(handshakeBlob));
     q.bindValue(":now", now);
     if (!q.exec())
-        qWarning() << "SessionStore::savePendingHandshake:" << QString::fromStdString(q.lastError());
+        P2P_WARN("SessionStore::savePendingHandshake: " << q.lastError());
 }
 
 SessionStore::Bytes SessionStore::loadPendingHandshake(const std::string& peerId,
@@ -209,9 +207,7 @@ std::vector<std::string> SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
         q.prepare("DELETE FROM pending_handshakes WHERE created_at < :cutoff;");
         q.bindValue(":cutoff", cutoff);
         q.exec();
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionStore] Pruned" << int(pruned.size()) << "stale pending handshakes";
-#endif
+        P2P_LOG("[SessionStore] Pruned " << int(pruned.size()) << " stale pending handshakes");
     }
     return pruned;
 }

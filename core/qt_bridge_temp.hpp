@@ -36,14 +36,6 @@ inline QByteArray toQByteArray(const Bytes& b) {
                       static_cast<int>(b.size()));
 }
 
-// Tag a C string literal as a Bytes buffer — handy for ad-hoc domain strings
-// passed into HKDF / keyed-hash calls during the Qt-strip transition.
-inline Bytes strBytes(const char* s) {
-    const size_t n = std::strlen(s);
-    return Bytes(reinterpret_cast<const uint8_t*>(s),
-                 reinterpret_cast<const uint8_t*>(s) + n);
-}
-
 // Wipe-in-place helpers that accept Qt types.  CryptoEngine::secureZero
 // only takes Bytes/std::string now; these are the Qt-caller equivalents.
 inline void secureZeroQ(QByteArray& buf) {

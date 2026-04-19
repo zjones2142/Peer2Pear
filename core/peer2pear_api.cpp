@@ -17,19 +17,14 @@
 #include "SqlCipherDb.hpp"
 #include "SessionStore.hpp"
 
-#include <QCoreApplication>
-#include <QByteArray>
-#include <QString>
-#include <QUrl>
-#include <QMap>
-#include <QDateTime>
-#include <QStringList>
-#include <QTimer>
-
-#include <string>
-#include <map>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <string>
+#include <thread>
 
 // ── CWebSocket: IWebSocket backed by C function pointers ────────────────────
 
@@ -172,37 +167,93 @@ private:
     std::map<int, Callback> m_pending;
 };
 
-// ── Timer factory: Qt-based for now; Phase 8 routes through platform cbs. ──
+// ── StdTimer / StdTimerFactory: thread-based, no Qt dependency. ────────────
 //
-// peer2pear_api currently links Qt::Core (core/CMakeLists still depends on
-// it).  When that drops and iOS builds start, this factory is replaced by
-// a CTimerFactory that calls platform-provided scheduling functions via
-// p2p_platform.  Kept inline here so there's exactly one place to swap.
+// The C API hosts (iOS, Android, generic) don't have a Qt event loop.  These
+// timers spawn a worker thread per timer that sleeps until the deadline (or
+// a cancellation signal arrives) and then fires the callback.
+//
+// **Threading caveat:** callbacks fire on the timer's worker thread, not on
+// any host main thread.  ChatController's maintenance routine (the only
+// internal user) reads/writes m_envelopeCount, m_handshakeFailCount, etc.
+// while the relay's WebSocket callbacks may also be touching them on
+// whatever thread the host's WS impl runs on.  This is acceptable because:
+//   1. The desktop binary does NOT route through this C API — it uses
+//      QtTimerFactory directly (desktop/QtTimer.hpp), which keeps everything
+//      on the Qt main thread.
+//   2. Mobile hosts (iOS/Android) typically marshal all p2p_* callbacks back
+//      to their main/UI thread before invoking them, so the host's
+//      observable behavior is single-threaded.
+//   3. The internal racy fields (envelope counters, fail counters) are
+//      tolerant of dirty reads — worst case is a missed reset cycle.
+//
+// Phase 8 will likely add a host-provided "post to event loop" hook so
+// callbacks are guaranteed to fire on a known thread.  For now, this is
+// good enough to get iOS linking and running smoke tests.
 
-class QtApiTimer : public ITimer {
+class StdTimer : public ITimer {
 public:
-    QtApiTimer() {
-        m_t.setSingleShot(true);
-        QObject::connect(&m_t, &QTimer::timeout, &m_t, [this]() {
-            if (m_cb) m_cb();
+    StdTimer() = default;
+    ~StdTimer() override { cancelAndJoin(); }
+
+    StdTimer(const StdTimer&) = delete;
+    StdTimer& operator=(const StdTimer&) = delete;
+
+    void startSingleShot(int delayMs, std::function<void()> cb) override {
+        cancelAndJoin();
+        {
+            std::lock_guard<std::mutex> lk(m_mu);
+            m_canceled = false;
+            m_active = true;
+        }
+        m_thread = std::thread([this, delayMs, cb = std::move(cb)]() {
+            std::unique_lock<std::mutex> lk(m_mu);
+            // wait_for(predicate) returns true if the predicate became true,
+            // false if the timeout elapsed without it.  We want to fire on
+            // timeout, skip on cancel.
+            const bool gotCancel = m_cv.wait_for(
+                lk, std::chrono::milliseconds(delayMs),
+                [this] { return m_canceled; });
+            const bool fire = !gotCancel;
+            m_active = false;
+            lk.unlock();
+            if (fire && cb) cb();
         });
     }
-    void startSingleShot(int delayMs, std::function<void()> cb) override {
-        m_cb = std::move(cb);
-        m_t.start(delayMs);
+
+    void stop() override { cancelAndJoin(); }
+
+    bool isActive() const override {
+        std::lock_guard<std::mutex> lk(m_mu);
+        return m_active;
     }
-    void stop() override { m_t.stop(); m_cb = {}; }
-    bool isActive() const override { return m_t.isActive(); }
+
 private:
-    QTimer m_t;
-    std::function<void()> m_cb;
+    void cancelAndJoin() {
+        {
+            std::lock_guard<std::mutex> lk(m_mu);
+            m_canceled = true;
+        }
+        m_cv.notify_all();
+        if (m_thread.joinable()) m_thread.join();
+    }
+
+    mutable std::mutex      m_mu;
+    std::condition_variable m_cv;
+    bool                    m_canceled = false;
+    bool                    m_active   = false;
+    std::thread             m_thread;
 };
 
-class QtApiTimerFactory : public ITimerFactory {
+class StdTimerFactory : public ITimerFactory {
 public:
-    std::unique_ptr<ITimer> create() override { return std::make_unique<QtApiTimer>(); }
+    std::unique_ptr<ITimer> create() override { return std::make_unique<StdTimer>(); }
     void singleShot(int delayMs, std::function<void()> cb) override {
-        QTimer::singleShot(delayMs, [cb = std::move(cb)]() { if (cb) cb(); });
+        // Fire-and-forget detached worker.  Same threading caveat as StdTimer.
+        std::thread([delayMs, cb = std::move(cb)]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            if (cb) cb();
+        }).detach();
     }
 };
 
@@ -211,7 +262,7 @@ public:
 struct p2p_context {
     CWebSocket        ws;
     CHttpClient       http;
-    QtApiTimerFactory timers;
+    StdTimerFactory   timers;
     ChatController    controller;
 
     // Scratch buffer for returning strings (valid until next call)
@@ -257,7 +308,7 @@ struct p2p_context {
         void* file_blocked_ud = nullptr;
     } cb;
 
-    QString dataDir;
+    std::string dataDir;
 
     p2p_context(p2p_platform platform)
         : ws(platform)
@@ -268,135 +319,98 @@ struct p2p_context {
 
 // ── Helper: assign ChatController callbacks → C FFI callbacks ──────────────
 //
-// ChatController is a plain class now (Phase 7b); direct assignment replaces
-// QObject::connect.  The callback signatures are still Qt-typed at this
-// layer (QString/QDateTime); the Qt-free conversion happens when
-// ChatController's signatures migrate to std types in a future pass.
+// ChatController is a plain class with std-typed callbacks (Phase 7c).
+// Each lambda just forwards arguments to the matching C function pointer.
 
 static void wire_signals(p2p_context* ctx)
 {
     auto& c = ctx->controller;
 
-    c.onStatus = [ctx](const QString& s) {
-        if (ctx->cb.on_status) {
-            const QByteArray u = s.toUtf8();
-            ctx->cb.on_status(u.constData(), ctx->cb.status_ud);
-        }
+    c.onStatus = [ctx](const std::string& s) {
+        if (ctx->cb.on_status)
+            ctx->cb.on_status(s.c_str(), ctx->cb.status_ud);
     };
 
     c.onRelayConnected = [ctx]() {
         if (ctx->cb.on_connected) ctx->cb.on_connected(ctx->cb.connected_ud);
     };
 
-    c.onPresenceChanged = [ctx](const QString& peerId, bool online) {
-        if (ctx->cb.on_presence) {
-            const QByteArray id = peerId.toUtf8();
-            ctx->cb.on_presence(id.constData(), online ? 1 : 0, ctx->cb.presence_ud);
-        }
+    c.onPresenceChanged = [ctx](const std::string& peerId, bool online) {
+        if (ctx->cb.on_presence)
+            ctx->cb.on_presence(peerId.c_str(), online ? 1 : 0, ctx->cb.presence_ud);
     };
 
-    c.onMessageReceived = [ctx](const QString& from, const QString& text,
-                                 const QDateTime& ts, const QString& msgId) {
-        if (ctx->cb.on_message) {
-            const QByteArray f = from.toUtf8();
-            const QByteArray t = text.toUtf8();
-            const QByteArray m = msgId.toUtf8();
-            ctx->cb.on_message(f.constData(), t.constData(),
-                               ts.toSecsSinceEpoch(), m.constData(),
+    c.onMessageReceived = [ctx](const std::string& from, const std::string& text,
+                                 int64_t tsSecs, const std::string& msgId) {
+        if (ctx->cb.on_message)
+            ctx->cb.on_message(from.c_str(), text.c_str(),
+                               tsSecs, msgId.c_str(),
                                ctx->cb.message_ud);
-        }
     };
 
-    c.onGroupMessageReceived = [ctx](const QString& from, const QString& groupId,
-                                      const QString& groupName,
-                                      const QStringList& memberKeys,
-                                      const QString& text, const QDateTime& ts,
-                                      const QString& msgId) {
+    c.onGroupMessageReceived = [ctx](const std::string& from, const std::string& groupId,
+                                      const std::string& groupName,
+                                      const std::vector<std::string>& memberKeys,
+                                      const std::string& text, int64_t tsSecs,
+                                      const std::string& msgId) {
         if (ctx->cb.on_group_message) {
-            const QByteArray f = from.toUtf8();
-            const QByteArray gid = groupId.toUtf8();
-            const QByteArray gn = groupName.toUtf8();
-            const QByteArray t = text.toUtf8();
-            const QByteArray m = msgId.toUtf8();
-
-            std::vector<QByteArray> memberBufs;
             std::vector<const char*> memberPtrs;
-            for (const QString& k : memberKeys) {
-                memberBufs.push_back(k.toUtf8());
-                memberPtrs.push_back(memberBufs.back().constData());
-            }
+            memberPtrs.reserve(memberKeys.size() + 1);
+            for (const std::string& k : memberKeys) memberPtrs.push_back(k.c_str());
             memberPtrs.push_back(nullptr);
 
             ctx->cb.on_group_message(
-                f.constData(), gid.constData(), gn.constData(),
-                memberPtrs.data(), t.constData(),
-                ts.toSecsSinceEpoch(), m.constData(),
+                from.c_str(), groupId.c_str(), groupName.c_str(),
+                memberPtrs.data(), text.c_str(),
+                tsSecs, msgId.c_str(),
                 ctx->cb.group_message_ud);
         }
     };
 
-    c.onFileChunkReceived = [ctx](const QString& from, const QString& transferId,
-                                   const QString& fileName, qint64 fileSize,
+    c.onFileChunkReceived = [ctx](const std::string& from, const std::string& transferId,
+                                   const std::string& fileName, int64_t fileSize,
                                    int chunksRcvd, int chunksTotal,
-                                   const QString& savedPath, const QDateTime& ts,
-                                   const QString&, const QString&) {
+                                   const std::string& savedPath, int64_t tsSecs,
+                                   const std::string&, const std::string&) {
         if (ctx->cb.on_file_progress) {
-            const QByteArray f = from.toUtf8();
-            const QByteArray tid = transferId.toUtf8();
-            const QByteArray fn = fileName.toUtf8();
-            const QByteArray sp = savedPath.toUtf8();
             ctx->cb.on_file_progress(
-                f.constData(), tid.constData(), fn.constData(),
+                from.c_str(), transferId.c_str(), fileName.c_str(),
                 fileSize, chunksRcvd, chunksTotal,
-                savedPath.isEmpty() ? nullptr : sp.constData(),
-                ts.toSecsSinceEpoch(),
+                savedPath.empty() ? nullptr : savedPath.c_str(),
+                tsSecs,
                 ctx->cb.file_progress_ud);
         }
     };
 
-    c.onAvatarReceived = [ctx](const QString& peerId, const QString& name,
-                                const QString& b64) {
-        if (ctx->cb.on_avatar) {
-            const QByteArray p = peerId.toUtf8();
-            const QByteArray n = name.toUtf8();
-            const QByteArray a = b64.toUtf8();
-            ctx->cb.on_avatar(p.constData(), n.constData(), a.constData(),
+    c.onAvatarReceived = [ctx](const std::string& peerId, const std::string& name,
+                                const std::string& b64) {
+        if (ctx->cb.on_avatar)
+            ctx->cb.on_avatar(peerId.c_str(), name.c_str(), b64.c_str(),
                               ctx->cb.avatar_ud);
-        }
     };
 
-    c.onFileAcceptRequested = [ctx](const QString& from, const QString& tid,
-                                     const QString& fileName, qint64 fileSize) {
-        if (ctx->cb.on_file_request) {
-            const QByteArray f  = from.toUtf8();
-            const QByteArray t  = tid.toUtf8();
-            const QByteArray fn = fileName.toUtf8();
-            ctx->cb.on_file_request(f.constData(), t.constData(), fn.constData(),
+    c.onFileAcceptRequested = [ctx](const std::string& from, const std::string& tid,
+                                     const std::string& fileName, int64_t fileSize) {
+        if (ctx->cb.on_file_request)
+            ctx->cb.on_file_request(from.c_str(), tid.c_str(), fileName.c_str(),
                                     fileSize, ctx->cb.file_request_ud);
-        }
     };
 
-    c.onFileTransferCanceled = [ctx](const QString& tid, bool byReceiver) {
-        if (ctx->cb.on_file_canceled) {
-            const QByteArray t = tid.toUtf8();
-            ctx->cb.on_file_canceled(t.constData(), byReceiver ? 1 : 0,
+    c.onFileTransferCanceled = [ctx](const std::string& tid, bool byReceiver) {
+        if (ctx->cb.on_file_canceled)
+            ctx->cb.on_file_canceled(tid.c_str(), byReceiver ? 1 : 0,
                                      ctx->cb.file_canceled_ud);
-        }
     };
 
-    c.onFileTransferDelivered = [ctx](const QString& tid) {
-        if (ctx->cb.on_file_delivered) {
-            const QByteArray t = tid.toUtf8();
-            ctx->cb.on_file_delivered(t.constData(), ctx->cb.file_delivered_ud);
-        }
+    c.onFileTransferDelivered = [ctx](const std::string& tid) {
+        if (ctx->cb.on_file_delivered)
+            ctx->cb.on_file_delivered(tid.c_str(), ctx->cb.file_delivered_ud);
     };
 
-    c.onFileTransferBlocked = [ctx](const QString& tid, bool byReceiver) {
-        if (ctx->cb.on_file_blocked) {
-            const QByteArray t = tid.toUtf8();
-            ctx->cb.on_file_blocked(t.constData(), byReceiver ? 1 : 0,
+    c.onFileTransferBlocked = [ctx](const std::string& tid, bool byReceiver) {
+        if (ctx->cb.on_file_blocked)
+            ctx->cb.on_file_blocked(tid.c_str(), byReceiver ? 1 : 0,
                                     ctx->cb.file_blocked_ud);
-        }
     };
 }
 
@@ -405,11 +419,11 @@ static void wire_signals(p2p_context* ctx)
 p2p_context* p2p_create(const char* data_dir, p2p_platform platform)
 {
     auto* ctx = new p2p_context(platform);
-    ctx->dataDir = QString::fromUtf8(data_dir);
+    ctx->dataDir = data_dir ? data_dir : "";
     // Route identity.json and salt files to the host-provided directory.
     // Without this, iOS/Android would try to read/write to a non-existent
-    // QStandardPaths::AppDataLocation path.
-    if (!ctx->dataDir.isEmpty())
+    // AppDataLocation path.
+    if (!ctx->dataDir.empty())
         ctx->controller.setDataDir(ctx->dataDir);
     wire_signals(ctx);
     return ctx;
@@ -426,20 +440,20 @@ void p2p_destroy(p2p_context* ctx)
 void p2p_set_passphrase(p2p_context* ctx, const char* passphrase)
 {
     if (!ctx) return;
-    ctx->controller.setPassphrase(QString::fromUtf8(passphrase));
+    ctx->controller.setPassphrase(passphrase ? passphrase : "");
 }
 
 const char* p2p_my_id(p2p_context* ctx)
 {
     if (!ctx) return "";
-    ctx->scratch = ctx->controller.myIdB64u().toStdString();
+    ctx->scratch = ctx->controller.myIdB64u();
     return ctx->scratch.c_str();
 }
 
 void p2p_set_relay_url(p2p_context* ctx, const char* url)
 {
     if (!ctx) return;
-    ctx->controller.setRelayUrl(QUrl(QString::fromUtf8(url)));
+    ctx->controller.setRelayUrl(url ? url : "");
 }
 
 void p2p_connect(p2p_context* ctx)
@@ -455,7 +469,7 @@ void p2p_disconnect(p2p_context* ctx)
 int p2p_send_text(p2p_context* ctx, const char* peer_id, const char* text)
 {
     if (!ctx || !peer_id || !text) return -1;
-    ctx->controller.sendText(QString::fromUtf8(peer_id), QString::fromUtf8(text));
+    ctx->controller.sendText(peer_id, text);
     return 0;
 }
 
@@ -466,13 +480,13 @@ int p2p_send_group_text(p2p_context* ctx,
                         const char* text)
 {
     if (!ctx || !group_id || !text || !member_ids) return -1;
-    QStringList members;
+    std::vector<std::string> members;
     for (const char** p = member_ids; *p; ++p)
-        members << QString::fromUtf8(*p);
+        members.emplace_back(*p);
     ctx->controller.sendGroupMessageViaMailbox(
-        QString::fromUtf8(group_id),
-        QString::fromUtf8(group_name ? group_name : ""),
-        members, QString::fromUtf8(text));
+        group_id,
+        group_name ? group_name : "",
+        members, text);
     return 0;
 }
 
@@ -482,12 +496,9 @@ const char* p2p_send_file(p2p_context* ctx,
                           const char* file_path)
 {
     if (!ctx || !peer_id || !file_name || !file_path) return nullptr;
-    QString tid = ctx->controller.sendFile(
-        QString::fromUtf8(peer_id),
-        QString::fromUtf8(file_name),
-        QString::fromUtf8(file_path));
-    if (tid.isEmpty()) return nullptr;
-    ctx->scratch = tid.toStdString();
+    std::string tid = ctx->controller.sendFile(peer_id, file_name, file_path);
+    if (tid.empty()) return nullptr;
+    ctx->scratch = std::move(tid);
     return ctx->scratch.c_str();
 }
 
@@ -499,7 +510,7 @@ void p2p_respond_file_request(p2p_context* ctx,
                               int require_p2p)
 {
     if (!ctx || !transfer_id) return;
-    const QString tid = QString::fromUtf8(transfer_id);
+    const std::string tid = transfer_id;
     if (accept) {
         ctx->controller.acceptFileTransfer(tid, require_p2p != 0);
     } else {
@@ -510,7 +521,7 @@ void p2p_respond_file_request(p2p_context* ctx,
 void p2p_cancel_transfer(p2p_context* ctx, const char* transfer_id)
 {
     if (!ctx || !transfer_id) return;
-    ctx->controller.cancelFileTransfer(QString::fromUtf8(transfer_id));
+    ctx->controller.cancelFileTransfer(transfer_id);
 }
 
 void p2p_set_file_auto_accept_mb(p2p_context* ctx, int mb)
@@ -531,18 +542,20 @@ void p2p_set_file_require_p2p(p2p_context* ctx, int enabled)
 void p2p_check_presence(p2p_context* ctx, const char** peer_ids, int count)
 {
     if (!ctx || !peer_ids) return;
-    QStringList ids;
+    std::vector<std::string> ids;
+    ids.reserve(count);
     for (int i = 0; i < count; i++)
-        if (peer_ids[i]) ids << QString::fromUtf8(peer_ids[i]);
+        if (peer_ids[i]) ids.emplace_back(peer_ids[i]);
     ctx->controller.checkPresence(ids);
 }
 
 void p2p_subscribe_presence(p2p_context* ctx, const char** peer_ids, int count)
 {
     if (!ctx || !peer_ids) return;
-    QStringList ids;
+    std::vector<std::string> ids;
+    ids.reserve(count);
     for (int i = 0; i < count; i++)
-        if (peer_ids[i]) ids << QString::fromUtf8(peer_ids[i]);
+        if (peer_ids[i]) ids.emplace_back(peer_ids[i]);
     ctx->controller.subscribePresence(ids);
 }
 

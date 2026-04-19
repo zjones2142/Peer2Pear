@@ -6,8 +6,7 @@
 // Debug logging uses QDebug temporarily for consistency with the rest of
 // core/.  Phase 7 swaps this for a std::cerr macro alongside the QObject
 // strip.
-#include <QDebug>
-#include <QString>
+#include "log.hpp"
 
 // ─── SqlCipherDb ─────────────────────────────────────────────────────────────
 
@@ -24,7 +23,7 @@ bool SqlCipherDb::open(const std::string& path, const Bytes& key)
                              nullptr);
     if (rc != SQLITE_OK) {
         m_lastError = m_db ? sqlite3_errmsg(m_db) : "sqlite3_open_v2 failed";
-        qWarning() << "SqlCipherDb::open failed";
+        P2P_WARN("SqlCipherDb::open failed");
         sqlite3_close_v2(m_db);
         m_db = nullptr;
         return false;
@@ -37,7 +36,7 @@ bool SqlCipherDb::open(const std::string& path, const Bytes& key)
         rc = sqlite3_key(m_db, key.data(), static_cast<int>(key.size()));
         if (rc != SQLITE_OK) {
             m_lastError = sqlite3_errmsg(m_db);
-            qWarning() << "sqlite3_key failed:" << QString::fromStdString(m_lastError);
+            P2P_WARN("sqlite3_key failed: " << m_lastError);
             close();
             return false;
         }
@@ -60,7 +59,7 @@ bool SqlCipherDb::open(const std::string& path, const Bytes& key)
         if (rc != SQLITE_OK) {
             m_lastError = err ? err : "PRAGMA key failed";
             sqlite3_free(err);
-            qWarning() << "SqlCipherDb: PRAGMA key failed";
+            P2P_WARN("SqlCipherDb: PRAGMA key failed");
             close();
             return false;
         }
@@ -72,7 +71,7 @@ bool SqlCipherDb::open(const std::string& path, const Bytes& key)
         if (rc != SQLITE_OK) {
             m_lastError = verifyErr ? verifyErr : "Key verification failed";
             sqlite3_free(verifyErr);
-            qWarning() << "SqlCipherDb: wrong key or unencrypted database";
+            P2P_WARN("SqlCipherDb: wrong key or unencrypted database");
             close();
             return false;
         }
@@ -87,7 +86,7 @@ bool SqlCipherDb::open(const std::string& path, const Bytes& key)
             const char* ver = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
             if (ver && std::strlen(ver) > 0) {
                 m_isSqlCipher = true;
-                qDebug() << "SqlCipherDb: SQLCipher version" << ver;
+                P2P_LOG("SqlCipherDb: SQLCipher version " << ver);
             }
         }
         sqlite3_finalize(stmt);
@@ -97,7 +96,7 @@ bool SqlCipherDb::open(const std::string& path, const Bytes& key)
         m_lastError =
             "SQLCipher is required but the linked sqlite library is plain sqlite3. "
             "Install SQLCipher and rebuild.";
-        qCritical() << "SqlCipherDb: SQLCipher required but not available";
+        P2P_CRITICAL("SqlCipherDb: SQLCipher required but not available");
         close();
         return false;
     }
@@ -107,9 +106,7 @@ bool SqlCipherDb::open(const std::string& path, const Bytes& key)
     sqlite3_exec(m_db, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
     sqlite3_exec(m_db, "PRAGMA cipher_memory_security=ON;", nullptr, nullptr, nullptr);
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "SqlCipherDb: opened" << QString::fromStdString(path) << "(encrypted)";
-#endif
+    P2P_LOG("SqlCipherDb: opened " << path << " (encrypted)");
     return true;
 }
 

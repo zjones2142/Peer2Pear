@@ -11,43 +11,75 @@
 #include <cstring>
 #include <utility>
 
-// Qt usage is confined to the .cpp — URL manipulation only, via three tiny
-// helpers.  Phase 7 leaves this in place; a pure-std URL helper can replace
-// it later without touching any caller.
-#include <QUrl>
-#include <QDebug>
-#include <QString>
+#include "log.hpp"
 
 using json = nlohmann::json;
 
 namespace {
 
+// Tiny URL parser — handles `scheme://host[:port][/path][?query][#fragment]`.
+// We only support http(s)/ws(s) URLs in well-formed shape.  Path/query/fragment
+// are intentionally discarded by every helper that constructs a new URL — the
+// callers pass in the path they want.
+struct ParsedUrl {
+    std::string scheme;       // "https", "wss", …
+    std::string host;
+    int         port = -1;    // -1 if not specified
+};
+
+ParsedUrl parseUrl(const std::string& url) {
+    ParsedUrl out;
+    auto schemeEnd = url.find("://");
+    if (schemeEnd == std::string::npos) return out;
+    out.scheme = url.substr(0, schemeEnd);
+    auto rest = url.substr(schemeEnd + 3);
+    // Strip path/query/fragment — first '/' '?' '#' wins
+    auto cut = rest.find_first_of("/?#");
+    std::string authority = (cut == std::string::npos) ? rest : rest.substr(0, cut);
+    // Split host[:port]
+    auto colon = authority.find(':');
+    if (colon == std::string::npos) {
+        out.host = authority;
+    } else {
+        out.host = authority.substr(0, colon);
+        try { out.port = std::stoi(authority.substr(colon + 1)); }
+        catch (...) { out.port = -1; }
+    }
+    return out;
+}
+
+std::string buildUrl(const std::string& scheme, const std::string& host,
+                     int port, const std::string& path) {
+    std::string out = scheme + "://" + host;
+    if (port > 0) out += ":" + std::to_string(port);
+    if (!path.empty()) {
+        if (path[0] != '/') out += '/';
+        out += path;
+    }
+    return out;
+}
+
 std::string urlWithPath(const std::string& baseUrl, const std::string& path) {
-    QUrl u(QString::fromStdString(baseUrl));
-    u.setPath(QString::fromStdString(path));
-    return u.toString().toStdString();
+    auto p = parseUrl(baseUrl);
+    return buildUrl(p.scheme, p.host, p.port, path);
 }
 
 std::string baseOf(const std::string& url) {
-    QUrl u(QString::fromStdString(url));
-    return u.toString(QUrl::RemovePath | QUrl::RemoveQuery | QUrl::RemoveFragment)
-        .toStdString();
+    auto p = parseUrl(url);
+    return buildUrl(p.scheme, p.host, p.port, {});
 }
 
 std::string wsUrl(const std::string& baseUrl, const std::string& path) {
-    QUrl u(QString::fromStdString(baseUrl));
-    if      (u.scheme() == "https") u.setScheme("wss");
-    else if (u.scheme() == "http")  u.setScheme("ws");
-    u.setPath(QString::fromStdString(path));
-    return u.toString().toStdString();
+    auto p = parseUrl(baseUrl);
+    if      (p.scheme == "https") p.scheme = "wss";
+    else if (p.scheme == "http")  p.scheme = "ws";
+    return buildUrl(p.scheme, p.host, p.port, path);
 }
 
 std::string hostPort(const std::string& url) {
-    QUrl u(QString::fromStdString(url));
-    const QString host = u.host();
-    if (u.port() > 0)
-        return (host + ":" + QString::number(u.port())).toStdString();
-    return host.toStdString();
+    auto p = parseUrl(url);
+    if (p.port > 0) return p.host + ":" + std::to_string(p.port);
+    return p.host;
 }
 
 int64_t nowMs() {
@@ -55,9 +87,9 @@ int64_t nowMs() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-QString peerPrefix(const std::string& id) {
+std::string peerPrefix(const std::string& id) {
     const size_t n = std::min<size_t>(8, id.size());
-    return QString::fromStdString(id.substr(0, n)) + "…";
+    return id.substr(0, n) + "…";
 }
 
 }  // anonymous namespace
@@ -99,9 +131,7 @@ void RelayClient::connectToRelay()
     m_authenticated = false;
 
     const std::string wsU = wsUrl(m_relayUrl, "/v1/receive");
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Relay] Connecting to" << QString::fromStdString(wsU);
-#endif
+    P2P_LOG("[Relay] Connecting to " << wsU);
     m_ws.open(wsU);
 }
 
@@ -114,9 +144,7 @@ void RelayClient::disconnectFromRelay()
 
 void RelayClient::onWsConnected()
 {
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Relay] WebSocket connected, authenticating...";
-#endif
+    P2P_LOG("[Relay] WebSocket connected, authenticating...");
     m_reconnectAttempt = 0;
     authenticate();
 }
@@ -145,9 +173,7 @@ void RelayClient::onWsDisconnected()
     m_coverTimer->stop();
     m_onlinePeers.clear();
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Relay] WebSocket disconnected";
-#endif
+    P2P_LOG("[Relay] WebSocket disconnected");
 
     if (onDisconnected) onDisconnected();
 
@@ -160,9 +186,7 @@ void RelayClient::scheduleReconnect()
     const int delaySec = std::min(1 << m_reconnectAttempt, kMaxReconnectDelaySec);
     m_reconnectAttempt++;
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Relay] Reconnecting in" << delaySec << "seconds...";
-#endif
+    P2P_LOG("[Relay] Reconnecting in " << delaySec << " seconds...");
     m_reconnectTimer->startSingleShot(delaySec * 1000,
                                        [this] { connectToRelay(); });
 }
@@ -188,10 +212,7 @@ void RelayClient::onWsTextMessage(const std::string& message)
 
     if (type == "auth_ok") {
         m_authenticated = true;
-#ifndef QT_NO_DEBUG_OUTPUT
-        const std::string authedAs = obj.value("peer_id", "");
-        qDebug() << "[Relay] Authenticated as" << peerPrefix(authedAs);
-#endif
+        P2P_LOG("[Relay] Authenticated as " << peerPrefix(obj.value("peer_id", std::string())));
         if (m_coverIntervalSec > 0) scheduleCoverTimer();
         refreshRelayInfo();
         if (onConnected) onConnected();
@@ -560,10 +581,7 @@ void RelayClient::refreshRelayInfo()
             const Bytes pub = CryptoEngine::fromBase64Url(pubB64u);
             if (pub.size() != 32) return;
             m_relayX25519Pubs[cacheKey] = pub;
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[Relay] cached X25519 pub for onion routing:"
-                     << QString::fromStdString(cacheKey);
-#endif
+            P2P_LOG("[Relay] cached X25519 pub for onion routing: " << cacheKey);
         });
     };
     if (!m_relayUrl.empty()) fetchOne(m_relayUrl);

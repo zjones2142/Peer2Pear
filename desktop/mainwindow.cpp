@@ -2,6 +2,7 @@
 #include "./ui_mainwindow.h"
 #include "onboardingdialog.h"
 #include "qt_bridge_temp.hpp"  // TEMP: bridge for CryptoEngine calls
+#include "bytes_util.hpp"      // strBytes helper (Qt-free)
 
 #include <QPixmap>
 #include <QHBoxLayout>
@@ -120,7 +121,7 @@ MainWindow::MainWindow(QWidget *parent)
             // setPassphrase(pass, identityKey) still needs pass for legacy v4
             // migration (deriveKeyFromPassphrase inside loadIdentityFromDisk).
             // Once migrated to v5, the passphrase is never used for identity.
-            m_controller.setPassphrase(pass, identityKey);
+            m_controller.setPassphrase(pass.toStdString(), p2p::bridge::toBytes(identityKey));
             p2p::bridge::secureZeroQ(identityKey);
 
             // ── Open DB with SQLCipher encryption ────────────────────────────
@@ -141,10 +142,17 @@ MainWindow::MainWindow(QWidget *parent)
             //   Gen 2: BLAKE2b(passphrase + "peer2pear-dbkey")
             // decryptField() tries the primary key first, then each legacy
             // key in order until one succeeds.
-            QByteArray legacyGen1 = ChatController::blake2b256(
-                m_controller.myIdB64u().toUtf8() + QByteArray("peer2pear-dbkey"));
-            QByteArray legacyGen2 = ChatController::blake2b256(
-                pass.toUtf8() + QByteArray("peer2pear-dbkey"));
+            // ChatController::blake2b256 now takes Bytes, not QByteArray — build
+            // the legacy key inputs as byte vectors directly.
+            auto bytesConcat = [](const std::string& a, const char* b) {
+                Bytes out(a.begin(), a.end());
+                out.insert(out.end(), b, b + std::strlen(b));
+                return out;
+            };
+            QByteArray legacyGen1 = p2p::bridge::toQByteArray(ChatController::blake2b256(
+                bytesConcat(m_controller.myIdB64u(), "peer2pear-dbkey")));
+            QByteArray legacyGen2 = p2p::bridge::toQByteArray(ChatController::blake2b256(
+                bytesConcat(pass.toStdString(), "peer2pear-dbkey")));
             m_db.setEncryptionKey(fieldKey, {legacyGen2, legacyGen1});
             p2p::bridge::secureZeroQ(fieldKey);
             p2p::bridge::secureZeroQ(legacyGen1);
@@ -154,8 +162,14 @@ MainWindow::MainWindow(QWidget *parent)
             m_controller.setDatabase(m_db.database());
 
             // GAP5: restore persisted group sequence counters
-            m_controller.setGroupSeqCounters(m_db.loadGroupSeqOut(),
-                                              m_db.loadGroupSeqIn());
+            auto qMapToStd = [](const QMap<QString, qint64>& qm) {
+                std::map<std::string, int64_t> out;
+                for (auto it = qm.cbegin(); it != qm.cend(); ++it)
+                    out.emplace(it.key().toStdString(), int64_t(it.value()));
+                return out;
+            };
+            m_controller.setGroupSeqCounters(qMapToStd(m_db.loadGroupSeqOut()),
+                                              qMapToStd(m_db.loadGroupSeqIn()));
 
             p2p::bridge::secureZeroQ(pass);
             break;
@@ -222,7 +236,7 @@ MainWindow::MainWindow(QWidget *parent)
     // yet — edit `SELECT value FROM settings WHERE key='relayUrl';` via
     // SQLCipher, or plumb in a Settings field).
     const QString relayUrl = m_db.loadSetting("relayUrl", "https://peer2pear.com");
-    m_controller.setRelayUrl(QUrl(relayUrl));
+    m_controller.setRelayUrl(relayUrl.toStdString());
 
 #ifdef PEER2PEAR_P2P
     // TURN relay for symmetric NAT fallback — only meaningful when P2P is
@@ -232,13 +246,14 @@ MainWindow::MainWindow(QWidget *parent)
     const QString turnUser = m_db.loadSetting("turnUser", "peer2pear");
     const QString turnPass = m_db.loadSetting("turnPass", "peer2pear");
     if (!turnHost.isEmpty())
-        m_controller.setTurnServer(turnHost, turnPort, turnUser, turnPass);
+        m_controller.setTurnServer(turnHost.toStdString(), turnPort,
+                                    turnUser.toStdString(), turnPass.toStdString());
 #endif
 
     m_controller.connectToRelay();
 
     // ── Profile handle: first 8 chars of public key ───────────────────────────
-    const QString fullKey = m_controller.myIdB64u();
+    const QString fullKey = QString::fromStdString(m_controller.myIdB64u());
     ui->profileHandleLabel->setText(fullKey.left(8) + "…");
     ui->profileHandleLabel->setToolTip(fullKey);
 
@@ -261,7 +276,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_settingsPanel = new SettingsPanel(ui->rootWidget);
     m_settingsPanel->setProfileInfo(m_db.loadSetting("displayName"),
-                                    m_controller.myIdB64u());
+                                    QString::fromStdString(m_controller.myIdB64u()));
     m_settingsPanel->setDatabase(&m_db);
     m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
 
@@ -276,53 +291,72 @@ MainWindow::MainWindow(QWidget *parent)
 
     // ── Wire callbacks ────────────────────────────────────────────────────────
     // ChatController is a plain class (Phase 7b); direct assignment replaces
-    // QObject::connect.  The lambdas just bounce into ChatView's slots on
-    // the main thread — MainWindow owns both halves so lifetimes match.
+    // QObject::connect.  The lambdas bounce into ChatView's slots, converting
+    // std:: types to Qt at the boundary.  MainWindow owns both halves so
+    // lifetimes match.
+    //
+    // Helpers for the std → Qt conversion.  Local lambdas so the intent is
+    // obvious at each site.
+    auto toQ  = [](const std::string& s) { return QString::fromStdString(s); };
+    auto toQL = [](const std::vector<std::string>& v) {
+        QStringList out;
+        out.reserve(int(v.size()));
+        for (const std::string& s : v) out << QString::fromStdString(s);
+        return out;
+    };
+    auto toDT = [](int64_t secs) {
+        return secs > 0
+            ? QDateTime::fromSecsSinceEpoch(secs, QTimeZone::utc()).toLocalTime()
+            : QDateTime::currentDateTime();
+    };
+
     m_controller.onMessageReceived =
-        [cv = m_chatView](const QString& from, const QString& text,
-                          const QDateTime& ts, const QString& msgId) {
-            cv->onIncomingMessage(from, text, ts, msgId);
+        [cv = m_chatView, toQ, toDT](const std::string& from, const std::string& text,
+                                     int64_t tsSecs, const std::string& msgId) {
+            cv->onIncomingMessage(toQ(from), toQ(text), toDT(tsSecs), toQ(msgId));
         };
     m_controller.onStatus =
-        [cv = m_chatView](const QString& s) { cv->onStatus(s); };
+        [cv = m_chatView, toQ](const std::string& s) { cv->onStatus(toQ(s)); };
     m_controller.onGroupMessageReceived =
-        [cv = m_chatView](const QString& from, const QString& gid,
-                          const QString& gn, const QStringList& members,
-                          const QString& text, const QDateTime& ts,
-                          const QString& msgId) {
-            cv->onIncomingGroupMessage(from, gid, gn, members, text, ts, msgId);
+        [cv = m_chatView, toQ, toQL, toDT](const std::string& from, const std::string& gid,
+                                            const std::string& gn, const std::vector<std::string>& members,
+                                            const std::string& text, int64_t tsSecs,
+                                            const std::string& msgId) {
+            cv->onIncomingGroupMessage(toQ(from), toQ(gid), toQ(gn), toQL(members),
+                                        toQ(text), toDT(tsSecs), toQ(msgId));
         };
     m_controller.onGroupMemberLeft =
-        [cv = m_chatView](const QString& from, const QString& gid,
-                          const QString& gn, const QStringList& members,
-                          const QDateTime& ts, const QString& msgId) {
-            cv->onGroupMemberLeft(from, gid, gn, members, ts, msgId);
+        [cv = m_chatView, toQ, toQL, toDT](const std::string& from, const std::string& gid,
+                                            const std::string& gn, const std::vector<std::string>& members,
+                                            int64_t tsSecs, const std::string& msgId) {
+            cv->onGroupMemberLeft(toQ(from), toQ(gid), toQ(gn), toQL(members),
+                                   toDT(tsSecs), toQ(msgId));
         };
     m_controller.onFileChunkReceived =
-        [cv = m_chatView](const QString& from, const QString& tid,
-                          const QString& fn, qint64 fsize,
-                          int rcvd, int total, const QString& saved,
-                          const QDateTime& ts, const QString& gid,
-                          const QString& gn) {
-            cv->onFileChunkReceived(from, tid, fn, fsize, rcvd, total,
-                                     saved, ts, gid, gn);
+        [cv = m_chatView, toQ, toDT](const std::string& from, const std::string& tid,
+                                     const std::string& fn, int64_t fsize,
+                                     int rcvd, int total, const std::string& saved,
+                                     int64_t tsSecs, const std::string& gid,
+                                     const std::string& gn) {
+            cv->onFileChunkReceived(toQ(from), toQ(tid), toQ(fn), fsize, rcvd, total,
+                                     toQ(saved), toDT(tsSecs), toQ(gid), toQ(gn));
         };
     m_controller.onPresenceChanged =
-        [cv = m_chatView](const QString& peerId, bool online) {
-            cv->onPresenceChanged(peerId, online);
+        [cv = m_chatView, toQ](const std::string& peerId, bool online) {
+            cv->onPresenceChanged(toQ(peerId), online);
         };
     m_controller.onAvatarReceived =
-        [cv = m_chatView](const QString& peerId, const QString& name,
-                          const QString& b64) {
-            cv->onAvatarReceived(peerId, name, b64);
+        [cv = m_chatView, toQ](const std::string& peerId, const std::string& name,
+                                const std::string& b64) {
+            cv->onAvatarReceived(toQ(peerId), toQ(name), toQ(b64));
         };
     m_controller.onGroupRenamed =
-        [cv = m_chatView](const QString& gid, const QString& newName) {
-            cv->onGroupRenamed(gid, newName);
+        [cv = m_chatView, toQ](const std::string& gid, const std::string& newName) {
+            cv->onGroupRenamed(toQ(gid), toQ(newName));
         };
     m_controller.onGroupAvatarReceived =
-        [cv = m_chatView](const QString& gid, const QString& b64) {
-            cv->onGroupAvatarReceived(gid, b64);
+        [cv = m_chatView, toQ](const std::string& gid, const std::string& b64) {
+            cv->onGroupAvatarReceived(toQ(gid), toQ(b64));
         };
 
     // ── Notifier ──────────────────────────────────────────────────────────────
@@ -362,7 +396,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_settingsPanel, &SettingsPanel::relayUrlChanged,
             this, [this](const QString &url) {
         m_controller.disconnectFromRelay();
-        m_controller.setRelayUrl(QUrl(url));
+        m_controller.setRelayUrl(url.toStdString());
         m_controller.connectToRelay();
     });
 
@@ -375,23 +409,23 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Phase 2: file accept/decline prompt + cancel notifications → ChatView
     m_controller.onFileAcceptRequested =
-        [cv = m_chatView](const QString& from, const QString& tid,
-                          const QString& fn, qint64 size) {
-            cv->onFileAcceptRequested(from, tid, fn, size);
+        [cv = m_chatView, toQ](const std::string& from, const std::string& tid,
+                                const std::string& fn, int64_t size) {
+            cv->onFileAcceptRequested(toQ(from), toQ(tid), toQ(fn), size);
         };
     m_controller.onFileTransferCanceled =
-        [cv = m_chatView](const QString& tid, bool byReceiver) {
-            cv->onFileTransferCanceled(tid, byReceiver);
+        [cv = m_chatView, toQ](const std::string& tid, bool byReceiver) {
+            cv->onFileTransferCanceled(toQ(tid), byReceiver);
         };
 
     // Phase 3: delivery confirmation + transport-policy block
     m_controller.onFileTransferDelivered =
-        [cv = m_chatView](const QString& tid) {
-            cv->onFileTransferDelivered(tid);
+        [cv = m_chatView, toQ](const std::string& tid) {
+            cv->onFileTransferDelivered(toQ(tid));
         };
     m_controller.onFileTransferBlocked =
-        [cv = m_chatView](const QString& tid, bool byReceiver) {
-            cv->onFileTransferBlocked(tid, byReceiver);
+        [cv = m_chatView, toQ](const std::string& tid, bool byReceiver) {
+            cv->onFileTransferBlocked(toQ(tid), byReceiver);
         };
 
     // ── Resize debounce ───────────────────────────────────────────────────────
@@ -406,8 +440,14 @@ MainWindow::~MainWindow() {
     m_controller.disconnectFromRelay();
 
     // GAP5: persist group sequence counters before shutdown
-    m_db.saveGroupSeqOut(m_controller.groupSeqOut());
-    m_db.saveGroupSeqIn(m_controller.groupSeqIn());
+    auto stdToQ = [](const std::map<std::string, int64_t>& m) {
+        QMap<QString, qint64> out;
+        for (const auto& kv : m)
+            out.insert(QString::fromStdString(kv.first), qint64(kv.second));
+        return out;
+    };
+    m_db.saveGroupSeqOut(stdToQ(m_controller.groupSeqOut()));
+    m_db.saveGroupSeqIn(stdToQ(m_controller.groupSeqIn()));
 
     delete ui;
 }

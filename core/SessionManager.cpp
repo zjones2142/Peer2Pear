@@ -1,7 +1,7 @@
 #include "SessionManager.hpp"
-#include "qt_bridge_temp.hpp"  // TEMP: bridge for SessionStore (still on Qt, Phase 6)
+#include "bytes_util.hpp"  // strBytes helper
+#include "log.hpp"
 #include <sodium.h>
-#include <QDebug>
 #include <cstring>
 #include <algorithm>
 
@@ -11,11 +11,10 @@
 
 namespace {
 
-// Display-only — first 8 chars of a peer ID plus ellipsis.  Used only for
-// logging, never for identity comparisons.
-inline QString peerPrefix(const std::string& id) {
+// Display-only — first 8 chars of a peer ID plus ellipsis.  Logging only.
+inline std::string peerPrefix(const std::string& id) {
     const size_t n = std::min<size_t>(8, id.size());
-    return QString::fromStdString(id.substr(0, n)) + "...";
+    return id.substr(0, n) + "...";
 }
 
 inline void write_u32_be(uint8_t* dst, uint32_t v) {
@@ -97,18 +96,14 @@ void SessionManager::deleteSession(const std::string& peerIdB64u) {
 Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
                                       const Bytes& plaintext,
                                       const Bytes& peerKemPub) {
-    using p2p::bridge::toBytes;
-    using p2p::bridge::toQByteArray;
     using p2p::bridge::strBytes;
 
     RatchetSession* session = getSession(peerIdB64u);
 
     if (session) {
         // Existing session — normal ratchet encrypt
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Ratchet encrypting for" << peerPrefix(peerIdB64u)
-                 << "| plaintext:" << int(plaintext.size()) << "B";
-#endif
+        P2P_LOG("[SessionManager] Ratchet encrypting for " << peerPrefix(peerIdB64u)
+                << " | plaintext: " << int(plaintext.size()) << "B");
         Bytes ratchetCt = session->encrypt(plaintext);
         if (ratchetCt.empty()) return {};
 
@@ -153,11 +148,9 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
             write_u32_be(existing.data() + 96, counter);
             m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, existing);
 
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[SessionManager] Additional pre-key message #" << counter
-                     << "for" << peerPrefix(peerIdB64u)
-                     << "| payload:" << int(encPayload.size()) << "B";
-#endif
+            P2P_LOG("[SessionManager] Additional pre-key message #" << counter
+                    << " for " << peerPrefix(peerIdB64u)
+                    << " | payload: " << int(encPayload.size()) << "B");
 
             // Wire: [0x06][counter(4 BE)][encPayload]
             Bytes out;
@@ -187,10 +180,8 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
 
     // Choose hybrid or classical Noise IK based on PQ key availability
     const bool useHybrid = (peerKemPub.size() == 1184 && m_crypto.hasPQKeys());
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[SessionManager] Initiating" << (useHybrid ? "HYBRID PQ" : "classical")
-             << "Noise IK handshake with" << peerPrefix(peerIdB64u);
-#endif
+    P2P_LOG("[SessionManager] Initiating " << (useHybrid ? "HYBRID PQ" : "classical")
+            << " Noise IK handshake with " << peerPrefix(peerIdB64u));
     NoiseState noise = useHybrid
         ? NoiseState::createHybridInitiator(
               m_crypto.curvePub(), m_crypto.curvePriv(),
@@ -204,7 +195,7 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
     // Write handshake message 1 (no payload in the handshake itself)
     Bytes noiseMsg1 = noise.writeMessage1();
     if (noiseMsg1.empty()) {
-        qWarning() << "[SessionManager] Failed to write Noise msg1 for" << peerPrefix(peerIdB64u);
+        P2P_WARN("[SessionManager] Failed to write Noise msg1 for " << peerPrefix(peerIdB64u));
         return {};
     }
 
@@ -225,9 +216,7 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
     m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, pendingBlob);
     // L4 fix: zero the local private key copy now that it's persisted (encrypted)
     sodium_memzero(ratchetDhPriv.data(), ratchetDhPriv.size());
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[SessionManager] Saved pending handshake + ratchet DH for" << peerPrefix(peerIdB64u);
-#endif
+    P2P_LOG("[SessionManager] Saved pending handshake + ratchet DH for " << peerPrefix(peerIdB64u));
 
     // Derive a one-shot key from the Noise chaining key after msg1 (shared by both sides)
     Bytes prekeyKey = CryptoEngine::hkdf(
@@ -235,7 +224,7 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
 
     Bytes encPayload = m_crypto.aeadEncrypt(prekeyKey, plaintext);
     if (encPayload.empty()) {
-        qWarning() << "[SessionManager] Pre-key payload encryption failed for" << peerPrefix(peerIdB64u);
+        P2P_WARN("[SessionManager] Pre-key payload encryption failed for " << peerPrefix(peerIdB64u));
         return {};
     }
 
@@ -244,11 +233,9 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
     // the Noise chaining key, so the receiver's decryptFromPeer also has it.
     m_lastMessageKey = prekeyKey;
     CryptoEngine::secureZero(prekeyKey);
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[SessionManager] Encrypted pre-key message for" << peerPrefix(peerIdB64u)
-             << "| noiseMsg1:" << int(noiseMsg1.size()) << "B"
-             << "| payload:" << int(encPayload.size()) << "B";
-#endif
+    P2P_LOG("[SessionManager] Encrypted pre-key message for " << peerPrefix(peerIdB64u)
+            << " | noiseMsg1: " << int(noiseMsg1.size()) << "B"
+            << " | payload: " << int(encPayload.size()) << "B");
 
     // Wire: [type][4-byte noiseMsg1Len][noiseMsg1][32-byte ratchetDhPub][encPayload]
     const uint8_t msgType = useHybrid ? kHybridPreKeyMsg : kPreKeyMsg;
@@ -272,8 +259,6 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
 Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
                                        const Bytes& blob,
                                        Bytes* msgKeyOut) {
-    using p2p::bridge::toBytes;
-    using p2p::bridge::toQByteArray;
     using p2p::bridge::strBytes;
 
     if (blob.empty()) return {};
@@ -284,26 +269,22 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         // Normal ratchet message
         RatchetSession* session = getSession(senderIdB64u);
         if (!session) {
-            qWarning() << "[SessionManager] No ratchet session for" << peerPrefix(senderIdB64u);
+            P2P_WARN("[SessionManager] No ratchet session for " << peerPrefix(senderIdB64u));
             return {};
         }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Decrypting ratchet message from" << peerPrefix(senderIdB64u)
-                 << "| size:" << int(blob.size()) << "B";
-#endif
+        P2P_LOG("[SessionManager] Decrypting ratchet message from " << peerPrefix(senderIdB64u)
+                << " | size: " << int(blob.size()) << "B");
         Bytes pt = session->decrypt(tail(blob, 1));
         if (pt.empty()) {
-            qWarning() << "[SessionManager] Ratchet decrypt failed from" << peerPrefix(senderIdB64u);
+            P2P_WARN("[SessionManager] Ratchet decrypt failed from " << peerPrefix(senderIdB64u));
             return {};
         }
 
         m_lastMessageKey = session->lastMessageKey();
         if (msgKeyOut) *msgKeyOut = m_lastMessageKey;  // M3 fix: return key directly
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Ratchet decrypt OK from" << peerPrefix(senderIdB64u)
-                 << "| plaintext:" << int(pt.size()) << "B";
-#endif
+        P2P_LOG("[SessionManager] Ratchet decrypt OK from " << peerPrefix(senderIdB64u)
+                << " | plaintext: " << int(pt.size()) << "B");
         persistSession(senderIdB64u);
         return pt;
     }
@@ -312,10 +293,8 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         // Pre-key message: Noise msg1 + encrypted payload
         // We are the responder
         const bool hybrid = (msgType == kHybridPreKeyMsg);
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Received pre-key message from" << peerPrefix(senderIdB64u)
-                 << "| size:" << int(blob.size()) << "B";
-#endif
+        P2P_LOG("[SessionManager] Received pre-key message from " << peerPrefix(senderIdB64u)
+                << " | size: " << int(blob.size()) << "B");
 
         if (blob.size() < 5) return {};
         const uint32_t msg1Len = read_u32_be(blob.data() + 1);
@@ -327,10 +306,8 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         Bytes encPayload                = tail(blob, 5 + msg1Len + 32);
 
         // Create Noise responder (hybrid or classical based on message type)
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Processing" << (hybrid ? "HYBRID PQ" : "classical")
-                 << "Noise IK handshake (responder) from" << peerPrefix(senderIdB64u);
-#endif
+        P2P_LOG("[SessionManager] Processing " << (hybrid ? "HYBRID PQ" : "classical")
+                << " Noise IK handshake (responder) from " << peerPrefix(senderIdB64u));
         NoiseState noise = (hybrid && m_crypto.hasPQKeys())
             ? NoiseState::createHybridResponder(
                   m_crypto.curvePub(), m_crypto.curvePriv(),
@@ -341,7 +318,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         Bytes handshakePayload;
         Bytes noiseMsg2 = noise.readMessage1AndWriteMessage2(noiseMsg1, handshakePayload);
         if (noiseMsg2.empty()) {
-            qWarning() << "[SessionManager] Failed to process Noise msg1 from" << peerPrefix(senderIdB64u);
+            P2P_WARN("[SessionManager] Failed to process Noise msg1 from " << peerPrefix(senderIdB64u));
             return {};
         }
 
@@ -351,9 +328,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
 
         // Complete the handshake
         HandshakeResult hr = noise.finish();
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Noise IK handshake complete (responder) for" << peerPrefix(senderIdB64u);
-#endif
+        P2P_LOG("[SessionManager] Noise IK handshake complete (responder) for " << peerPrefix(senderIdB64u));
 
         // Initialize ratchet with the initiator's fresh ratchet DH pub (from wire format)
         // This lets us derive both recv and send chains immediately — no LEGACY fallback
@@ -362,10 +337,8 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Double Ratchet session initialized (responder) for"
-                 << peerPrefix(senderIdB64u);
-#endif
+        P2P_LOG("[SessionManager] Double Ratchet session initialized (responder) for "
+                << peerPrefix(senderIdB64u));
 
         // Store the chaining key so we can decrypt additional pre-key messages (type 0x06)
         m_pendingCk[senderIdB64u] = noise.postMsg1ChainingKey();
@@ -379,11 +352,9 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
             // B1 fix: expose prekey-derived key so file_key announcements work
             m_lastMessageKey = prekeyKey;
             if (msgKeyOut) *msgKeyOut = m_lastMessageKey;
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[SessionManager] Pre-key payload decrypted OK |" << int(pt.size()) << "B";
-#endif
+            P2P_LOG("[SessionManager] Pre-key payload decrypted OK | " << int(pt.size()) << "B");
         } else {
-            qWarning() << "[SessionManager] Pre-key payload decryption FAILED";
+            P2P_WARN("[SessionManager] Pre-key payload decryption FAILED");
         }
         CryptoEngine::secureZero(prekeyKey);
 
@@ -400,9 +371,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
             append(response, noiseMsg2);
 
             m_sendResponse(senderIdB64u, response);
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[SessionManager] Sent Noise msg2 (pre-key response) to" << peerPrefix(senderIdB64u);
-#endif
+            P2P_LOG("[SessionManager] Sent Noise msg2 (pre-key response) to " << peerPrefix(senderIdB64u));
         }
 
         return pt;
@@ -411,9 +380,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
     if (msgType == kPreKeyResponse || msgType == kHybridPreKeyResp) {
         // Pre-key response: Noise msg2 from responder
         // We are the initiator — complete the handshake
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Received pre-key response from" << peerPrefix(senderIdB64u);
-#endif
+        P2P_LOG("[SessionManager] Received pre-key response from " << peerPrefix(senderIdB64u));
 
         if (blob.size() < 5) return {};
         const uint32_t msg2Len = read_u32_be(blob.data() + 1);
@@ -425,7 +392,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         int role = 0;
         Bytes pendingBlob = m_store.loadPendingHandshake(senderIdB64u, role);
         if (pendingBlob.size() < 64 || role != NoiseState::Initiator) {
-            qWarning() << "[SessionManager] No pending initiator handshake for" << peerPrefix(senderIdB64u);
+            P2P_WARN("[SessionManager] No pending initiator handshake for " << peerPrefix(senderIdB64u));
             return {};
         }
 
@@ -441,16 +408,14 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         noise.setStaticPrivateKey(m_crypto.curvePriv());
         Bytes responsePayload;
         if (!noise.readMessage2(noiseMsg2, responsePayload)) {
-            qWarning() << "[SessionManager] Failed to process Noise msg2 from" << peerPrefix(senderIdB64u);
+            P2P_WARN("[SessionManager] Failed to process Noise msg2 from " << peerPrefix(senderIdB64u));
             return {};
         }
 
         HandshakeResult hr = noise.finish();
         m_store.deletePendingHandshake(senderIdB64u);
         m_pendingCk.erase(senderIdB64u);  // clean up chaining key (no longer needed)
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Noise IK handshake complete (initiator) for" << peerPrefix(senderIdB64u);
-#endif
+        P2P_LOG("[SessionManager] Noise IK handshake complete (initiator) for " << peerPrefix(senderIdB64u));
 
         // Initialize ratchet with our saved fresh ratchet DH keypair
         // The responder's Noise ephemeral (first 32 bytes of msg2) is the remote DH pub
@@ -466,10 +431,8 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
 
         m_sessions[senderIdB64u] = ratchet;
         persistSession(senderIdB64u);
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[SessionManager] Double Ratchet session initialized (initiator) for"
-                 << peerPrefix(senderIdB64u);
-#endif
+        P2P_LOG("[SessionManager] Double Ratchet session initialized (initiator) for "
+                << peerPrefix(senderIdB64u));
 
         // The pre-key response may not carry user payload (it's a handshake completion)
         // Return the response payload if present
@@ -486,8 +449,8 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
 
         auto ckIt = m_pendingCk.find(senderIdB64u);
         if (ckIt == m_pendingCk.end() || ckIt->second.empty()) {
-            qWarning() << "[SessionManager] Additional pre-key msg from" << peerPrefix(senderIdB64u)
-                       << "but no chaining key on record (initial handshake not yet received?)";
+            P2P_WARN("[SessionManager] Additional pre-key msg from " << peerPrefix(senderIdB64u)
+                    << " but no chaining key on record (initial handshake not yet received?)");
             return {};
         }
 
@@ -501,19 +464,17 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         if (!pt.empty()) {
             m_lastMessageKey = prekeyKey;
             if (msgKeyOut) *msgKeyOut = m_lastMessageKey;
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[SessionManager] Additional pre-key #" << counter
-                     << "decrypted OK from" << peerPrefix(senderIdB64u)
-                     << "|" << int(pt.size()) << "B";
-#endif
+            P2P_LOG("[SessionManager] Additional pre-key #" << counter
+                    << " decrypted OK from " << peerPrefix(senderIdB64u)
+                    << " | " << int(pt.size()) << "B");
         } else {
-            qWarning() << "[SessionManager] Additional pre-key #" << counter
-                       << "decrypt FAILED from" << peerPrefix(senderIdB64u);
+            P2P_WARN("[SessionManager] Additional pre-key #" << counter
+                    << " decrypt FAILED from " << peerPrefix(senderIdB64u));
         }
         CryptoEngine::secureZero(prekeyKey);
         return pt;
     }
 
-    qWarning() << "[SessionManager] Unknown message type" << int(msgType);
+    P2P_WARN("[SessionManager] Unknown message type " << int(msgType));
     return {};
 }

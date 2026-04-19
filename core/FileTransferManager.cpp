@@ -6,7 +6,7 @@
 #include <sodium.h>
 #include <nlohmann/json.hpp>
 
-#include <QDebug>       // TEMP: logging parity with the rest of core/.
+#include "log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -80,9 +80,9 @@ FileTransferManager::Bytes tail(const FileTransferManager::Bytes& b, size_t off)
 }
 
 // First 8 chars of a peer/transfer ID plus ellipsis (logging only).
-QString idPrefix(const std::string& id) {
+std::string idPrefix(const std::string& id) {
     const size_t n = std::min<size_t>(8, id.size());
-    return QString::fromStdString(id.substr(0, n));
+    return id.substr(0, n);
 }
 
 // Derive a safe filename — strip any directory components.
@@ -143,8 +143,8 @@ FileTransferManager::Bytes FileTransferManager::blake2b256File(const std::string
 {
     std::ifstream f(filePath, std::ios::binary);
     if (!f.is_open()) {
-        qWarning() << "[FileTransfer] blake2b256File: cannot open"
-                   << QString::fromStdString(filePath);
+        P2P_WARN("[FileTransfer] blake2b256File: cannot open"
+                   << filePath);
         return {};
     }
 
@@ -162,8 +162,8 @@ FileTransferManager::Bytes FileTransferManager::blake2b256File(const std::string
             static_cast<unsigned long long>(n));
     }
     if (f.bad()) {
-        qWarning() << "[FileTransfer] blake2b256File: read error on"
-                   << QString::fromStdString(filePath);
+        P2P_WARN("[FileTransfer] blake2b256File: read error on"
+                   << filePath);
         return {};
     }
 
@@ -216,7 +216,7 @@ bool FileTransferManager::dispatchChunk(const std::string& senderIdB64u,
             if (m_sendFn) m_sendFn(peerIdB64u, sealedEnv);
             return true;
         }
-        qWarning() << "[FileTransfer] Seal failed — chunk BLOCKED";
+        P2P_WARN("[FileTransfer] Seal failed — chunk BLOCKED");
         return false;
     }
 
@@ -250,8 +250,8 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
 {
     std::ifstream src(filePath, std::ios::binary);
     if (!src.is_open()) {
-        qWarning() << "[FileTransfer] Cannot open"
-                   << QString::fromStdString(filePath) << "for streaming";
+        P2P_WARN("[FileTransfer] Cannot open"
+                   << filePath << "for streaming");
         if (onStatus) onStatus(std::string("Cannot read file: ") + fileName);
         return;
     }
@@ -264,8 +264,8 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
     for (int i = 0; i < totalChunks; ++i) {
         // Fix #12: sender-side cancel check.
         if (m_abortedTransfers.count(transferId)) {
-            qDebug() << "[FileTransfer] aborted mid-stream at chunk" << i
-                     << "of" << idPrefix(transferId);
+            P2P_LOG("[FileTransfer] aborted mid-stream at chunk" << i
+                     << "of" << idPrefix(transferId));
             m_abortedTransfers.erase(transferId);
             return;
         }
@@ -285,8 +285,8 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
         chunk.assign(size_t(toRead), 0);
         src.read(reinterpret_cast<char*>(chunk.data()), std::streamsize(toRead));
         if (src.gcount() != toRead) {
-            qWarning() << "[FileTransfer] Short read at chunk" << i
-                       << "of" << idPrefix(transferId);
+            P2P_WARN("[FileTransfer] Short read at chunk" << i
+                       << "of" << idPrefix(transferId));
             break;
         }
 
@@ -318,8 +318,8 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
         innerPayload.insert(innerPayload.end(), encChunk.begin(), encChunk.end());
 
         if (!dispatchChunk(senderIdB64u, peerIdB64u, innerPayload, effectiveMode)) {
-            qWarning() << "[FileTransfer] P2P lost mid-stream at chunk" << i
-                       << "— aborting transfer" << idPrefix(transferId);
+            P2P_WARN("[FileTransfer] P2P lost mid-stream at chunk" << i
+                       << "— aborting transfer" << idPrefix(transferId));
             if (onStatus) onStatus(std::string("Transfer interrupted: direct connection lost."));
             return;
         }
@@ -392,16 +392,16 @@ bool FileTransferManager::announceIncoming(const std::string& fromId,
     if (transferId.empty() || totalChunks <= 0 ||
         fileSize <= 0 || fileSize > kMaxFileBytes ||
         fileHash.size() != 32 || fileKey.size() != 32) {
-        qWarning() << "[FileTransfer] announceIncoming: invalid args for"
-                   << idPrefix(transferId);
+        P2P_WARN("[FileTransfer] announceIncoming: invalid args for"
+                   << idPrefix(transferId));
         return false;
     }
 
     const int expectedChunks = int((fileSize + kChunkBytes - 1) / kChunkBytes);
     if (totalChunks != expectedChunks) {
-        qWarning() << "[FileTransfer] announceIncoming: totalChunks"
+        P2P_WARN("[FileTransfer] announceIncoming: totalChunks"
                    << totalChunks << "doesn't match fileSize"
-                   << qint64(fileSize) << "(expected" << expectedChunks << ")";
+                   << int64_t(fileSize) << "(expected" << expectedChunks << ")");
         return false;
     }
 
@@ -435,8 +435,8 @@ bool FileTransferManager::announceIncoming(const std::string& fromId,
     xfer.partialFile = std::make_unique<std::fstream>(xfer.partialPath,
         std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
     if (!xfer.partialFile->is_open()) {
-        qWarning() << "[FileTransfer] announceIncoming: cannot open partial file"
-                   << QString::fromStdString(xfer.partialPath);
+        P2P_WARN("[FileTransfer] announceIncoming: cannot open partial file"
+                   << xfer.partialPath);
         if (onStatus) onStatus(std::string("Cannot write to disk: ") + xfer.fileName);
         return false;
     }
@@ -477,8 +477,8 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
         }
     }
     if (metaJson.empty()) {
-        qWarning() << "[FileTransfer] No ratchet key found for file chunk from"
-                   << idPrefix(fromId) + "...";
+        P2P_WARN("[FileTransfer] No ratchet key found for file chunk from"
+                   << idPrefix(fromId) + "...");
         return false;
     }
 
@@ -498,8 +498,8 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
 
     auto itXfer = m_incomingTransfers.find(transferId);
     if (itXfer == m_incomingTransfers.end() || !itXfer->second) {
-        qWarning() << "[FileTransfer] chunk for unannounced transfer"
-                   << idPrefix(transferId) << "from" << idPrefix(fromId) + "... — dropped";
+        P2P_WARN("[FileTransfer] chunk for unannounced transfer"
+                   << idPrefix(transferId) << "from" << idPrefix(fromId) + "... — dropped");
         return true;
     }
 
@@ -512,10 +512,10 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
     if (claimedTotal != xfer.totalChunks ||
         claimedSize  != xfer.fileSize ||
         (xfer.fileHash.size() == 32 && !claimedHash.empty() && claimedHash != xfer.fileHash)) {
-        qWarning() << "[FileTransfer] chunk metadata disagrees with announce for"
+        P2P_WARN("[FileTransfer] chunk metadata disagrees with announce for"
                    << idPrefix(transferId) << "— dropped."
-                   << "claimed(size/chunks)=" << qint64(claimedSize) << "/" << claimedTotal
-                   << "vs announced=" << qint64(xfer.fileSize) << "/" << xfer.totalChunks;
+                   << "claimed(size/chunks)=" << int64_t(claimedSize) << "/" << claimedTotal
+                   << "vs announced=" << int64_t(xfer.fileSize) << "/" << xfer.totalChunks);
         return true;
     }
 
@@ -532,15 +532,15 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
             ? (xfer.fileSize - int64_t(chunkIndex) * kChunkBytes)
             : kChunkBytes;
     if (int64_t(chunkData.size()) != expectedLen) {
-        qWarning() << "[FileTransfer] chunk" << chunkIndex << "has wrong plaintext size"
-                   << qint64(chunkData.size()) << "(expected" << qint64(expectedLen) << ")";
+        P2P_WARN("[FileTransfer] chunk" << chunkIndex << "has wrong plaintext size"
+                   << int64_t(chunkData.size()) << "(expected" << int64_t(expectedLen) << ")");
         return true;
     }
 
     // Guard against the partial file being closed (e.g., after completion).
     if (!xfer.partialFile || !xfer.partialFile->is_open()) {
-        qWarning() << "[FileTransfer] chunk for closed partial file"
-                   << idPrefix(transferId) << "— dropped";
+        P2P_WARN("[FileTransfer] chunk for closed partial file"
+                   << idPrefix(transferId) << "— dropped");
         return true;
     }
 
@@ -555,8 +555,8 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
     xfer.partialFile->write(reinterpret_cast<const char*>(chunkData.data()),
                              std::streamsize(chunkData.size()));
     if (!xfer.partialFile->good()) {
-        qWarning() << "[FileTransfer] Write failed for chunk" << chunkIndex
-                   << "of" << idPrefix(transferId);
+        P2P_WARN("[FileTransfer] Write failed for chunk" << chunkIndex
+                   << "of" << idPrefix(transferId));
         return true;
     }
     xfer.partialFile->flush();
@@ -614,9 +614,9 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
     ec.clear();
     fs::rename(partialPath, finalPath, ec);
     if (ec) {
-        qWarning() << "[FileTransfer] Rename failed"
-                   << QString::fromStdString(partialPath) << "->"
-                   << QString::fromStdString(finalPath);
+        P2P_WARN("[FileTransfer] Rename failed"
+                   << partialPath << "->"
+                   << finalPath);
         if (onStatus) onStatus(std::string("Could not save file: ") + fileName);
         return true;
     }
@@ -677,7 +677,7 @@ void FileTransferManager::queueOutboundFile(const std::string& senderIdB64u,
                                              const std::string& groupName)
 {
     if (fileKey.size() != 32 || fileHash.size() != 32) {
-        qWarning() << "[FileTransfer] queueOutboundFile: bad key/hash length";
+        P2P_WARN("[FileTransfer] queueOutboundFile: bad key/hash length");
         return;
     }
     OutboundTransfer out;
@@ -701,8 +701,8 @@ bool FileTransferManager::startOutboundStream(const std::string& transferId,
 {
     auto it = m_outboundPending.find(transferId);
     if (it == m_outboundPending.end()) {
-        qWarning() << "[FileTransfer] startOutboundStream: unknown transferId"
-                   << idPrefix(transferId);
+        P2P_WARN("[FileTransfer] startOutboundStream: unknown transferId"
+                   << idPrefix(transferId));
         return false;
     }
 
@@ -1199,8 +1199,8 @@ void FileTransferManager::loadPersistedTransfers()
                 xferPtr->partialFile = std::make_unique<std::fstream>(ppath,
                     std::ios::in | std::ios::out | std::ios::binary);
                 if (!xferPtr->partialFile->is_open()) {
-                    qWarning() << "[FileTransfer] loadPersisted: cannot reopen"
-                               << QString::fromStdString(ppath);
+                    P2P_WARN("[FileTransfer] loadPersisted: cannot reopen"
+                               << ppath);
                     deleteIncomingRow(tid);
                     continue;
                 }
@@ -1269,21 +1269,21 @@ bool FileTransferManager::resendChunks(const std::string& transferId,
 {
     auto itSent = m_sentTransfers.find(transferId);
     if (itSent == m_sentTransfers.end()) {
-        qWarning() << "[FileTransfer] resendChunks: no sender record for"
-                   << idPrefix(transferId);
+        P2P_WARN("[FileTransfer] resendChunks: no sender record for"
+                   << idPrefix(transferId));
         return false;
     }
     SentTransfer& s = itSent->second;
     if (!fs::exists(s.filePath)) {
-        qWarning() << "[FileTransfer] resendChunks: source file gone"
-                   << QString::fromStdString(s.filePath);
+        P2P_WARN("[FileTransfer] resendChunks: source file gone"
+                   << s.filePath);
         return false;
     }
 
     std::ifstream src(s.filePath, std::ios::binary);
     if (!src.is_open()) {
-        qWarning() << "[FileTransfer] resendChunks: cannot open"
-                   << QString::fromStdString(s.filePath);
+        P2P_WARN("[FileTransfer] resendChunks: cannot open"
+                   << s.filePath);
         return false;
     }
 
@@ -1305,7 +1305,7 @@ bool FileTransferManager::resendChunks(const std::string& transferId,
         chunk.assign(size_t(toRead), 0);
         src.read(reinterpret_cast<char*>(chunk.data()), std::streamsize(toRead));
         if (src.gcount() != toRead) {
-            qWarning() << "[FileTransfer] resendChunks: short read at chunk" << i;
+            P2P_WARN("[FileTransfer] resendChunks: short read at chunk" << i);
             break;
         }
 

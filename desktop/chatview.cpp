@@ -46,6 +46,17 @@ static bool isValidPublicKey(const QString &key)
     return rx.match(key).hasMatch();
 }
 
+// ── ChatController boundary helpers ─────────────────────────────────────────
+// ChatController's public surface is std-typed (Phase 7c).  Convert at the
+// boundary; the desktop UI keeps using QString/QStringList internally.
+static std::vector<std::string> qListToStd(const QStringList& qs)
+{
+    std::vector<std::string> out;
+    out.reserve(int(qs.size()));
+    for (const QString& s : qs) out.push_back(s.toStdString());
+    return out;
+}
+
 // ── renderInitialsAvatar ──────────────────────────────────────────────────────
 static QPixmap renderInitialsAvatar(const QString &initial, const QColor &bg, int size)
 {
@@ -656,18 +667,18 @@ void ChatView::startPresencePolling(int /*intervalMs*/)
 void ChatView::subscribeAllPresence()
 {
     QSet<QString> seen;
-    QStringList peerIds;
-    const QString myKey = m_controller->myIdB64u();
+    std::vector<std::string> peerIds;
+    const QString myKey = QString::fromStdString(m_controller->myIdB64u());
     for (const ChatData &c : std::as_const(m_chats)) {
         for (const QString &k : c.keys) {
             const QString trimmed = k.trimmed();
             if (!trimmed.isEmpty() && trimmed != myKey && !seen.contains(trimmed)) {
                 seen.insert(trimmed);
-                peerIds << trimmed;
+                peerIds.push_back(trimmed.toStdString());
             }
         }
     }
-    if (!peerIds.isEmpty())
+    if (!peerIds.empty())
         m_controller->subscribePresence(peerIds);
 }
 
@@ -686,7 +697,7 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 
             // Update group header if this is the currently selected chat
             if (i == m_currentChat) {
-                const QString myKey = m_controller->myIdB64u();
+                const QString myKey = QString::fromStdString(m_controller->myIdB64u());
                 int onlineCount = 0, totalMembers = 0;
                 for (const QString &k : std::as_const(m_chats[i].keys)) {
                     const QString trimmed = k.trimmed();
@@ -724,7 +735,8 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
                 const QString myName   = m_db->loadSetting("displayName");
                 const QString myAvatar = m_db->loadSetting("avatarData");
                 if (!myName.isEmpty())
-                    m_controller->sendAvatar(peerIdB64u, myName, myAvatar);
+                    m_controller->sendAvatar(peerIdB64u.toStdString(),
+                                              myName.toStdString(), myAvatar.toStdString());
             }
 
             // Update the header if this is the currently selected chat
@@ -847,7 +859,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     // Merge any new member keys we didn't know about before
     // This is how members discover each other without manual key exchange
     bool keysUpdated = false;
-    const QString myKey = m_controller->myIdB64u();
+    const QString myKey = QString::fromStdString(m_controller->myIdB64u());
     for (const QString &key : memberKeys) {
         if (key.trimmed().isEmpty()) continue;
         if (key.trimmed() == myKey) continue; // don't add own key to group member list
@@ -1097,7 +1109,8 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
             if (!myName.isEmpty()) {
                 const QString myAvatarIsPhoto = m_db->loadSetting("avatarIsPhoto");
                 const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
-                m_controller->sendAvatar(peerIdB64u, myName, broadcastAvatar);
+                m_controller->sendAvatar(peerIdB64u.toStdString(),
+                                          myName.toStdString(), broadcastAvatar.toStdString());
             }
         }
 
@@ -1163,7 +1176,8 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
             const QString myAvatar        = m_db->loadSetting("avatarData");
             const QString myAvatarIsPhoto = m_db->loadSetting("avatarIsPhoto");
             const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
-            m_controller->sendAvatar(peerIdB64u, myName, broadcastAvatar);
+            m_controller->sendAvatar(peerIdB64u.toStdString(),
+                                      myName.toStdString(), broadcastAvatar.toStdString());
         }
     }
 
@@ -1196,7 +1210,8 @@ void ChatView::onGroupAvatarReceived(const QString &groupId, const QString &avat
 
         // Relay to all group members so stragglers receive it too
         if (m_controller && !m_chats[i].keys.isEmpty())
-            m_controller->sendGroupAvatar(groupId, avatarB64, m_chats[i].keys);
+            m_controller->sendGroupAvatar(groupId.toStdString(), avatarB64.toStdString(),
+                                           qListToStd(m_chats[i].keys));
 
         rebuildChatList();
         if (m_currentChat == i) loadChat(i);
@@ -1246,15 +1261,17 @@ void ChatView::onAttachFile()
     constexpr qint64 kChunk = 240LL * 1024;
 
     if (chat.isGroup) {
-        localTransferId = m_controller->sendGroupFile(
-            chat.groupId, chat.name, chat.keys, fileName, path);
+        localTransferId = QString::fromStdString(m_controller->sendGroupFile(
+            chat.groupId.toStdString(), chat.name.toStdString(),
+            qListToStd(chat.keys), fileName.toStdString(), path.toStdString()));
         if (!localTransferId.isEmpty())
             totalChunks = int((fileSize + kChunk - 1) / kChunk);
     } else {
         // 1:1: send to every key belonging to this contact
         for (const QString &key : chat.keys) {
             if (key.trimmed().isEmpty()) continue;
-            const QString tid = m_controller->sendFile(key.trimmed(), fileName, path);
+            const QString tid = QString::fromStdString(m_controller->sendFile(
+                key.trimmed().toStdString(), fileName.toStdString(), path.toStdString()));
             if (!tid.isEmpty() && localTransferId.isEmpty()) {
                 localTransferId = tid;
                 totalChunks = int((fileSize + kChunk - 1) / kChunk);
@@ -1351,10 +1368,12 @@ void ChatView::onSendMessage()
         const QString gid = m_chats[m_currentChat].groupId.isEmpty()
         ? m_chats[m_currentChat].name : m_chats[m_currentChat].groupId;
         m_controller->sendGroupMessageViaMailbox(
-            gid, m_chats[m_currentChat].name, m_chats[m_currentChat].keys, text);
+            gid.toStdString(), m_chats[m_currentChat].name.toStdString(),
+            qListToStd(m_chats[m_currentChat].keys), text.toStdString());
     } else {
         for (const QString &k : std::as_const(m_chats[m_currentChat].keys))
-            if (!k.trimmed().isEmpty()) m_controller->sendText(k.trimmed(), text);
+            if (!k.trimmed().isEmpty())
+                m_controller->sendText(k.trimmed().toStdString(), text.toStdString());
     }
 }
 
@@ -1646,7 +1665,7 @@ void ChatView::onEditProfile()
     // ── Your Public Key (read-only) ─────────────────────────────────────────
     root->addWidget(new QLabel("Your Public Key", &dlg));
 
-    const QString myKey = m_controller->myIdB64u();
+    const QString myKey = QString::fromStdString(m_controller->myIdB64u());
 
     auto *keyRow = new QHBoxLayout;
     keyRow->setSpacing(8);
@@ -1739,7 +1758,8 @@ void ChatView::onEditProfile()
         const QString broadcastAvatar = usingPhoto ? newAvatarB64 : QString();
         for (const ChatData &chat : std::as_const(m_chats)) {
             if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
-                m_controller->sendAvatar(chat.peerIdB64u, displayName, broadcastAvatar);
+                m_controller->sendAvatar(chat.peerIdB64u.toStdString(),
+                                          displayName.toStdString(), broadcastAvatar.toStdString());
         }
     }
 }
@@ -1812,12 +1832,16 @@ void ChatView::onEditContact(int index)
 
         // Broadcast group changes to all members
         if (wasGroup) {
+            const std::vector<std::string> stdKeys = qListToStd(keys);
             if (name != oldName)
-                m_controller->sendGroupRename(m_chats[index].groupId, name, keys);
+                m_controller->sendGroupRename(m_chats[index].groupId.toStdString(),
+                                               name.toStdString(), stdKeys);
             if (avatar != oldAvatar)
-                m_controller->sendGroupAvatar(m_chats[index].groupId, avatar, keys);
+                m_controller->sendGroupAvatar(m_chats[index].groupId.toStdString(),
+                                               avatar.toStdString(), stdKeys);
             if (keys != oldKeys)
-                m_controller->sendGroupMemberUpdate(m_chats[index].groupId, m_chats[index].name, keys);
+                m_controller->sendGroupMemberUpdate(m_chats[index].groupId.toStdString(),
+                                                     m_chats[index].name.toStdString(), stdKeys);
         }
     } else if (result == ContactEditorResult::Removed) {
         // Use the same key logic as saveContact
@@ -1839,17 +1863,16 @@ void ChatView::onEditContact(int index)
         // G3 fix: wipe ratchet state so next message triggers a fresh handshake
         const QString peerId = m_chats[index].peerIdB64u;
         if (!peerId.isEmpty())
-            m_controller->resetSession(peerId);
+            m_controller->resetSession(peerId.toStdString());
         if (m_db) m_db->saveContact(m_chats[index]);
         rebuildChatList();
     } else if (result == ContactEditorResult::Left) {
         // Notify all members you're leaving
         const QString groupId = m_chats[index].groupId;
         m_controller->sendGroupLeaveNotification(
-            groupId,
-            m_chats[index].name,
-            m_chats[index].keys
-            );
+            groupId.toStdString(),
+            m_chats[index].name.toStdString(),
+            qListToStd(m_chats[index].keys));
 
         // Remove group locally
         const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
@@ -1988,7 +2011,8 @@ void ChatView::onAddContact()
         const QString myName   = m_db ? m_db->loadSetting("displayName") : QString();
         const QString myAvatar = m_db ? m_db->loadSetting("avatarData")  : QString();
         if (!myName.isEmpty())
-            m_controller->sendAvatar(nc.peerIdB64u, myName, myAvatar);
+            m_controller->sendAvatar(nc.peerIdB64u.toStdString(),
+                                      myName.toStdString(), myAvatar.toStdString());
     }
 
     rebuildChatList();
@@ -2051,7 +2075,7 @@ void ChatView::initChats()
     for (const auto &c : std::as_const(m_chats)) m_ui->chatList->addItem(c.name);
 
     // Show first 8 chars of public key as handle
-    const QString fullKey = m_controller->myIdB64u();
+    const QString fullKey = QString::fromStdString(m_controller->myIdB64u());
     if (!fullKey.isEmpty()) {
         m_ui->profileHandleLabel->setText(fullKey.left(8) + "…");
         m_ui->profileHandleLabel->setToolTip(fullKey);
@@ -2181,7 +2205,7 @@ void ChatView::loadChat(int index)
         // Show per-member presence summary for groups, but only after
         // at least one member's presence has been resolved — avoids a
         // misleading "0 of N online" flash before the first poll returns.
-        const QString myKey = m_controller->myIdB64u();
+        const QString myKey = QString::fromStdString(m_controller->myIdB64u());
         int onlineCount = 0, totalMembers = 0;
         bool anyResolved = false;
         for (const QString &k : std::as_const(chat.keys)) {
@@ -2842,7 +2866,7 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
 
         const QString transferId = rec.transferId;
         QObject::connect(cancelFileBtn, &QPushButton::clicked, [this, transferId]() {
-            m_controller->cancelFileTransfer(transferId);
+            m_controller->cancelFileTransfer(transferId.toStdString());
         });
 
         bl->addWidget(cancelFileBtn);
@@ -2920,9 +2944,9 @@ void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
     if (box.clickedButton() == acceptBtn) {
         // Respect the user's global "require P2P" setting — ChatController
         // will OR it with our per-call flag.
-        m_controller->acceptFileTransfer(transferId, /*requireP2P=*/false);
+        m_controller->acceptFileTransfer(transferId.toStdString(), /*requireP2P=*/false);
     } else {
-        m_controller->declineFileTransfer(transferId);
+        m_controller->declineFileTransfer(transferId.toStdString());
     }
     Q_UNUSED(declineBtn);
 }

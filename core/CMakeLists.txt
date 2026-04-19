@@ -42,17 +42,31 @@ target_include_directories(peer2pear-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(peer2pear-core PUBLIC cxx_std_17)
 
 target_link_libraries(peer2pear-core PUBLIC
-    Qt${QT_VERSION_MAJOR}::Core
     unofficial-sodium::sodium
     OQS::oqs
     nlohmann_json::nlohmann_json
     ${SQLCIPHER_TARGET}
 )
-# NOTE: Qt::Core is on its way out.  The Qt strip is tracked in
-# REFACTOR_PLAN.md — subsystems are being migrated one at a time to
-# std:: containers + nlohmann/json.  When the last Qt::* reference leaves
-# core/, this line drops the Qt dependency entirely and mobile builds
-# no longer need Qt for iOS / Android.
+
+# Qt::Core is **conditional**, not unconditional, after Phase 7c (2026-04-18).
+#
+# The two Qt holdouts that justify linking it:
+#   1. ChatController.cpp uses QObject::connect / QByteArray bridges to talk
+#      to QuicConnection (a QObject in desktop/) — only when PEER2PEAR_P2P=ON.
+#   2. CryptoEngine.cpp + FileTransferManager.cpp use QStandardPaths to find
+#      the platform default data/download directory — only when QT_CORE_LIB
+#      is defined (which is automatic when Qt::Core is on the link line).
+#   3. SqlCipherDb.hpp exposes QString/QByteArray convenience overloads for
+#      desktop callers that haven't migrated — also `#ifdef QT_CORE_LIB`.
+#
+# Mobile builds (iOS/Android) turn PEER2PEAR_P2P off and pass
+# WITH_QT_CORE=OFF, in which case core/ links zero Qt libraries.  Desktop
+# still pulls Qt::Core in transitively via Qt::Widgets either way.
+option(WITH_QT_CORE "Link core/ against Qt::Core (desktop default; iOS=OFF)" ON)
+if(WITH_QT_CORE)
+    target_link_libraries(peer2pear-core PUBLIC Qt${QT_VERSION_MAJOR}::Core)
+endif()
+
 # NOTE: Qt::Network and Qt::WebSockets removed from core — abstracted behind
 # IHttpClient and IWebSocket interfaces. Desktop provides Qt implementations.
 

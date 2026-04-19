@@ -1,8 +1,8 @@
 #include "RatchetSession.hpp"
 #include "CryptoEngine.hpp"
 #include "binary_io.hpp"
+#include "log.hpp"
 #include <sodium.h>
-#include <QDebug>
 #include <cstring>
 #include <algorithm>
 
@@ -205,7 +205,7 @@ RatchetSession RatchetSession::initAsInitiator(const Bytes& rootKey,
     s.m_sendChainKey = sendChain;
 
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Ratchet] initAsInitiator: session created" << (hybrid ? "(hybrid PQ)" : "");
+    P2P_LOG("[Ratchet] initAsInitiator: session created " << (hybrid ? "(hybrid PQ)" : ""));
 #endif
     return s;
 }
@@ -261,7 +261,7 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     s.m_sendChainKey = sendChain;
 
 #ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Ratchet] initAsResponder: session created" << (hybrid ? "(hybrid PQ)" : "");
+    P2P_LOG("[Ratchet] initAsResponder: session created " << (hybrid ? "(hybrid PQ)" : ""));
 #endif
     return s;
 }
@@ -354,14 +354,14 @@ void RatchetSession::dhRatchetStep(const Bytes& remoteDhPub,
 
 Bytes RatchetSession::encrypt(const Bytes& plaintext) {
     if (m_sendChainKey.empty()) {
-        qWarning() << "[Ratchet] encrypt: sendChainKey is empty!";
+        P2P_WARN("[Ratchet] encrypt: sendChainKey is empty!");
         return {};
     }
 
     // H1 fix: prevent nonce reuse from counter overflow.
     // uint32_t wraps at 2^32. Force a session reset well before that.
     if (m_sendMsgNum >= 0xFFFFFFF0u) {
-        qWarning() << "[Ratchet] encrypt: message counter near overflow — refusing to encrypt";
+        P2P_WARN("[Ratchet] encrypt: message counter near overflow — refusing to encrypt");
         return {};
     }
 
@@ -386,10 +386,8 @@ Bytes RatchetSession::encrypt(const Bytes& plaintext) {
         m_pendingKemCt.clear();          // consume — don't send same ciphertext twice
     }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Ratchet] encrypt: msgNum=" << header.messageNum
-             << (m_hybrid ? "(hybrid PQ)" : "");
-#endif
+    P2P_LOG("[Ratchet] encrypt: msgNum=" << header.messageNum
+            << " " << (m_hybrid ? "(hybrid PQ)" : ""));
 
     Bytes headerBytes = header.serialize();
 
@@ -484,22 +482,20 @@ bool RatchetSession::skipMessageKeys(const Bytes& dhPub, uint32_t until) {
 
 Bytes RatchetSession::decrypt(const Bytes& headerAndCiphertext) {
     if (headerAndCiphertext.size() < static_cast<size_t>(RatchetHeader::kClassicalSize)) {
-        qWarning() << "[Ratchet] decrypt: too short" << headerAndCiphertext.size();
+        P2P_WARN("[Ratchet] decrypt: too short " << headerAndCiphertext.size());
         return {};
     }
 
     size_t headerLen = 0;
     RatchetHeader header = RatchetHeader::deserialize(headerAndCiphertext, headerLen);
     if (headerLen == 0) {
-        qWarning() << "[Ratchet] decrypt: header deserialize failed";
+        P2P_WARN("[Ratchet] decrypt: header deserialize failed");
         return {};
     }
 
     Bytes ciphertext = tail(headerAndCiphertext, headerLen);
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[Ratchet] decrypt: msgNum=" << header.messageNum
-             << "prevChain=" << header.prevChainLen;
-#endif
+    P2P_LOG("[Ratchet] decrypt: msgNum=" << header.messageNum
+            << " prevChain=" << header.prevChainLen);
 
     // Try skipped keys first
     Bytes skippedResult = trySkippedKeys(header, ciphertext);
@@ -507,9 +503,7 @@ Bytes RatchetSession::decrypt(const Bytes& headerAndCiphertext) {
 
     // If the DH key changed, perform a DH ratchet step
     if (header.dhPub != m_remoteDhPub) {
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[Ratchet] DH ratchet step" << (m_hybrid ? "(hybrid PQ)" : "");
-#endif
+        P2P_LOG("[Ratchet] DH ratchet step " << (m_hybrid ? "(hybrid PQ)" : ""));
         // Skip any remaining messages in the current receiving chain
         if (!skipMessageKeys(m_remoteDhPub, header.prevChainLen))
             return {};
@@ -521,9 +515,7 @@ Bytes RatchetSession::decrypt(const Bytes& headerAndCiphertext) {
 
         // Pass KEM ciphertext to dhRatchetStep — it handles decaps + root key mixing
         dhRatchetStep(header.dhPub, header.kemCt);
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[Ratchet] ratchet step complete";
-#endif
+        P2P_LOG("[Ratchet] ratchet step complete");
     }
 
     // Skip ahead in the current chain if needed
