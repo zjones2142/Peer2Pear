@@ -6,9 +6,13 @@ REM   - git, cmake, ninja, Python
 REM   - Visual Studio 2022 Build Tools (VC workload, Windows 10/11 SDK)
 REM Then uses aqtinstall to download Qt (msvc2019_64 + WebSockets module)
 REM to C:\Qt\, clones and bootstraps vcpkg, runs vcpkg in manifest mode to
-REM install everything listed in vcpkg.json (sqlcipher, pkgconf, libsodium,
-REM liboqs, and the "p2p" feature's msquic/libnice/glib), and setx's
+REM install everything listed in vcpkg.json (libsodium, liboqs, openssl,
+REM nlohmann-json, and the "p2p" feature's msquic/libnice/glib), and setx's
 REM CMAKE_PREFIX_PATH so CMake finds Qt.
+REM
+REM SQLCipher is NOT installed via winget/vcpkg -- the repo vendors the
+REM amalgamation in third_party/sqlcipher/ and core/ builds it from source
+REM against the OpenSSL that vcpkg pulls in.
 REM
 REM Idempotent -- re-running after a successful setup is a no-op.
 REM
@@ -50,7 +54,7 @@ echo Peer2Pear setup (Windows)
 echo.
 echo This will install (skipping anything already present):
 echo   git, cmake, ninja, Python 3, Visual Studio 2022 Build Tools,
-echo   Qt %QT_VERSION%, vcpkg, sqlcipher, pkgconf
+echo   Qt %QT_VERSION%, vcpkg
 echo.
 echo First-time total download: ~7-8 GB, roughly 45 minutes.
 echo.
@@ -186,9 +190,10 @@ setx CMAKE_PREFIX_PATH "%QT_DIR%" >nul
 
 REM ---- vcpkg -----------------------------------------------------------
 REM vcpkg.json lists everything the build needs:
-REM   - core:          libsodium, liboqs, nlohmann-json
-REM   - windows-only:  sqlcipher, pkgconf
+REM   - core:          libsodium, liboqs, openssl, nlohmann-json
 REM   - feature "p2p": msquic, libnice, glib  (default ON)
+REM
+REM SQLCipher is vendored (third_party/sqlcipher/) -- no vcpkg dep needed.
 REM
 REM We run vcpkg in MANIFEST mode -- positional package args are not
 REM supported once a vcpkg.json exists in the repo root, so everything

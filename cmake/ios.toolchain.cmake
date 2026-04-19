@@ -35,14 +35,22 @@ if(NOT DEFINED PLATFORM)
     set(PLATFORM "OS64")
 endif()
 
+# Minimum deployment target.  Default iOS 26.0 — the app targets modern iOS
+# so we can use the current SwiftUI / Network.framework / CryptoKit surface
+# without legacy-OS workarounds.  Users on iOS 26.0 through the current 26.x
+# point release will be able to install.  Override with
+#   -DIOS_DEPLOYMENT_TARGET=<version>
+# if you need to cut wider (e.g. 17.0) or narrower (e.g. 26.3).
+if(NOT DEFINED IOS_DEPLOYMENT_TARGET)
+    set(IOS_DEPLOYMENT_TARGET "26.0")
+endif()
+
 if(PLATFORM STREQUAL "OS64")
     set(IOS_SDK "iphoneos")
     set(IOS_ARCH "arm64")
-    set(IOS_DEPLOYMENT_TARGET "15.0")
 elseif(PLATFORM STREQUAL "SIMULATOR64")
     set(IOS_SDK "iphonesimulator")
     set(IOS_ARCH "arm64")
-    set(IOS_DEPLOYMENT_TARGET "15.0")
 else()
     message(FATAL_ERROR
         "Unknown PLATFORM='${PLATFORM}'.  Valid values: OS64, SIMULATOR64.")

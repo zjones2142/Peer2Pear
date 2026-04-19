@@ -59,10 +59,13 @@ require_cmd cmake "Install CMake >= 3.16 from your package manager or https://cm
 # These can't be provided by vcpkg cleanly:
 #   - ninja:      build tool; vcpkg can't bootstrap itself to build ninja to
 #                 build vcpkg (chicken/egg).  Use system package.
-#   - pkg-config: used by CMakeLists.txt to locate sqlcipher, libnice, glib.
-#   - sqlcipher:  we rely on the system SQLCipher so it links against the
-#                 system OpenSSL/libcrypto.  On Windows we use vcpkg because
-#                 no good system package manager exists there.
+#   - pkg-config: used by CMakeLists.txt to locate libnice + glib when the
+#                 PEER2PEAR_P2P feature is on.
+#
+# SQLCipher is NOT a system dep anymore — the repo vendors the SQLCipher
+# amalgamation in third_party/sqlcipher/ (sqlite3.c + sqlite3.h, committed).
+# core/ compiles it against the OpenSSL that vcpkg pulls in transitively via
+# liboqs.  Same build on desktop and mobile, no per-platform install step.
 
 install_macos_deps() {
     if ! command -v brew >/dev/null 2>&1; then
@@ -73,7 +76,7 @@ install_macos_deps() {
 
     # `qt` currently maps to Qt 6 on Homebrew.  CMake's find_package(Qt6)
     # picks up the brew prefix via the default CMAKE_SYSTEM_PREFIX_PATH.
-    local pkgs=(ninja pkg-config sqlcipher qt)
+    local pkgs=(ninja pkg-config qt)
     for p in "${pkgs[@]}"; do
         if brew list --versions "$p" >/dev/null 2>&1; then
             echo "  [ok] $p (already installed)"
@@ -95,8 +98,6 @@ install_debian_deps() {
         build-essential
         ninja-build
         pkg-config
-        sqlcipher
-        libsqlcipher-dev
         qt6-base-dev
     )
     local pkgs=("${base_pkgs[@]}")
@@ -137,23 +138,25 @@ else
     echo "Install these packages manually, then re-run:"
     echo "    build tools:     gcc, g++, make"
     echo "    build-system:    ninja, pkg-config, cmake"
-    echo "    sqlcipher:       runtime + dev headers"
     echo "    qt6:             qtbase (Widgets, Network), qtwebsockets"
+    echo
+    echo "SQLCipher is NOT a system dep — the repo vendors the amalgamation."
     echo
     echo "On Fedora/RHEL:"
     echo "    sudo dnf install gcc gcc-c++ make ninja-build pkgconf-pkg-config \\"
-    echo "                     cmake sqlcipher-devel qt6-qtbase-devel qt6-qtwebsockets-devel"
+    echo "                     cmake qt6-qtbase-devel qt6-qtwebsockets-devel"
     echo "On Arch:"
-    echo "    sudo pacman -S base-devel ninja pkgconf cmake sqlcipher qt6-base qt6-websockets"
+    echo "    sudo pacman -S base-devel ninja pkgconf cmake qt6-base qt6-websockets"
     exit 1
 fi
 echo
 
 # ── vcpkg (manifest mode via vcpkg.json) ─────────────────────────────────────
 #
-# vcpkg.json declares libsodium, liboqs, nlohmann-json, and (feature "p2p")
-# msquic, libnice, glib.  The toolchain file (set in CMakeLists.txt) triggers
-# auto-install on first CMake configure — no manual `vcpkg install` needed.
+# vcpkg.json declares libsodium, liboqs, openssl, nlohmann-json, and
+# (feature "p2p") msquic, libnice, glib.  The toolchain file (set in
+# CMakeLists.txt) triggers auto-install on first CMake configure — no
+# manual `vcpkg install` needed.
 
 if [ ! -d vcpkg ]; then
     echo "Cloning vcpkg..."

@@ -5,18 +5,12 @@
     "libsodium",
     "liboqs",
     {
+      "name": "openssl",
+      "$comment": "libcrypto is linked by third_party/sqlcipher (amalgamation) and comes in transitively via liboqs anyway. Declared explicitly so it doesn't depend on the transitive graph."
+    },
+    {
       "name": "nlohmann-json",
       "$comment": "Header-only JSON used by core/ (replaces QJsonDocument/QJsonObject). Cross-platform, tiny."
-    },
-    {
-      "name": "sqlcipher",
-      "platform": "windows",
-      "$comment": "On macOS/Linux sqlcipher comes from brew/apt; on Windows vcpkg supplies it."
-    },
-    {
-      "name": "pkgconf",
-      "platform": "windows",
-      "$comment": "Windows lacks a system pkg-config; vcpkg provides the shim used by CMakeLists."
     }
   ],
   "features": {

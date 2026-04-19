@@ -8,6 +8,14 @@ option(PEER2PEAR_P2P
     "Enable direct peer-to-peer transport (QUIC over ICE). Adds msquic + libnice + glib dependencies; on Windows this requires MSVC."
     ON)
 
+# BUILD_DESKTOP=ON pulls in Qt::Widgets/Network/WebSockets and the desktop/
+# subdirectory.  Turn it OFF for iOS / Android / headless builds — the
+# mobile apps link libpeer2pear-core.a directly via the C API and bring
+# their own platform adapters.  When OFF, core/ gets WITH_QT_CORE=OFF too.
+option(BUILD_DESKTOP
+    "Build the Qt Widgets desktop app (desktop/).  Turn OFF for iOS/Android cross-compiles."
+    ON)
+
 # Forward the option into vcpkg's manifest feature selection so the extra
 # P2P deps only get pulled in when actually needed.  FORCE ensures a flip
 # from ON to OFF invalidates the previous cached value.
@@ -21,7 +29,9 @@ endif()
 set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake"
     CACHE STRING "Vcpkg toolchain file")
 
-project(Peer2Pear VERSION 0.2 LANGUAGES CXX)
+project(Peer2Pear VERSION 0.2 LANGUAGES C CXX)
+# C is enabled because third_party/sqlcipher compiles sqlite3.c (the vendored
+# SQLCipher amalgamation).  Everything else is still C++.
 
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
@@ -31,13 +41,21 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── Qt ────────────────────────────────────────────────────────────────────────
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network WebSockets)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network WebSockets)
+# Only needed when building the desktop app.  iOS / Android cross-compiles set
+# BUILD_DESKTOP=OFF and skip this entirely — libpeer2pear-core.a itself is
+# Qt-free when WITH_QT_CORE=OFF (driven by BUILD_DESKTOP below).
+if(BUILD_DESKTOP)
+    find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network WebSockets)
+    find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network WebSockets)
 
-# Fix Qt's malformed framework flags on macOS
-if(APPLE)
-    set(CMAKE_EXE_LINKER_FLAGS
-        "${CMAKE_EXE_LINKER_FLAGS} -framework CoreFoundation -framework AppKit -framework Carbon")
+    # Fix Qt's malformed framework flags on macOS desktop builds.
+    if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(CMAKE_EXE_LINKER_FLAGS
+            "${CMAKE_EXE_LINKER_FLAGS} -framework CoreFoundation -framework AppKit -framework Carbon")
+    endif()
+else()
+    # Propagate to core/: no Qt::Core linkage, so qt_interop.hpp compiles to nothing.
+    set(WITH_QT_CORE OFF CACHE BOOL "Link core/ against Qt::Core" FORCE)
 endif()
 
 # ── vcpkg Dependencies ────────────────────────────────────────────────────────
@@ -59,23 +77,18 @@ if(PEER2PEAR_P2P)
     endif()
 endif()
 
-# ── SQLCipher ─────────────────────────────────────────────────────────────────
-if(APPLE)
-    execute_process(
-        COMMAND brew --prefix sqlcipher
-        OUTPUT_VARIABLE _SQLCIPHER_PREFIX
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    if(_SQLCIPHER_PREFIX)
-        set(ENV{PKG_CONFIG_PATH}
-            "$ENV{PKG_CONFIG_PATH}:${_SQLCIPHER_PREFIX}/lib/pkgconfig")
-    endif()
-endif()
-pkg_check_modules(SQLCIPHER REQUIRED IMPORTED_TARGET sqlcipher)
-message(STATUS "SQLCipher found: ${SQLCIPHER_VERSION}")
-set(SQLCIPHER_TARGET PkgConfig::SQLCIPHER)
+# ── SQLCipher (vendored amalgamation) ────────────────────────────────────────
+# Built from the vendored amalgamation in third_party/sqlcipher/ — same
+# static library on every platform (desktop / iOS / Android).  Regenerate
+# the amalgamation with third_party/sqlcipher/fetch.sh on SQLCipher bumps.
+# Reads the OpenSSL that comes in transitively via liboqs from vcpkg.
+add_subdirectory(third_party/sqlcipher)
+set(SQLCIPHER_TARGET sqlcipher)
+message(STATUS "SQLCipher: vendored amalgamation "
+    "(third_party/sqlcipher/VERSION: see file)")
 
 # ── Subdirectories ────────────────────────────────────────────────────────────
 add_subdirectory(core)      # libpeer2pear-core (static library)
-add_subdirectory(desktop)   # Peer2Pear desktop executable
+if(BUILD_DESKTOP)
+    add_subdirectory(desktop)   # Peer2Pear desktop executable
+endif()

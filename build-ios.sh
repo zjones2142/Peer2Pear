@@ -9,14 +9,18 @@
 #   ./build-ios.sh --simulator          # arm64 simulator (Apple Silicon Mac)
 #   ./build-ios.sh --both               # both device and simulator
 #
-# Prerequisites (see ios/README.md for details):
-#   - Xcode Command Line Tools
+# Prerequisites:
+#   - Xcode Command Line Tools (xcode-select --install)
 #   - CMake 3.16+
 #   - vcpkg bootstrapped (run ./setup.sh first if needed)
-#   - Qt for iOS installed, with QT_IOS_PREFIX exported or passed via --qt-ios
 #
-# The build uses PEER2PEAR_P2P=OFF because msquic / libnice / glib do not
-# cross-compile cleanly for iOS.  iOS is a relay-only client by design.
+# Build configuration:
+#   BUILD_DESKTOP=OFF  → skip Qt::Widgets and the desktop/ subdirectory
+#   WITH_QT_CORE=OFF   → libpeer2pear-core.a has zero Qt symbols
+#   PEER2PEAR_P2P=OFF  → skip msquic / libnice / glib (don't build for iOS)
+#
+# iOS is a relay-only client for now.  P2P on mobile is a separate effort
+# (libnice + GLib ports to iOS).  The core itself is Qt-free either way.
 
 set -euo pipefail
 
@@ -26,15 +30,13 @@ cd "$SCRIPT_DIR"
 # ── Parse args ───────────────────────────────────────────────────────────────
 
 TARGETS=("device")
-QT_IOS_PREFIX="${QT_IOS_PREFIX:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --simulator)  TARGETS=("simulator") ;;
         --both)       TARGETS=("device" "simulator") ;;
-        --qt-ios)     QT_IOS_PREFIX="$2"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--simulator | --both] [--qt-ios <path>]"
+            echo "Usage: $0 [--simulator | --both]"
             exit 0
             ;;
         *)
@@ -44,30 +46,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-
-# ── Validate Qt for iOS ──────────────────────────────────────────────────────
-
-if [ -z "$QT_IOS_PREFIX" ]; then
-    echo "Error: QT_IOS_PREFIX not set and --qt-ios flag not provided."
-    echo
-    echo "The core library links against Qt::Core.  On iOS we need Qt's iOS"
-    echo "target libraries, which aren't installed by 'brew install qt'."
-    echo
-    echo "Install Qt for iOS:"
-    echo "  pip install aqtinstall"
-    echo "  aqt install-qt mac ios 6.5.3 -O \$HOME/Qt"
-    echo
-    echo "Then re-run with one of:"
-    echo "  QT_IOS_PREFIX=\$HOME/Qt/6.5.3/ios ./build-ios.sh"
-    echo "  ./build-ios.sh --qt-ios \$HOME/Qt/6.5.3/ios"
-    exit 1
-fi
-
-if [ ! -f "$QT_IOS_PREFIX/lib/cmake/Qt6/Qt6Config.cmake" ]; then
-    echo "Error: $QT_IOS_PREFIX doesn't look like a Qt for iOS install."
-    echo "Expected to find: $QT_IOS_PREFIX/lib/cmake/Qt6/Qt6Config.cmake"
-    exit 1
-fi
 
 # ── Validate vcpkg ───────────────────────────────────────────────────────────
 
@@ -107,21 +85,21 @@ build_for() {
     echo "==============================================================="
     echo
 
-    # vcpkg manifest mode -- pulls libsodium, liboqs, sqlcipher for iOS.
-    # PEER2PEAR_P2P=OFF so msquic/libnice/glib are skipped.
+    # vcpkg manifest mode pulls libsodium, liboqs, sqlcipher, nlohmann-json
+    # for the iOS triplet.  BUILD_DESKTOP=OFF propagates WITH_QT_CORE=OFF to
+    # core/ so no Qt is required at any layer.
 
     cmake -S . -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_TOOLCHAIN_FILE="$SCRIPT_DIR/cmake/ios.toolchain.cmake" \
-        -DPLATFORM="$platform" \
+        -DCMAKE_TOOLCHAIN_FILE="$SCRIPT_DIR/vcpkg/scripts/buildsystems/vcpkg.cmake" \
         -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$SCRIPT_DIR/cmake/ios.toolchain.cmake" \
         -DVCPKG_MANIFEST_MODE=ON \
         -DVCPKG_TARGET_TRIPLET="$triplet" \
-        -DCMAKE_PREFIX_PATH="$QT_IOS_PREFIX" \
-        -DPEER2PEAR_P2P=OFF \
-        -DBUILD_DESKTOP=OFF
+        -DPLATFORM="$platform" \
+        -DBUILD_DESKTOP=OFF \
+        -DPEER2PEAR_P2P=OFF
 
-    # Only build the core static library on iOS — skip desktop/.
+    # Only build the core static library on iOS.
     cmake --build "$build_dir" --target peer2pear-core
 
     echo
@@ -136,5 +114,6 @@ done
 echo
 echo "iOS build complete."
 echo
-echo "Next: open ios/Peer2Pear.xcodeproj in Xcode, or run 'xcodegen generate'"
-echo "in ios/ to create the Xcode project from project.yml."
+echo "Next: open ios/Peer2Pear.xcodeproj in Xcode (once created), or use the"
+echo "shipped sources in ios/Peer2Pear/Sources/ to wire up an iOS app that"
+echo "links against build-ios-<target>/core/libpeer2pear-core.a."

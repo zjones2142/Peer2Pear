@@ -174,7 +174,7 @@ Both relay implementations speak the identical wire protocol. Clients can rotate
 | [msquic](https://github.com/microsoft/msquic) | Optional: QUIC transport for direct P2P (`-DPEER2PEAR_P2P=ON`) |
 | [libnice](https://libnice.freedesktop.org/) | Optional: ICE/STUN/TURN for direct P2P |
 
-Client dependencies are managed via [vcpkg](https://vcpkg.io/). SQLCipher must be installed separately (`brew install sqlcipher` on macOS, `apt install sqlcipher libsqlcipher-dev` on Ubuntu).
+Client dependencies are managed via [vcpkg](https://vcpkg.io/). SQLCipher is vendored in `third_party/sqlcipher/` (amalgamation) so no system install is required — the repo compiles it from source against the OpenSSL that vcpkg pulls in.
 
 ### Go relay
 
@@ -189,9 +189,9 @@ Client dependencies are managed via [vcpkg](https://vcpkg.io/). SQLCipher must b
 ### Prerequisites
 
 - CMake ≥ 3.16
-- Qt 5 or Qt 6 (Widgets, Network, WebSockets modules)
-- SQLCipher (`brew install sqlcipher` / `apt install sqlcipher libsqlcipher-dev`)
+- Qt 5 or Qt 6 (Widgets, Network, WebSockets modules) — **desktop only**; iOS / Android drop Qt entirely via `-DBUILD_DESKTOP=OFF`
 - A C++17-capable compiler
+- (SQLCipher is vendored — see `third_party/sqlcipher/`.)
 - [vcpkg](https://vcpkg.io/) (bootstrapped automatically)
 
 ### Linux / macOS
