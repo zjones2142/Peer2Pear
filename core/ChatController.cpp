@@ -1,18 +1,14 @@
 #include "ChatController.hpp"
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
-#ifdef QT_CORE_LIB
-#include "qt_bridge_temp.hpp"   // TEMP: Qt↔std bridge for desktop QuicConnection (QByteArray signals)
-#endif
 #ifdef PEER2PEAR_P2P
-// GLib's gio headers use a struct member named 'signals' which clashes
-// with Qt5's 'signals' macro. Include GLib first with the macro disabled,
-// then restore it before pulling in the Qt-based QuicConnection header.
+// QuicConnection is Qt-free (Phase 7d).  NiceConnection.hpp pulls in
+// nice/agent.h, whose gio dependency uses `signals` as a struct member —
+// clashes with Qt's `signals` macro.  Undef before, restore after so any
+// Qt header later in the TU still compiles cleanly.
 #undef signals
-#include <glib.h>
-#include <gio/gio.h>
-#include <nice/agent.h>
-#define signals Q_SIGNALS
+#include "NiceConnection.hpp"   // brings nice/agent.h (NICE_COMPONENT_STATE_*)
 #include "QuicConnection.hpp"
+#define signals Q_SIGNALS
 #endif
 // SqlCipherQuery is available via ChatController.hpp -> SqlCipherDb.hpp
 #include <sodium.h>
@@ -205,7 +201,7 @@ void ChatController::runMaintenance()
     for (const std::string &key : toRemove) {
         P2P_LOG("[ICE] Cleaning up stale connection to " << key.substr(0, 8) << "..."
                  << " (exceeded " << kP2PCleanupGraceSecs << "s grace)");
-        m_p2pConnections[key]->deleteLater();
+        delete m_p2pConnections[key];   // QuicConnection is plain class now (Phase 7d)
         m_p2pConnections.erase(key);
         m_p2pCreatedSecs.erase(key);
     }
@@ -335,7 +331,7 @@ void ChatController::setDatabase(SqlCipherDb& db)
         if (it != m_p2pConnections.end() &&
             it->second->isReady() &&
             it->second->quicActive()) {
-            it->second->sendFileData(p2p::bridge::toQByteArray(data));
+            it->second->sendFileData(data);
             return true;
         }
         return false;  // fall back to mailbox
@@ -373,7 +369,7 @@ void ChatController::sendText(const std::string& peerIdB64u, const std::string& 
     auto itConn = m_p2pConnections.find(peerIdB64u);
     if (itConn != m_p2pConnections.end() && itConn->second->isReady()) {
         P2P_LOG("[SEND P2P] sealed text to " << peerIdB64u.substr(0, 8) << "...");
-        itConn->second->sendData(p2p::bridge::toQByteArray(sealedEnv));
+        itConn->second->sendData(sealedEnv);
     } else
 #endif
     {
@@ -918,34 +914,29 @@ void ChatController::sendSealedPayload(const std::string& peerIdB64u,
 // ── QUIC + ICE connection setup ──────────────────────────────────────────────
 QuicConnection* ChatController::setupP2PConnection(const std::string& peerIdB64u, bool controlling)
 {
-    // ChatController isn't a QObject anymore (Phase 7b).  QuicConnection is
-    // a QObject, so we pass nullptr for parent and lifetime-manage via
-    // m_p2pConnections + deleteLater() in runMaintenance().
-    //
-    // Signal connects below use `conn` as the receiver so the connection
-    // lifetime tracks the QuicConnection itself — when it's deleteLater'd,
-    // all lambdas capturing `this` stop firing.
-    QuicConnection* conn = new QuicConnection(nullptr);
+    // QuicConnection is a plain class now (Phase 7d) — no Qt parent, no
+    // signal/slot.  Lifetime is managed by m_p2pConnections raw pointer
+    // ownership; runMaintenance() deletes stale entries.
+    QuicConnection* conn = new QuicConnection(*m_timerFactory);
     if (!m_turnHost.empty())
-        conn->setTurnServer(QString::fromStdString(m_turnHost), m_turnPort,
-                             QString::fromStdString(m_turnUser),
-                             QString::fromStdString(m_turnPass));
+        conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
     m_p2pConnections[peerIdB64u] = conn;
     m_p2pCreatedSecs[peerIdB64u] = nowSecs();
 
     const std::string iceType = controlling ? "ice_offer" : "ice_answer";
-    QObject::connect(conn, &QuicConnection::localSdpReady, conn,
-            [this, peerIdB64u, iceType, conn](const QString& sdp) {
+
+    // Callbacks fire on the GLib worker thread (ICE) or msquic worker
+    // (QUIC).  ChatController's downstream callbacks are thread-tolerant.
+    conn->onLocalSdpReady = [this, peerIdB64u, iceType, conn](const std::string& sdp) {
         json p = json::object();
         p["type"] = iceType;
         p["from"] = myIdB64u();
-        p["sdp"]  = sdp.toStdString();
+        p["sdp"]  = sdp;
         p["quic"] = true;
-        p["quic_fingerprint"] = conn->localQuicFingerprint().toStdString();
+        p["quic_fingerprint"] = conn->localQuicFingerprint();
         sendSealedPayload(peerIdB64u, p);
-    });
-    QObject::connect(conn, &QuicConnection::stateChanged, conn,
-            [this, peerIdB64u, conn](int state) {
+    };
+    conn->onStateChanged = [this, peerIdB64u, conn](int state) {
         if (state == NICE_COMPONENT_STATE_READY) {
             const std::string mode = conn->quicActive() ? "QUIC" : "ICE";
             if (onStatus) onStatus("P2P ready (" + mode + ") with " + peerIdB64u);
@@ -953,18 +944,15 @@ QuicConnection* ChatController::setupP2PConnection(const std::string& peerIdB64u
         } else if (state == NICE_COMPONENT_STATE_FAILED) {
             if (onStatus) onStatus("P2P failed for " + peerIdB64u);
         }
-    });
-    QObject::connect(conn, &QuicConnection::dataReceived, conn,
-            [this, peerIdB64u](const QByteArray& d) {
-        onP2PDataReceived(peerIdB64u, p2p::bridge::toBytes(d));
-    });
-    QObject::connect(conn, &QuicConnection::fileDataReceived, conn,
-            [this, peerIdB64u](const QByteArray& d) {
-        m_fileMgr.handleFileEnvelope(peerIdB64u,
-            p2p::bridge::toBytes(d),
+    };
+    conn->onDataReceived = [this, peerIdB64u](const Bytes& d) {
+        onP2PDataReceived(peerIdB64u, d);
+    };
+    conn->onFileDataReceived = [this, peerIdB64u](const Bytes& d) {
+        m_fileMgr.handleFileEnvelope(peerIdB64u, d,
             [this](const std::string& id) { return markSeen(id); },
             m_fileKeys);
-    });
+    };
     conn->initIce(controlling);
     return conn;
 }
@@ -1334,10 +1322,10 @@ void ChatController::onEnvelope(const Bytes& body)
                     // Pass QUIC capability from signaling
                     if (o.value("quic", false)) {
                         connIt->second->setPeerSupportsQuic(
-                            true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
+                            true, o.value("quic_fingerprint", std::string()));
                     }
                     connIt->second->setRemoteSdp(
-                        QString::fromStdString(o.value("sdp", std::string())));
+                        o.value("sdp", std::string()));
                 }
             }
         } else if (type == "ice_answer") {
@@ -1346,10 +1334,10 @@ void ChatController::onEnvelope(const Bytes& body)
             if (connIt != m_p2pConnections.end() && !connIt->second->isReady()) {
                 if (o.value("quic", false)) {
                     connIt->second->setPeerSupportsQuic(
-                        true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
+                        true, o.value("quic_fingerprint", std::string()));
                 }
                 connIt->second->setRemoteSdp(
-                    QString::fromStdString(o.value("sdp", std::string())));
+                    o.value("sdp", std::string()));
             }
 #endif // PEER2PEAR_P2P
         } else if (type == "file_key") {
@@ -1665,10 +1653,10 @@ void ChatController::onEnvelope(const Bytes& body)
             if (it != m_p2pConnections.end()) {
                 if (o.value("quic", false)) {
                     it->second->setPeerSupportsQuic(
-                        true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
+                        true, o.value("quic_fingerprint", std::string()));
                 }
                 it->second->setRemoteSdp(
-                    QString::fromStdString(o.value("sdp", std::string())));
+                    o.value("sdp", std::string()));
             }
         }
     } else if (type == "ice_answer") {
@@ -1676,10 +1664,10 @@ void ChatController::onEnvelope(const Bytes& body)
         if (it != m_p2pConnections.end() && !it->second->isReady()) {
             if (o.value("quic", false)) {
                 it->second->setPeerSupportsQuic(
-                    true, QString::fromStdString(o.value("quic_fingerprint", std::string())));
+                    true, o.value("quic_fingerprint", std::string()));
             }
             it->second->setRemoteSdp(
-                QString::fromStdString(o.value("sdp", std::string())));
+                o.value("sdp", std::string()));
         }
     }
 #endif // PEER2PEAR_P2P

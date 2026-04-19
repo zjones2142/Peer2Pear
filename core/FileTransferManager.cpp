@@ -1,7 +1,6 @@
 #include "FileTransferManager.hpp"
 #include "CryptoEngine.hpp"
 #include "SqlCipherDb.hpp"
-#include "qt_bridge_temp.hpp"  // TEMP: bridge for SqlCipherDb (still on Qt, Phase 6)
 
 #include <sodium.h>
 #include <nlohmann/json.hpp>

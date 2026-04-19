@@ -567,6 +567,67 @@ Verification:
   peer2pear-core rebuild, 15 translation units → `libpeer2pear-core.a`.
   `nm` confirms zero Qt symbols.
 
+**Post-Phase-7c cosmetic cleanup (2026-04-18):**
+- `qt_bridge_temp.hpp` renamed → `qt_interop.hpp`.  The conversions are no
+  longer transitional — they're a permanent boundary layer between Qt-typed
+  desktop UI and std-typed core.  Banner comment updated to reflect this.
+- Removed dead `qt_bridge_temp.hpp` include from `FileTransferManager.cpp`
+  (unused after the Phase 6 SqlCipherDb migration).
+
+### Phase 7d — Qt strip from QuicConnection + NiceConnection ✅ (2026-04-18)
+
+The last QObject classes that held real behavior (not just UI) got the
+Phase 7b treatment.  Now no class in the project inherits QObject except
+desktop UI widgets.
+
+**NiceConnection** (ICE / libnice / GLib wrapper, `desktop/`):
+- Dropped `QThread` base → plain class with a `std::thread` member that
+  runs the GLib main loop.  GLib doesn't need Qt's event loop, so this
+  was structurally a renaming.
+- Dropped `Q_OBJECT` + `Q_SIGNALS` → `std::function` callback members
+  (`onLocalSdpReady`, `onStateChanged`, `onDataReceived`).  Callbacks
+  fire on the GLib worker thread.
+- `QString` → `std::string`, `QByteArray` → `Bytes` throughout.
+- `QChar(0)`-fill credential wipe → `sodium_memzero` on `std::string`.
+- `qDebug` → `P2P_LOG`.
+
+**QuicConnection** (QUIC / msquic, `desktop/`):
+- Dropped `Q_OBJECT` + `Q_SIGNALS` → `std::function` callback members.
+- `QTimer` (3-second handshake timeout) → `ITimer` via constructor-injected
+  `ITimerFactory&` (same pattern ChatController uses).
+- `QHostAddress` (peer address after ICE) → `std::string`.
+- `QUdpSocket` (ephemeral port probe) → POSIX/Winsock `socket()` +
+  `bind(0)` + `getsockname()` in a tiny `findEphemeralUdpPort()` helper.
+- `QJsonObject`/`QJsonDocument` (bootstrap message) → `nlohmann::json`.
+- `QMetaObject::invokeMethod` (state-change marshaling to QObject thread)
+  → direct call.  ChatController callbacks were already thread-tolerant
+  (relay WebSocket impls invoke them from arbitrary threads).
+- `QObject::connect` to NiceConnection signals → direct callback assignment
+  (`m_ice->onStateChanged = [...]`).
+- `qDebug` → `P2P_LOG`.
+
+**ChatController.cpp PEER2PEAR_P2P branches:**
+- Dropped all `QObject::connect(conn, &QuicConnection::xxx, ...)` calls;
+  use direct callback assignment (`conn->onDataReceived = [...]`).
+- Dropped all `p2p::bridge::toBytes`/`toQByteArray` calls — types match now.
+- `new QuicConnection(nullptr)` → `new QuicConnection(*m_timerFactory)`.
+- `deleteLater()` → `delete` (QuicConnection isn't a QObject anymore).
+- Dropped the `qt_interop.hpp` include from `ChatController.cpp` entirely.
+- Include order tweaked: `NiceConnection.hpp` before `QuicConnection.hpp`
+  (with `signals` undef'd) so gio's struct member doesn't clash with Qt.
+
+**Verification:**
+- `build/` (desktop, `PEER2PEAR_P2P=ON`, `WITH_QT_CORE=ON`) — full clean
+  rebuild, 25 targets green, app links and runs.
+- `build-mobile/` (`WITH_QT_CORE=OFF`, `PEER2PEAR_P2P=OFF`) — full clean
+  `peer2pear-core` build, 15 TU → `libpeer2pear-core.a`, zero Qt symbols.
+- `build-mobile-p2p/` (`WITH_QT_CORE=OFF`, `PEER2PEAR_P2P=ON`) — proves
+  ChatController's P2P branches compile against the new Qt-free
+  QuicConnection header.  `libpeer2pear-core.a`, zero Qt symbols.
+  (Linking a runnable mobile binary still requires libnice + msquic +
+  GLib ports for iOS/Android — that's a platform-availability problem,
+  not a Qt problem.)
+
 **Step 7 — ChatController.hpp public surface (~30 min).**
 Once the .cpp is std-native, migrate the header:
 

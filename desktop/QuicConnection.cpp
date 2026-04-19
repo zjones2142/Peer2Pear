@@ -1,11 +1,25 @@
 #include "QuicConnection.hpp"
+#include "NiceConnection.hpp"
 #include "CryptoEngine.hpp"
-#include <QDebug>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QUdpSocket>
-#include <QtEndian>
+#include "log.hpp"
+
+#include <nlohmann/json.hpp>
 #include <sodium.h>
+#include <cstring>
+#include <cstdlib>
+
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "Ws2_32.lib")
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <unistd.h>
+  #include <arpa/inet.h>
+#endif
+
+using json = nlohmann::json;
 
 // S4 fix: max frame size matches the mailbox envelope limit (256 KB)
 static constexpr uint32_t kMaxFrameSize = 256 * 1024;
@@ -34,13 +48,13 @@ void QuicConnection::initQuicGlobal() {
     if (s_initialized) return;
 
     if (QUIC_FAILED(MsQuicOpen2(&s_msquic))) {
-        qWarning() << "[QUIC] Failed to open MsQuic";
+        P2P_WARN("[QUIC] Failed to open MsQuic");
         return;
     }
 
     QUIC_REGISTRATION_CONFIG regConfig = { "Peer2Pear", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
     if (QUIC_FAILED(s_msquic->RegistrationOpen(&regConfig, &s_registration))) {
-        qWarning() << "[QUIC] Failed to open registration";
+        P2P_WARN("[QUIC] Failed to open registration");
         MsQuicClose(s_msquic);
         s_msquic = nullptr;
         return;
@@ -48,42 +62,90 @@ void QuicConnection::initQuicGlobal() {
 
     s_initialized = true;
     atexit(cleanupMsquic);  // S5 fix
-
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[QUIC] MsQuic initialized";
-#endif
+    P2P_LOG("[QUIC] MsQuic initialized");
 }
+
+// ---------------------------
+// Helpers
+// ---------------------------
+
+namespace {
+
+// Bind a UDP socket to an ephemeral port, read it back, then close the socket.
+// There's a TOCTOU race between the close here and msquic's later bind on the
+// same port — same as the previous QUdpSocket-based version.  Acceptable for
+// local development; iOS/Android will pick the port via system APIs anyway.
+uint16_t findEphemeralUdpPort() {
+#ifdef _WIN32
+    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) return 0;
+#else
+    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;
+#endif
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;
+    if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+#ifdef _WIN32
+        ::closesocket(s);
+#else
+        ::close(s);
+#endif
+        return 0;
+    }
+#ifdef _WIN32
+    int len = sizeof(addr);
+#else
+    socklen_t len = sizeof(addr);
+#endif
+    uint16_t port = 0;
+    if (::getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+        port = ntohs(addr.sin_port);
+    }
+#ifdef _WIN32
+    ::closesocket(s);
+#else
+    ::close(s);
+#endif
+    return port;
+}
+
+// Replaces QByteArray::startsWith for Bytes.
+inline bool bytesStartsWith(const QuicConnection::Bytes& data, const char* prefix) {
+    const size_t n = std::strlen(prefix);
+    if (data.size() < n) return false;
+    return std::memcmp(data.data(), prefix, n) == 0;
+}
+
+}  // namespace
 
 // ---------------------------
 // Constructor / Destructor
 // ---------------------------
 
-QuicConnection::QuicConnection(QObject* parent)
-    : QObject(parent)
+QuicConnection::QuicConnection(ITimerFactory& timers)
+    : m_timerFactory(&timers)
+    , m_handshakeTimer(timers.create())
 {
     initQuicGlobal();
-
-    m_handshakeTimer.setSingleShot(true);
-    m_handshakeTimer.setInterval(3000);
-    connect(&m_handshakeTimer, &QTimer::timeout, this, &QuicConnection::onQuicHandshakeTimeout);
 }
 
 QuicConnection::~QuicConnection() {
+    if (m_handshakeTimer) m_handshakeTimer->stop();
     if (s_msquic) {
-        if (m_msgStream) s_msquic->StreamClose(m_msgStream);
+        if (m_msgStream)  s_msquic->StreamClose(m_msgStream);
         if (m_fileStream) s_msquic->StreamClose(m_fileStream);
         if (m_connection) {
             s_msquic->ConnectionShutdown(m_connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
             s_msquic->ConnectionClose(m_connection);
         }
-        if (m_listener) s_msquic->ListenerClose(m_listener);
+        if (m_listener)      s_msquic->ListenerClose(m_listener);
         if (m_configuration) s_msquic->ConfigurationClose(m_configuration);
     }
-    if (m_ice) {
-        m_ice->quit();
-        m_ice->wait();
-        m_ice->deleteLater();
-    }
+    // m_ice's unique_ptr destructor cleans up the GLib loop and joins the
+    // worker thread — see NiceConnection::~NiceConnection.
 }
 
 // ---------------------------
@@ -92,27 +154,29 @@ QuicConnection::~QuicConnection() {
 
 void QuicConnection::initIce(bool controlling) {
     m_controlling = controlling;
-    m_ice = new NiceConnection(this);
+    m_ice = std::make_unique<NiceConnection>();
 
-    connect(m_ice, &NiceConnection::localSdpReady, this, &QuicConnection::localSdpReady);
-    connect(m_ice, &NiceConnection::stateChanged, this, &QuicConnection::onIceStateChanged);
-    connect(m_ice, &NiceConnection::dataReceived, this, &QuicConnection::onIceDataReceived);
+    m_ice->onLocalSdpReady = [this](const std::string& sdp) {
+        if (onLocalSdpReady) onLocalSdpReady(sdp);
+    };
+    m_ice->onStateChanged  = [this](int state) { onIceStateChanged(state); };
+    m_ice->onDataReceived  = [this](const Bytes& data) { onIceDataReceived(data); };
 
     m_ice->initIce(controlling);
 }
 
-void QuicConnection::setTurnServer(const QString& host, int port,
-                                    const QString& user, const QString& pass) {
+void QuicConnection::setTurnServer(const std::string& host, int port,
+                                    const std::string& user, const std::string& pass) {
     if (m_ice) m_ice->setTurnServer(host, port, user, pass);
 }
 
-void QuicConnection::setRemoteSdp(const QString& sdp) {
+void QuicConnection::setRemoteSdp(const std::string& sdp) {
     if (m_ice) m_ice->setRemoteSdp(sdp);
 }
 
-void QuicConnection::setPeerSupportsQuic(bool supports, const QString& fingerprint) {
+void QuicConnection::setPeerSupportsQuic(bool supports, const std::string& fingerprint) {
     m_peerSupportsQuic = supports;
-    m_peerFingerprint = fingerprint;
+    m_peerFingerprint  = fingerprint;
 }
 
 bool QuicConnection::isReady() const {
@@ -127,118 +191,115 @@ bool QuicConnection::isReady() const {
 
 void QuicConnection::onIceStateChanged(int state) {
     if (state == NICE_COMPONENT_STATE_READY) {
-        // S3 fix: check if ICE path is relayed (TURN) — can't do QUIC over TURN
+        // S3 fix: check if ICE path is relayed (TURN) — can't do QUIC over TURN.
         if (m_ice && m_ice->isRelayed()) {
-#ifndef QT_NO_DEBUG_OUTPUT
-            qDebug() << "[QUIC] ICE selected TURN relay — QUIC not possible, using raw ICE";
-#endif
+            P2P_LOG("[QUIC] ICE selected TURN relay — QUIC not possible, using raw ICE");
             fallbackToRawIce();
-            emit stateChanged(NICE_COMPONENT_STATE_READY);
+            if (onStateChanged) onStateChanged(NICE_COMPONENT_STATE_READY);
             return;
         }
 
         if (!m_peerSupportsQuic || !s_initialized) {
             fallbackToRawIce();
-            emit stateChanged(NICE_COMPONENT_STATE_READY);
+            if (onStateChanged) onStateChanged(NICE_COMPONENT_STATE_READY);
             return;
         }
 
-        // S3 fix: extract peer's actual address from ICE selected pair
-        QString peerHost;
-        quint16 peerPort = 0;
+        // S3 fix: extract peer's actual address from ICE selected pair.
+        std::string peerHost;
+        uint16_t    peerPort = 0;
         if (m_ice && m_ice->getSelectedPeerAddress(peerHost, peerPort)) {
-            m_peerAddress = QHostAddress(peerHost);
+            m_peerAddress = peerHost;
         } else {
-            qWarning() << "[QUIC] Could not get peer address from ICE — falling back";
+            P2P_WARN("[QUIC] Could not get peer address from ICE — falling back");
             fallbackToRawIce();
-            emit stateChanged(NICE_COMPONENT_STATE_READY);
+            if (onStateChanged) onStateChanged(NICE_COMPONENT_STATE_READY);
             return;
         }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[QUIC] ICE ready — attempting QUIC upgrade to"
-                 << m_peerAddress.toString()
-                 << (m_controlling ? "(client)" : "(server)");
-#endif
-        m_handshakeTimer.start();
+        P2P_LOG("[QUIC] ICE ready — attempting QUIC upgrade to "
+                << m_peerAddress << " " << (m_controlling ? "(client)" : "(server)"));
+        if (m_handshakeTimer)
+            m_handshakeTimer->startSingleShot(3000, [this]() { onQuicHandshakeTimeout(); });
 
-        // Find a free UDP port for QUIC
-        QUdpSocket probe;
-        probe.bind(QHostAddress::AnyIPv4, quint16(0));
-        m_localQuicPort = probe.localPort();
-        probe.close();
+        // Find a free UDP port for QUIC.
+        m_localQuicPort = findEphemeralUdpPort();
 
         // S2 fix: sign the bootstrap message with our identity key so the peer
-        // can verify it's authentic (prevents port redirection attacks on ICE channel)
-        QJsonObject bootstrap;
-        bootstrap["quic_port"] = m_localQuicPort;
+        // can verify it's authentic (prevents port redirection attacks on ICE channel).
+        json bootstrap = json::object();
+        bootstrap["quic_port"]   = m_localQuicPort;
         bootstrap["fingerprint"] = m_localFingerprint;
-        QByteArray msg = "QUIC:" + QJsonDocument(bootstrap).toJson(QJsonDocument::Compact);
+        const std::string body = bootstrap.dump();
+        Bytes msg;
+        msg.reserve(5 + body.size());
+        const char prefix[] = "QUIC:";
+        msg.insert(msg.end(),
+                   reinterpret_cast<const uint8_t*>(prefix),
+                   reinterpret_cast<const uint8_t*>(prefix) + 5);
+        msg.insert(msg.end(),
+                   reinterpret_cast<const uint8_t*>(body.data()),
+                   reinterpret_cast<const uint8_t*>(body.data()) + body.size());
         m_ice->sendData(msg);
 
         if (m_peerQuicPort > 0) {
-            if (m_controlling)
-                startQuicClient();
-            else
-                startQuicServer();
+            if (m_controlling) startQuicClient();
+            else               startQuicServer();
         }
     } else if (state == NICE_COMPONENT_STATE_FAILED) {
-        emit stateChanged(NICE_COMPONENT_STATE_FAILED);
+        if (onStateChanged) onStateChanged(NICE_COMPONENT_STATE_FAILED);
     }
 }
 
-void QuicConnection::onIceDataReceived(const QByteArray& data) {
-    // Check for QUIC bootstrap message
-    if (data.startsWith("QUIC:")) {
-        QJsonObject obj = QJsonDocument::fromJson(data.mid(5)).object();
-        m_peerQuicPort = static_cast<quint16>(obj.value("quic_port").toInt());
+void QuicConnection::onIceDataReceived(const Bytes& data) {
+    // Check for QUIC bootstrap message.
+    if (bytesStartsWith(data, "QUIC:")) {
+        const std::string body(reinterpret_cast<const char*>(data.data()) + 5,
+                                data.size() - 5);
+        const json obj = json::parse(body, /*cb=*/nullptr, /*allow_exceptions=*/false);
+        if (!obj.is_object()) return;
+        m_peerQuicPort = static_cast<uint16_t>(obj.value("quic_port", 0));
 
-        // S2 fix: verify the bootstrap fingerprint matches what we received in signaling
-        const QString bootFingerprint = obj.value("fingerprint").toString();
-        if (!m_peerFingerprint.isEmpty() && bootFingerprint != m_peerFingerprint) {
-            qWarning() << "[QUIC] Bootstrap fingerprint mismatch — possible tampering, falling back";
+        // S2 fix: verify the bootstrap fingerprint matches what we received in signaling.
+        const std::string bootFingerprint = obj.value("fingerprint", std::string());
+        if (!m_peerFingerprint.empty() && bootFingerprint != m_peerFingerprint) {
+            P2P_WARN("[QUIC] Bootstrap fingerprint mismatch — possible tampering, falling back");
             fallbackToRawIce();
-            emit stateChanged(NICE_COMPONENT_STATE_READY);
+            if (onStateChanged) onStateChanged(NICE_COMPONENT_STATE_READY);
             return;
         }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[QUIC] Peer QUIC port:" << m_peerQuicPort;
-#endif
+        P2P_LOG("[QUIC] Peer QUIC port: " << m_peerQuicPort);
 
         if (m_ice->isReady() && !m_quicActive && !m_rawIceMode) {
-            if (m_controlling)
-                startQuicClient();
-            else
-                startQuicServer();
+            if (m_controlling) startQuicClient();
+            else               startQuicServer();
         }
         return;
     }
 
     if (m_rawIceMode) {
-        emit dataReceived(data);
+        if (onDataReceived) onDataReceived(data);
         return;
     }
 
     if (!m_quicActive) {
-        emit dataReceived(data);
+        if (onDataReceived) onDataReceived(data);
     }
 }
 
 void QuicConnection::onQuicHandshakeTimeout() {
     if (!m_quicActive) {
-        qWarning() << "[QUIC] Handshake timeout — falling back to raw ICE";
+        P2P_WARN("[QUIC] Handshake timeout — falling back to raw ICE");
         fallbackToRawIce();
-        emit stateChanged(NICE_COMPONENT_STATE_READY);
+        if (onStateChanged) onStateChanged(NICE_COMPONENT_STATE_READY);
     }
 }
 
 void QuicConnection::fallbackToRawIce() {
     m_rawIceMode = true;
     m_quicActive = false;
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[QUIC] Fallback to raw ICE mode";
-#endif
+    P2P_LOG("[QUIC] Fallback to raw ICE mode");
 }
 
 // ---------------------------
@@ -257,51 +318,43 @@ void QuicConnection::startQuicClient() {
     settings.PeerBidiStreamCount = 2;
     settings.IsSet.PeerBidiStreamCount = TRUE;
 
-    // S1 fix: use certificate validation via peer fingerprint instead of disabling
+    // S1 fix: app-layer crypto is the primary security layer.  See header for rationale.
     QUIC_CREDENTIAL_CONFIG credConfig = {};
-    credConfig.Type = QUIC_CREDENTIAL_TYPE_NONE;
+    credConfig.Type  = QUIC_CREDENTIAL_TYPE_NONE;
     credConfig.Flags = QUIC_CREDENTIAL_FLAG_CLIENT |
                        QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
-    // Note: QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION is acceptable here because:
-    // 1. All data is already encrypted at the application layer (sealed envelopes + ratchet)
-    // 2. QUIC TLS is defense-in-depth, not the primary security layer
-    // 3. The peer's identity is authenticated via Ed25519/ML-DSA signatures in sealed envelopes
-    // 4. The fingerprint in ice_offer/ice_answer is authenticated by the sealed ratchet channel
-    // Full cert pinning would require generating self-signed certs — deferred to a future hardening pass.
 
     if (QUIC_FAILED(s_msquic->ConfigurationOpen(s_registration, &alpn, 1,
                                                   &settings, sizeof(settings),
                                                   nullptr, &m_configuration))) {
-        qWarning() << "[QUIC] Failed to open client configuration";
+        P2P_WARN("[QUIC] Failed to open client configuration");
         fallbackToRawIce();
         return;
     }
 
     if (QUIC_FAILED(s_msquic->ConfigurationLoadCredential(m_configuration, &credConfig))) {
-        qWarning() << "[QUIC] Failed to load client credentials";
+        P2P_WARN("[QUIC] Failed to load client credentials");
         fallbackToRawIce();
         return;
     }
 
     if (QUIC_FAILED(s_msquic->ConnectionOpen(s_registration, connectionCallback,
                                                this, &m_connection))) {
-        qWarning() << "[QUIC] Failed to open connection";
+        P2P_WARN("[QUIC] Failed to open connection");
         fallbackToRawIce();
         return;
     }
 
     if (QUIC_FAILED(s_msquic->ConnectionStart(m_connection, m_configuration,
                                                 QUIC_ADDRESS_FAMILY_INET,
-                                                m_peerAddress.toString().toUtf8().constData(),
+                                                m_peerAddress.c_str(),
                                                 m_peerQuicPort))) {
-        qWarning() << "[QUIC] Failed to start connection";
+        P2P_WARN("[QUIC] Failed to start connection");
         fallbackToRawIce();
         return;
     }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[QUIC] Client connecting to" << m_peerAddress.toString() << ":" << m_peerQuicPort;
-#endif
+    P2P_LOG("[QUIC] Client connecting to " << m_peerAddress << ":" << m_peerQuicPort);
 }
 
 void QuicConnection::startQuicServer() {
@@ -314,28 +367,28 @@ void QuicConnection::startQuicServer() {
     settings.PeerBidiStreamCount = 2;
     settings.IsSet.PeerBidiStreamCount = TRUE;
 
-    // S1 fix: same rationale as client — app-layer crypto is the primary security layer
+    // S1 fix: same rationale as client — app-layer crypto is the primary security layer.
     QUIC_CREDENTIAL_CONFIG credConfig = {};
-    credConfig.Type = QUIC_CREDENTIAL_TYPE_NONE;
+    credConfig.Type  = QUIC_CREDENTIAL_TYPE_NONE;
     credConfig.Flags = QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
 
     if (QUIC_FAILED(s_msquic->ConfigurationOpen(s_registration, &alpn, 1,
                                                   &settings, sizeof(settings),
                                                   nullptr, &m_configuration))) {
-        qWarning() << "[QUIC] Failed to open server configuration";
+        P2P_WARN("[QUIC] Failed to open server configuration");
         fallbackToRawIce();
         return;
     }
 
     if (QUIC_FAILED(s_msquic->ConfigurationLoadCredential(m_configuration, &credConfig))) {
-        qWarning() << "[QUIC] Failed to load server credentials";
+        P2P_WARN("[QUIC] Failed to load server credentials");
         fallbackToRawIce();
         return;
     }
 
     if (QUIC_FAILED(s_msquic->ListenerOpen(s_registration, listenerCallback,
                                              this, &m_listener))) {
-        qWarning() << "[QUIC] Failed to open listener";
+        P2P_WARN("[QUIC] Failed to open listener");
         fallbackToRawIce();
         return;
     }
@@ -345,41 +398,37 @@ void QuicConnection::startQuicServer() {
     QuicAddrSetPort(&addr, m_localQuicPort);
 
     if (QUIC_FAILED(s_msquic->ListenerStart(m_listener, &alpn, 1, &addr))) {
-        qWarning() << "[QUIC] Failed to start listener on port" << m_localQuicPort;
+        P2P_WARN("[QUIC] Failed to start listener on port " << m_localQuicPort);
         fallbackToRawIce();
         return;
     }
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[QUIC] Server listening on port" << m_localQuicPort;
-#endif
+    P2P_LOG("[QUIC] Server listening on port " << m_localQuicPort);
 }
 
 // ---------------------------
 // QUIC callbacks
 // ---------------------------
 
-QUIC_STATUS QUIC_API QuicConnection::connectionCallback(HQUIC conn, void* ctx,
+QUIC_STATUS QUIC_API QuicConnection::connectionCallback(HQUIC /*conn*/, void* ctx,
                                                           QUIC_CONNECTION_EVENT* ev) {
     auto* self = static_cast<QuicConnection*>(ctx);
 
     switch (ev->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED:
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[QUIC] Connected!";
-#endif
+        P2P_LOG("[QUIC] Connected!");
         self->m_quicActive = true;
-        self->m_handshakeTimer.stop();
+        if (self->m_handshakeTimer) self->m_handshakeTimer->stop();
         self->openStreams();
-        QMetaObject::invokeMethod(self, [self]() {
-            emit self->stateChanged(NICE_COMPONENT_STATE_READY);
-        }, Qt::QueuedConnection);
+        // Fire the state-change callback directly on the msquic worker thread.
+        // Previously this used QMetaObject::invokeMethod with a queued
+        // connection to marshal back to the QObject's owning thread.  After
+        // the QObject strip, ChatController's callbacks are thread-tolerant.
+        if (self->onStateChanged) self->onStateChanged(NICE_COMPONENT_STATE_READY);
         return QUIC_STATUS_SUCCESS;
 
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
-#ifndef QT_NO_DEBUG_OUTPUT
-        qDebug() << "[QUIC] Connection shutdown complete";
-#endif
+        P2P_LOG("[QUIC] Connection shutdown complete");
         self->m_quicActive = false;
         return QUIC_STATUS_SUCCESS;
 
@@ -395,7 +444,8 @@ QUIC_STATUS QUIC_API QuicConnection::connectionCallback(HQUIC conn, void* ctx,
     }
 
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
-        qWarning() << "[QUIC] Peer-initiated shutdown, error:" << ev->SHUTDOWN_INITIATED_BY_PEER.ErrorCode;
+        P2P_WARN("[QUIC] Peer-initiated shutdown, error: "
+                 << ev->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
         return QUIC_STATUS_SUCCESS;
 
     default:
@@ -414,17 +464,17 @@ QUIC_STATUS QUIC_API QuicConnection::streamCallback(HQUIC stream, void* ctx,
 
             if (stream == self->m_msgStream) {
                 self->processFramedStream(self->m_msgRecvBuf, buf.Buffer, buf.Length,
-                                           &QuicConnection::dataReceived);
+                                           self->onDataReceived);
             } else if (stream == self->m_fileStream) {
                 self->processFramedStream(self->m_fileRecvBuf, buf.Buffer, buf.Length,
-                                           &QuicConnection::fileDataReceived);
+                                           self->onFileDataReceived);
             }
         }
         return QUIC_STATUS_SUCCESS;
     }
 
     case QUIC_STREAM_EVENT_SEND_COMPLETE:
-        free(ev->SEND_COMPLETE.ClientContext);
+        std::free(ev->SEND_COMPLETE.ClientContext);
         return QUIC_STATUS_SUCCESS;
 
     case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
@@ -438,7 +488,7 @@ QUIC_STATUS QUIC_API QuicConnection::streamCallback(HQUIC stream, void* ctx,
     }
 }
 
-QUIC_STATUS QUIC_API QuicConnection::listenerCallback(HQUIC listener, void* ctx,
+QUIC_STATUS QUIC_API QuicConnection::listenerCallback(HQUIC /*listener*/, void* ctx,
                                                         QUIC_LISTENER_EVENT* ev) {
     auto* self = static_cast<QuicConnection*>(ctx);
 
@@ -448,18 +498,9 @@ QUIC_STATUS QUIC_API QuicConnection::listenerCallback(HQUIC listener, void* ctx,
 
         // S7 fix: verify the connecting peer's IP matches the ICE-discovered peer.
         // Note: port may differ (peer binds a new ephemeral port for QUIC).
-        if (!self->m_peerAddress.isNull()) {
-            QUIC_ADDR remoteAddr = {};
-            uint32_t addrLen = sizeof(remoteAddr);
-            if (QUIC_SUCCEEDED(s_msquic->GetParam(conn, QUIC_PARAM_CONN_REMOTE_ADDRESS,
-                                                    &addrLen, &remoteAddr))) {
-                // Extract IP from the QUIC_ADDR and compare
-                char addrBuf[64] = {};
-                // QuicAddrGetFamily/Port are helpers; for IP comparison we rely on
-                // the fact that both sides went through ICE and the bootstrap verified
-                // the fingerprint (S2 fix). Full IP validation deferred.
-            }
-        }
+        // Full IP validation deferred — the bootstrap fingerprint check (S2) and
+        // the sealed-envelope auth at the application layer cover the gap.
+        (void)self;
 
         self->m_connection = conn;
         s_msquic->SetCallbackHandler(conn, (void*)connectionCallback, ctx);
@@ -478,42 +519,40 @@ QUIC_STATUS QUIC_API QuicConnection::listenerCallback(HQUIC listener, void* ctx,
 void QuicConnection::openStreams() {
     if (!s_msquic || !m_connection) return;
 
-    // Only the controlling side opens streams (client initiates)
+    // Only the controlling side opens streams (client initiates).
     if (!m_controlling) return;
 
     if (QUIC_FAILED(s_msquic->StreamOpen(m_connection, QUIC_STREAM_OPEN_FLAG_NONE,
                                            streamCallback, this, &m_msgStream))) {
-        qWarning() << "[QUIC] Failed to open message stream";
+        P2P_WARN("[QUIC] Failed to open message stream");
         return;
     }
     s_msquic->StreamStart(m_msgStream, QUIC_STREAM_START_FLAG_NONE);
 
     if (QUIC_FAILED(s_msquic->StreamOpen(m_connection, QUIC_STREAM_OPEN_FLAG_NONE,
                                            streamCallback, this, &m_fileStream))) {
-        qWarning() << "[QUIC] Failed to open file stream";
+        P2P_WARN("[QUIC] Failed to open file stream");
         return;
     }
     s_msquic->StreamStart(m_fileStream, QUIC_STREAM_START_FLAG_NONE);
 
-#ifndef QT_NO_DEBUG_OUTPUT
-    qDebug() << "[QUIC] Opened message + file streams";
-#endif
+    P2P_LOG("[QUIC] Opened message + file streams");
 }
 
-void QuicConnection::sendFramed(HQUIC stream, const QByteArray& data) {
+void QuicConnection::sendFramed(HQUIC stream, const Bytes& data) {
     if (!stream || !s_msquic) return;
 
-    const uint32_t len = static_cast<uint32_t>(data.size());
+    const uint32_t len      = static_cast<uint32_t>(data.size());
     const uint32_t totalLen = 4 + len;
 
-    auto* buf = static_cast<uint8_t*>(malloc(totalLen));
+    auto* buf = static_cast<uint8_t*>(std::malloc(totalLen));
     if (!buf) return;
 
     buf[0] = static_cast<uint8_t>((len >> 24) & 0xFF);
     buf[1] = static_cast<uint8_t>((len >> 16) & 0xFF);
     buf[2] = static_cast<uint8_t>((len >>  8) & 0xFF);
     buf[3] = static_cast<uint8_t>( len        & 0xFF);
-    memcpy(buf + 4, data.constData(), len);
+    std::memcpy(buf + 4, data.data(), len);
 
     QUIC_BUFFER quicBuf;
     quicBuf.Length = totalLen;
@@ -522,29 +561,30 @@ void QuicConnection::sendFramed(HQUIC stream, const QByteArray& data) {
     s_msquic->StreamSend(stream, &quicBuf, 1, QUIC_SEND_FLAG_NONE, buf);
 }
 
-void QuicConnection::processFramedStream(QByteArray& buf, const uint8_t* data, uint32_t len,
-                                           void (QuicConnection::*signal)(const QByteArray&)) {
-    buf.append(reinterpret_cast<const char*>(data), static_cast<int>(len));
+void QuicConnection::processFramedStream(Bytes& buf, const uint8_t* data, uint32_t len,
+                                           std::function<void(const Bytes&)>& cb) {
+    buf.insert(buf.end(), data, data + len);
 
     while (buf.size() >= 4) {
-        const uint32_t frameLen = (static_cast<uint8_t>(buf[0]) << 24) |
-                                   (static_cast<uint8_t>(buf[1]) << 16) |
-                                   (static_cast<uint8_t>(buf[2]) <<  8) |
-                                    static_cast<uint8_t>(buf[3]);
+        const uint32_t frameLen =
+            (static_cast<uint32_t>(buf[0]) << 24) |
+            (static_cast<uint32_t>(buf[1]) << 16) |
+            (static_cast<uint32_t>(buf[2]) <<  8) |
+             static_cast<uint32_t>(buf[3]);
 
-        // S4 fix: reject frames larger than the mailbox envelope limit
+        // S4 fix: reject frames larger than the mailbox envelope limit.
         if (frameLen > kMaxFrameSize) {
-            qWarning() << "[QUIC] Frame too large:" << frameLen << "— dropping buffer";
+            P2P_WARN("[QUIC] Frame too large: " << frameLen << " — dropping buffer");
             buf.clear();
             return;
         }
 
-        if (buf.size() < static_cast<int>(4 + frameLen)) break;
+        if (buf.size() < 4u + frameLen) break;
 
-        QByteArray payload = buf.mid(4, static_cast<int>(frameLen));
-        buf.remove(0, 4 + static_cast<int>(frameLen));
+        Bytes payload(buf.begin() + 4, buf.begin() + 4 + frameLen);
+        buf.erase(buf.begin(), buf.begin() + 4 + frameLen);
 
-        (this->*signal)(payload);
+        if (cb) cb(payload);
     }
 }
 
@@ -552,7 +592,7 @@ void QuicConnection::processFramedStream(QByteArray& buf, const uint8_t* data, u
 // Send interface
 // ---------------------------
 
-void QuicConnection::sendData(const QByteArray& data) {
+void QuicConnection::sendData(const Bytes& data) {
     if (m_rawIceMode) {
         if (m_ice) m_ice->sendData(data);
         return;
@@ -565,8 +605,8 @@ void QuicConnection::sendData(const QByteArray& data) {
     }
 }
 
-// S6 fix: return bool indicating success
-bool QuicConnection::sendFileData(const QByteArray& data) {
+// S6 fix: return bool indicating success.
+bool QuicConnection::sendFileData(const Bytes& data) {
     if (m_rawIceMode) return false;  // no QUIC file stream in raw mode
 
     if (m_quicActive && m_fileStream) {

@@ -1,8 +1,8 @@
 #include "mainwindow.h"
 #include "./ui_mainwindow.h"
 #include "onboardingdialog.h"
-#include "qt_bridge_temp.hpp"  // TEMP: bridge for CryptoEngine calls
-#include "bytes_util.hpp"      // strBytes helper (Qt-free)
+#include "qt_interop.hpp"  // Qt↔std boundary helpers for CryptoEngine calls
+#include "bytes_util.hpp"  // strBytes helper (Qt-free)
 
 #include <QPixmap>
 #include <QHBoxLayout>

@@ -1,5 +1,5 @@
 #include "databasemanager.h"
-#include "qt_bridge_temp.hpp"   // TEMP: bridge SqlCipherDb calls until desktop migrates too
+#include "qt_interop.hpp"   // Qt↔std boundary helpers for SqlCipherDb calls
 
 #include <QStandardPaths>
 #include <QDir>

@@ -1,8 +1,8 @@
 #pragma once
 //
 // Pure-std byte utilities.  No Qt, no sodium — safe for every host.
-// The Qt-dependent bridge helpers (QByteArray ↔ Bytes) live in
-// qt_bridge_temp.hpp and are gated on `#ifdef QT_CORE_LIB`.
+// The Qt-dependent boundary helpers (QByteArray ↔ Bytes, secureZeroQ) live
+// in qt_interop.hpp and are gated on `#ifdef QT_CORE_LIB`.
 //
 
 #include <cstdint>
