@@ -158,6 +158,111 @@ TEST(CApi, SetPassphraseV2RejectsWeakPassphrase) {
     fs::remove_all(dir);
 }
 
+// ── Group C API surface ────────────────────────────────────────────────
+// The group action / callback surface exists so mobile clients can
+// rename / leave / file-send / avatar / update-members in groups.
+// Full round-trip (action → network → peer's callback) requires two
+// contexts + a mock relay harness like test_e2e_two_clients.cpp — we
+// do that in the ChatController-level tests.  At the C API layer we
+// pin the contract: setters install without error, actions reject
+// null/empty args with -1 and accept well-formed args with 0.
+
+TEST(CApi, GroupCallbackSettersAreCallableAndSafe) {
+    const std::string dir = makeTempDir("p2p-capi-grpcb");
+    p2p_context* ctx = p2p_create(dir.c_str(), nullPlatform());
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(p2p_set_passphrase_v2(ctx, "test-only-passphrase"), 0);
+
+    // Install each new callback — they must register without touching
+    // any other state.  We don't invoke them here; this simply pins the
+    // signatures against ABI drift.
+    p2p_set_on_group_member_left(ctx,
+        [](const char*, const char*, const char*, const char**,
+           int64_t, const char*, void*) {}, nullptr);
+    p2p_set_on_group_renamed(ctx,
+        [](const char*, const char*, void*) {}, nullptr);
+    p2p_set_on_group_avatar(ctx,
+        [](const char*, const char*, void*) {}, nullptr);
+
+    // Re-installing to nullptr clears the slot — must not crash.
+    p2p_set_on_group_member_left(ctx, nullptr, nullptr);
+    p2p_set_on_group_renamed(ctx, nullptr, nullptr);
+    p2p_set_on_group_avatar(ctx, nullptr, nullptr);
+
+    // A NULL context on any setter is a no-op (not a crash).
+    p2p_set_on_group_member_left(nullptr, nullptr, nullptr);
+    p2p_set_on_group_renamed(nullptr, nullptr, nullptr);
+    p2p_set_on_group_avatar(nullptr, nullptr, nullptr);
+
+    p2p_destroy(ctx);
+    fs::remove_all(dir);
+}
+
+TEST(CApi, GroupActionsValidateArguments) {
+    const std::string dir = makeTempDir("p2p-capi-grpargs");
+    p2p_context* ctx = p2p_create(dir.c_str(), nullPlatform());
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(p2p_set_passphrase_v2(ctx, "test-only-passphrase"), 0);
+
+    const char* emptyMembers[] = { nullptr };
+    const char* members[] = { "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                              nullptr };
+
+    // Null ctx — every action must return its error sentinel (-1 / nullptr).
+    EXPECT_EQ(p2p_rename_group(nullptr, "g", "new", emptyMembers), -1);
+    EXPECT_EQ(p2p_leave_group(nullptr, "g", "n", emptyMembers), -1);
+    EXPECT_EQ(p2p_send_group_avatar(nullptr, "g", "a", emptyMembers), -1);
+    EXPECT_EQ(p2p_update_group_members(nullptr, "g", "n", emptyMembers), -1);
+    EXPECT_EQ(p2p_send_group_file(nullptr, "g", "n", members, "f", "/tmp/x"),
+              nullptr);
+
+    // Null required arg → -1 / nullptr.  group_name is optional and
+    // tolerated as NULL where documented; group_id + members are required.
+    EXPECT_EQ(p2p_rename_group(ctx, nullptr, "new", members), -1);
+    EXPECT_EQ(p2p_rename_group(ctx, "g", nullptr, members), -1);
+    EXPECT_EQ(p2p_rename_group(ctx, "g", "new", nullptr), -1);
+
+    EXPECT_EQ(p2p_leave_group(ctx, nullptr, "n", members), -1);
+    EXPECT_EQ(p2p_leave_group(ctx, "g", "n", nullptr), -1);
+
+    EXPECT_EQ(p2p_send_group_avatar(ctx, nullptr, "a", members), -1);
+    EXPECT_EQ(p2p_send_group_avatar(ctx, "g", nullptr, members), -1);
+    EXPECT_EQ(p2p_send_group_avatar(ctx, "g", "a", nullptr), -1);
+
+    EXPECT_EQ(p2p_update_group_members(ctx, nullptr, "n", members), -1);
+    EXPECT_EQ(p2p_update_group_members(ctx, "g", "n", nullptr), -1);
+
+    EXPECT_EQ(p2p_send_group_file(ctx, nullptr, "n", members, "f", "/tmp/x"),
+              nullptr);
+    EXPECT_EQ(p2p_send_group_file(ctx, "g", "n", nullptr, "f", "/tmp/x"),
+              nullptr);
+    EXPECT_EQ(p2p_send_group_file(ctx, "g", "n", members, nullptr, "/tmp/x"),
+              nullptr);
+    EXPECT_EQ(p2p_send_group_file(ctx, "g", "n", members, "f", nullptr),
+              nullptr);
+
+    // Well-formed args with empty roster — rename/avatar/update_members
+    // fire the control send loop with zero members (no-op, but the call
+    // itself must succeed).  leave_group likewise.
+    EXPECT_EQ(p2p_rename_group(ctx, "g", "new", emptyMembers), 0);
+    EXPECT_EQ(p2p_leave_group(ctx, "g", "n", emptyMembers), 0);
+    EXPECT_EQ(p2p_send_group_avatar(ctx, "g", "a", emptyMembers), 0);
+    EXPECT_EQ(p2p_update_group_members(ctx, "g", "n", emptyMembers), 0);
+
+    p2p_destroy(ctx);
+    fs::remove_all(dir);
+}
+
+// ── Round-trip: rename triggers onGroupRenamed when the control message
+// bounces through the sender's own decrypt path.  The sender's
+// ChatController wires its own sendSealedPayload → (in this single-
+// context setup) the message goes nowhere because there's no wire, but
+// the callback setter contract is pinned by the earlier tests.  Full
+// bidirectional round-trip coverage lives in the E2E suite that stands
+// up two ChatControllers with a mock relay — extending it to exercise
+// the C API directly is blocked on plumbing p2p_platform through the
+// mock harness (a separate piece of work).
+
 // ── 4. Null / empty passphrase and missing data_dir are rejected ─────────
 
 TEST(CApi, SetPassphraseV2RejectsBadArguments) {

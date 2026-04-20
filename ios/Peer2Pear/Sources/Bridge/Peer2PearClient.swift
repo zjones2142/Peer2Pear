@@ -22,6 +22,18 @@ struct P2PGroupMessage: Identifiable {
     let timestamp: Date
 }
 
+/// Client-side group state.  The core doesn't track groups itself (the
+/// relay is memberless) — each client maintains its own group roster
+/// derived from inbound messages + locally-created groups.  `memberIds`
+/// includes the peers you send to; your own peerId is NOT in the list
+/// (self-filtering is handled in the core when fanning out).
+struct P2PGroup: Identifiable {
+    let id: String         // groupId — a UUID chosen by the creator
+    var name: String
+    var memberIds: [String]
+    var lastActivity: Date
+}
+
 /// Avatar received from a peer.
 struct P2PAvatar {
     let from: String
@@ -91,6 +103,16 @@ final class Peer2PearClient: ObservableObject {
 
     /// Group message log.  Views partition by `groupId`.
     @Published var groupMessages: [P2PGroupMessage] = []
+
+    /// Known groups keyed by groupId.  Populated from two sources:
+    /// (1) `createGroup` when the local user creates one, and
+    /// (2) `on_group_message` upserts when a peer adds us to a group
+    /// or sends a message whose member roster we didn't know.
+    @Published var groups: [String: P2PGroup] = [:]
+
+    /// groupId → base64 avatar payload.  Set by on_group_avatar or
+    /// locally after a successful sendGroupAvatar.
+    @Published var groupAvatars: [String: String] = [:]
 
     /// peerId → online.  Updated by `on_presence` pushes.
     @Published var peerPresence: [String: Bool] = [:]
@@ -220,6 +242,26 @@ final class Peer2PearClient: ObservableObject {
         p2p_send_text(ctx, peerId, text)
     }
 
+    /// Create a new group locally.  `memberPeerIds` is the roster you
+    /// want to invite (self is NOT included — the core filters self
+    /// out when fanning out sends).  The returned `groupId` is a fresh
+    /// UUID the app keeps and passes to every subsequent sendGroupText.
+    ///
+    /// There's no network round-trip here — groups exist only in the
+    /// client.  Members learn about the group the first time they
+    /// receive a message tagged with this groupId.
+    @discardableResult
+    func createGroup(name: String, memberPeerIds: [String]) -> String {
+        let gid = UUID().uuidString.lowercased()
+        let group = P2PGroup(id: gid, name: name,
+                             memberIds: memberPeerIds,
+                             lastActivity: Date())
+        DispatchQueue.main.async { [weak self] in
+            self?.groups[gid] = group
+        }
+        return gid
+    }
+
     /// Send a text message to every member of a group.  `memberPeerIds`
     /// must include the recipients (self is filtered out internally).
     func sendGroupText(groupId: String,
@@ -227,14 +269,118 @@ final class Peer2PearClient: ObservableObject {
                        memberPeerIds: [String],
                        text: String) {
         guard let ctx = rawContext else { return }
-        // Build a NULL-terminated C array of member IDs.
-        let cStrings = memberPeerIds.map { strdup($0) }
+        withCStringArray(memberPeerIds) { ptr in
+            _ = p2p_send_group_text(ctx, groupId, groupName, ptr, text)
+        }
+    }
+
+    /// Send a file to every member of a group.  Mirrors `sendFile` for
+    /// 1:1 — chunks stream after each recipient's file_accept.
+    @discardableResult
+    func sendGroupFile(groupId: String,
+                       groupName: String,
+                       memberPeerIds: [String],
+                       fileName: String,
+                       filePath: String) -> String? {
+        guard let ctx = rawContext else { return nil }
+        return withCStringArray(memberPeerIds) { ptr -> String? in
+            guard let c = p2p_send_group_file(ctx, groupId, groupName,
+                                              ptr, fileName, filePath) else {
+                return nil
+            }
+            return String(cString: c)
+        }
+    }
+
+    /// Rename a group — broadcasts a `group_rename` control message.
+    @discardableResult
+    func renameGroup(groupId: String, newName: String,
+                     memberPeerIds: [String]) -> Bool {
+        guard let ctx = rawContext else { return false }
+        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
+            p2p_rename_group(ctx, groupId, newName, ptr)
+        }
+        if rc == 0 {
+            DispatchQueue.main.async { [weak self] in
+                if var g = self?.groups[groupId] {
+                    g.name = newName
+                    g.lastActivity = Date()
+                    self?.groups[groupId] = g
+                }
+            }
+        }
+        return rc == 0
+    }
+
+    /// Leave a group — broadcasts a `group_leave` notification and drops
+    /// the group from our local state.  Peers will remove us from their
+    /// rosters via their on_group_member_left callback.
+    @discardableResult
+    func leaveGroup(groupId: String, groupName: String,
+                    memberPeerIds: [String]) -> Bool {
+        guard let ctx = rawContext else { return false }
+        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
+            p2p_leave_group(ctx, groupId, groupName, ptr)
+        }
+        if rc == 0 {
+            DispatchQueue.main.async { [weak self] in
+                self?.groups.removeValue(forKey: groupId)
+                self?.groupMessages.removeAll { $0.groupId == groupId }
+                self?.groupAvatars.removeValue(forKey: groupId)
+            }
+        }
+        return rc == 0
+    }
+
+    /// Publish a new group avatar.
+    @discardableResult
+    func sendGroupAvatar(groupId: String, avatarB64: String,
+                         memberPeerIds: [String]) -> Bool {
+        guard let ctx = rawContext else { return false }
+        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
+            p2p_send_group_avatar(ctx, groupId, avatarB64, ptr)
+        }
+        if rc == 0 {
+            DispatchQueue.main.async { [weak self] in
+                self?.groupAvatars[groupId] = avatarB64
+            }
+        }
+        return rc == 0
+    }
+
+    /// Broadcast an updated member list — new members learn about the
+    /// group, dropped members see a left-marker.
+    @discardableResult
+    func updateGroupMembers(groupId: String, groupName: String,
+                            memberPeerIds: [String]) -> Bool {
+        guard let ctx = rawContext else { return false }
+        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
+            p2p_update_group_members(ctx, groupId, groupName, ptr)
+        }
+        if rc == 0 {
+            DispatchQueue.main.async { [weak self] in
+                if var g = self?.groups[groupId] {
+                    g.memberIds = memberPeerIds
+                    g.lastActivity = Date()
+                    self?.groups[groupId] = g
+                }
+            }
+        }
+        return rc == 0
+    }
+
+    // Helper: marshal [String] into the `const char**` (NULL-terminated)
+    // shape the C API expects.  All five group-mutation wrappers above
+    // share the same prologue — consolidate here to keep them readable.
+    private func withCStringArray<R>(_ strings: [String],
+                                      _ body: (UnsafeMutablePointer<UnsafePointer<CChar>?>?) -> R) -> R {
+        let cStrings = strings.map { strdup($0) }
         defer { cStrings.forEach { free($0) } }
         var cArray: [UnsafePointer<CChar>?] =
             cStrings.map { $0.map { UnsafePointer($0) } }
         cArray.append(nil)
-        cArray.withUnsafeMutableBufferPointer { buf in
-            _ = p2p_send_group_text(ctx, groupId, groupName, buf.baseAddress, text)
+        return cArray.withUnsafeMutableBufferPointer { buf in
+            body(buf.baseAddress)
         }
     }
 
@@ -409,7 +555,96 @@ final class Peer2PearClient: ObservableObject {
                 text: String(cString: text),
                 timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
             )
-            DispatchQueue.main.async { client.groupMessages.append(gm) }
+            DispatchQueue.main.async {
+                client.groupMessages.append(gm)
+                // Upsert group roster.  Non-creator members learn about
+                // a group by receiving a message tagged with its ID.
+                // If the creator renames the group later, we also pick
+                // that up here (last-write-wins on name + members).
+                var roster = gm.members
+                if !roster.contains(client.myPeerId) {
+                    roster.append(client.myPeerId)
+                }
+                var g = client.groups[gm.groupId]
+                    ?? P2PGroup(id: gm.groupId, name: gm.groupName,
+                                 memberIds: roster, lastActivity: gm.timestamp)
+                g.name = gm.groupName.isEmpty ? g.name : gm.groupName
+                g.memberIds = roster
+                g.lastActivity = max(g.lastActivity, gm.timestamp)
+                client.groups[gm.groupId] = g
+            }
+        }, selfPtr)
+
+        // ── Group member left ──────────────────────────────────────────
+        // member_ids is the NEW roster as the sender saw it — replace
+        // our stored roster verbatim.  Removing self means we were
+        // removed; we leave our local state alone and let the user decide.
+        p2p_set_on_group_member_left(ctx, {
+            from, gid, gname, memberIds, _, _, ud in
+            guard let client = Peer2PearClient.from(ud),
+                  let from, let gid, let gname else { return }
+            let gidStr    = String(cString: gid)
+            let fromStr   = String(cString: from)
+            let gnameStr  = String(cString: gname)
+            var members: [String] = []
+            if let memberIds {
+                var i = 0
+                while let p = memberIds[i] {
+                    members.append(String(cString: p))
+                    i += 1
+                }
+            }
+            DispatchQueue.main.async {
+                // Drop the departing peer from our stored roster.
+                if var g = client.groups[gidStr] {
+                    g.memberIds = members.filter { $0 != client.myPeerId }
+                    if !gnameStr.isEmpty { g.name = gnameStr }
+                    g.lastActivity = Date()
+                    client.groups[gidStr] = g
+                } else {
+                    // Unknown group — create a shell so the UI has something
+                    // to render if the user reconnects mid-departure.
+                    client.groups[gidStr] = P2PGroup(
+                        id: gidStr, name: gnameStr, memberIds: members,
+                        lastActivity: Date())
+                }
+                // Surface a transcript marker so the user sees what happened.
+                let marker = P2PGroupMessage(
+                    id: UUID().uuidString,
+                    from: fromStr, groupId: gidStr, groupName: gnameStr,
+                    members: members,
+                    text: fromStr == client.myPeerId
+                        ? "You left the group"
+                        : "\(fromStr.prefix(8))… left the group",
+                    timestamp: Date())
+                client.groupMessages.append(marker)
+            }
+        }, selfPtr)
+
+        // ── Group renamed ──────────────────────────────────────────────
+        p2p_set_on_group_renamed(ctx, { gid, newName, ud in
+            guard let client = Peer2PearClient.from(ud),
+                  let gid, let newName else { return }
+            let gidStr = String(cString: gid)
+            let nameStr = String(cString: newName)
+            DispatchQueue.main.async {
+                if var g = client.groups[gidStr] {
+                    g.name = nameStr
+                    g.lastActivity = Date()
+                    client.groups[gidStr] = g
+                }
+            }
+        }, selfPtr)
+
+        // ── Group avatar updated ───────────────────────────────────────
+        p2p_set_on_group_avatar(ctx, { gid, avatarB64, ud in
+            guard let client = Peer2PearClient.from(ud),
+                  let gid, let avatarB64 else { return }
+            let gidStr = String(cString: gid)
+            let avatarStr = String(cString: avatarB64)
+            DispatchQueue.main.async {
+                client.groupAvatars[gidStr] = avatarStr
+            }
         }, selfPtr)
 
         // ── Presence push ──────────────────────────────────────────────

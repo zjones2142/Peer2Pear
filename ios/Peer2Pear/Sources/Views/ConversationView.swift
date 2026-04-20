@@ -153,6 +153,267 @@ struct ConversationView: View {
     }
 }
 
+// MARK: - Group conversation
+// Mirrors ConversationView for 1:1 chats: scroll-of-messages + input bar.
+// Group-specific affordances: show sender name above each bubble (so
+// members can tell messages apart), toolbar button to see the roster.
+//
+// Outbound messages use `client.sendGroupText` which fans out to every
+// member in the group's roster.  Inbound messages land in
+// `client.groupMessages` via the on_group_message callback — we filter
+// to this groupId and render.
+
+struct GroupConversationView: View {
+    @ObservedObject var client: Peer2PearClient
+    let groupId: String
+    @State private var messageText = ""
+    @State private var showRoster = false
+    @State private var showFilePicker = false
+
+    private var group: P2PGroup? { client.groups[groupId] }
+
+    private var groupMessages: [P2PGroupMessage] {
+        client.groupMessages.filter { $0.groupId == groupId }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            messagesScroll
+            Divider()
+            inputBar
+        }
+        .navigationTitle(group?.name ?? "Group")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showRoster = true
+                } label: {
+                    Image(systemName: "person.3")
+                }
+                .disabled(group == nil)
+            }
+        }
+        .sheet(isPresented: $showRoster) {
+            if let group {
+                GroupRosterSheet(client: client, group: group)
+            }
+        }
+        .fileImporter(isPresented: $showFilePicker,
+                      allowedContentTypes: [.data],
+                      allowsMultipleSelection: false) { result in
+            handleFilePick(result: result)
+        }
+    }
+
+    @ViewBuilder private var messagesScroll: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(groupMessages) { msg in
+                        GroupMessageBubble(message: msg,
+                                           isMine: msg.from == client.myPeerId)
+                            .id(msg.id)
+                    }
+                }
+                .padding()
+            }
+            .onChange(of: groupMessages.count) {
+                if let last = groupMessages.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var inputBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                showFilePicker = true
+            } label: {
+                Image(systemName: "paperclip")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(group == nil)
+
+            TextField("Message", text: $messageText)
+                .textFieldStyle(.roundedBorder)
+
+            Button {
+                send()
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.green)
+            }
+            .disabled(messageText.isEmpty || group == nil)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+
+    private func handleFilePick(result: Result<[URL], Error>) {
+        guard case .success(let urls) = result, let url = urls.first,
+              let group else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        _ = client.sendGroupFile(groupId: group.id,
+                                 groupName: group.name,
+                                 memberPeerIds: group.memberIds,
+                                 fileName: url.lastPathComponent,
+                                 filePath: url.path)
+    }
+
+    private func send() {
+        guard let group, !messageText.isEmpty else { return }
+        client.sendGroupText(groupId: group.id,
+                             groupName: group.name,
+                             memberPeerIds: group.memberIds,
+                             text: messageText)
+        // Local echo — the core doesn't loop-back our own group sends
+        // through on_group_message, so we append ourselves to keep the
+        // transcript in-sync with what recipients see.
+        let echo = P2PGroupMessage(
+            id: UUID().uuidString,
+            from: client.myPeerId,
+            groupId: group.id,
+            groupName: group.name,
+            members: group.memberIds,
+            text: messageText,
+            timestamp: Date()
+        )
+        client.groupMessages.append(echo)
+        // Bump lastActivity so the group floats to the top of the list.
+        var g = group
+        g.lastActivity = Date()
+        client.groups[group.id] = g
+        messageText = ""
+    }
+}
+
+// Group message bubble — adds a sender-label row above the bubble so
+// members can attribute messages.  Own messages skip the label.
+
+struct GroupMessageBubble: View {
+    let message: P2PGroupMessage
+    let isMine: Bool
+
+    var body: some View {
+        HStack {
+            if isMine { Spacer() }
+            VStack(alignment: isMine ? .trailing : .leading, spacing: 2) {
+                if !isMine {
+                    Text(message.from.prefix(8) + "...")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                }
+                Text(message.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(isMine ? Color.green : Color(.systemGray5))
+                    .foregroundStyle(isMine ? .white : .primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                Text(message.timestamp, style: .time)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if !isMine { Spacer() }
+        }
+    }
+}
+
+// Group roster sheet — shows the full member list with trust badges +
+// online status dots.  No mutations from here today (no C API for
+// adding/removing members yet); it's purely a view.
+
+struct GroupRosterSheet: View {
+    @ObservedObject var client: Peer2PearClient
+    let group: P2PGroup
+    @Environment(\.dismiss) private var dismiss
+    @State private var showRename = false
+    @State private var newName = ""
+    @State private var confirmLeave = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(group.memberIds, id: \.self) { peerId in
+                        HStack {
+                            Image(systemName: peerId == client.myPeerId
+                                   ? "person.fill" : "person")
+                                .foregroundStyle(.secondary)
+                            Text(peerId == client.myPeerId
+                                 ? "You"
+                                 : String(peerId.prefix(12)) + "...")
+                            Spacer()
+                            if peerId != client.myPeerId {
+                                if client.peerPresence[peerId] == true {
+                                    Circle().fill(.green).frame(width: 8, height: 8)
+                                }
+                                TrustBadge(trust: client.peerTrust(for: peerId))
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Members (\(group.memberIds.count))")
+                }
+
+                Section {
+                    Button {
+                        newName = group.name
+                        showRename = true
+                    } label: {
+                        Label("Rename Group", systemImage: "pencil")
+                    }
+                    Button(role: .destructive) {
+                        confirmLeave = true
+                    } label: {
+                        Label("Leave Group", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                }
+            }
+            .navigationTitle(group.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .alert("Rename Group", isPresented: $showRename) {
+                TextField("Group name", text: $newName)
+                    .autocapitalization(.words)
+                Button("Cancel", role: .cancel) {}
+                Button("Rename") {
+                    let trimmed = newName.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty else { return }
+                    _ = client.renameGroup(groupId: group.id,
+                                           newName: trimmed,
+                                           memberPeerIds: group.memberIds)
+                }
+            } message: {
+                Text("Other members will see the new name.")
+            }
+            .confirmationDialog("Leave this group?",
+                                isPresented: $confirmLeave,
+                                titleVisibility: .visible) {
+                Button("Leave", role: .destructive) {
+                    _ = client.leaveGroup(groupId: group.id,
+                                          groupName: group.name,
+                                          memberPeerIds: group.memberIds)
+                    dismiss()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Other members will see you left.  Your local messages will be cleared.")
+            }
+        }
+    }
+}
+
 // MARK: - Message bubble (unchanged)
 
 struct MessageBubble: View {

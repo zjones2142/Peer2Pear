@@ -353,6 +353,17 @@ struct p2p_context {
                                  const char**, const char*, int64_t, const char*, void*) = nullptr;
         void* group_message_ud = nullptr;
 
+        // Group member-left / rename / avatar (all fire from inbound
+        // control messages — see ChatController::onGroupMemberLeft /
+        // onGroupRenamed / onGroupAvatarReceived).
+        void (*on_group_member_left)(const char*, const char*, const char*,
+                                     const char**, int64_t, const char*, void*) = nullptr;
+        void* group_member_left_ud = nullptr;
+        void (*on_group_renamed)(const char*, const char*, void*) = nullptr;
+        void* group_renamed_ud = nullptr;
+        void (*on_group_avatar)(const char*, const char*, void*) = nullptr;
+        void* group_avatar_ud = nullptr;
+
         void (*on_presence)(const char*, int, void*) = nullptr;
         void* presence_ud = nullptr;
 
@@ -450,6 +461,39 @@ static void wire_signals(p2p_context* ctx)
                 memberPtrs.data(), text.c_str(),
                 tsSecs, msgId.c_str(),
                 ctx->cb.group_message_ud);
+        }
+    };
+
+    c.onGroupMemberLeft = [ctx](const std::string& from,
+                                 const std::string& groupId,
+                                 const std::string& groupName,
+                                 const std::vector<std::string>& memberKeys,
+                                 int64_t tsSecs,
+                                 const std::string& msgId) {
+        if (ctx->cb.on_group_member_left) {
+            std::vector<const char*> memberPtrs;
+            memberPtrs.reserve(memberKeys.size() + 1);
+            for (const std::string& k : memberKeys) memberPtrs.push_back(k.c_str());
+            memberPtrs.push_back(nullptr);
+
+            ctx->cb.on_group_member_left(
+                from.c_str(), groupId.c_str(), groupName.c_str(),
+                memberPtrs.data(), tsSecs, msgId.c_str(),
+                ctx->cb.group_member_left_ud);
+        }
+    };
+
+    c.onGroupRenamed = [ctx](const std::string& groupId, const std::string& newName) {
+        if (ctx->cb.on_group_renamed) {
+            ctx->cb.on_group_renamed(
+                groupId.c_str(), newName.c_str(), ctx->cb.group_renamed_ud);
+        }
+    };
+
+    c.onGroupAvatarReceived = [ctx](const std::string& groupId, const std::string& avatarB64) {
+        if (ctx->cb.on_group_avatar) {
+            ctx->cb.on_group_avatar(
+                groupId.c_str(), avatarB64.c_str(), ctx->cb.group_avatar_ud);
         }
     };
 
@@ -723,6 +767,83 @@ int p2p_send_group_text(p2p_context* ctx,
     return 0;
 }
 
+// Helper: materialize a NULL-terminated C array into a std::vector.  Used
+// by every group action below — same pattern as p2p_send_group_text.
+static std::vector<std::string> cStringArrayToVector(const char** arr) {
+    std::vector<std::string> out;
+    if (!arr) return out;
+    for (const char** p = arr; *p; ++p) out.emplace_back(*p);
+    return out;
+}
+
+const char* p2p_send_group_file(p2p_context* ctx,
+                                const char* group_id,
+                                const char* group_name,
+                                const char** member_ids,
+                                const char* file_name,
+                                const char* file_path)
+{
+    if (!ctx || !group_id || !member_ids || !file_name || !file_path) return nullptr;
+    P2P_CTX_GUARD(ctx);
+    std::string tid = ctx->controller.sendGroupFile(
+        group_id, group_name ? group_name : "",
+        cStringArrayToVector(member_ids),
+        file_name, file_path);
+    if (tid.empty()) return nullptr;
+    ctx->scratch = std::move(tid);
+    return ctx->scratch.c_str();
+}
+
+int p2p_rename_group(p2p_context* ctx,
+                     const char* group_id,
+                     const char* new_name,
+                     const char** member_ids)
+{
+    if (!ctx || !group_id || !new_name || !member_ids) return -1;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.sendGroupRename(
+        group_id, new_name, cStringArrayToVector(member_ids));
+    return 0;
+}
+
+int p2p_leave_group(p2p_context* ctx,
+                    const char* group_id,
+                    const char* group_name,
+                    const char** member_ids)
+{
+    if (!ctx || !group_id || !member_ids) return -1;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.sendGroupLeaveNotification(
+        group_id, group_name ? group_name : "",
+        cStringArrayToVector(member_ids));
+    return 0;
+}
+
+int p2p_send_group_avatar(p2p_context* ctx,
+                          const char* group_id,
+                          const char* avatar_b64,
+                          const char** member_ids)
+{
+    if (!ctx || !group_id || !avatar_b64 || !member_ids) return -1;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.sendGroupAvatar(
+        group_id, avatar_b64, cStringArrayToVector(member_ids));
+    return 0;
+}
+
+int p2p_update_group_members(p2p_context* ctx,
+                             const char* group_id,
+                             const char* group_name,
+                             const char** member_ids)
+{
+    if (!ctx || !group_id || !member_ids) return -1;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.sendGroupMemberUpdate(
+        group_id, group_name ? group_name : "",
+        cStringArrayToVector(member_ids));
+    return 0;
+}
+
 const char* p2p_send_file(p2p_context* ctx,
                           const char* peer_id,
                           const char* file_name,
@@ -908,6 +1029,35 @@ void p2p_set_on_presence(p2p_context* ctx,
     P2P_CTX_GUARD(ctx);
     ctx->cb.on_presence = cb;
     ctx->cb.presence_ud = ud;
+}
+
+void p2p_set_on_group_member_left(p2p_context* ctx,
+    void (*cb)(const char*, const char*, const char*,
+               const char**, int64_t, const char*, void*),
+    void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_group_member_left = cb;
+    ctx->cb.group_member_left_ud = ud;
+}
+
+void p2p_set_on_group_renamed(p2p_context* ctx,
+    void (*cb)(const char*, const char*, void*), void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_group_renamed = cb;
+    ctx->cb.group_renamed_ud = ud;
+}
+
+void p2p_set_on_group_avatar(p2p_context* ctx,
+    void (*cb)(const char*, const char*, void*), void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_group_avatar = cb;
+    ctx->cb.group_avatar_ud = ud;
 }
 
 void p2p_set_on_file_progress(p2p_context* ctx,

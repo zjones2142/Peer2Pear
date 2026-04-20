@@ -3,30 +3,55 @@ import SwiftUI
 struct ChatListView: View {
     @ObservedObject var client: Peer2PearClient
     @State private var showAddContact = false
+    @State private var showNewGroup = false
     @State private var newContactId = ""
 
-    /// Group messages by sender into "conversations"
+    /// 1:1 conversations keyed by the other peer's ID.
     private var conversations: [String: [P2PMessage]] {
         Dictionary(grouping: client.messages, by: \.from)
+    }
+
+    /// Groups sorted most-recently-active first.
+    private var groupsSorted: [P2PGroup] {
+        client.groups.values.sorted { $0.lastActivity > $1.lastActivity }
+    }
+
+    private var isEmpty: Bool {
+        conversations.isEmpty && groupsSorted.isEmpty
     }
 
     var body: some View {
         NavigationStack {
             List {
-                ForEach(conversations.keys.sorted(), id: \.self) { peerId in
-                    NavigationLink {
-                        ConversationView(client: client, peerId: peerId)
-                    } label: {
-                        ChatRow(client: client, peerId: peerId,
-                                preview: conversations[peerId]?.last?.text)
-                    }
-                    .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                        NavigationLink {
-                            ContactDetailView(client: client, peerId: peerId)
-                        } label: {
-                            Label("Info", systemImage: "info.circle")
+                if !groupsSorted.isEmpty {
+                    Section("Groups") {
+                        ForEach(groupsSorted) { group in
+                            NavigationLink {
+                                GroupConversationView(client: client, groupId: group.id)
+                            } label: {
+                                GroupRow(client: client, group: group)
+                            }
                         }
-                        .tint(.blue)
+                    }
+                }
+                if !conversations.isEmpty {
+                    Section("Direct Messages") {
+                        ForEach(conversations.keys.sorted(), id: \.self) { peerId in
+                            NavigationLink {
+                                ConversationView(client: client, peerId: peerId)
+                            } label: {
+                                ChatRow(client: client, peerId: peerId,
+                                        preview: conversations[peerId]?.last?.text)
+                            }
+                            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                NavigationLink {
+                                    ContactDetailView(client: client, peerId: peerId)
+                                } label: {
+                                    Label("Info", systemImage: "info.circle")
+                                }
+                                .tint(.blue)
+                            }
+                        }
                     }
                 }
             }
@@ -38,10 +63,19 @@ struct ChatListView: View {
                         .foregroundStyle(client.isConnected ? .green : .red)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showAddContact = true
+                    Menu {
+                        Button {
+                            showAddContact = true
+                        } label: {
+                            Label("New Chat", systemImage: "bubble.left")
+                        }
+                        Button {
+                            showNewGroup = true
+                        } label: {
+                            Label("New Group", systemImage: "person.3")
+                        }
                     } label: {
-                        Image(systemName: "plus.message")
+                        Image(systemName: "plus")
                     }
                 }
             }
@@ -58,13 +92,57 @@ struct ChatListView: View {
             } message: {
                 Text("Enter the peer's public key or scan their QR code")
             }
+            .sheet(isPresented: $showNewGroup) {
+                NewGroupSheet(client: client)
+            }
             .overlay {
-                if conversations.isEmpty {
+                if isEmpty {
                     ContentUnavailableView(
                         "No conversations yet",
                         systemImage: "bubble.left.and.bubble.right",
-                        description: Text("Tap + to start a new chat")
+                        description: Text("Tap + to start a new chat or group")
                     )
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Group list row
+// Group icon + name + last message preview.  The preview pulls the most
+// recent groupMessages entry, falling back to "No messages yet" before
+// anything lands.
+
+struct GroupRow: View {
+    @ObservedObject var client: Peer2PearClient
+    let group: P2PGroup
+
+    private var preview: String? {
+        client.groupMessages.last(where: { $0.groupId == group.id })?.text
+    }
+
+    var body: some View {
+        HStack {
+            Circle()
+                .fill(.indigo)
+                .frame(width: 40, height: 40)
+                .overlay {
+                    Image(systemName: "person.3.fill")
+                        .foregroundStyle(.white)
+                        .font(.subheadline)
+                }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(group.name)
+                    .font(.headline)
+                if let preview, !preview.isEmpty {
+                    Text(preview)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text("\(group.memberIds.count) member\(group.memberIds.count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -111,6 +189,85 @@ struct ChatRow: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .accessibilityLabel("Safety number changed")
+            }
+        }
+    }
+}
+
+// MARK: - New group creation sheet
+// Source of truth for "known contacts": peers we've exchanged 1:1
+// messages with.  In a full build we'd have a dedicated address book;
+// for now, the DM log is what we have to pick from.
+
+struct NewGroupSheet: View {
+    @ObservedObject var client: Peer2PearClient
+    @Environment(\.dismiss) private var dismiss
+    @State private var groupName = ""
+    @State private var selectedPeers: Set<String> = []
+
+    /// Peer IDs we've seen in 1:1 messages — potential group members.
+    private var knownPeers: [String] {
+        let ids = Set(client.messages.map(\.from))
+            .union(Set(client.peerPresence.keys))
+        return ids.filter { $0 != client.myPeerId }.sorted()
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Group Name") {
+                    TextField("e.g. Weekend Plans", text: $groupName)
+                }
+                Section {
+                    if knownPeers.isEmpty {
+                        Text("No contacts yet.  Start a 1:1 chat first, then " +
+                             "come back to create a group.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(knownPeers, id: \.self) { peerId in
+                            Button {
+                                if selectedPeers.contains(peerId) {
+                                    selectedPeers.remove(peerId)
+                                } else {
+                                    selectedPeers.insert(peerId)
+                                }
+                            } label: {
+                                HStack {
+                                    Image(systemName: selectedPeers.contains(peerId)
+                                           ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(selectedPeers.contains(peerId)
+                                                         ? .green : .secondary)
+                                    Text(peerId.prefix(12) + "...")
+                                        .font(.body)
+                                    Spacer()
+                                    TrustBadge(trust: client.peerTrust(for: peerId))
+                                }
+                            }
+                            .foregroundStyle(.primary)
+                        }
+                    }
+                } header: {
+                    Text("Members")
+                } footer: {
+                    Text("Members will see the group appear on their device the first time you send a message.")
+                }
+            }
+            .navigationTitle("New Group")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") {
+                        _ = client.createGroup(name: groupName.trimmingCharacters(in: .whitespaces),
+                                               memberPeerIds: Array(selectedPeers))
+                        dismiss()
+                    }
+                    .disabled(groupName.trimmingCharacters(in: .whitespaces).isEmpty
+                              || selectedPeers.isEmpty)
+                }
             }
         }
     }

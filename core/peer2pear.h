@@ -222,6 +222,65 @@ int p2p_send_group_text(p2p_context* ctx,
                         const char** member_ids,
                         const char* text);
 
+/**
+ * Send an encrypted file to every member of a group.
+ * Same semantics as p2p_send_file; chunks stream to each recipient once
+ * their file_accept arrives (Phase 2 consent).
+ *
+ * @return Transfer ID string (valid until next call), or NULL on failure.
+ */
+const char* p2p_send_group_file(p2p_context* ctx,
+                                const char* group_id,
+                                const char* group_name,
+                                const char** member_ids,  /* NULL-terminated */
+                                const char* file_name,
+                                const char* file_path);
+
+/**
+ * Rename a group.  A `group_rename` control message is sent to every
+ * member; they must surface it via on_group_renamed.
+ * @return 0 on success, -1 on bad args.
+ */
+int p2p_rename_group(p2p_context* ctx,
+                     const char* group_id,
+                     const char* new_name,
+                     const char** member_ids);
+
+/**
+ * Leave a group.  Sends a `group_leave` notification; peers receive it
+ * via on_group_member_left and should remove us from their roster.
+ * No local state is deleted here — the app decides whether to drop
+ * the group from its own UI after the send completes.
+ * @return 0 on success, -1 on bad args.
+ */
+int p2p_leave_group(p2p_context* ctx,
+                    const char* group_id,
+                    const char* group_name,
+                    const char** member_ids);
+
+/**
+ * Publish a new group avatar to every member.  `avatar_b64` is the same
+ * base64 PNG/JPEG payload the 1:1 avatar API uses.
+ * @return 0 on success, -1 on bad args.
+ */
+int p2p_send_group_avatar(p2p_context* ctx,
+                          const char* group_id,
+                          const char* avatar_b64,
+                          const char** member_ids);
+
+/**
+ * Broadcast the current member roster to every member (including new
+ * ones being added or the full group in cases of removal).  Peers apply
+ * the update on their side via on_group_member_left (for removals)
+ * and on_group_message (for the member-list field, which carries the
+ * updated roster).
+ * @return 0 on success, -1 on bad args.
+ */
+int p2p_update_group_members(p2p_context* ctx,
+                             const char* group_id,
+                             const char* group_name,
+                             const char** member_ids);
+
 /* ── File transfer ─────────────────────────────────────────────────────── */
 
 /**
@@ -346,6 +405,36 @@ void p2p_set_on_group_message(p2p_context* ctx,
 
 void p2p_set_on_presence(p2p_context* ctx,
     void (*cb)(const char* peer_id, int online, void* ud), void* ud);
+
+/**
+ * A peer left (or was removed from) a group.  `member_ids` is the NEW
+ * roster (post-departure) as the sender observed it.  Clients should
+ * replace their stored roster with this list.
+ */
+void p2p_set_on_group_member_left(p2p_context* ctx,
+    void (*cb)(const char* from,
+               const char* group_id,
+               const char* group_name,
+               const char** member_ids,   /* NULL-terminated */
+               int64_t timestamp_sec,
+               const char* msg_id,
+               void* ud),
+    void* ud);
+
+/**
+ * A peer renamed the group.  Clients should update their stored name.
+ */
+void p2p_set_on_group_renamed(p2p_context* ctx,
+    void (*cb)(const char* group_id, const char* new_name, void* ud),
+    void* ud);
+
+/**
+ * A peer published a new group avatar.  `avatar_b64` is the raw
+ * base64 payload (typically PNG/JPEG).
+ */
+void p2p_set_on_group_avatar(p2p_context* ctx,
+    void (*cb)(const char* group_id, const char* avatar_b64, void* ud),
+    void* ud);
 
 /**
  * File transfer progress callback.
