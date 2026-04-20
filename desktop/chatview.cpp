@@ -200,7 +200,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                                              bool isGroup = false,
                                              const QVector<ChatData> *allContacts = nullptr,
                                              std::function<void(const ChatData&)> onNewContact = nullptr,
-                                             QString *avatarInOut = nullptr)
+                                             QString *avatarInOut = nullptr,
+                                             ChatController *controller = nullptr)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -457,6 +458,90 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         if (!keysInOut.isEmpty()) keyInput->setText(keysInOut.first());
         keyInput->setProperty("_singleKeyInput", true);   // tag for save logic
         root->addWidget(keyInput);
+    }
+
+    // ── Safety number (1:1 contacts only, controller available) ─────────
+    // Shows the 60-digit out-of-band verification code.  User reads it
+    // aloud (or scans a future QR) with the peer and taps "Mark as
+    // verified" once confirmed.  Stored fingerprint is derived from
+    // current (self, peer) Ed25519 pubs; unverify on request.
+    if (!isGroup && controller && !keysInOut.isEmpty()) {
+        const std::string peerIdStd = keysInOut.first().trimmed().toStdString();
+        // Only show if the key is well-formed — otherwise the current
+        // trust query returns junk.
+        if (peerIdStd.size() == 43) {
+            auto *sn = new QFrame(&dlg);
+            sn->setFrameShape(QFrame::HLine);
+            sn->setStyleSheet("color: #2a2a2a;");
+            root->addWidget(sn);
+
+            auto *lbl = new QLabel("Safety Number", &dlg);
+            lbl->setStyleSheet("color:#d0d0d0;font-size:13px;background:transparent;");
+            root->addWidget(lbl);
+
+            const QString number = QString::fromStdString(
+                controller->safetyNumber(peerIdStd));
+            auto *numLbl = new QLabel(number, &dlg);
+            numLbl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            numLbl->setStyleSheet(
+                "QLabel{color:#f0f0f0;background:#111;border:1px solid #2a2a2a;"
+                "border-radius:8px;padding:10px 14px;"
+                "font-family:'Menlo','Monaco',monospace;font-size:13px;"
+                "letter-spacing:0.5px;}");
+            numLbl->setWordWrap(true);
+            root->addWidget(numLbl);
+
+            const auto trust = controller->peerTrust(peerIdStd);
+            auto *statusLbl = new QLabel(&dlg);
+            auto *verifyBtn = new QPushButton(&dlg);
+            verifyBtn->setAutoDefault(false);
+
+            auto refresh = [controller, peerIdStd, statusLbl, verifyBtn]() {
+                const auto t = controller->peerTrust(peerIdStd);
+                if (t == ChatController::PeerTrust::Verified) {
+                    statusLbl->setText("✓ Verified — compared out of band");
+                    statusLbl->setStyleSheet(
+                        "QLabel{color:#5dd868;font-size:12px;background:transparent;}");
+                    verifyBtn->setText("Unverify");
+                } else if (t == ChatController::PeerTrust::Mismatch) {
+                    statusLbl->setText(
+                        "! Safety number changed — either you or they reinstalled. "
+                        "Compare again before continuing.");
+                    statusLbl->setStyleSheet(
+                        "QLabel{color:#e6a33a;font-size:12px;background:transparent;}");
+                    verifyBtn->setText("Re-verify");
+                } else {
+                    statusLbl->setText("Not yet verified — compare this number "
+                                       "with your contact out of band.");
+                    statusLbl->setStyleSheet(
+                        "QLabel{color:#888;font-size:12px;background:transparent;}");
+                    verifyBtn->setText("Mark as Verified");
+                }
+            };
+            refresh();
+            statusLbl->setWordWrap(true);
+            root->addWidget(statusLbl);
+
+            verifyBtn->setStyleSheet(
+                "QPushButton{background:#111;border:1px solid #333;color:#f0f0f0;"
+                "border-radius:8px;padding:8px 14px;font-size:13px;}"
+                "QPushButton:hover{background:#1a1a1a;border:1px solid #555;}");
+            QObject::connect(verifyBtn, &QPushButton::clicked,
+                [controller, peerIdStd, refresh]() {
+                    if (controller->peerTrust(peerIdStd)
+                            == ChatController::PeerTrust::Verified) {
+                        controller->unverifyPeer(peerIdStd);
+                    } else {
+                        controller->markPeerVerified(peerIdStd);
+                    }
+                    refresh();
+                });
+
+            auto *verifyRow = new QHBoxLayout;
+            verifyRow->addStretch();
+            verifyRow->addWidget(verifyBtn);
+            root->addLayout(verifyRow);
+        }
     }
 
     root->addStretch();
@@ -1787,7 +1872,8 @@ void ChatView::onEditContact(int index)
                               if (m_db) m_db->saveContact(newContact);
                               rebuildChatList();
                           },
-                          wasGroup ? &avatar : nullptr);
+                          wasGroup ? &avatar : nullptr,
+                          m_controller);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
         // Validate key format and prevent duplicate keys — 1:1 contacts only
@@ -2118,6 +2204,37 @@ void ChatView::rebuildChatList()
         auto *nameLbl = new QLabel(m_chats[i].name, row);
         nameLbl->setStyleSheet("color:#d0d0d0;font-size:14px;background:transparent;");
         hl->addWidget(nameLbl, 1);
+
+        // Safety-number verification indicator (1:1 contacts only — groups
+        // inherit verification per-member and are shown in the contact
+        // editor's member list).  Green check = Verified; orange "!" =
+        // Mismatch (peer's safety number changed vs stored); no indicator
+        // for Unverified (the default first-contact state).
+        if (!m_chats[i].isGroup && m_controller && !m_chats[i].keys.isEmpty()) {
+            const std::string peerIdB64u =
+                m_chats[i].keys.first().trimmed().toStdString();
+            const auto trust = m_controller->peerTrust(peerIdB64u);
+            if (trust != ChatController::PeerTrust::Unverified) {
+                auto *badge = new QLabel(row);
+                badge->setFixedSize(16, 16);
+                badge->setAlignment(Qt::AlignCenter);
+                if (trust == ChatController::PeerTrust::Verified) {
+                    badge->setText("✓");
+                    badge->setStyleSheet(
+                        "QLabel{color:#5dd868;font-size:13px;"
+                        "font-weight:bold;background:transparent;}");
+                    badge->setToolTip("Verified safety number");
+                } else {
+                    badge->setText("!");
+                    badge->setStyleSheet(
+                        "QLabel{color:#e6a33a;font-size:13px;"
+                        "font-weight:bold;background:#3a2b12;"
+                        "border-radius:8px;}");
+                    badge->setToolTip("Safety number changed — re-verify");
+                }
+                hl->addWidget(badge);
+            }
+        }
 
         ensureUnreadSize();
         if (m_unread[i] > 0) {

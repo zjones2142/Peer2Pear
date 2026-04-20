@@ -243,10 +243,15 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
     m_requireP2PEnabled = (m_db->loadSetting("fileRequireP2P", "false") == "true");
     applyRequireP2PState();
 
+    m_hardBlockKeyChangeEnabled =
+        (m_db->loadSetting("hardBlockOnKeyChange", "false") == "true");
+    applyHardBlockKeyChangeState();
+
     // Emit initial values so MainWindow/ChatController sync up.
     emit fileAutoAcceptMaxChanged(softMB);
     emit fileHardMaxChanged(hardMB);
     emit fileRequireP2PToggled(m_requireP2PEnabled);
+    emit hardBlockOnKeyChangeToggled(m_hardBlockKeyChangeEnabled);
 
     // Relay URL — load whatever's stored (the mainwindow startup path is
     // the source of truth for the default; here we just reflect what's
@@ -1289,7 +1294,109 @@ QWidget *SettingsPanel::makePrivacySection()
     connect(m_privacyBtn2, &QPushButton::clicked, this,
             [this]() { onPrivacyLevelChanged(2); });
 
+    // ── Hard-block on peer key change (safety numbers) ──────────────────
+    {
+        QFrame *div = new QFrame();
+        div->setFrameShape(QFrame::HLine);
+        div->setStyleSheet("color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;");
+        cardLayout->addWidget(div);
+
+        QWidget *row = new QWidget();
+        row->setStyleSheet("background: transparent; border: none;");
+        QVBoxLayout *rv = new QVBoxLayout(row);
+        rv->setContentsMargins(16, 10, 16, 10);
+        rv->setSpacing(4);
+
+        QHBoxLayout *top = new QHBoxLayout();
+        top->setContentsMargins(0, 0, 0, 0);
+        top->setSpacing(8);
+
+        QLabel *label = new QLabel("Block contacts whose safety number changed");
+        label->setStyleSheet(
+            "color: #cccccc; font-size: 13px; background: transparent; border: none;");
+
+        m_hardBlockKeyChangeStatusLbl = new QLabel("Off");
+        m_hardBlockKeyChangeStatusLbl->setStyleSheet(
+            "color: #888888; font-size: 13px; background: transparent; border: none;");
+        m_hardBlockKeyChangeStatusLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+        m_hardBlockKeyChangeToggleBtn = new QPushButton("Enable");
+        m_hardBlockKeyChangeToggleBtn->setFixedSize(76, 28);
+        m_hardBlockKeyChangeToggleBtn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1a2a1a;"
+            "  color: #77cc77;"
+            "  border: 1px solid #2e5e2e;"
+            "  border-radius: 6px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: #203020; }");
+        connect(m_hardBlockKeyChangeToggleBtn, &QPushButton::clicked,
+                this, &SettingsPanel::onToggleHardBlockOnKeyChange);
+
+        top->addWidget(label);
+        top->addStretch();
+        top->addWidget(m_hardBlockKeyChangeStatusLbl);
+        top->addSpacing(8);
+        top->addWidget(m_hardBlockKeyChangeToggleBtn);
+        rv->addLayout(top);
+
+        QLabel *sub = new QLabel(
+            "If on, the app refuses to send to (or accept from) a previously-"
+            "verified contact whose safety number no longer matches. Default off: "
+            "a mismatch shows a banner, you decide whether to continue.");
+        sub->setStyleSheet(
+            "color: #777777; font-size: 11px; background: transparent; border: none;");
+        sub->setWordWrap(true);
+        rv->addWidget(sub);
+
+        cardLayout->addWidget(row);
+    }
+
     return card;
+}
+
+void SettingsPanel::onToggleHardBlockOnKeyChange()
+{
+    m_hardBlockKeyChangeEnabled = !m_hardBlockKeyChangeEnabled;
+    if (m_db) m_db->saveSetting("hardBlockOnKeyChange",
+                                 m_hardBlockKeyChangeEnabled ? "true" : "false");
+    applyHardBlockKeyChangeState();
+    emit hardBlockOnKeyChangeToggled(m_hardBlockKeyChangeEnabled);
+}
+
+void SettingsPanel::applyHardBlockKeyChangeState()
+{
+    if (!m_hardBlockKeyChangeStatusLbl || !m_hardBlockKeyChangeToggleBtn) return;
+    if (m_hardBlockKeyChangeEnabled) {
+        m_hardBlockKeyChangeStatusLbl->setText("On");
+        m_hardBlockKeyChangeStatusLbl->setStyleSheet(
+            "color: #4caf50; font-size: 13px; background: transparent; border: none;");
+        m_hardBlockKeyChangeToggleBtn->setText("Disable");
+        m_hardBlockKeyChangeToggleBtn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #2e1a1a;"
+            "  color: #cc5555;"
+            "  border: 1px solid #5e2e2e;"
+            "  border-radius: 6px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: #3a2020; }");
+    } else {
+        m_hardBlockKeyChangeStatusLbl->setText("Off");
+        m_hardBlockKeyChangeStatusLbl->setStyleSheet(
+            "color: #888888; font-size: 13px; background: transparent; border: none;");
+        m_hardBlockKeyChangeToggleBtn->setText("Enable");
+        m_hardBlockKeyChangeToggleBtn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1a2a1a;"
+            "  color: #77cc77;"
+            "  border: 1px solid #2e5e2e;"
+            "  border-radius: 6px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: #203020; }");
+    }
 }
 
 void SettingsPanel::onPrivacyLevelChanged(int level)

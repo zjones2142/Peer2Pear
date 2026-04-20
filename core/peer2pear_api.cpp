@@ -376,6 +376,13 @@ struct p2p_context {
 
         void (*on_file_blocked)(const char*, int, void*) = nullptr;
         void* file_blocked_ud = nullptr;
+
+        // Safety numbers
+        void (*on_peer_key_changed)(const char*,
+                                    const uint8_t*, int,
+                                    const uint8_t*, int,
+                                    void*) = nullptr;
+        void* peer_key_changed_ud = nullptr;
     } cb;
 
     std::string dataDir;
@@ -486,6 +493,18 @@ static void wire_signals(p2p_context* ctx)
         if (ctx->cb.on_file_blocked)
             ctx->cb.on_file_blocked(tid.c_str(), byReceiver ? 1 : 0,
                                     ctx->cb.file_blocked_ud);
+    };
+
+    c.onPeerKeyChanged = [ctx](const std::string& peerId,
+                                const Bytes& oldFp, const Bytes& newFp) {
+        if (!ctx->cb.on_peer_key_changed) return;
+        ctx->cb.on_peer_key_changed(
+            peerId.c_str(),
+            oldFp.empty() ? nullptr : oldFp.data(),
+            static_cast<int>(oldFp.size()),
+            newFp.empty() ? nullptr : newFp.data(),
+            static_cast<int>(newFp.size()),
+            ctx->cb.peer_key_changed_ud);
     };
 }
 
@@ -598,6 +617,47 @@ const char* p2p_my_id(p2p_context* ctx)
     P2P_CTX_GUARD(ctx);
     ctx->scratch = ctx->controller.myIdB64u();
     return ctx->scratch.c_str();
+}
+
+const char* p2p_safety_number(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return "";
+    P2P_CTX_GUARD(ctx);
+    ctx->scratch = ctx->controller.safetyNumber(peer_id);
+    return ctx->scratch.c_str();
+}
+
+int p2p_peer_trust(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return P2P_PEER_UNVERIFIED;
+    P2P_CTX_GUARD(ctx);
+    switch (ctx->controller.peerTrust(peer_id)) {
+        case ChatController::PeerTrust::Unverified: return P2P_PEER_UNVERIFIED;
+        case ChatController::PeerTrust::Verified:   return P2P_PEER_VERIFIED;
+        case ChatController::PeerTrust::Mismatch:   return P2P_PEER_MISMATCH;
+    }
+    return P2P_PEER_UNVERIFIED;
+}
+
+int p2p_mark_peer_verified(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->controller.markPeerVerified(peer_id) ? 0 : -1;
+}
+
+void p2p_unverify_peer(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.unverifyPeer(peer_id);
+}
+
+void p2p_set_hard_block_on_key_change(p2p_context* ctx, int enabled)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.setHardBlockOnKeyChange(enabled != 0);
 }
 
 void p2p_set_relay_url(p2p_context* ctx, const char* url)
@@ -893,4 +953,14 @@ void p2p_set_on_file_blocked(p2p_context* ctx,
     P2P_CTX_GUARD(ctx);
     ctx->cb.on_file_blocked    = cb;
     ctx->cb.file_blocked_ud    = ud;
+}
+
+void p2p_set_on_peer_key_changed(p2p_context* ctx,
+    void (*cb)(const char*, const uint8_t*, int, const uint8_t*, int, void*),
+    void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_peer_key_changed = cb;
+    ctx->cb.peer_key_changed_ud = ud;
 }

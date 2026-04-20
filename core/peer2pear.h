@@ -139,6 +139,49 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase);
  */
 const char* p2p_my_id(p2p_context* ctx);
 
+/* ── Safety numbers / out-of-band key verification ───────────────────── */
+
+/**
+ * Return the 60-digit safety-number display string for the (self, peer)
+ * pair — 12 groups of 5 digits separated by spaces.  Users compare the
+ * string out-of-band to confirm the peerId wasn't MITM'd on contact
+ * exchange.  Returns a pointer valid until the next p2p_* call; empty
+ * string on any error (null ctx, bad peerId).
+ */
+const char* p2p_safety_number(p2p_context* ctx, const char* peer_id);
+
+/**
+ * Trust state for a peer, returned by p2p_peer_trust().
+ *   0 = Unverified (no record; first contact; messaging allowed)
+ *   1 = Verified   (stored fingerprint matches current)
+ *   2 = Mismatch   (stored fingerprint no longer matches — usually means
+ *                   local identity was regenerated; fires on_peer_key_changed
+ *                   and is blocked when p2p_set_hard_block_on_key_change(1))
+ */
+#define P2P_PEER_UNVERIFIED 0
+#define P2P_PEER_VERIFIED   1
+#define P2P_PEER_MISMATCH   2
+int p2p_peer_trust(p2p_context* ctx, const char* peer_id);
+
+/**
+ * Mark the current (self, peer) fingerprint as user-verified.  Call
+ * after the user has compared the p2p_safety_number() display with the
+ * peer out-of-band.  Returns 0 on success, -1 on invalid args.
+ */
+int p2p_mark_peer_verified(p2p_context* ctx, const char* peer_id);
+
+/**
+ * Forget any prior verification for peer_id — returns them to Unverified.
+ */
+void p2p_unverify_peer(p2p_context* ctx, const char* peer_id);
+
+/**
+ * Policy: when enabled, messages to/from a Mismatch peer are refused at
+ * the core level.  Default is off (soft warn via on_peer_key_changed;
+ * UI decides).  Enable to hard-block.
+ */
+void p2p_set_hard_block_on_key_change(p2p_context* ctx, int enabled);
+
 /* ── Relay ─────────────────────────────────────────────────────────────── */
 
 /** Set the relay server URL (e.g., "https://relay.peer2pear.org:8443"). */
@@ -365,6 +408,20 @@ void p2p_set_on_file_delivered(p2p_context* ctx,
  */
 void p2p_set_on_file_blocked(p2p_context* ctx,
     void (*cb)(const char* transfer_id, int by_receiver, void* ud),
+    void* ud);
+
+/**
+ * Safety numbers: fires once per session when a previously-verified
+ * peer's fingerprint no longer matches the current (self, peer) pair.
+ * The UI should surface a banner and invite the user to re-verify.
+ * `old_fingerprint` / `new_fingerprint` are the raw 32-byte BLAKE2b
+ * values (for display or QR encoding); lengths are always 32.
+ */
+void p2p_set_on_peer_key_changed(p2p_context* ctx,
+    void (*cb)(const char* peer_id,
+               const uint8_t* old_fingerprint, int old_len,
+               const uint8_t* new_fingerprint, int new_len,
+               void* ud),
     void* ud);
 
 #ifdef __cplusplus

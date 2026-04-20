@@ -105,6 +105,45 @@ public:
     // G3: Wipe ratchet session for a peer, forcing a fresh Noise IK handshake
     void resetSession(const std::string& peerIdB64u);
 
+    // ── Safety numbers / out-of-band key verification ──────────────────────
+    //
+    // Audit #1 called this out as the single biggest missing feature —
+    // without it, Alice has no way to confirm the peerId she received
+    // via any out-of-band channel (invite link, QR scan) wasn't MITM'd.
+    //
+    // Trust states:
+    //   Unverified — no record; first contact; messaging works with a
+    //                soft "unverified" indicator in the UI.
+    //   Verified   — user previously compared safety numbers out-of-band
+    //                and confirmed.  Current fingerprint matches stored.
+    //   Mismatch   — stored fingerprint no longer matches current —
+    //                usually means the local identity was regenerated
+    //                (fresh install) and every verification is stale.
+    //                Fires onPeerKeyChanged.  If hard-block toggle is on,
+    //                sends + receives for that peer are refused.
+    enum class PeerTrust { Unverified, Verified, Mismatch };
+
+    /// Returns the 60-digit safety-number display string for the
+    /// (self, peer) pair.  Empty on invalid peerId.
+    std::string safetyNumber(const std::string& peerIdB64u) const;
+
+    /// Current verification state for peer.  Computed fresh each call.
+    PeerTrust peerTrust(const std::string& peerIdB64u) const;
+
+    /// Persist "user has compared safety numbers and confirmed".  The
+    /// current (self, peer) fingerprint is stored; mismatches surface
+    /// if either side changes.  Returns false on invalid peerId.
+    bool markPeerVerified(const std::string& peerIdB64u);
+
+    /// Forget the verification for a peer — they become Unverified.
+    void unverifyPeer(const std::string& peerIdB64u);
+
+    /// Policy toggle: when true, messages to/from a Mismatch peer are
+    /// blocked at the ChatController level.  Default false (soft warn
+    /// via onPeerKeyChanged; UI decides how to surface).
+    void setHardBlockOnKeyChange(bool on) { m_hardBlockOnKeyChange = on; }
+    bool hardBlockOnKeyChange() const     { return m_hardBlockOnKeyChange; }
+
     // GAP5: restore/persist group sequence counters across restarts
     void setGroupSeqCounters(const std::map<std::string, int64_t>& seqOut,
                              const std::map<std::string, int64_t>& seqIn);
@@ -190,6 +229,15 @@ public:
     /// SEC9: peer may be running an older client that doesn't support our
     /// current hybrid-PQ Noise messages.
     std::function<void(const std::string& peerId)> onPeerMayNeedUpgrade;
+
+    /// Safety numbers: fires ONCE per session when a previously-verified
+    /// peer's fingerprint no longer matches (usually: local identity
+    /// regenerated, or DB tampering).  The UI should surface a banner.
+    /// `oldFingerprint` is the stored 32-byte BLAKE2b, `newFingerprint`
+    /// is the freshly-computed one.
+    std::function<void(const std::string& peerId,
+                       const Bytes&       oldFingerprint,
+                       const Bytes&       newFingerprint)> onPeerKeyChanged;
 
     // ── Phase 2: file consent / cancellation callbacks ──────────────────────
     std::function<void(const std::string& from, const std::string& transferId,
@@ -302,6 +350,25 @@ private:
     // transferIds under a single group-level id returned to the caller, so
     // cancelFileTransfer() can fan out across all members.
     std::map<std::string, std::vector<std::string>> m_groupFileMembers;
+
+    // Safety-numbers state.
+    bool m_hardBlockOnKeyChange = false;
+    // In-memory set of peerIds we've already fired onPeerKeyChanged for
+    // this session — prevents spamming the UI on every message from a
+    // mismatched peer.  Cleared when a peer is re-verified or explicitly
+    // unverified.
+    std::set<std::string> m_keyChangeWarned;
+    // DB-backed helpers (defined in ChatController.cpp).
+    void ensureVerifiedPeersTable();
+    // Returns stored 32-byte fingerprint, or empty if no row.
+    Bytes loadVerifiedFingerprint(const std::string& peerIdB64u) const;
+    void  saveVerifiedFingerprint(const std::string& peerIdB64u,
+                                   const Bytes& fingerprint);
+    void  deleteVerifiedPeer(const std::string& peerIdB64u);
+    // Returns true if a Mismatch was detected (and fires onPeerKeyChanged
+    // at most once per session per peer).  Caller decides whether to
+    // continue based on m_hardBlockOnKeyChange.
+    bool detectKeyChange(const std::string& peerIdB64u);
 
     // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
     // Populated by file_key announcements (after consent), consumed by handleFileEnvelope().

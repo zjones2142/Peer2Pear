@@ -48,6 +48,11 @@ signals:
     // RelayClient.  MainWindow forwards to m_controller.relay().setPrivacyLevel.
     void privacyLevelChanged(int level);
 
+    // Safety-numbers: when on, messages to/from peers whose safety number
+    // changed are refused at the ChatController layer.  MainWindow forwards
+    // to m_controller.setHardBlockOnKeyChange.
+    void hardBlockOnKeyChangeToggled(bool on);
+
 private slots:
     void onToggleNotifications();
     void onToggleDnd();
@@ -57,6 +62,7 @@ private slots:
     void onApplyRelayUrl();
     void onResetRelayUrl();
     void onPrivacyLevelChanged(int level);
+    void onToggleHardBlockOnKeyChange();
 
 private:
     void buildUI();
@@ -110,6 +116,12 @@ private:
     QPushButton *m_privacyBtn1          = nullptr;
     QPushButton *m_privacyBtn2          = nullptr;
     QLabel      *m_privacyDescLabel     = nullptr;
+
+    // Safety-numbers hard-block toggle.
+    bool         m_hardBlockKeyChangeEnabled = false;
+    QPushButton *m_hardBlockKeyChangeToggleBtn = nullptr;
+    QLabel      *m_hardBlockKeyChangeStatusLbl = nullptr;
+    void applyHardBlockKeyChangeState();
 };
 
 #endif // SETTINGSPANEL_H

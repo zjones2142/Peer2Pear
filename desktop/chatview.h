@@ -111,6 +111,9 @@ private slots:
 
 public:
     void initChats();
+    /// Safety-numbers: called when ChatController::onPeerKeyChanged
+    /// fires, so the contact list re-renders its verification badges.
+    void refreshAfterKeyChange() { rebuildChatList(); }
 
 private:
     void rebuildChatList();

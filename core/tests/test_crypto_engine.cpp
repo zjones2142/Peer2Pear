@@ -293,6 +293,80 @@ TEST(CryptoEngine, HkdfMatchesSpecifiedConstruction) {
         << "HKDF-BLAKE2b construction diverged from PROTOCOL.md §10.2";
 }
 
+// ── 6e. Safety numbers: symmetry, determinism, independence ─────────────
+// The fingerprint and display string MUST be:
+//   - deterministic (same inputs → same output)
+//   - symmetric       (f(A,B) == f(B,A)) — both parties derive the same
+//     value without coordinating who's "us"
+//   - peer-specific  (different peer → different fingerprint)
+//
+// The display string format is also contract (third-party UIs compare
+// 60-digit strings).  Verify shape: 12 groups of 5 digits, 11 spaces.
+
+TEST(CryptoEngine, SafetyNumberIsSymmetric) {
+    auto [aPub, aPriv] = CryptoEngine::generateEphemeralX25519();
+    auto [bPub, bPriv] = CryptoEngine::generateEphemeralX25519();
+    ASSERT_EQ(aPub.size(), 32u);
+
+    EXPECT_EQ(CryptoEngine::safetyNumber(aPub, bPub),
+              CryptoEngine::safetyNumber(bPub, aPub));
+    EXPECT_EQ(CryptoEngine::safetyFingerprint(aPub, bPub),
+              CryptoEngine::safetyFingerprint(bPub, aPub));
+}
+
+TEST(CryptoEngine, SafetyNumberIsDeterministic) {
+    auto [aPub, aPriv] = CryptoEngine::generateEphemeralX25519();
+    auto [bPub, bPriv] = CryptoEngine::generateEphemeralX25519();
+
+    const std::string s1 = CryptoEngine::safetyNumber(aPub, bPub);
+    const std::string s2 = CryptoEngine::safetyNumber(aPub, bPub);
+    EXPECT_EQ(s1, s2);
+}
+
+TEST(CryptoEngine, SafetyNumberDiffersByPeer) {
+    auto [aPub, _a]   = CryptoEngine::generateEphemeralX25519();
+    auto [b1Pub, _b1] = CryptoEngine::generateEphemeralX25519();
+    auto [b2Pub, _b2] = CryptoEngine::generateEphemeralX25519();
+
+    EXPECT_NE(CryptoEngine::safetyNumber(aPub, b1Pub),
+              CryptoEngine::safetyNumber(aPub, b2Pub));
+}
+
+TEST(CryptoEngine, SafetyNumberFormatIsTwelveGroupsOfFive) {
+    auto [aPub, _a] = CryptoEngine::generateEphemeralX25519();
+    auto [bPub, _b] = CryptoEngine::generateEphemeralX25519();
+
+    const std::string s = CryptoEngine::safetyNumber(aPub, bPub);
+    ASSERT_EQ(s.size(), 71u);  // 12*5 + 11 spaces
+
+    int digitRuns = 0, spaceCount = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        if (std::isdigit(static_cast<unsigned char>(s[i]))) {
+            int run = 0;
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+                ++run; ++i;
+            }
+            EXPECT_EQ(run, 5) << "group of " << run << " digits";
+            ++digitRuns;
+        } else if (s[i] == ' ') {
+            ++spaceCount; ++i;
+        } else {
+            FAIL() << "unexpected character at " << i;
+        }
+    }
+    EXPECT_EQ(digitRuns, 12);
+    EXPECT_EQ(spaceCount, 11);
+}
+
+TEST(CryptoEngine, SafetyNumberRejectsWrongSize) {
+    Bytes ok(32, 0x11);
+    Bytes bad(31, 0x22);
+    EXPECT_TRUE(CryptoEngine::safetyNumber(bad, ok).empty());
+    EXPECT_TRUE(CryptoEngine::safetyFingerprint(ok, bad).empty());
+    EXPECT_TRUE(CryptoEngine::safetyNumber({}, ok).empty());
+}
+
 // ── 7. ML-KEM-768 encaps / decaps round-trip ──────────────────────────────
 
 TEST(CryptoEngine, MlKem768EncapsDecapsRoundTrip) {

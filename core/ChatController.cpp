@@ -268,6 +268,8 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
     // H5 fix: envelope-ID dedup survives restart when a DB is present.
     ensureSeenEnvelopesTable();
+    // Safety-numbers store for out-of-band verification.
+    ensureVerifiedPeersTable();
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
     m_sessionMgr->setSendResponseFn([this](const std::string& peerId, const Bytes& blob) {
@@ -355,6 +357,11 @@ std::string ChatController::myIdB64u() const
 
 void ChatController::sendText(const std::string& peerIdB64u, const std::string& text)
 {
+    // Safety-numbers check happens inside sealForPeer — one choke point
+    // covers 1:1 text, 1:1 avatar/file, group fan-outs, and group control
+    // messages uniformly.  sealForPeer returns empty under hard-block,
+    // which the caller interprets as "message not sent".
+
     json payload = json::object();
     payload["from"]  = myIdB64u();
     payload["type"]  = "text";
@@ -956,6 +963,24 @@ Bytes ChatController::sealForPeer(const std::string& peerIdB64u,
                                   const Bytes& plaintext)
 {
     if (!m_sessionMgr) return {};
+
+    // Safety-numbers enforcement — applies to every user-initiated
+    // outbound send because sealForPeer is the single choke point for
+    // sendText / sendAvatar / sendGroupMessageViaMailbox / sendFile /
+    // sendGroupFile / group control messages.  (The Noise handshake
+    // response path bypasses sealForPeer and builds its envelope
+    // directly via SessionManager's sendResponseFn callback, so
+    // infrastructure traffic is never gated.)
+    //
+    // detectKeyChange fires onPeerKeyChanged once per session per peer.
+    // When the hard-block toggle is on, a Mismatch returns empty here
+    // and the caller sees "seal failed" → surfaces as a status message.
+    if (detectKeyChange(peerIdB64u) && m_hardBlockOnKeyChange) {
+        P2P_WARN("[SEND] BLOCKED — peer's safety number changed for "
+                 << peerIdB64u.substr(0, 8) << "... (hard-block on)");
+        return {};
+    }
+
     // Pass peer's KEM pub so SessionManager can do hybrid Noise handshake if available
     Bytes peerKemPub = lookupPeerKemPub(peerIdB64u);
     Bytes sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext, peerKemPub);
@@ -1234,6 +1259,17 @@ void ChatController::onEnvelope(const Bytes& body)
         const std::string msgId = o.value("msgId", std::string());
 
         P2P_LOG("[RECV " << via << "] sealed type: " << type << " from " << senderId.substr(0, 8) << "...");
+
+        // Safety-numbers check on inbound.  Fires onPeerKeyChanged at
+        // most once per session; the hard-block toggle then refuses to
+        // deliver to the app callbacks.  Only applies to previously-
+        // verified peers — first-contact / unverified messages flow
+        // through as before.
+        if (detectKeyChange(senderId) && m_hardBlockOnKeyChange) {
+            P2P_WARN("[RECV] dropping message from " << senderId.substr(0, 8)
+                     << "... — hard-block on key change");
+            return;
+        }
 
         if (type == "text") {
             if (!msgId.empty() && !markSeen(msgId)) return;
@@ -1817,6 +1853,121 @@ void ChatController::resetSession(const std::string& peerIdB64u)
         P2P_LOG("[SESSION] Reset ratchet session for " << peerIdB64u.substr(0, 8) << "...");
         if (onStatus) onStatus("Session reset — next message will establish a fresh handshake.");
     }
+}
+
+// ── Safety numbers / out-of-band key verification ───────────────────────────
+
+void ChatController::ensureVerifiedPeersTable()
+{
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
+    SqlCipherQuery q(*m_dbPtr);
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS verified_peers ("
+        "  peer_id              TEXT PRIMARY KEY,"
+        "  verified_at          INTEGER NOT NULL,"
+        "  verified_fingerprint BLOB NOT NULL"
+        ");"
+    );
+}
+
+Bytes ChatController::loadVerifiedFingerprint(const std::string& peerIdB64u) const
+{
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return {};
+    SqlCipherQuery q(m_dbPtr->handle());
+    if (!q.prepare("SELECT verified_fingerprint FROM verified_peers WHERE peer_id=:pid;"))
+        return {};
+    q.bindValue(":pid", peerIdB64u);
+    if (q.exec() && q.next()) return q.valueBlob(0);
+    return {};
+}
+
+void ChatController::saveVerifiedFingerprint(const std::string& peerIdB64u,
+                                              const Bytes& fingerprint)
+{
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
+    SqlCipherQuery q(*m_dbPtr);
+    if (!q.prepare(
+            "INSERT INTO verified_peers (peer_id, verified_at, verified_fingerprint)"
+            " VALUES (:pid, :at, :fp)"
+            " ON CONFLICT(peer_id) DO UPDATE SET"
+            "   verified_at=excluded.verified_at,"
+            "   verified_fingerprint=excluded.verified_fingerprint;"))
+        return;
+    q.bindValue(":pid", peerIdB64u);
+    q.bindValue(":at",  nowSecs());
+    q.bindValue(":fp",  fingerprint);
+    q.exec();
+}
+
+void ChatController::deleteVerifiedPeer(const std::string& peerIdB64u)
+{
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
+    SqlCipherQuery q(*m_dbPtr);
+    if (!q.prepare("DELETE FROM verified_peers WHERE peer_id=:pid;"))
+        return;
+    q.bindValue(":pid", peerIdB64u);
+    q.exec();
+}
+
+std::string ChatController::safetyNumber(const std::string& peerIdB64u) const
+{
+    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEd.size() != 32) return {};
+    return CryptoEngine::safetyNumber(m_crypto.identityPub(), peerEd);
+}
+
+ChatController::PeerTrust ChatController::peerTrust(const std::string& peerIdB64u) const
+{
+    const Bytes stored = loadVerifiedFingerprint(peerIdB64u);
+    if (stored.size() != 32) return PeerTrust::Unverified;
+
+    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEd.size() != 32) return PeerTrust::Unverified;
+
+    const Bytes current =
+        CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
+    return (current == stored) ? PeerTrust::Verified : PeerTrust::Mismatch;
+}
+
+bool ChatController::markPeerVerified(const std::string& peerIdB64u)
+{
+    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEd.size() != 32) return false;
+    const Bytes fp =
+        CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
+    if (fp.size() != 32) return false;
+    saveVerifiedFingerprint(peerIdB64u, fp);
+    // A fresh mark clears the once-per-session warning so if the user
+    // re-verifies and we later detect ANOTHER change they'll see it.
+    m_keyChangeWarned.erase(peerIdB64u);
+    return true;
+}
+
+void ChatController::unverifyPeer(const std::string& peerIdB64u)
+{
+    deleteVerifiedPeer(peerIdB64u);
+    m_keyChangeWarned.erase(peerIdB64u);
+}
+
+bool ChatController::detectKeyChange(const std::string& peerIdB64u)
+{
+    const Bytes stored = loadVerifiedFingerprint(peerIdB64u);
+    if (stored.size() != 32) return false;  // Unverified — not a mismatch
+
+    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEd.size() != 32) return false;
+
+    const Bytes current =
+        CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
+    if (current == stored) return false;
+
+    // Mismatch.  Fire the callback at most once per session per peer.
+    if (m_keyChangeWarned.insert(peerIdB64u).second) {
+        if (onPeerKeyChanged) onPeerKeyChanged(peerIdB64u, stored, current);
+        P2P_WARN("[SAFETY] key-change detected for " << peerIdB64u.substr(0, 8)
+                 << "... (hardBlock=" << (m_hardBlockOnKeyChange ? "on" : "off") << ")");
+    }
+    return true;
 }
 
 // ── GAP5: Group sequence counter persistence ────────────────────────────────

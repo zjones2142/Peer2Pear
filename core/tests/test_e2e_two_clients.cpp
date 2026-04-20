@@ -421,6 +421,117 @@ TEST_F(TwoClientSuite, PersistentEnvelopeDedupSurvivesRestart) {
         << "persistent envelope dedup must drop a replay after restart";
 }
 
+// ── 3c. Safety numbers: first contact is Unverified, symmetric display ──
+// No verification record → peerTrust is Unverified for both peers.  The
+// 60-digit safety number is the same byte-for-byte on both sides (sort
+// invariance).
+
+TEST_F(TwoClientSuite, SafetyNumber_FirstContactUnverifiedAndSymmetric) {
+    connectBoth();
+
+    EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Unverified);
+    EXPECT_EQ(bob.ctrl->peerTrust(alice.id),
+              ChatController::PeerTrust::Unverified);
+
+    const std::string aNum = alice.ctrl->safetyNumber(bob.id);
+    const std::string bNum = bob.ctrl->safetyNumber(alice.id);
+    EXPECT_EQ(aNum, bNum);
+    EXPECT_EQ(aNum.size(), 71u);  // 12 groups × 5 digits + 11 spaces
+}
+
+// ── 3d. Safety numbers: mark → Verified → unverify ───────────────────────
+
+TEST_F(TwoClientSuite, SafetyNumber_MarkAndUnverifyFlow) {
+    connectBoth();
+
+    EXPECT_TRUE(alice.ctrl->markPeerVerified(bob.id));
+    EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Verified);
+    // Idempotent re-mark.
+    EXPECT_TRUE(alice.ctrl->markPeerVerified(bob.id));
+    EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Verified);
+
+    alice.ctrl->unverifyPeer(bob.id);
+    EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Unverified);
+}
+
+// ── 3e. Safety numbers: corrupt stored fingerprint → Mismatch + callback ─
+// Simulates "something changed since verification" (reinstall, DB
+// tampering).  The onPeerKeyChanged callback must fire AT MOST ONCE
+// per session per peer.
+
+TEST_F(TwoClientSuite, SafetyNumber_MismatchFiresCallbackOnceAndPersists) {
+    connectBoth();
+
+    ASSERT_TRUE(alice.ctrl->markPeerVerified(bob.id));
+    ASSERT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Verified);
+
+    // Simulate mismatch: corrupt the stored fingerprint in Alice's DB.
+    {
+        SqlCipherQuery q(*alice.db);
+        ASSERT_TRUE(q.prepare(
+            "UPDATE verified_peers SET verified_fingerprint = :fp"
+            " WHERE peer_id = :pid;"));
+        q.bindValue(":fp", Bytes(32, 0x11));  // definitely not the real FP
+        q.bindValue(":pid", bob.id);
+        ASSERT_TRUE(q.exec());
+    }
+    EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Mismatch);
+
+    // Wire the callback and fire a send — should trigger exactly once.
+    int callCount = 0;
+    std::string changedPeer;
+    Bytes lastOldFp, lastNewFp;
+    alice.ctrl->onPeerKeyChanged = [&](const std::string& pid,
+                                        const Bytes& oldFp, const Bytes& newFp) {
+        ++callCount;
+        changedPeer = pid;
+        lastOldFp   = oldFp;
+        lastNewFp   = newFp;
+    };
+
+    alice.ctrl->sendText(bob.id, "hi");
+    EXPECT_EQ(callCount, 1);
+    EXPECT_EQ(changedPeer, bob.id);
+    EXPECT_EQ(lastOldFp.size(), 32u);
+    EXPECT_EQ(lastNewFp.size(), 32u);
+    EXPECT_NE(lastOldFp, lastNewFp);
+
+    // Second send must NOT re-fire — the once-per-session guard holds.
+    alice.ctrl->sendText(bob.id, "hi 2");
+    EXPECT_EQ(callCount, 1);
+}
+
+// ── 3f. Hard-block toggle refuses sends + receives on mismatch ──────────
+
+TEST_F(TwoClientSuite, SafetyNumber_HardBlockRefusesSend) {
+    connectBoth();
+
+    ASSERT_TRUE(alice.ctrl->markPeerVerified(bob.id));
+    alice.ctrl->setHardBlockOnKeyChange(true);
+
+    // Corrupt Alice's stored fingerprint for Bob.
+    {
+        SqlCipherQuery q(*alice.db);
+        ASSERT_TRUE(q.prepare(
+            "UPDATE verified_peers SET verified_fingerprint = :fp"
+            " WHERE peer_id = :pid;"));
+        q.bindValue(":fp", Bytes(32, 0x22));
+        q.bindValue(":pid", bob.id);
+        ASSERT_TRUE(q.exec());
+    }
+
+    const size_t before = bob.received.size();
+    alice.ctrl->sendText(bob.id, "should be blocked");
+    EXPECT_EQ(bob.received.size(), before)
+        << "hard-block should have prevented the send from reaching Bob";
+}
+
 // ── 4. Envelope addressed to a stranger doesn't reach Alice or Bob ───────
 // A sealed envelope's AAD binds recipient identity; the relay routes by
 // recipientEdPub.  An envelope whose routing header targets a third party

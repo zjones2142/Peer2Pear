@@ -409,6 +409,22 @@ MainWindow::MainWindow(QWidget *parent)
         m_controller.relay().setPrivacyLevel(level);
     });
 
+    // Safety numbers — hard-block on key change.
+    connect(m_settingsPanel, &SettingsPanel::hardBlockOnKeyChangeToggled,
+            this, [this](bool on) {
+        m_controller.setHardBlockOnKeyChange(on);
+    });
+
+    // Surface safety-number mismatches as a status message + rebuild
+    // the chat list so the warning badge appears next to the display
+    // name.  UI will pick up details from peerTrust() on next render.
+    m_controller.onPeerKeyChanged =
+        [this, toQ](const std::string& peerId,
+                    const Bytes& /*oldFp*/, const Bytes& /*newFp*/) {
+        (void)peerId;
+        if (m_chatView) m_chatView->refreshAfterKeyChange();
+    };
+
     // Phase 2: file accept/decline prompt + cancel notifications → ChatView
     m_controller.onFileAcceptRequested =
         [cv = m_chatView, toQ](const std::string& from, const std::string& tid,

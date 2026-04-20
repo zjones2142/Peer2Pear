@@ -145,6 +145,31 @@ public:
     // Securely zero a std::string's buffer in-place.
     static void secureZero(std::string& str);
 
+    // ── Safety numbers (out-of-band key verification) ────────────────────
+    //
+    // Signal-style fingerprint derived from both peers' Ed25519 identity
+    // keys.  The audit called this out as the single biggest missing
+    // feature — without it, the crypto is correct but users have no way
+    // to confirm the peerId they received via any out-of-band channel
+    // (invite link, QR scan) wasn't substituted by a MITM.
+    //
+    // safetyNumber() returns a 60-digit display string (12 groups of 5
+    // separated by spaces) for users to read aloud or compare visually.
+    // The underlying 32-byte BLAKE2b fingerprint (via safetyFingerprint)
+    // is what gets persisted for later mismatch detection.
+    //
+    // The input is SORTED before hashing so the same value is produced
+    // on both sides regardless of who's "us" vs "them".  Construction:
+    //
+    //   fp = BLAKE2b-512(sort(edA, edB))           // 64-byte output
+    //   display[i] = sprintf("%05u", u40(fp[5i..5i+4]) mod 100000)
+    //                for i in 0..11, joined with spaces
+    //   fingerprint = BLAKE2b-256(sort(edA, edB))  // 32-byte persistable
+    //
+    // Returns empty on any input-size error.
+    static std::string safetyNumber(const Bytes& edA, const Bytes& edB);
+    static Bytes       safetyFingerprint(const Bytes& edA, const Bytes& edB);
+
 private:
     // Encrypted persistence helpers
     bool loadIdentityFromDisk();

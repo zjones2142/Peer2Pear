@@ -980,6 +980,77 @@ std::pair<Bytes, Bytes> CryptoEngine::generateEphemeralX25519() {
 }
 
 // ---------------------------
+// Safety numbers — see header comment for construction details.
+// Sort-and-hash is the whole trick; keep it boring so a third-party
+// implementation matches byte-for-byte from the spec alone.
+// ---------------------------
+
+namespace {
+// Lexicographic compare on two 32-byte pubkeys; memcmp-style.  Kept
+// local so the sort order is explicit at every call site.
+inline bool edLess(const Bytes& a, const Bytes& b) {
+    return std::lexicographical_compare(
+        a.begin(), a.end(), b.begin(), b.end());
+}
+}  // namespace
+
+Bytes CryptoEngine::safetyFingerprint(const Bytes& edA, const Bytes& edB) {
+    if (edA.size() != 32 || edB.size() != 32) return {};
+    const Bytes& first  = edLess(edA, edB) ? edA : edB;
+    const Bytes& second = edLess(edA, edB) ? edB : edA;
+
+    Bytes input;
+    input.reserve(64);
+    input.insert(input.end(), first.begin(),  first.end());
+    input.insert(input.end(), second.begin(), second.end());
+
+    unsigned char out[32];
+    if (crypto_generichash(out, sizeof(out),
+                           input.data(), input.size(),
+                           nullptr, 0) != 0) {
+        return {};
+    }
+    return Bytes(out, out + sizeof(out));
+}
+
+std::string CryptoEngine::safetyNumber(const Bytes& edA, const Bytes& edB) {
+    if (edA.size() != 32 || edB.size() != 32) return {};
+    const Bytes& first  = edLess(edA, edB) ? edA : edB;
+    const Bytes& second = edLess(edA, edB) ? edB : edA;
+
+    Bytes input;
+    input.reserve(64);
+    input.insert(input.end(), first.begin(),  first.end());
+    input.insert(input.end(), second.begin(), second.end());
+
+    // BLAKE2b-512 gives 64 bytes — plenty for 12 groups × 5 bytes = 60.
+    unsigned char h[64];
+    if (crypto_generichash(h, sizeof(h),
+                           input.data(), input.size(),
+                           nullptr, 0) != 0) {
+        return {};
+    }
+
+    std::string out;
+    out.reserve(71);  // 12*5 digits + 11 spaces
+    for (int i = 0; i < 12; ++i) {
+        const unsigned char* p = h + i * 5;
+        const uint64_t v =
+            (uint64_t(p[0]) << 32) |
+            (uint64_t(p[1]) << 24) |
+            (uint64_t(p[2]) << 16) |
+            (uint64_t(p[3]) <<  8) |
+             uint64_t(p[4]);
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%05u",
+                      static_cast<unsigned>(v % 100000ULL));
+        if (i > 0) out += ' ';
+        out += buf;
+    }
+    return out;
+}
+
+// ---------------------------
 // HKDF-style KDF — keyed BLAKE2b, NOT RFC 5869 HMAC-HKDF.  See the header
 // comment for the exact construction and the audit-M4 deviations.  The
 // name "hkdf" is retained because the callers all use it, and a rename
