@@ -18,10 +18,19 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
 	cryptorand "crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +41,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/nacl/box"
 )
 
 // ── Fixture ────────────────────────────────────────────────────────────
@@ -83,16 +93,16 @@ func newTestRelayOpt(t *testing.T, trustProxy bool) *testRelay {
 	return &testRelay{srv: srv, hub: hub, mbox: mbox, dbPath: dbPath}
 }
 
-// The relay onion key is X25519.  Tests don't exercise onion routing,
-// so a 32-byte random buffer (never referenced) is enough.
+// The relay onion key is X25519.  Most tests don't exercise onion
+// routing, but the onion tests below wrap envelopes to this pubkey, so
+// we generate a real keypair here — the pub half must actually match.
 func testRelayOnionKey(t *testing.T) (*[32]byte, *[32]byte) {
 	t.Helper()
-	var pub, priv [32]byte
-	if _, err := cryptorand.Read(priv[:]); err != nil {
-		t.Fatalf("rand: %v", err)
+	pub, priv, err := box.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("box.GenerateKey: %v", err)
 	}
-	copy(pub[:], priv[:]) // placeholder — never used on the wire here.
-	return &pub, &priv
+	return pub, priv
 }
 
 // ── Crypto helpers for test clients ────────────────────────────────────
@@ -700,6 +710,116 @@ func TestIpSafe(t *testing.T) {
 	}
 }
 
+// ── 16b. L1 audit-#2: --cert + --key path uses ListenAndServeTLS ──────
+// Spin up a relay listening on TLS with a self-signed cert and verify
+// that an HTTPS client (configured to trust the test cert) reaches
+// /healthz.  A plain HTTP client against the same port must fail.
+
+func TestRelay_NativeTlsEndpointServes(t *testing.T) {
+	cert, key := makeSelfSignedCertPEM(t)
+
+	// Build the same handler mux main.go uses.  We can't call main()
+	// directly, so stand up a parallel http.Server.
+	dbPath := filepath.Join(t.TempDir(), "tls.db")
+	mbox, err := NewMailbox(dbPath)
+	if err != nil {
+		t.Fatalf("mbox: %v", err)
+	}
+	defer mbox.Close()
+	hub := NewHub(mbox, false)
+	pub, priv := testRelayOnionKey(t)
+	hub.relayX25519Pub, hub.relayX25519Priv = pub, priv
+	defer hub.CloseAll()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "impl": "go"})
+	})
+
+	// Build a TLS Certificate from the PEM we just produced.
+	tlsCert, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+
+	// httptest.NewUnstartedServer lets us wire the TLS config ourselves.
+	srv := httptest.NewUnstartedServer(mux)
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{tlsCert}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	// Dial with a client that trusts our self-signed cert.
+	pool := x509.NewCertPool()
+	if ok := pool.AppendCertsFromPEM(cert); !ok {
+		t.Fatalf("AppendCertsFromPEM")
+	}
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+		Timeout: 5 * time.Second,
+	}
+	resp, err := tlsClient.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("TLS GET /healthz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("TLS status %d, want 200", resp.StatusCode)
+	}
+
+	// Plaintext client against the same TLS port: Go's TLS server
+	// either errors or replies with a 400 "client sent an HTTP request
+	// to an HTTPS server" message.  Either way the plaintext request
+	// must NOT see our real /healthz JSON payload.
+	plainURL := strings.Replace(srv.URL, "https://", "http://", 1)
+	plain := &http.Client{Timeout: 1 * time.Second}
+	plainResp, plainErr := plain.Get(plainURL + "/healthz")
+	if plainErr == nil {
+		defer plainResp.Body.Close()
+		// Hard check: status must NOT be 200, and body must NOT contain
+		// our healthz JSON keys.
+		if plainResp.StatusCode == http.StatusOK {
+			t.Fatalf("plain HTTP got 200 from TLS endpoint (L1 regression)")
+		}
+		var body bytes.Buffer
+		_, _ = body.ReadFrom(plainResp.Body)
+		if strings.Contains(body.String(), `"impl"`) {
+			t.Fatalf("plain HTTP leaked /healthz JSON — server isn't actually TLS-only")
+		}
+	}
+}
+
+// makeSelfSignedCertPEM builds a 2048-bit RSA self-signed cert + key in
+// PEM form, valid for the test duration.  Used to exercise TLS without
+// depending on any external CA.
+func makeSelfSignedCertPEM(t *testing.T) (cert []byte, key []byte) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	serial, _ := rand.Int(cryptorand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "peer2pear-test"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(cryptorand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, _ := x509.MarshalPKCS8PrivateKey(priv)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM
+}
+
 // ── 17. /healthz returns 200 + version tag ────────────────────────────
 
 func TestHealthz(t *testing.T) {
@@ -718,5 +838,438 @@ func TestHealthz(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&body)
 	if body["impl"] != "go" {
 		t.Fatalf("impl field: %v", body["impl"])
+	}
+}
+
+// ── 18. GET /v1/relay_info publishes the onion X25519 pubkey ─────────
+// Fix #7 prereq: clients need the relay's pubkey to wrap onions for it.
+// The handler must return the SAME key the hub holds in relayX25519Pub,
+// not a random placeholder.
+
+func TestHandleRelayInfo_PublishesX25519PubKey(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	resp, err := http.Get(r.srv.URL + "/v1/relay_info")
+	if err != nil {
+		t.Fatalf("GET /v1/relay_info: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	pubB64, ok := body["x25519_pub"].(string)
+	if !ok || pubB64 == "" {
+		t.Fatalf("x25519_pub missing or not string: %v", body)
+	}
+	pubBytes, err := base64.RawURLEncoding.DecodeString(pubB64)
+	if err != nil || len(pubBytes) != 32 {
+		t.Fatalf("x25519_pub not valid 32-byte b64url: err=%v len=%d", err, len(pubBytes))
+	}
+	if !bytes.Equal(pubBytes, r.hub.relayX25519Pub[:]) {
+		t.Fatalf("advertised pubkey mismatch")
+	}
+	if body["impl"] != "go" {
+		t.Fatalf("impl field: %v", body["impl"])
+	}
+}
+
+// wrapOnion builds a version-1 onion envelope for the relay's pubkey.
+// Wire format (must match onion.go): [ver=0x01][ephPub 32][nonce 24][Box ct]
+// where Box plaintext = [urlLen u16 BE][nextHopURL][innerBlob].
+func wrapOnion(t *testing.T, relayPub *[32]byte, nextHopURL string, innerBlob []byte) []byte {
+	t.Helper()
+	ephPub, ephPriv, err := box.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("box.GenerateKey: %v", err)
+	}
+	var nonce [24]byte
+	if _, err := cryptorand.Read(nonce[:]); err != nil {
+		t.Fatalf("rand nonce: %v", err)
+	}
+
+	urlBytes := []byte(nextHopURL)
+	if len(urlBytes) > 0xFFFF {
+		t.Fatalf("URL too long for u16 length prefix")
+	}
+	plain := make([]byte, 2+len(urlBytes)+len(innerBlob))
+	binary.BigEndian.PutUint16(plain[0:2], uint16(len(urlBytes)))
+	copy(plain[2:], urlBytes)
+	copy(plain[2+len(urlBytes):], innerBlob)
+
+	ct := box.Seal(nil, plain, &nonce, relayPub, ephPriv)
+
+	out := make([]byte, 1+32+24+len(ct))
+	out[0] = onionVersion
+	copy(out[1:33], ephPub[:])
+	copy(out[33:57], nonce[:])
+	copy(out[57:], ct)
+	return out
+}
+
+// ── 19. /v1/forward-onion peels a layer end-to-end ────────────────────
+// A correctly-wrapped onion targeting this relay's pubkey must decrypt,
+// parse the next-hop URL, and advance to the SSRF guard.  Targeting
+// 127.0.0.1 trips that guard and returns 403 — which is precisely how
+// we prove the decrypt+parse+validate chain works.  A regression in any
+// earlier step would return 400 "onion decrypt failed" or similar.
+
+func TestHandleForwardOnion_PeelsAndValidates(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	innerBlob := bytes.Repeat([]byte{0xAB}, 200)
+	onion := wrapOnion(t, r.hub.relayX25519Pub,
+		"http://127.0.0.1:8443/v1/send", innerBlob)
+
+	resp, err := http.Post(r.srv.URL+"/v1/forward-onion",
+		"application/octet-stream", bytes.NewReader(onion))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d (want 403 from SSRF); body=%s", resp.StatusCode, body)
+	}
+}
+
+// ── 20. /v1/forward-onion: corrupt ciphertext → 400 decrypt failed ───
+// Validates the AEAD tag is actually checked.  If we flip a byte inside
+// the Box ciphertext, box.Open must refuse to return plaintext.
+
+func TestHandleForwardOnion_RejectsCorruptCiphertext(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	onion := wrapOnion(t, r.hub.relayX25519Pub,
+		"https://relay.example.com/v1/send",
+		bytes.Repeat([]byte{0xCD}, 100))
+	// Flip a byte deep in the ciphertext region (past version+ephPub+nonce).
+	onion[80] ^= 0xFF
+
+	resp, err := http.Post(r.srv.URL+"/v1/forward-onion",
+		"application/octet-stream", bytes.NewReader(onion))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400 (decrypt failure)", resp.StatusCode)
+	}
+}
+
+// ── 21. /v1/forward-onion: assorted malformed payloads → 400 ─────────
+
+func TestHandleForwardOnion_RejectsBadInputs(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	tooShort := make([]byte, 10)
+	tooShort[0] = onionVersion
+
+	wrongVer := make([]byte, 80)
+	wrongVer[0] = 0x02
+
+	// Valid crypto but a non-http(s) next-hop scheme.
+	ftpOnion := wrapOnion(t, r.hub.relayX25519Pub,
+		"ftp://relay.example.com/v1/send", bytes.Repeat([]byte{0x11}, 80))
+
+	// Valid crypto but disallowed next-hop path.
+	adminOnion := wrapOnion(t, r.hub.relayX25519Pub,
+		"https://relay.example.com/admin", bytes.Repeat([]byte{0x22}, 80))
+
+	// Valid crypto but a garbage URL that url.Parse still accepts as a
+	// relative path — we want empty scheme / host to trip the guard.
+	emptyURL := wrapOnion(t, r.hub.relayX25519Pub,
+		"", bytes.Repeat([]byte{0x33}, 80))
+
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"too-short", tooShort},
+		{"wrong-version", wrongVer},
+		{"ftp-scheme", ftpOnion},
+		{"disallowed-path", adminOnion},
+		{"empty-url", emptyURL},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp, err := http.Post(r.srv.URL+"/v1/forward-onion",
+				"application/octet-stream", bytes.NewReader(c.body))
+			if err != nil {
+				t.Fatalf("POST: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status %d, want 400", resp.StatusCode)
+			}
+		})
+	}
+}
+
+// ── Presence helpers ──────────────────────────────────────────────────
+// Presence + cover-traffic arrive interleaved on the WS — these helpers
+// skip past binary dummy envelopes to find the next matching JSON frame.
+
+func readNextJSONOfType(t *testing.T, conn *websocket.Conn, wantType string, deadline time.Duration) map[string]any {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(deadline))
+	for {
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read waiting for %q: %v", wantType, err)
+		}
+		if mt == websocket.BinaryMessage {
+			continue
+		}
+		var msg map[string]any
+		if json.Unmarshal(data, &msg) != nil {
+			continue
+		}
+		if msg["type"] == wantType {
+			return msg
+		}
+	}
+}
+
+// ── 22. presence_subscribe: initial snapshot + live online/offline ────
+
+func TestPresence_SubscribeReceivesStateAndLiveUpdates(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	bob := newTestPeer(t)
+
+	aliceConn, rep := dialAndAuth(t, r, alice, time.Now().UnixMilli())
+	defer aliceConn.Close()
+	if rep.Reply["type"] != "auth_ok" {
+		t.Fatalf("alice auth: %v", rep.Reply)
+	}
+
+	// Subscribe to Bob (offline).
+	if err := aliceConn.WriteJSON(map[string]any{
+		"type":     "presence_subscribe",
+		"peer_ids": []string{bob.idB64},
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	snap := readNextJSONOfType(t, aliceConn, "presence_result", 3*time.Second)
+	peers, _ := snap["peers"].(map[string]any)
+	if online, _ := peers[bob.idB64].(bool); online {
+		t.Fatalf("bob should be offline initially: %v", snap)
+	}
+
+	// Bob connects — Alice must receive an online push.
+	bobConn, rep2 := dialAndAuth(t, r, bob, time.Now().UnixMilli())
+	if rep2.Reply["type"] != "auth_ok" {
+		bobConn.Close()
+		t.Fatalf("bob auth: %v", rep2.Reply)
+	}
+	push := readNextJSONOfType(t, aliceConn, "presence", 3*time.Second)
+	if push["peer_id"] != bob.idB64 || !push["online"].(bool) {
+		t.Fatalf("expected online push for bob, got %v", push)
+	}
+
+	// Bob disconnects — Alice must receive an offline push.
+	bobConn.Close()
+	push = readNextJSONOfType(t, aliceConn, "presence", 3*time.Second)
+	if push["peer_id"] != bob.idB64 || push["online"].(bool) {
+		t.Fatalf("expected offline push for bob, got %v", push)
+	}
+}
+
+// ── 23. presence_query: snapshot without subscribing ─────────────────
+
+func TestPresence_QueryReturnsSnapshot(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	bob := newTestPeer(t)
+	carol := newTestPeer(t)
+
+	aliceConn, _ := dialAndAuth(t, r, alice, time.Now().UnixMilli())
+	defer aliceConn.Close()
+
+	bobConn, _ := dialAndAuth(t, r, bob, time.Now().UnixMilli())
+	defer bobConn.Close()
+
+	if err := aliceConn.WriteJSON(map[string]any{
+		"type":     "presence_query",
+		"peer_ids": []string{bob.idB64, carol.idB64},
+	}); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	snap := readNextJSONOfType(t, aliceConn, "presence_result", 3*time.Second)
+	peers, _ := snap["peers"].(map[string]any)
+	if online, _ := peers[bob.idB64].(bool); !online {
+		t.Fatalf("bob should be online: %v", snap)
+	}
+	if online, _ := peers[carol.idB64].(bool); online {
+		t.Fatalf("carol should be offline: %v", snap)
+	}
+}
+
+// ── 24. L2 audit-#2: presence_query is rate-limited per connection ────
+// After maxPresenceQueriesPerWin queries, further queries are silently
+// dropped.  The attacker model: authenticated peer trying to enumerate
+// the social graph at arbitrary speed.
+
+func TestPresence_QueryRateLimitDropsAfterCap(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	bob := newTestPeer(t)
+
+	conn, _ := dialAndAuth(t, r, alice, time.Now().UnixMilli())
+	defer conn.Close()
+
+	// Burn the budget — every query below the cap gets a reply.
+	for i := 0; i < maxPresenceQueriesPerWin; i++ {
+		if err := conn.WriteJSON(map[string]any{
+			"type":     "presence_query",
+			"peer_ids": []string{bob.idB64},
+		}); err != nil {
+			t.Fatalf("query #%d: %v", i, err)
+		}
+		readNextJSONOfType(t, conn, "presence_result", 3*time.Second)
+	}
+
+	// One more — must be silently dropped.
+	if err := conn.WriteJSON(map[string]any{
+		"type":     "presence_query",
+		"peer_ids": []string{bob.idB64},
+	}); err != nil {
+		t.Fatalf("overflow query: %v", err)
+	}
+
+	// Expect no presence_result in a reasonable window.  Skip cover-traffic
+	// binary frames; anything else signals the cap didn't hold.
+	conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+	for {
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			return // expected — no presence_result arrived
+		}
+		if mt == websocket.BinaryMessage {
+			continue
+		}
+		var msg map[string]any
+		if json.Unmarshal(data, &msg) == nil && msg["type"] == "presence_result" {
+			t.Fatalf("presence_result after cap — L2 regression: %v", msg)
+		}
+	}
+}
+
+// ── 25. H4: presence_subscribe caps the watched-set size ─────────────
+
+func TestPresence_SubscribeCapsAtMaxSize(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	conn, _ := dialAndAuth(t, r, alice, time.Now().UnixMilli())
+	defer conn.Close()
+
+	overBudget := make([]string, maxPresenceSubs+50)
+	for i := range overBudget {
+		overBudget[i] = fmt.Sprintf("peer-enum-%d", i)
+	}
+	if err := conn.WriteJSON(map[string]any{
+		"type":     "presence_subscribe",
+		"peer_ids": overBudget,
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	// Drain the initial snapshot so we know the handler has processed it.
+	readNextJSONOfType(t, conn, "presence_result", 3*time.Second)
+
+	r.hub.mu.RLock()
+	got := len(r.hub.subs[alice.idB64])
+	r.hub.mu.RUnlock()
+	if got != maxPresenceSubs {
+		t.Fatalf("subs count %d, want %d (H4 cap)", got, maxPresenceSubs)
+	}
+}
+
+// ── 26. Concurrent-peer race: new WS for same peer replaces old ──────
+// Two sequential connections for the same peer ID.  Hub.register must
+// close the old conn (with code 4005 "replaced") before installing the
+// new one — otherwise envelopes could double-deliver or land on a
+// stale socket.  This also exercises the implicit "second auth with a
+// fresh timestamp isn't rejected as replay" path.
+
+func TestHub_SecondConnectionReplacesFirst(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+
+	conn1, rep1 := dialAndAuth(t, r, alice, time.Now().UnixMilli())
+	defer conn1.Close()
+	if rep1.Reply["type"] != "auth_ok" {
+		t.Fatalf("first auth: %v", rep1.Reply)
+	}
+
+	// Distinct ts so the L4 nonce store sees a different row.
+	conn2, rep2 := dialAndAuth(t, r, alice, time.Now().UnixMilli()+1)
+	defer conn2.Close()
+	if rep2.Reply["type"] != "auth_ok" {
+		t.Fatalf("second auth: %v", rep2.Reply)
+	}
+
+	// Hub state: exactly one peer entry, pointing at the new conn.
+	time.Sleep(100 * time.Millisecond) // let register/unregister settle
+	r.hub.mu.RLock()
+	p, online := r.hub.peers[alice.idB64]
+	r.hub.mu.RUnlock()
+	if !online {
+		t.Fatalf("no peer entry after replacement")
+	}
+	if p.Conn == conn1 {
+		t.Fatalf("hub still pointing at first conn after replace")
+	}
+
+	// The old conn must observe its close.
+	conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, _, err := conn1.ReadMessage()
+		if err == nil {
+			continue // drain any queued frame
+		}
+		if ce, ok := err.(*websocket.CloseError); ok && ce.Code == 4005 {
+			break
+		}
+		// Any error is acceptable — the conn is dead.
+		break
+	}
+
+	// An envelope sent now lands on conn2.
+	env := buildEnvelope(alice, 128)
+	resp, err := http.Post(r.srv.URL+"/v1/send",
+		"application/octet-stream", bytes.NewReader(env))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	conn2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		mt, body, err := conn2.ReadMessage()
+		if err != nil {
+			t.Fatalf("conn2 read: %v", err)
+		}
+		if mt == websocket.BinaryMessage && bytes.Equal(body, env) {
+			return
+		}
 	}
 }

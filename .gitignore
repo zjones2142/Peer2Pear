@@ -101,6 +101,10 @@ ios/Peer2Pear.xcworkspace/
 # Xcode build cache / intermediate outputs.
 DerivedData/
 build-ios-*/  # the CMake iOS build dirs (already caught by /build*/, here for clarity)
+# `ios/generate.sh` passes -derivedDataPath ios/.xcodebuild so xcodebuild
+# drops its DerivedData inside the iOS dir instead of ~/Library.  Local-only
+# intermediate output — 90 MB+ of .o/.swiftmodule/etc., regenerated on build.
+ios/.xcodebuild/
 
 # ── SQLCipher amalgamation ──────────────────────────────────────────────────
 # We DO commit sqlite3.c + sqlite3.h + LICENSE + SQLCIPHER_VERSION.txt

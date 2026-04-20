@@ -133,8 +133,20 @@ docker compose up relay-go
 ```bash
 cd relay-go
 go mod tidy
+
+# Plaintext — run only behind a reverse proxy that terminates TLS.
 go run .
+
+# Native TLS — pass a certificate and key (PEM) and the relay listens
+# with ListenAndServeTLS directly.  No reverse proxy required.
+go run . --cert /path/to/fullchain.pem --key /path/to/privkey.pem
+
+# Same via env vars (useful in Docker / systemd):
+TLS_CERT=/path/to/fullchain.pem TLS_KEY=/path/to/privkey.pem go run .
 ```
+
+Specify both `--cert` and `--key` together; supplying just one is a
+config error and the relay refuses to start.
 
 ### Relay endpoints
 

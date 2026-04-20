@@ -229,18 +229,31 @@ func (h *Hub) register(p *Peer) {
 	h.notifyPresence(p.ID, true)
 }
 
-// unregister removes a peer from the hub.
-func (h *Hub) unregister(peerID string) {
+// unregister removes a peer from the hub.  Takes the full *Peer so we
+// can verify identity: if a second connection for the same ID replaced
+// us in `register`, that call already closed our Send channel and
+// installed the new peer; we must NOT wipe the new peer's state when
+// our own HandleReceive finally exits.  Pre-audit-#2 this bug existed:
+// `unregister(peerID)` would happily close the replacement conn's Send
+// channel because it lookup-by-ID only.
+func (h *Hub) unregister(self *Peer) {
 	h.mu.Lock()
-	if p, ok := h.peers[peerID]; ok {
-		close(p.Send)
-		delete(h.peers, peerID)
+	cur, ok := h.peers[self.ID]
+	replaced := !ok || cur != self
+	if !replaced {
+		close(cur.Send)
+		delete(h.peers, self.ID)
+		delete(h.subs, self.ID)
 	}
-	delete(h.subs, peerID)
 	h.mu.Unlock()
 
-	log.Printf("disconnected: %s…", truncID(peerID))
-	h.notifyPresence(peerID, false)
+	if replaced {
+		// A newer connection owns this ID; don't log a spurious disconnect
+		// nor flip presence to offline — the newer conn is still online.
+		return
+	}
+	log.Printf("disconnected: %s…", truncID(self.ID))
+	h.notifyPresence(self.ID, false)
 }
 
 // deliverOrStore tries WebSocket push first, falls back to mailbox storage.
@@ -448,7 +461,7 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 		Send: make(chan []byte, 256),
 	}
 	h.register(peer)
-	defer h.unregister(peer.ID)
+	defer h.unregister(peer)
 
 	// Step 3: Deliver stored envelopes (M6 mark-and-confirm — each row is
 	// deleted only after its WS write returns nil, so a crash partway
