@@ -427,13 +427,24 @@ void RelayClient::sendCoverEnvelope()
     onlinePool.reserve(m_knownPeers.size());
     for (const std::string& pid : m_knownPeers)
         if (m_onlinePeers.count(pid)) onlinePool.push_back(pid);
-    if (onlinePool.empty()) {
-        if (m_burstRemaining > 0) --m_burstRemaining;
-        scheduleCoverTimer();
-        return;
+
+    // M5 audit fix (2026-04-19): when no contacts are online (or the user
+    // simply has no contacts yet), fall back to a self-addressed cover
+    // envelope instead of going silent.  Before the fix, a relay operator
+    // observing a steady cover-traffic rate suddenly drop to zero could
+    // infer "all this user's contacts just went offline," and the
+    // cover↔silence transitions themselves leaked online-state changes.
+    // Routing the packet to our own mailbox keeps the outbound profile
+    // constant regardless of peer presence; the envelope lands back in
+    // our own inbox, fails unseal (random body), and is discarded.
+    Bytes recipientPub;
+    if (!onlinePool.empty()) {
+        const std::string& peerId =
+            onlinePool[randombytes_uniform(uint32_t(onlinePool.size()))];
+        recipientPub = CryptoEngine::fromBase64Url(peerId);
+    } else if (m_crypto) {
+        recipientPub = m_crypto->identityPub();
     }
-    const std::string& peerId = onlinePool[randombytes_uniform(uint32_t(onlinePool.size()))];
-    Bytes recipientPub = CryptoEngine::fromBase64Url(peerId);
     if (recipientPub.size() != 32) {
         if (m_burstRemaining > 0) --m_burstRemaining;
         scheduleCoverTimer();

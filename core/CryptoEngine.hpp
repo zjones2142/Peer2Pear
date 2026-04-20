@@ -89,7 +89,22 @@ public:
     // Generate a fresh ephemeral X25519 keypair (pub, priv)
     static std::pair<Bytes, Bytes> generateEphemeralX25519();
 
-    // HKDF using BLAKE2b: derive outputLen bytes from input key material
+    // HKDF-style key derivation using keyed BLAKE2b — NOT RFC 5869.
+    //
+    // Extract: PRK = BLAKE2b-256(key=salt, input=ikm)   // 32-byte PRK
+    // Expand : out = BLAKE2b(key=PRK, input=info||0x01) // single block
+    //
+    // Known deviations from RFC 5869 (audit M4):
+    //   - RFC 5869 specifies HMAC-SHA-256; we use keyed BLAKE2b-256 as the PRF.
+    //   - PRK is 32 bytes, not HashLen (64 for BLAKE2b-512).
+    //   - Expand emits one block, so `outputLen` is capped at 64 bytes —
+    //     larger requests return {}.
+    //
+    // The construction is sound (BLAKE2b is a secure PRF, salt is used as
+    // the key in Extract, info is domain-separated via the 0x01 counter)
+    // but any interoperable third-party implementation MUST match this
+    // byte-for-byte and cannot drop in a stock RFC 5869 HKDF.  See
+    // PROTOCOL.md §10.2 for the full construction spec.
     static Bytes hkdf(const Bytes& ikm, const Bytes& salt,
                       const Bytes& info, int outputLen = 32);
 

@@ -91,8 +91,14 @@ final class Peer2PearClient: ObservableObject {
         // Set event callbacks
         setupCallbacks()
 
-        // Initialize identity and connect
-        p2p_set_passphrase(rawContext, passphrase)
+        // Initialize identity (v5 unified Argon2id path — H4 fix).
+        let rc = p2p_set_passphrase_v2(rawContext, passphrase)
+        if rc != 0 {
+            statusMessage = "Identity unlock failed (wrong passphrase?)"
+            p2p_destroy(rawContext)
+            rawContext = nil
+            return
+        }
         myPeerId = String(cString: p2p_my_id(rawContext))
         p2p_set_relay_url(rawContext, relayUrl)
         p2p_connect(rawContext)

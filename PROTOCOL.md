@@ -468,8 +468,17 @@ After Noise IK completes, both sides initialize a Double Ratchet using
 the Noise-derived chain key as the root. Parameters:
 
 - **DH:** X25519
-- **KDF:** HKDF-SHA-256
+- **KDF:** HKDF-BLAKE2b (keyed BLAKE2b — NOT RFC 5869; see §10.2 for the
+  exact construction)
 - **AEAD:** XChaCha20-Poly1305
+- **Max skipped keys per chain:** 1000 (LC3).  Caps the per-session cache
+  of out-of-order message keys.  Receivers MUST silently drop messages
+  whose `messageNum` would require skipping more than this bound past the
+  current chain head — both to prevent a peer (or a malicious relay
+  replaying old ciphertexts with fabricated high counters) from forcing
+  unbounded key derivations, and to keep the persisted ratchet blob
+  size-bounded.  Legitimate network reordering almost never exceeds a few
+  hundred in-flight messages.
 
 A DH ratchet step occurs on the first message in a new direction.
 Symmetric-key (chain) ratchets advance per message.
@@ -779,6 +788,8 @@ Implementations MUST apply all three.
 
 ## 10. Implementation conformance
 
+### 10.1 Client and relay requirements
+
 A conforming **client** MUST:
 
 - Generate identity keys using the algorithms in §2.1.
@@ -809,6 +820,39 @@ A conforming **relay** MUST:
 - Enforce SSRF restrictions on `/v1/forward` and `/v1/forward-onion`.
 - NEVER log envelope content, unsealed payloads, or anything beyond
   (hashed IP, recipient pubkey prefix, timing, size bucket).
+
+### 10.2 HKDF-BLAKE2b key derivation primitive
+
+The `HKDF(...)` invocations throughout this document (§6.3 Double Ratchet,
+§6.3.1 KEM ratchet, pre-key payload keys in SessionManager, identity-unlock
+subkey, session-store at-rest key) all refer to the construction below.
+It is **not** RFC 5869 HKDF — implementations that substitute HMAC-HKDF will
+not interoperate.
+
+```
+HKDF-BLAKE2b(ikm, salt, info, L):
+    requires 1 <= L <= 64
+    Extract:
+        PRK = BLAKE2b-256(key = salt, input = ikm)     // 32-byte PRK
+    Expand:
+        T   = BLAKE2b-L  (key = PRK,  input = info || 0x01)
+    return T
+```
+
+Deviations from RFC 5869, all intentional:
+- PRF is **keyed BLAKE2b** (libsodium `crypto_generichash`), not HMAC-SHA-256.
+- PRK length is 32 bytes regardless of output size (RFC 5869 uses HashLen).
+- Expand emits a single block — `L` is capped at 64 bytes (BLAKE2b max
+  digest).  Larger outputs are unsupported; implementations MUST return
+  an empty buffer rather than chain blocks.
+- `info` is domain-separated by appending a single `0x01` counter byte
+  before hashing.  Implementations MUST preserve this byte exactly.
+
+Audit note (M4): the mismatch between "HKDF" in the name and the actual
+construction is a historical artefact; it is documented rather than
+renamed to avoid churning every call site.  A future protocol revision
+may switch to libsodium's `crypto_kdf_*` family for cleaner audit
+alignment.
 
 ---
 

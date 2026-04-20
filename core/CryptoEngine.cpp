@@ -980,7 +980,10 @@ std::pair<Bytes, Bytes> CryptoEngine::generateEphemeralX25519() {
 }
 
 // ---------------------------
-// HKDF using BLAKE2b
+// HKDF-style KDF — keyed BLAKE2b, NOT RFC 5869 HMAC-HKDF.  See the header
+// comment for the exact construction and the audit-M4 deviations.  The
+// name "hkdf" is retained because the callers all use it, and a rename
+// would churn the ratchet / envelope / identity derivation call sites.
 // ---------------------------
 
 Bytes CryptoEngine::hkdf(const Bytes& ikm, const Bytes& salt,
@@ -1043,11 +1046,25 @@ Bytes CryptoEngine::deriveMasterKey(const std::string& passphrase, const Bytes& 
     std::string passCopy = passphrase;
     Bytes masterKey(32, 0);
 
-    // Mobile devices have tight memory limits — use INTERACTIVE (64 MB).
-    // Desktop can afford MODERATE (256 MB) for stronger brute-force resistance.
-#if defined(Q_OS_IOS) || defined(Q_OS_ANDROID) || defined(__APPLE__) && TARGET_OS_IPHONE
-    constexpr auto opsLimit = crypto_pwhash_OPSLIMIT_INTERACTIVE;
-    constexpr auto memLimit = crypto_pwhash_MEMLIMIT_INTERACTIVE;
+    // L1 audit fix (2026-04-19): raise the mobile Argon2 floor above
+    // libsodium's INTERACTIVE tier (2 ops, 64 MiB — flagged as potentially
+    // brute-forceable for short passphrases).  The new mobile tier uses
+    //   - 3 iterations (MODERATE-level opslimit)
+    //   - 128 MiB memory  (halfway between INTERACTIVE and MODERATE)
+    // which roughly triples attacker cost per guess while staying inside
+    // the memory budget of every supported iPhone (iPhone 8 and up).  Full
+    // MODERATE (256 MiB) risks iOS jetsam termination on ≤3 GiB devices
+    // during onboarding; that's the reason we don't just reuse the desktop
+    // tier.  Android uses the same mobile tier.
+    //
+    // Wire-compat: this changes the master key that a given (passphrase,
+    // salt) pair derives to, so mobile identity.json files created before
+    // this bump can't be unlocked by post-bump builds.  The project has no
+    // shipped mobile users yet; desktop is unchanged.
+#if defined(Q_OS_IOS) || defined(Q_OS_ANDROID) \
+    || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    constexpr auto opsLimit = 3ULL;                     // matches MODERATE ops
+    constexpr auto memLimit = 128ULL * 1024 * 1024;     // 128 MiB
 #else
     constexpr auto opsLimit = crypto_pwhash_OPSLIMIT_MODERATE;
     constexpr auto memLimit = crypto_pwhash_MEMLIMIT_MODERATE;

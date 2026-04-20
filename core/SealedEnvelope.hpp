@@ -12,12 +12,12 @@
  * Classical v2 wire format (version 0x02):
  *   0x02 || ephPub(32) || AEAD(envelopeKey, AAD=ephPub||recipientEdPub,
  *                               envelopeId(16) || senderEdPub(32) || sig(64) || innerCt)
- *   envelopeKey = BLAKE2b-256(ecdhShared)
+ *   envelopeKey = BLAKE2b-256(key="Peer2Pear-SealedEnvelope-v2", ecdhShared)
  *
  * Hybrid v2 wire format (version 0x03):
  *   0x03 || ephPub(32) || kemCt(1088) || AEAD(envelopeKey, AAD=ephPub||recipientEdPub,
  *                                              envelopeId(16) || senderEdPub(32) || sig(64) || innerCt)
- *   envelopeKey = BLAKE2b-256(ecdhShared || kemShared)
+ *   envelopeKey = BLAKE2b-256(key="Peer2Pear-SealedEnvelope-v2", ecdhShared || kemShared)
  *
  * The sender signs (envelopeId || innerPayload) with their Ed25519 key.
  * Binding recipientEdPub into the AEAD AAD prevents a malicious relay from

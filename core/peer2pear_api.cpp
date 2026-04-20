@@ -20,10 +20,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 
 // ── CWebSocket: IWebSocket backed by C function pointers ────────────────────
@@ -440,7 +442,71 @@ void p2p_destroy(p2p_context* ctx)
 void p2p_set_passphrase(p2p_context* ctx, const char* passphrase)
 {
     if (!ctx) return;
-    ctx->controller.setPassphrase(passphrase ? passphrase : "");
+    // M2 audit fix (2026-04-19): keep the passphrase copy in a named local
+    // so we can zero it on the way out.  Previously an implicit std::string
+    // temporary was created on-the-fly and destructed with the passphrase
+    // bytes still in its buffer.  The caller's own `passphrase` C string is
+    // out of our control — the header documents that they must zero it.
+    std::string pass = passphrase ? passphrase : "";
+    ctx->controller.setPassphrase(pass);
+    CryptoEngine::secureZero(pass);
+}
+
+int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
+{
+    if (!ctx || !passphrase || passphrase[0] == '\0') return -1;
+    // M3 audit fix: enforce the library-side strength floor.  Platform UIs
+    // should reject weak passphrases long before they reach this entry,
+    // but a byte-length check here keeps the core from ever accepting a
+    // 1-char passphrase via a misconfigured FFI caller.
+    if (std::strlen(passphrase) < P2P_MIN_PASSPHRASE_BYTES) return -1;
+    if (ctx->dataDir.empty()) return -1;
+
+    namespace fs = std::filesystem;
+    const std::string keysDir = ctx->dataDir + "/keys";
+    std::error_code ec;
+    fs::create_directories(keysDir, ec);  // no-op if already there
+
+    const std::string saltPath = keysDir + "/db_salt.bin";
+    Bytes salt = CryptoEngine::loadOrCreateSalt(saltPath);
+    if (salt.size() != 16) return -1;
+
+    // M2 fix: route the passphrase through one named local we can zero
+    // on every exit path, so no intermediate std::string holds it after
+    // this function returns.
+    std::string pass = passphrase;
+
+    Bytes masterKey = CryptoEngine::deriveMasterKey(pass, salt);
+    if (masterKey.size() != 32) {
+        CryptoEngine::secureZero(pass);
+        return -1;
+    }
+
+    // HKDF info label must stay byte-identical to what the desktop
+    // onboarding flow uses (mainwindow.cpp:115) so v4→v5 migration
+    // succeeds across frontends.
+    static const char kIdentityInfo[] = "identity-unlock";
+    Bytes info(
+        reinterpret_cast<const uint8_t*>(kIdentityInfo),
+        reinterpret_cast<const uint8_t*>(kIdentityInfo)
+            + sizeof(kIdentityInfo) - 1);
+
+    Bytes identityKey = CryptoEngine::deriveSubkey(masterKey, info);
+    CryptoEngine::secureZero(masterKey);
+    if (identityKey.size() != 32) {
+        CryptoEngine::secureZero(pass);
+        return -1;
+    }
+
+    int rc = 0;
+    try {
+        ctx->controller.setPassphrase(pass, identityKey);
+    } catch (...) {
+        rc = -1;  // wrong passphrase or corrupted identity.json
+    }
+    CryptoEngine::secureZero(identityKey);
+    CryptoEngine::secureZero(pass);
+    return rc;
 }
 
 const char* p2p_my_id(p2p_context* ctx)

@@ -237,6 +237,18 @@ private:
     std::vector<std::string> m_seenOrder;
     bool markSeen(const std::string& id); // true = first time; false = duplicate
 
+    // H5 fix (audit 2026-04-19): persistent envelope-ID dedup survives app
+    // restart.  Backs the in-memory LRU with a row in seen_envelopes so a
+    // malicious relay can't replay a sealed envelope after we restart and
+    // our RAM cache is cold.  Use this (not markSeen) for the outer env:
+    // check; msgIds inside the ratchet don't need persistence because the
+    // chain counter already rejects replays once a message key is consumed.
+    bool markSeenPersistent(const std::string& id);
+    void ensureSeenEnvelopesTable();
+    void pruneSeenEnvelopes();
+    static constexpr int64_t kSeenEnvelopesMaxAgeSecs =
+        30LL * 24 * 60 * 60;  // 30 days
+
     CryptoEngine         m_crypto;
     RelayClient          m_relay;
     FileTransferManager  m_fileMgr;
@@ -283,6 +295,13 @@ private:
     std::set<std::string> m_kemPubAnnounced;  // peers we've already announced to this session
     Bytes lookupPeerKemPub(const std::string& peerIdB64u);
     void announceKemPub(const std::string& peerIdB64u);
+
+    // LC4 audit fix (2026-04-19): group file transfers now create a distinct
+    // per-member transferId internally so the sender honors each recipient's
+    // Phase 2 consent gate independently.  This map bundles those per-member
+    // transferIds under a single group-level id returned to the caller, so
+    // cancelFileTransfer() can fan out across all members.
+    std::map<std::string, std::vector<std::string>> m_groupFileMembers;
 
     // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
     // Populated by file_key announcements (after consent), consumed by handleFileEnvelope().

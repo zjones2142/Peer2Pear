@@ -107,8 +107,16 @@ public:
     static constexpr int     kP2PReadyWaitSecs           = 10;
     static constexpr int64_t kOutboundPendingTimeoutSecs = 10LL * 60;
     static constexpr int64_t kMaxTransferAgeSecs         = 30LL * 60;
-    static constexpr int64_t kSentTransferMaxAgeSecs     = 24LL * 60 * 60;
-    static constexpr int64_t kPartialFileMaxAgeSecs      = 7LL * 24 * 60 * 60;
+    // L6 audit fix (2026-04-19): shortened both at-rest file-key TTLs so a
+    // device compromise exposes fewer in-flight keys.  Receiver window was
+    // 7 days — cut to 3, which is still long enough for a weekend-away
+    // resumption while cutting at-rest surface by ~2.3×.  Sender window
+    // was 24 h — cut to 12 h, since senders are typically active around
+    // the transfer.  Both values are the DB-row TTL; the in-memory
+    // IncomingTransfer is still purged after kMaxTransferAgeSecs (30 min)
+    // of inactivity.
+    static constexpr int64_t kSentTransferMaxAgeSecs     = 12LL * 60 * 60;
+    static constexpr int64_t kPartialFileMaxAgeSecs      = 3LL * 24 * 60 * 60;
 
     /// Send a file to a single peer using a pre-derived per-file ratchet key.
     std::string sendFileWithKey(const std::string& senderIdB64u,

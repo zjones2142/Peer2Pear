@@ -176,6 +176,7 @@ public:
 
         auto it = m_peers.find(key);
         if (it != m_peers.end() && it->second != nullptr) {
+            m_captured[key].push_back(relayEnvelope);
             // Optional knob for tests that want to observe replay defense.
             for (int i = 0; i < m_deliverTimes; ++i) {
                 it->second->deliverBinary(relayEnvelope);
@@ -190,9 +191,21 @@ public:
     // Test-only knob: deliver each relayed envelope this many times (default 1).
     void setDeliverMultiplier(int n) { m_deliverTimes = n; }
 
+    // Capture the bytes of each relay envelope delivered to a peer, so tests
+    // that simulate an app restart can re-inject an old envelope after the
+    // in-memory dedup cache has been wiped.
+    const std::vector<Bytes>& capturedFor(const std::string& peerId) const {
+        static const std::vector<Bytes> kEmpty;
+        auto it = m_captured.find(peerId);
+        return it == m_captured.end() ? kEmpty : it->second;
+    }
+
 private:
     std::map<std::string, MockWebSocket*> m_peers;
+    std::map<std::string, std::vector<Bytes>> m_captured;
     int m_deliverTimes = 1;
+
+    friend class TwoClientSuite;  // needed for restart-replay test only
 };
 
 void MockWebSocket::sendTextMessage(const std::string& message) {
@@ -359,6 +372,53 @@ TEST_F(TwoClientSuite, ReplayedEnvelopeDeduped) {
     ASSERT_EQ(bob.received.size(), 1u)
         << "envelope dedup on envelopeId should suppress the duplicate delivery";
     EXPECT_EQ(bob.received[0].text, "deliver me once, please");
+}
+
+// ── 3b. Replay across app restart is dropped (H5 audit fix) ─────────────
+// Before the fix, the envelope-ID dedup cache lived only in RAM — a relay
+// that stored sealed envelopes could replay them after Bob restarted and
+// his cache was cold.  The seen_envelopes SQLCipher table now makes the
+// dedup survive restart.  Exercise it end-to-end: send a message, record
+// the envelope bytes, rebuild Bob's ChatController on the same DB +
+// identity, and re-inject the captured envelope.  Bob's message callback
+// must NOT fire a second time.
+
+TEST_F(TwoClientSuite, PersistentEnvelopeDedupSurvivesRestart) {
+    connectBoth();
+
+    alice.ctrl->sendText(bob.id, "please don't deliver me twice");
+    ASSERT_EQ(bob.received.size(), 1u);
+
+    // Grab the last envelope that landed at Bob — this is what the relay
+    // would have on disk to replay after Bob restarts.
+    const auto& captured = relay->capturedFor(bob.id);
+    ASSERT_FALSE(captured.empty());
+    const Bytes replay = captured.back();
+
+    // Tear down Bob's controller (identity.json + DB survive on disk).
+    bob.ctrl.reset();
+
+    // Rebuild Bob's controller on the same data dir + same DB + same WS.
+    // The DB pointer is still valid because we kept bob.db alive.
+    bob.ctrl = std::make_unique<ChatController>(*bob.ws, *bob.http, *bob.timers);
+    bob.ctrl->setDataDir(bob.dataDir);
+    bob.ctrl->setPassphrase("bob-test-only-passphrase");
+    bob.ctrl->setDatabase(*bob.db);
+    bob.ctrl->setRelayUrl("wss://mock-relay.test");
+    bob.ctrl->onMessageReceived = [this](const std::string& from,
+                                          const std::string& text,
+                                          int64_t ts,
+                                          const std::string& msgId) {
+        bob.received.push_back({from, text, ts, msgId});
+    };
+    // Re-register in the mock relay so routing still works.
+    relay->registerPeer(bob.id, bob.ws.get());
+    bob.ctrl->connectToRelay();
+
+    // Now replay the captured envelope directly onto Bob's WS.
+    bob.ws->deliverBinary(replay);
+    EXPECT_EQ(bob.received.size(), 1u)
+        << "persistent envelope dedup must drop a replay after restart";
 }
 
 // ── 4. Envelope addressed to a stranger doesn't reach Alice or Bob ───────

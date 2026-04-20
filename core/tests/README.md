@@ -34,6 +34,7 @@ ctest items.
 | `test_session_manager.cpp` | End-to-end Noise IK + ratchet (classical & hybrid PQ), pre-key offline queue, persistence across manager rebuild | 5 (manager) | 8 |
 | `test_file_transfer.cpp` | Chunked file transfer — streaming hash, in-order + out-of-order reassembly, hash-mismatch discard, resumption via DB | 6 (files) | 8 |
 | `test_e2e_two_clients.cpp` | Two ChatController instances routed through an in-process mock relay — full send → seal → relay → unseal → ratchet round-trip | 7 (E2E) | 4 |
+| `test_c_api.cpp` | Public C FFI surface — H4 v5 passphrase path, identity persistence, wrong-passphrase rejection, arg validation | C API | 4 |
 
 The Tier 1 suite includes an RFC 8032 §7.1 KAT for Ed25519 and asserts
 the FIPS-203 public/ciphertext sizes for ML-KEM-768, so a regression that

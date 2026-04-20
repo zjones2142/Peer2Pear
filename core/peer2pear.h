@@ -79,10 +79,59 @@ void p2p_destroy(p2p_context* ctx);
 /* ── Identity ──────────────────────────────────────────────────────────── */
 
 /**
+ * Minimum accepted passphrase length at the v2 FFI entry (M3 audit).
+ * Measured in UTF-8 bytes — 8 ASCII chars minimum, or any UTF-8 string
+ * whose encoded form is ≥ 8 bytes.  Platforms should enforce stronger
+ * requirements in their onboarding UI (entropy, common-passwords list,
+ * etc.); this is a library-side floor, not a policy.
+ */
+#define P2P_MIN_PASSPHRASE_BYTES 8
+
+/**
  * Set the passphrase and derive/load the identity keypair.
  * Must be called before p2p_connect().
+ *
+ * DEPRECATED — new callers should use p2p_set_passphrase_v2().  This
+ * function routes to the legacy per-key Argon2 derivation path which
+ * runs Argon2id three times (once per private key) and can't be
+ * migrated to v5 identity storage.
+ *
+ * Memory hygiene (M2 audit): the library zeros its own copies of the
+ * passphrase after using them, but the caller's `passphrase` buffer is
+ * out of its control.  Zero it yourself as soon as this function
+ * returns if you want the bytes gone from process memory.
  */
 void p2p_set_passphrase(p2p_context* ctx, const char* passphrase);
+
+/**
+ * Set the passphrase via the v5 unified key-derivation path (audit H4).
+ *
+ * Runs Argon2id MODERATE once over (passphrase, salt) → 32-byte master
+ * key, then HKDFs `identity-unlock` → 32-byte identity key and installs
+ * it on the controller.  Existing v4 identity files are migrated to v5
+ * on first load.  The salt file lives at <data_dir>/keys/db_salt.bin
+ * and is created on first use; data_dir is the one supplied to
+ * p2p_create().
+ *
+ * Prefer this over p2p_set_passphrase(): mobile callers that use the
+ * legacy function pay ~3x the Argon2 cost and are pinned to the older
+ * on-disk layout.
+ *
+ * Memory hygiene (M2 audit): same contract as p2p_set_passphrase —
+ * every intermediate copy the library makes is zeroed on return, but
+ * the caller's `passphrase` buffer is not.  Wipe it yourself.
+ *
+ * Strength floor (M3 audit): passphrases shorter than
+ * P2P_MIN_PASSPHRASE_BYTES (8) are rejected outright.  This is a
+ * defense-in-depth check — platform UIs should enforce a stronger
+ * policy before calling.
+ *
+ * @return 0 on success, non-zero on failure (null args, empty or too-
+ *         short passphrase, p2p_create() was called without a
+ *         data_dir, the salt file is corrupt, Argon2 failed, or the
+ *         supplied passphrase can't decrypt an existing identity).
+ */
+int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase);
 
 /**
  * Get this device's peer ID (base64url-encoded Ed25519 public key).

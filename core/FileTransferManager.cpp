@@ -1343,8 +1343,8 @@ void FileTransferManager::purgeStalePartialFiles()
 {
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
     const int64_t now = nowSecs();
-    const int64_t cutoffIn  = now - kPartialFileMaxAgeSecs;   // 7 days for receiver
-    const int64_t cutoffOut = now - kSentTransferMaxAgeSecs;  // Fix #15: 24h for sender
+    const int64_t cutoffIn  = now - kPartialFileMaxAgeSecs;   // L6: 3 days for receiver
+    const int64_t cutoffOut = now - kSentTransferMaxAgeSecs;  // L6: 12h for sender
 
     SqlCipherQuery qSel(*m_dbPtr);
     std::vector<std::string> toDelete;

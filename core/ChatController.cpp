@@ -189,6 +189,9 @@ void ChatController::runMaintenance()
         }
     }
 
+    // H5 fix: age out the persistent envelope-ID dedup table.
+    pruneSeenEnvelopes();
+
 #ifdef PEER2PEAR_P2P
     const int64_t now = nowSecs();
     std::vector<std::string> toRemove;
@@ -261,6 +264,9 @@ void ChatController::setDatabase(SqlCipherDb& db)
     m_fileMgr.setDatabase(&db);
     m_fileMgr.loadPersistedTransfers();
     m_fileMgr.purgeStalePartialFiles();
+
+    // H5 fix: envelope-ID dedup survives restart when a DB is present.
+    ensureSeenEnvelopesTable();
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
     m_sessionMgr->setSendResponseFn([this](const std::string& peerId, const Bytes& blob) {
@@ -491,9 +497,17 @@ std::string ChatController::sendGroupFile(const std::string& groupId,
                                 / FileTransferManager::kChunkBytes);
 
     const std::string myId = myIdB64u();
-    const std::string transferId = p2p::makeUuid();
 
-    // Per-member file_key announcement, then per-member streamed send.
+    // LC4 audit fix (2026-04-19): each member gets a unique transferId so
+    // the sender can honor Phase 2 consent (queue-then-wait-for-file_accept)
+    // independently per recipient, matching 1:1 behavior.  The caller sees
+    // a single group-level transferId that fans out to all members for
+    // cancellation; per-member callbacks (file_accept, file_ack, file_cancel
+    // etc.) fire with the per-member transferId as they do for 1:1.
+    const std::string groupTransferId = p2p::makeUuid();
+    std::vector<std::string> memberTids;
+    memberTids.reserve(memberPeerIds.size());
+
     for (const std::string& peerIdRaw : memberPeerIds) {
         // Trim leading/trailing whitespace (was QString::trimmed()).
         auto lb = peerIdRaw.find_first_not_of(" \t\r\n");
@@ -502,10 +516,12 @@ std::string ChatController::sendGroupFile(const std::string& groupId,
         const std::string peerId = peerIdRaw.substr(lb, rb - lb + 1);
         if (peerId.empty() || peerId == myId) continue;
 
+        const std::string memberTid = p2p::makeUuid();
+
         json announce = json::object();
         announce["from"]        = myId;
         announce["type"]        = "file_key";
-        announce["transferId"]  = transferId;
+        announce["transferId"]  = memberTid;
         announce["fileName"]    = fileName;
         announce["fileSize"]    = fileSize;
         announce["fileHash"]    = CryptoEngine::toBase64Url(fileHash);
@@ -525,24 +541,25 @@ std::string ChatController::sendGroupFile(const std::string& groupId,
         m_relay.sendEnvelope(sealedEnv);
 
         Bytes fileKey = m_sessionMgr->lastMessageKey();
-        P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
+        P2P_LOG("[FILE] file_key announced for " << memberTid.substr(0, 8) << "..."
                  << " to " << peerId.substr(0, 8) << "... (group)");
 
-        // NOTE: Phase 2 intentionally does NOT gate group files on per-member
-        // consent. Each group member would need an independent file_accept
-        // roundtrip, which complicates the N-way announcement model. Group
-        // files stream immediately (old behavior), 1:1 files use the consent
-        // gate. Group-member consent is future work.
-        m_fileMgr.sendFileWithKey(myId, peerId, fileKey, transferId, fileName,
-                                  filePath, fileSize, fileHash,
-                                  groupId, groupName);
+        // Queue — do not stream.  Chunks for this member fly only after that
+        // member's file_accept arrives, identical to the 1:1 flow.
+        m_fileMgr.queueOutboundFile(myId, peerId, fileKey, memberTid, fileName,
+                                     filePath, fileSize, fileHash,
+                                     groupId, groupName);
         sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
+
+        memberTids.push_back(memberTid);
     }
 
-    if (onStatus) onStatus("'" + fileName + "' streamed in "
-                           + std::to_string(chunkCount)
-                           + " chunk(s) -> group " + groupName);
-    return transferId;
+    if (!memberTids.empty())
+        m_groupFileMembers[groupTransferId] = std::move(memberTids);
+
+    if (onStatus) onStatus("'" + fileName + "' queued for group " + groupName
+                           + " (awaiting per-member consent)");
+    return groupTransferId;
 }
 
 void ChatController::connectToRelay()
@@ -694,6 +711,24 @@ void ChatController::cancelFileTransfer(const std::string& transferId)
 {
     // Figure out which role we hold for this transferId and clean up + notify.
 
+    // LC4: if this is the group-level id we returned from sendGroupFile,
+    // fan out the cancel to every per-member transferId underneath it.
+    auto grpIt = m_groupFileMembers.find(transferId);
+    if (grpIt != m_groupFileMembers.end()) {
+        for (const std::string& memberTid : grpIt->second) {
+            const std::string peer = m_fileMgr.outboundPeerFor(memberTid);
+            if (peer.empty()) continue;  // already accepted/declined/streamed away
+            m_fileMgr.abandonOutboundTransfer(memberTid);
+            json msg = json::object();
+            msg["type"]       = "file_cancel";
+            msg["transferId"] = memberTid;
+            sendFileControlMessage(peer, msg);
+        }
+        m_groupFileMembers.erase(grpIt);
+        if (onFileTransferCanceled) onFileTransferCanceled(transferId, false);
+        return;
+    }
+
     // Outbound pending (sender canceling a queued-but-unaccepted send)?
     const std::string outboundPeer = m_fileMgr.outboundPeerFor(transferId);
     if (!outboundPeer.empty()) {
@@ -837,6 +872,76 @@ bool ChatController::markSeen(const std::string& id)
     m_seenIds.insert(idStd);
     m_seenOrder.push_back(idStd);
     return true;
+}
+
+// H5 fix (audit 2026-04-19): persistent envelope-ID dedup.  The in-memory
+// LRU is a speed cache; the row in seen_envelopes is the source of truth
+// across app restarts.  Only used for the outer envelope-level check; the
+// ratchet chain counter still covers replayed session payloads once the
+// envelope is past the gate.
+bool ChatController::markSeenPersistent(const std::string& id)
+{
+    // Hot-path: already in memory this session.
+    if (m_seenIds.count(id)) return false;
+
+    if (m_dbPtr && m_dbPtr->isOpen()) {
+        SqlCipherQuery sel(*m_dbPtr);
+        if (sel.prepare("SELECT 1 FROM seen_envelopes WHERE id = :id;")) {
+            sel.bindValue(":id", id);
+            if (sel.exec() && sel.next()) {
+                // Known from a previous process — cache it so the next
+                // replay in this session hits the fast path.
+                m_seenIds.insert(id);
+                return false;
+            }
+        }
+
+        SqlCipherQuery ins(*m_dbPtr);
+        if (ins.prepare(
+                "INSERT OR IGNORE INTO seen_envelopes(id, first_seen)"
+                " VALUES(:id, :ts);")) {
+            ins.bindValue(":id", id);
+            ins.bindValue(":ts", static_cast<int64_t>(nowSecs()));
+            ins.exec();
+        }
+    }
+
+    // Add to the bounded in-memory LRU so later lookups this session stay cheap.
+    if (int(m_seenOrder.size()) >= kSeenIdsCap) {
+        const int prune = kSeenIdsCap / 2;
+        for (int i = 0; i < prune; ++i) m_seenIds.erase(m_seenOrder[i]);
+        m_seenOrder.erase(m_seenOrder.begin(), m_seenOrder.begin() + prune);
+    }
+    m_seenIds.insert(id);
+    m_seenOrder.push_back(id);
+    return true;
+}
+
+void ChatController::ensureSeenEnvelopesTable()
+{
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
+    SqlCipherQuery q(*m_dbPtr);
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS seen_envelopes ("
+        "  id         TEXT PRIMARY KEY,"
+        "  first_seen INTEGER NOT NULL"
+        ");"
+    );
+    q.exec(
+        "CREATE INDEX IF NOT EXISTS idx_seen_envelopes_first_seen"
+        " ON seen_envelopes(first_seen);"
+    );
+}
+
+void ChatController::pruneSeenEnvelopes()
+{
+    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
+    const int64_t cutoff = nowSecs() - kSeenEnvelopesMaxAgeSecs;
+    SqlCipherQuery q(*m_dbPtr);
+    if (q.prepare("DELETE FROM seen_envelopes WHERE first_seen < :cutoff;")) {
+        q.bindValue(":cutoff", cutoff);
+        q.exec();
+    }
 }
 
 // pollOnce removed — relay pushes envelopes via WebSocket.
@@ -1036,7 +1141,9 @@ void ChatController::onEnvelope(const Bytes& body)
         // and the receiver would happily reprocess it.
         if (unsealedEnvelopeId.size() == 16) {
             const std::string envKey = "env:" + CryptoEngine::toBase64Url(unsealedEnvelopeId);
-            if (!markSeen(envKey)) {
+            // H5 fix: persistent dedup so a relay-level replay after app
+            // restart still gets dropped.
+            if (!markSeenPersistent(envKey)) {
                 P2P_LOG("[RECV " << via << "] dropping replayed envelope "
                          << envKey.substr(4, 8) << "...");
                 return;
