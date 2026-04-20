@@ -1,13 +1,11 @@
 // test_c_api.cpp — surface tests for the public C FFI.
 //
 // The mobile clients (iOS Swift, Android JNI) go through peer2pear.h, not
-// the C++ classes directly.  This file pins the contract the FFI exposes,
-// starting with the H4 audit fix:
+// the C++ classes directly.  This file pins the contract the FFI exposes:
 //
 //   * p2p_set_passphrase_v2 routes callers to the v5 unified Argon2id
 //     derivation (one Argon2 call + HKDF) instead of the legacy per-key
-//     Argon2 path that p2p_set_passphrase uses.  Mobile clients pinned
-//     to the legacy API couldn't upgrade their identities.
+//     Argon2 path that p2p_set_passphrase uses.
 //
 // Goals (keep the surface small):
 //   1. v2 succeeds, creates a v5 identity.json on disk, and p2p_my_id
@@ -23,6 +21,7 @@
 // during these tests, just identity bootstrapping.
 
 #include "peer2pear.h"
+#include "test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -38,20 +37,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-std::string makeTempDir(const char* tag) {
-    (void)sodium_init();
-    uint8_t rnd[8];
-    randombytes_buf(rnd, sizeof(rnd));
-    char buf[64];
-    std::snprintf(buf, sizeof(buf),
-                  "%s-%02x%02x%02x%02x%02x%02x%02x%02x",
-                  tag, rnd[0], rnd[1], rnd[2], rnd[3],
-                  rnd[4], rnd[5], rnd[6], rnd[7]);
-    const fs::path p = fs::temp_directory_path() / buf;
-    fs::remove_all(p);
-    fs::create_directories(p);
-    return p.string();
-}
+using p2p_test::makeTempDir;
 
 // All-null platform is fine for identity-only tests — nothing in the
 // passphrase path touches WS or HTTP.
@@ -133,9 +119,9 @@ TEST(CApi, SetPassphraseV2RejectsWrongPassphrase) {
 }
 
 // ── 3b. Passphrase shorter than P2P_MIN_PASSPHRASE_BYTES is rejected ────
-// M3 audit fix: library-side strength floor.  Platform UIs should enforce
-// stronger requirements before calling, but a caller that skips that step
-// shouldn't be able to mint a one-character-passphrase identity.
+// Library-side strength floor.  Platform UIs should enforce stronger
+// requirements before calling, but a caller that skips that step shouldn't
+// be able to mint a one-character-passphrase identity.
 
 TEST(CApi, SetPassphraseV2RejectsWeakPassphrase) {
     const std::string dir = makeTempDir("p2p-capi-weakpass");
@@ -253,15 +239,9 @@ TEST(CApi, GroupActionsValidateArguments) {
     fs::remove_all(dir);
 }
 
-// ── Round-trip: rename triggers onGroupRenamed when the control message
-// bounces through the sender's own decrypt path.  The sender's
-// ChatController wires its own sendSealedPayload → (in this single-
-// context setup) the message goes nowhere because there's no wire, but
-// the callback setter contract is pinned by the earlier tests.  Full
-// bidirectional round-trip coverage lives in the E2E suite that stands
-// up two ChatControllers with a mock relay — extending it to exercise
-// the C API directly is blocked on plumbing p2p_platform through the
-// mock harness (a separate piece of work).
+// Two-context round-trips (action-on-alice → callback-on-bob) live in
+// test_c_api_e2e.cpp; the surface tests above only pin the setter + arg
+// contract of each new entry point.
 
 // ── 4. Null / empty passphrase and missing data_dir are rejected ─────────
 

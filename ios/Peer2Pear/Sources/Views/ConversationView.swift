@@ -668,10 +668,10 @@ struct MessageBubble: View {
 }
 
 // MARK: - Key-change banner
-// Surfaces the audit M5/M6 mitigation: peers can tap Verify (which opens
-// contact details) or Dismiss (which hides the banner without trusting).
-// Hard-block mode is a separate setting — the banner respects it by
-// showing the same "messages refused" state the desktop does.
+// Peers can tap Verify (which opens contact details) or Dismiss (which
+// hides the banner without trusting).  Hard-block mode is a separate
+// setting — the banner respects it by showing the same "messages refused"
+// state the desktop does.
 
 struct KeyChangeBanner: View {
     @ObservedObject var client: Peer2PearClient
@@ -862,10 +862,6 @@ struct FileRequestSheet: View {
     }
 
     private var humanSize: String {
-        let bytes = request.fileSize
-        if bytes < 1024 { return "\(bytes) B" }
-        if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes)/1024) }
-        if bytes < 1024 * 1024 * 1024 { return String(format: "%.1f MB", Double(bytes)/1024/1024) }
-        return String(format: "%.1f GB", Double(bytes)/1024/1024/1024)
+        ByteCountFormatter.string(fromByteCount: request.fileSize, countStyle: .file)
     }
 }

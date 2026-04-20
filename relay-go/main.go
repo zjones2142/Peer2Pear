@@ -31,14 +31,13 @@ func main() {
 	port := flag.String("port", envOr("PORT", "8443"), "listen port")
 	dbPath := flag.String("db", envOr("DB_PATH", "peer2pear_relay.db"), "SQLite database path")
 	trustProxy := flag.Bool("trust-proxy", envOr("TRUST_PROXY", "") != "", "trust X-Forwarded-For header (set when behind a reverse proxy)")
-	// L1 audit-#2 fix: native TLS so operators don't need a reverse
-	// proxy just to terminate HTTPS.  Supply both --cert and --key (or
-	// TLS_CERT / TLS_KEY env vars) to switch from ListenAndServe to
-	// ListenAndServeTLS.  Without either, we fall back to plaintext
-	// HTTP — which is only safe behind a trusted reverse proxy that
-	// adds TLS for us.  The PROTOCOL.md spec requires HTTPS; the
-	// warning below calls the fallback out loudly so a misconfigured
-	// deploy can't silently ship cleartext auth signatures.
+	// Native TLS so operators don't need a reverse proxy just to terminate
+	// HTTPS.  Supply both --cert and --key (or TLS_CERT / TLS_KEY env vars)
+	// to switch from ListenAndServe to ListenAndServeTLS.  Without either,
+	// we fall back to plaintext HTTP — which is only safe behind a trusted
+	// reverse proxy that adds TLS for us.  The PROTOCOL.md spec requires
+	// HTTPS; the warning below calls the fallback out loudly so a
+	// misconfigured deploy can't silently ship cleartext auth signatures.
 	certPath := flag.String("cert", envOr("TLS_CERT", ""), "path to TLS certificate (PEM)")
 	keyPath  := flag.String("key",  envOr("TLS_KEY",  ""), "path to TLS private key (PEM)")
 	flag.Parse()
@@ -53,7 +52,7 @@ func main() {
 	// Initialize relay hub
 	hub := NewHub(mbox, *trustProxy)
 
-	// Fix #7: load or generate the relay's X25519 keypair for onion routing.
+	// Load or generate the relay's X25519 keypair for onion routing.
 	pub, priv, err := loadOrCreateRelayKey()
 	if err != nil {
 		log.Fatalf("init relay onion key: %v", err)
@@ -80,7 +79,7 @@ func main() {
 	mux.HandleFunc("POST /v1/send", hub.HandleSend)
 	mux.HandleFunc("/v1/receive", hub.HandleReceive) // WebSocket — no method restriction
 	mux.HandleFunc("POST /v1/forward", hub.HandleForward)
-	// Fix #7: onion routing endpoints.
+	// Onion routing endpoints.
 	mux.HandleFunc("GET /v1/relay_info", hub.HandleRelayInfo)
 	mux.HandleFunc("POST /v1/forward-onion", hub.HandleForwardOnion)
 	// NOTE: /v1/peers removed — exposing connected peer IDs is a privacy leak.
@@ -89,9 +88,9 @@ func main() {
 
 	// ── Health ───────────────────────────────────────────────────────
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		// Parity fix: expose PROTOCOL version (identical across impls) as
-		// `version`, and the implementation flavour as `impl`.  Clients can
-		// gate on `version` for compat, operators inspect `impl`.
+		// Expose PROTOCOL version (identical across impls) as `version`,
+		// and the implementation flavour as `impl`.  Clients can gate on
+		// `version` for compat, operators inspect `impl`.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":      true,
 			"version": "2.0.0",
@@ -117,10 +116,10 @@ func main() {
 		srv.Close()
 	}()
 
-	// L1 audit-#2: pick between plaintext HTTP and native TLS.  Both
-	// --cert and --key must be set (empty means use the reverse-proxy
-	// deployment, caller's choice).  Asymmetry between them is a
-	// config mistake — refuse to start rather than silently pick one.
+	// Pick between plaintext HTTP and native TLS.  Both --cert and --key
+	// must be set (empty means use the reverse-proxy deployment, caller's
+	// choice).  Asymmetry between them is a config mistake — refuse to
+	// start rather than silently pick one.
 	tlsOn  := *certPath != "" && *keyPath != ""
 	tlsBad := (*certPath != "") != (*keyPath != "")
 	if tlsBad {

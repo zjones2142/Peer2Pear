@@ -1,4 +1,4 @@
-// test_sealed_envelope.cpp — Tier 3 tests for SealedEnvelope.
+// test_sealed_envelope.cpp — tests for SealedEnvelope.
 //
 // SealedEnvelope is the sealed-sender layer that hides the sender's identity
 // from the relay.  It's built on:
@@ -11,7 +11,7 @@
 //   2. Tamper rejection — MAC catches any flipped bit.
 //   3. Recipient binding — recipientEdPub is in the AAD, so a relay that
 //      rewrites the routing header to redirect the envelope fails
-//      decryption (the "cross-user re-routing" attack in H1/H2 era).
+//      decryption (the cross-user re-routing attack).
 //   4. envelopeId uniqueness — each seal produces a fresh 16-byte id so
 //      replay dedup on the receiver side actually distinguishes envelopes.
 //   5. Relay wrap/unwrap round-trip with proper padding buckets.
@@ -156,8 +156,7 @@ TEST(SealedEnvelope, TamperedCiphertextRejected) {
 // ── 5. Recipient binding: a rerouted envelope fails decryption ────────────
 // The sealed envelope's AEAD binds the recipient's Ed25519 pub into AAD so
 // a malicious relay that swaps the routing header to target a different
-// recipient trips an authentication failure.  This is the exact attack the
-// H1/H2 cycle defended against.
+// recipient trips an authentication failure.
 
 TEST(SealedEnvelope, WrongRecipientBindingRejected) {
     const EdKey    sender    = makeEd();

@@ -24,8 +24,7 @@
  * re-routing the sealed blob to a different recipient.
  * The envelopeId is 16 random bytes that the receiver uses for replay detection.
  *
- * Types: std::vector<uint8_t> for all binary buffers (migrated off Qt 2026-04).
- * See REFACTOR_PLAN.md.
+ * Types: std::vector<uint8_t> for all binary buffers.
  */
 
 using Bytes = std::vector<uint8_t>;

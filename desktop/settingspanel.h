@@ -34,7 +34,7 @@ signals:
     void exportContactsClicked();
     void importContactsClicked();
 
-    // Phase 2: file-transfer consent settings changed.
+    // File-transfer consent settings changed.
     void fileAutoAcceptMaxChanged(int mb);
     void fileHardMaxChanged(int mb);
     void fileRequireP2PToggled(bool on);
@@ -97,7 +97,7 @@ private:
     QPushButton *m_dndToggleBtn         = nullptr;
     QLabel      *m_dndStatusLabel       = nullptr;
 
-    // Phase 2: file-transfer consent
+    // File-transfer consent
     QSpinBox    *m_fileAutoAcceptSpin   = nullptr;  // MB
     QSpinBox    *m_fileHardMaxSpin      = nullptr;  // MB
     bool         m_requireP2PEnabled    = false;

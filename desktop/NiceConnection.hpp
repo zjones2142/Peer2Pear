@@ -2,10 +2,9 @@
 //
 // NiceConnection — ICE NAT-traversal layer (libnice + GLib).
 //
-// Plain C++ class.  No Qt inheritance, no Qt types — the Phase 7d Qt strip
-// (2026-04-18) replaced the former QThread base + QObject signals with a
-// `std::thread` + `std::function` callbacks pattern.  This keeps the door
-// open for cross-platform P2P; libnice itself is C-only.
+// Plain C++ class.  No Qt inheritance, no Qt types — uses a `std::thread` +
+// `std::function` callbacks pattern.  This keeps the door open for
+// cross-platform P2P; libnice itself is C-only.
 //
 // **Threading model:** initIce() spawns a worker thread that runs the GLib
 // main loop.  All libnice callbacks (and therefore all of the on* callbacks

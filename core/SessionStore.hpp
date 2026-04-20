@@ -19,7 +19,6 @@
  * XChaCha20-Poly1305 before being written to the database.
  *
  * Types: std::string peer IDs, std::vector<uint8_t> (Bytes) blobs.
- * Migrated off Qt on 2026-04-18 (Phase 6 — tracks SqlCipherDb migration).
  */
 class SessionStore {
 public:
@@ -46,15 +45,16 @@ public:
     Bytes loadPendingHandshake(const std::string& peerId, int& roleOut) const;
     void  deletePendingHandshake(const std::string& peerId);
 
-    // H2 fix: reduced from 24h to 5 min — stuck handshakes block messaging.
-    // SEC9: returns peer IDs whose handshakes were pruned (for upgrade detection).
+    // 5-minute default: stuck handshakes otherwise block messaging for
+    // the peer.  Returns peer IDs whose handshakes were pruned (used by
+    // callers for upgrade detection).
     std::vector<std::string> pruneStaleHandshakes(int maxAgeSecs = 300);
 
 private:
     // Encrypt/decrypt a BLOB using XChaCha20-Poly1305 and m_storeKey.
-    // AAD (M1 audit-#2 fix) binds the row identity into the tag —
-    // callers supply a stable string per logical slot (see the static
-    // sessionAad() / handshakeAad() helpers in SessionStore.cpp).
+    // AAD binds the row identity into the tag — callers supply a stable
+    // string per logical slot (see the static sessionAad() /
+    // handshakeAad() helpers in SessionStore.cpp).
     Bytes encryptBlob(const Bytes& plaintext, const std::string& aad) const;
     Bytes decryptBlob(const Bytes& ciphertext, const std::string& aad) const;
 

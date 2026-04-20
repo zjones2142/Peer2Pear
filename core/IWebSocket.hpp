@@ -17,7 +17,7 @@
  * networking headers. Each platform provides ~50-80 lines of glue.
  *
  * Types: std::string for text/URLs (UTF-8), std::vector<uint8_t> for binary
- * frames.  Migrated off Qt 2026-04.
+ * frames.
  */
 class IWebSocket {
 public:

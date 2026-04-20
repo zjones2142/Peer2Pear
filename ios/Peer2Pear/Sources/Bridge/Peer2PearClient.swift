@@ -212,7 +212,7 @@ final class Peer2PearClient: ObservableObject {
         // Set event callbacks
         setupCallbacks()
 
-        // Initialize identity (v5 unified Argon2id path — H4 fix).
+        // Initialize identity (unified Argon2id path).
         let rc = p2p_set_passphrase_v2(rawContext, passphrase)
         if rc != 0 {
             statusMessage = "Identity unlock failed (wrong passphrase?)"
@@ -253,7 +253,7 @@ final class Peer2PearClient: ObservableObject {
     ///
     /// Also seeds the core's in-memory roster for this group so
     /// subsequent control messages (rename / avatar / leave) from
-    /// other members pass the H2 authorization check.
+    /// other members pass the authorization check.
     @discardableResult
     func createGroup(name: String, memberPeerIds: [String]) -> String {
         let gid = UUID().uuidString.lowercased()
@@ -280,7 +280,7 @@ final class Peer2PearClient: ObservableObject {
     /// Seed the core's roster for a group that was either (a) loaded
     /// from local persistence on startup or (b) learned about via an
     /// inbound message.  Call on every known group after start() so
-    /// the H2 check admits control messages from other members.
+    /// the authorization check admits control messages from other members.
     func setKnownGroupMembers(groupId: String, memberPeerIds: [String]) {
         guard let ctx = rawContext else { return }
         withCStringArray(memberPeerIds) { ptr in
@@ -410,6 +410,21 @@ final class Peer2PearClient: ObservableObject {
         }
     }
 
+    /// Read a NULL-terminated C string array into a Swift `[String]`.
+    /// Used by every callback that receives a member list from the C API.
+    fileprivate static func stringsFromCArray(
+        _ ptr: UnsafePointer<UnsafePointer<CChar>?>?
+    ) -> [String] {
+        guard let ptr else { return [] }
+        var out: [String] = []
+        var i = 0
+        while let p = ptr[i] {
+            out.append(String(cString: p))
+            i += 1
+        }
+        return out
+    }
+
     // MARK: - File transfer actions
 
     /// Start a file send.  Returns the transferId on success, nil otherwise.
@@ -460,22 +475,14 @@ final class Peer2PearClient: ObservableObject {
 
     func checkPresence(for peerIds: [String]) {
         guard let ctx = rawContext else { return }
-        let cStrings = peerIds.map { strdup($0) }
-        defer { cStrings.forEach { free($0) } }
-        var cArray: [UnsafePointer<CChar>?] =
-            cStrings.map { $0.map { UnsafePointer($0) } }
-        cArray.withUnsafeMutableBufferPointer { buf in
-            p2p_check_presence(ctx, buf.baseAddress, Int32(peerIds.count))
+        withCStringArray(peerIds) { ptr in
+            p2p_check_presence(ctx, ptr, Int32(peerIds.count))
         }
     }
     func subscribePresence(for peerIds: [String]) {
         guard let ctx = rawContext else { return }
-        let cStrings = peerIds.map { strdup($0) }
-        defer { cStrings.forEach { free($0) } }
-        var cArray: [UnsafePointer<CChar>?] =
-            cStrings.map { $0.map { UnsafePointer($0) } }
-        cArray.withUnsafeMutableBufferPointer { buf in
-            p2p_subscribe_presence(ctx, buf.baseAddress, Int32(peerIds.count))
+        withCStringArray(peerIds) { ptr in
+            p2p_subscribe_presence(ctx, ptr, Int32(peerIds.count))
         }
     }
 
@@ -563,15 +570,7 @@ final class Peer2PearClient: ObservableObject {
             from, gid, gname, memberIds, text, ts, msgId, ud in
             guard let client = Peer2PearClient.from(ud),
                   let from, let gid, let gname, let text, let msgId else { return }
-            // memberIds is a NULL-terminated array of C strings.
-            var members: [String] = []
-            if let memberIds {
-                var i = 0
-                while let p = memberIds[i] {
-                    members.append(String(cString: p))
-                    i += 1
-                }
-            }
+            let members = Peer2PearClient.stringsFromCArray(memberIds)
             let gm = P2PGroupMessage(
                 id: String(cString: msgId),
                 from: String(cString: from),
@@ -590,7 +589,7 @@ final class Peer2PearClient: ObservableObject {
                 // Always add the SENDER to the roster (sendGroupText
                 // strips self from the declared members so members ==
                 // recipients) — otherwise subsequent control messages
-                // from the sender would fail the H2 authorization check.
+                // from the sender would fail the authorization check.
                 var roster = gm.members
                 if !roster.contains(client.myPeerId) {
                     roster.append(client.myPeerId)
@@ -623,14 +622,7 @@ final class Peer2PearClient: ObservableObject {
             let gidStr    = String(cString: gid)
             let fromStr   = String(cString: from)
             let gnameStr  = String(cString: gname)
-            var members: [String] = []
-            if let memberIds {
-                var i = 0
-                while let p = memberIds[i] {
-                    members.append(String(cString: p))
-                    i += 1
-                }
-            }
+            let members   = Peer2PearClient.stringsFromCArray(memberIds)
             DispatchQueue.main.async {
                 // Drop the departing peer from our stored roster.
                 if var g = client.groups[gidStr] {
@@ -680,16 +672,27 @@ final class Peer2PearClient: ObservableObject {
             let gidStr = String(cString: gid)
             let avatarStr = String(cString: avatarB64)
             DispatchQueue.main.async {
-                client.groupAvatars[gidStr] = avatarStr
+                if client.groupAvatars[gidStr] != avatarStr {
+                    client.groupAvatars[gidStr] = avatarStr
+                }
             }
         }, selfPtr)
 
         // ── Presence push ──────────────────────────────────────────────
+        // No-op guard: `peerPresence[pid] = isUp` always triggers
+        // objectWillChange, even when the value is unchanged.  Relay
+        // pushes are unconditional on subscribe/reconnect, so without
+        // the guard every reconnect rebuilds every view that reads
+        // peerPresence.
         p2p_set_on_presence(ctx, { peerId, online, ud in
             guard let client = Peer2PearClient.from(ud), let peerId else { return }
             let pid = String(cString: peerId)
             let isUp = online != 0
-            DispatchQueue.main.async { client.peerPresence[pid] = isUp }
+            DispatchQueue.main.async {
+                if client.peerPresence[pid] != isUp {
+                    client.peerPresence[pid] = isUp
+                }
+            }
         }, selfPtr)
 
         // ── Avatar from a peer ─────────────────────────────────────────
@@ -701,7 +704,15 @@ final class Peer2PearClient: ObservableObject {
                 displayName: String(cString: name),
                 avatarB64: String(cString: avatarB64)
             )
-            DispatchQueue.main.async { client.peerAvatars[av.from] = av }
+            DispatchQueue.main.async {
+                // Skip the write when the base64 payload is unchanged —
+                // avatars are re-pushed on every connect, so without
+                // this guard every reconnect re-renders every view
+                // reading peerAvatars.
+                if client.peerAvatars[av.from]?.avatarB64 != av.avatarB64 {
+                    client.peerAvatars[av.from] = av
+                }
+            }
         }, selfPtr)
 
         // ── File transfer: inbound progress + completion ──────────────

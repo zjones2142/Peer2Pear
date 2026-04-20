@@ -1,10 +1,10 @@
-// test_relay_cover_traffic.cpp — M5 audit: cover traffic during silence.
+// test_relay_cover_traffic.cpp — cover traffic during silence.
 //
-// Before the fix, RelayClient::sendCoverEnvelope returned early when no
-// contacts were online — a relay operator observing the sudden drop to
-// zero outgoing envelopes could infer "all this user's contacts just
-// went offline."  The M5 recommendation is to self-address the cover
-// packet so the outbound rate stays constant regardless of peer state.
+// RelayClient::sendCoverEnvelope must not return early when no contacts
+// are online — a relay operator observing a sudden drop to zero outgoing
+// envelopes could infer "all this user's contacts just went offline."
+// The fix is to self-address the cover packet so the outbound rate stays
+// constant regardless of peer state.
 //
 // This binary wires a real RelayClient directly (not via ChatController)
 // to a minimal set of mocks:
@@ -23,6 +23,7 @@
 #include "IHttpClient.hpp"
 #include "ITimer.hpp"
 #include "IWebSocket.hpp"
+#include "test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -43,20 +44,7 @@ using Bytes = std::vector<uint8_t>;
 
 namespace {
 
-std::string makeTempDir(const char* tag) {
-    (void)sodium_init();
-    uint8_t rnd[8];
-    randombytes_buf(rnd, sizeof(rnd));
-    char buf[64];
-    std::snprintf(buf, sizeof(buf),
-                  "%s-%02x%02x%02x%02x%02x%02x%02x%02x",
-                  tag, rnd[0], rnd[1], rnd[2], rnd[3],
-                  rnd[4], rnd[5], rnd[6], rnd[7]);
-    const fs::path p = fs::temp_directory_path() / buf;
-    fs::remove_all(p);
-    fs::create_directories(p);
-    return p.string();
-}
+using p2p_test::makeTempDir;
 
 // ── Fireable timer ──────────────────────────────────────────────────────
 // Stores the most-recently-scheduled callback; fire() invokes it inline.
@@ -174,7 +162,7 @@ TEST(RelayCoverTraffic, SelfAddressedFallbackWhenNoPeersOnline) {
     ASSERT_GE(sodium_init(), 0);
 
     // Identity needs to be real — RelayClient signs the auth tuple and
-    // uses identityPub() for the M5 self-cover fallback.
+    // uses identityPub() for the self-cover fallback.
     const std::string dataDir = makeTempDir("p2p-cover");
     CryptoEngine crypto;
     crypto.setDataDir(dataDir);
@@ -195,18 +183,19 @@ TEST(RelayCoverTraffic, SelfAddressedFallbackWhenNoPeersOnline) {
     relay.connectToRelay();
     ASSERT_TRUE(relay.isConnected());
 
-    // Known-peers list is empty by construction — the M5 pre-fix path
-    // would silently drop every cover packet.
+    // Known-peers list is empty by construction — without the self-
+    // address fallback the cover-traffic path would silently drop every
+    // cover packet.
     http.posts.clear();  // discard anything queued by refreshRelayInfo etc.
 
     relay.setCoverTrafficInterval(1);  // arms the cover timer
 
     // The first fire of the cover timer must emit a self-addressed
     // envelope.  Subsequent fires may enqueue more; we only need the
-    // first POST to observe the fix.
+    // first POST to observe the fallback.
     while (timers.fireNext() && http.posts.empty()) { /* drain */ }
     ASSERT_FALSE(http.posts.empty())
-        << "cover traffic produced no POST — M5 fallback missing";
+        << "cover traffic produced no POST — self-address fallback missing";
 
     const Bytes& body = http.posts.front().body;
     ASSERT_GT(body.size(), 33u) << "envelope too short to contain a routing header";
@@ -221,7 +210,7 @@ TEST(RelayCoverTraffic, SelfAddressedFallbackWhenNoPeersOnline) {
     fs::remove_all(dataDir);
 }
 
-// ── M7 audit-#2: setRelayUrl refuses non-TLS URLs ────────────────────────
+// ── setRelayUrl refuses non-TLS URLs ─────────────────────────────────────
 // An http:// or ws:// URL would silently downgrade the transport to
 // cleartext.  Only https:// / wss:// are accepted for production URLs;
 // http:// / ws:// on localhost is tolerated for dev convenience.

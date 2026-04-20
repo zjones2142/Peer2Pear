@@ -9,7 +9,7 @@ struct Message {
     bool      sent;
     QString   text;
     QDateTime timestamp;
-    QString   msgId;      // dedup ID; empty for legacy messages
+    QString   msgId;      // dedup ID (may be empty on historical rows)
     QString   senderName; // populated for received group messages
 };
 

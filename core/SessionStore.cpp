@@ -19,7 +19,7 @@ SessionStore::SessionStore(SqlCipherDb& db, Bytes storeKey)
     , m_storeKey(std::move(storeKey))
 {
     createTables();
-    pruneStaleHandshakes();   // G2 fix: clean up on startup
+    pruneStaleHandshakes();   // clean up on startup
 }
 
 SessionStore::~SessionStore() {
@@ -39,8 +39,8 @@ void SessionStore::createTables() {
         ");"
     );
 
-    // B4 fix: skipped_message_keys table removed — RatchetSession manages
-    // skipped keys in its own serialized blob (in-memory map).
+    // RatchetSession manages skipped keys in its own serialized blob
+    // (in-memory map); drop any stale table from previous builds.
     q.exec("DROP TABLE IF EXISTS skipped_message_keys;");
 
     q.exec(
@@ -57,16 +57,11 @@ void SessionStore::createTables() {
 // Blob encryption helpers
 // ---------------------------
 
-// M1 audit-#2 fix: both helpers now take a string `aad` that's bound
-// into the AEAD.  Ratchet-session rows encrypt with aad="ratchet|<peer>"
-// and pending-handshake rows with aad="handshake|<peer>|<role>".  An
-// attacker with DB write access can no longer swap encrypted blobs
-// across tables or across peers — the AAD mismatch trips the AEAD tag.
-//
-// Wire-compat: rows encrypted by a pre-M1 build used aad=nullptr, so
-// they fail to decrypt after the upgrade.  Callers see an empty Bytes
-// and treat the session as missing (re-handshake on next send).  Pre-
-// production trade-off documented at the call sites.
+// Both helpers take a string `aad` that's bound into the AEAD.
+// Ratchet-session rows encrypt with aad="ratchet|<peer>" and pending-
+// handshake rows with aad="handshake|<peer>|<role>".  An attacker with
+// DB write access cannot swap encrypted blobs across tables or across
+// peers — the AAD mismatch trips the AEAD tag.
 
 SessionStore::Bytes SessionStore::encryptBlob(const Bytes& plaintext,
                                                const std::string& aad) const {
@@ -225,7 +220,7 @@ std::vector<std::string> SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
     const int64_t cutoff = nowSecs() - maxAgeSecs;
     std::vector<std::string> pruned;
 
-    // SEC9: collect peer IDs before deleting so we can report them.
+    // Collect peer IDs before deleting so we can report them.
     {
         SqlCipherQuery sel(m_db.handle());
         sel.prepare("SELECT peer_id FROM pending_handshakes WHERE created_at < :cutoff;");

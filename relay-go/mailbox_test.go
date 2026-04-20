@@ -1,18 +1,15 @@
 // mailbox_test.go — unit tests for the Mailbox storage layer.
 //
-// Covers the full CRUD surface plus the three audit fixes that live
-// here:
+// Covers the full CRUD surface plus:
 //
-//   - H5 (pre-existing): delete in a transaction so a failed commit
-//     leaves the mailbox intact.
-//   - L4 (2026-04-20):   auth-nonce replay state persists across
-//     relay restart — a freshly-opened Mailbox on the same DB file
-//     must still reject a previously-registered nonce.
-//   - M6 (2026-04-20):   two-phase delivery.  FetchAll marks rows
-//     as in-flight instead of deleting; ConfirmDelivered finishes
-//     the drop after a successful WS write.  A crash between mark
-//     and confirm is recoverable — the mark ages out and the next
-//     FetchAll returns the rows again.
+//   - Transactional delete so a failed commit leaves the mailbox intact.
+//   - Auth-nonce replay state persists across relay restart — a
+//     freshly-opened Mailbox on the same DB file must still reject a
+//     previously-registered nonce.
+//   - Two-phase delivery.  FetchAll marks rows as in-flight instead of
+//     deleting; ConfirmDelivered finishes the drop after a successful
+//     WS write.  A crash between mark and confirm is recoverable — the
+//     mark ages out and the next FetchAll returns the rows again.
 //
 // Each test uses a freshly-created SQLite file under t.TempDir() so
 // cases are isolated.  Integration tests that exercise the HTTP +
@@ -84,9 +81,9 @@ func TestMailbox_StoreFetchConfirm_RoundTrip(t *testing.T) {
 	}
 }
 
-// ── M6 crash safety: unconfirmed envelopes reappear after stale window ─
+// ── Crash safety: unconfirmed envelopes reappear after stale window ───
 
-func TestMailbox_M6_UnconfirmedRedeliversAfterStaleWindow(t *testing.T) {
+func TestMailbox_UnconfirmedRedeliversAfterStaleWindow(t *testing.T) {
 	m, _ := newTestMailbox(t)
 
 	mustStore(t, m, "bob", []byte("first"))
@@ -127,9 +124,9 @@ func TestMailbox_M6_UnconfirmedRedeliversAfterStaleWindow(t *testing.T) {
 	}
 }
 
-// ── M6 partial crash: some confirmed, rest reappear ────────────────────
+// ── Partial crash: some confirmed, rest reappear ───────────────────────
 
-func TestMailbox_M6_PartialConfirmLeavesRestForRedelivery(t *testing.T) {
+func TestMailbox_PartialConfirmLeavesRestForRedelivery(t *testing.T) {
 	m, _ := newTestMailbox(t)
 
 	payloads := [][]byte{
@@ -297,7 +294,7 @@ func TestMailbox_StoreWithTTL_CapsAtMax(t *testing.T) {
 	}
 }
 
-// ── L4: RegisterAuthNonce rejects replays within the window ────────────
+// ── RegisterAuthNonce rejects replays within the window ────────────────
 
 func TestMailbox_RegisterAuthNonce_RejectsReplay(t *testing.T) {
 	m, _ := newTestMailbox(t)
@@ -315,7 +312,7 @@ func TestMailbox_RegisterAuthNonce_RejectsReplay(t *testing.T) {
 	}
 }
 
-// ── L4: RegisterAuthNonce allows the same nonce after its expiry ───────
+// ── RegisterAuthNonce allows the same nonce after its expiry ───────────
 
 func TestMailbox_RegisterAuthNonce_ExpiredCanReuse(t *testing.T) {
 	m, _ := newTestMailbox(t)
@@ -331,11 +328,11 @@ func TestMailbox_RegisterAuthNonce_ExpiredCanReuse(t *testing.T) {
 	}
 }
 
-// ── L4 integration: auth replay survives relay restart ─────────────────
-// This is the actual audit concern — before L4, reopening the DB cleared
-// the seenAuth map and let an attacker replay.  Now the row is in SQLite.
+// ── Auth replay survives relay restart ─────────────────────────────────
+// Reopening the DB must still reject a previously-registered nonce within
+// its replay window — the row lives in SQLite.
 
-func TestMailbox_L4_AuthReplayPersistsAcrossReopen(t *testing.T) {
+func TestMailbox_AuthReplayPersistsAcrossReopen(t *testing.T) {
 	m, path := newTestMailbox(t)
 	exp := time.Now().UnixMilli() + 30_000
 
@@ -352,11 +349,11 @@ func TestMailbox_L4_AuthReplayPersistsAcrossReopen(t *testing.T) {
 	defer m2.Close()
 
 	if m2.RegisterAuthNonce("alice|42", exp) {
-		t.Fatalf("post-restart RegisterAuthNonce: returned true, want false (L4 regression)")
+		t.Fatalf("post-restart RegisterAuthNonce: returned true, want false (regression)")
 	}
 }
 
-// ── L4: PurgeExpiredAuthNonces removes stale rows only ─────────────────
+// ── PurgeExpiredAuthNonces removes stale rows only ─────────────────────
 
 func TestMailbox_PurgeExpiredAuthNonces(t *testing.T) {
 	m, _ := newTestMailbox(t)

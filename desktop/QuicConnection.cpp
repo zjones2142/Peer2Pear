@@ -21,7 +21,7 @@
 
 using json = nlohmann::json;
 
-// S4 fix: max frame size matches the mailbox envelope limit (256 KB)
+// Max frame size matches the mailbox envelope limit (256 KB).
 static constexpr uint32_t kMaxFrameSize = 256 * 1024;
 
 // ---------------------------
@@ -32,7 +32,7 @@ const QUIC_API_TABLE* QuicConnection::s_msquic = nullptr;
 HQUIC QuicConnection::s_registration = nullptr;
 bool QuicConnection::s_initialized = false;
 
-// S5 fix: cleanup on app exit
+// Cleanup on app exit.
 static void cleanupMsquic() {
     if (QuicConnection::s_msquic && QuicConnection::s_registration) {
         QuicConnection::s_msquic->RegistrationClose(QuicConnection::s_registration);
@@ -61,7 +61,7 @@ void QuicConnection::initQuicGlobal() {
     }
 
     s_initialized = true;
-    atexit(cleanupMsquic);  // S5 fix
+    atexit(cleanupMsquic);
     P2P_LOG("[QUIC] MsQuic initialized");
 }
 
@@ -73,8 +73,8 @@ namespace {
 
 // Bind a UDP socket to an ephemeral port, read it back, then close the socket.
 // There's a TOCTOU race between the close here and msquic's later bind on the
-// same port — same as the previous QUdpSocket-based version.  Acceptable for
-// local development; iOS/Android will pick the port via system APIs anyway.
+// same port.  Acceptable for local development; iOS/Android will pick the port
+// via system APIs anyway.
 uint16_t findEphemeralUdpPort() {
 #ifdef _WIN32
     SOCKET s = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -191,7 +191,7 @@ bool QuicConnection::isReady() const {
 
 void QuicConnection::onIceStateChanged(int state) {
     if (state == NICE_COMPONENT_STATE_READY) {
-        // S3 fix: check if ICE path is relayed (TURN) — can't do QUIC over TURN.
+        // If the ICE path is relayed (TURN), QUIC is not possible.
         if (m_ice && m_ice->isRelayed()) {
             P2P_LOG("[QUIC] ICE selected TURN relay — QUIC not possible, using raw ICE");
             fallbackToRawIce();
@@ -205,7 +205,7 @@ void QuicConnection::onIceStateChanged(int state) {
             return;
         }
 
-        // S3 fix: extract peer's actual address from ICE selected pair.
+        // Extract peer's actual address from the ICE selected pair.
         std::string peerHost;
         uint16_t    peerPort = 0;
         if (m_ice && m_ice->getSelectedPeerAddress(peerHost, peerPort)) {
@@ -225,8 +225,8 @@ void QuicConnection::onIceStateChanged(int state) {
         // Find a free UDP port for QUIC.
         m_localQuicPort = findEphemeralUdpPort();
 
-        // S2 fix: sign the bootstrap message with our identity key so the peer
-        // can verify it's authentic (prevents port redirection attacks on ICE channel).
+        // Include our identity fingerprint in the bootstrap so the peer can
+        // verify authenticity (prevents port redirection attacks on ICE channel).
         json bootstrap = json::object();
         bootstrap["quic_port"]   = m_localQuicPort;
         bootstrap["fingerprint"] = m_localFingerprint;
@@ -260,7 +260,7 @@ void QuicConnection::onIceDataReceived(const Bytes& data) {
         if (!obj.is_object()) return;
         m_peerQuicPort = static_cast<uint16_t>(obj.value("quic_port", 0));
 
-        // S2 fix: verify the bootstrap fingerprint matches what we received in signaling.
+        // Verify the bootstrap fingerprint matches what we received in signaling.
         const std::string bootFingerprint = obj.value("fingerprint", std::string());
         if (!m_peerFingerprint.empty() && bootFingerprint != m_peerFingerprint) {
             P2P_WARN("[QUIC] Bootstrap fingerprint mismatch — possible tampering, falling back");
@@ -318,7 +318,7 @@ void QuicConnection::startQuicClient() {
     settings.PeerBidiStreamCount = 2;
     settings.IsSet.PeerBidiStreamCount = TRUE;
 
-    // S1 fix: app-layer crypto is the primary security layer.  See header for rationale.
+    // App-layer crypto is the primary security layer.  See header for rationale.
     QUIC_CREDENTIAL_CONFIG credConfig = {};
     credConfig.Type  = QUIC_CREDENTIAL_TYPE_NONE;
     credConfig.Flags = QUIC_CREDENTIAL_FLAG_CLIENT |
@@ -367,7 +367,7 @@ void QuicConnection::startQuicServer() {
     settings.PeerBidiStreamCount = 2;
     settings.IsSet.PeerBidiStreamCount = TRUE;
 
-    // S1 fix: same rationale as client — app-layer crypto is the primary security layer.
+    // Same rationale as client — app-layer crypto is the primary security layer.
     QUIC_CREDENTIAL_CONFIG credConfig = {};
     credConfig.Type  = QUIC_CREDENTIAL_TYPE_NONE;
     credConfig.Flags = QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
@@ -421,9 +421,7 @@ QUIC_STATUS QUIC_API QuicConnection::connectionCallback(HQUIC /*conn*/, void* ct
         if (self->m_handshakeTimer) self->m_handshakeTimer->stop();
         self->openStreams();
         // Fire the state-change callback directly on the msquic worker thread.
-        // Previously this used QMetaObject::invokeMethod with a queued
-        // connection to marshal back to the QObject's owning thread.  After
-        // the QObject strip, ChatController's callbacks are thread-tolerant.
+        // ChatController's callbacks are thread-tolerant.
         if (self->onStateChanged) self->onStateChanged(NICE_COMPONENT_STATE_READY);
         return QUIC_STATUS_SUCCESS;
 
@@ -496,9 +494,9 @@ QUIC_STATUS QUIC_API QuicConnection::listenerCallback(HQUIC /*listener*/, void* 
     case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
         HQUIC conn = ev->NEW_CONNECTION.Connection;
 
-        // S7 fix: verify the connecting peer's IP matches the ICE-discovered peer.
-        // Note: port may differ (peer binds a new ephemeral port for QUIC).
-        // Full IP validation deferred — the bootstrap fingerprint check (S2) and
+        // The connecting peer's IP should match the ICE-discovered peer; note
+        // the port may differ (peer binds a new ephemeral port for QUIC).
+        // Full IP validation is deferred — the bootstrap fingerprint check and
         // the sealed-envelope auth at the application layer cover the gap.
         (void)self;
 
@@ -572,7 +570,7 @@ void QuicConnection::processFramedStream(Bytes& buf, const uint8_t* data, uint32
             (static_cast<uint32_t>(buf[2]) <<  8) |
              static_cast<uint32_t>(buf[3]);
 
-        // S4 fix: reject frames larger than the mailbox envelope limit.
+        // Reject frames larger than the mailbox envelope limit.
         if (frameLen > kMaxFrameSize) {
             P2P_WARN("[QUIC] Frame too large: " << frameLen << " — dropping buffer");
             buf.clear();
@@ -605,7 +603,7 @@ void QuicConnection::sendData(const Bytes& data) {
     }
 }
 
-// S6 fix: return bool indicating success.
+// Returns true if the file data was dispatched over QUIC.
 bool QuicConnection::sendFileData(const Bytes& data) {
     if (m_rawIceMode) return false;  // no QUIC file stream in raw mode
 

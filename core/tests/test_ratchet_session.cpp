@@ -1,4 +1,4 @@
-// test_ratchet_session.cpp — Tier 4 tests for RatchetSession (Double Ratchet).
+// test_ratchet_session.cpp — tests for RatchetSession (Double Ratchet).
 //
 // The Double Ratchet drives every in-session message after the Noise
 // handshake.  Getting it right is load-bearing: a subtle bug shows up as
@@ -272,11 +272,10 @@ TEST(RatchetSession, MalformedInputRejected) {
     }
 }
 
-// ── 11. H2 audit-#2: all-zeros remote DH pub is rejected ──────────────────
-// Before the fix, a peer (or malicious relay) could substitute an all-
-// zeros remote DH pubkey and force the scalarmult to land on a known
-// shared secret.  initAsInitiator / initAsResponder + dhRatchetStep all
-// get the same check.
+// ── 11. All-zeros remote DH pub is rejected ───────────────────────────────
+// A peer (or malicious relay) could substitute an all-zeros remote DH
+// pubkey and force the scalarmult to land on a known shared secret.
+// initAsInitiator / initAsResponder + dhRatchetStep all check for this.
 
 TEST(RatchetSession, InitAsInitiatorRejectsAllZeroRemotePub) {
     const Party alice = makeParty();

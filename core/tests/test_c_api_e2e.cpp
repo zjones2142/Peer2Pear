@@ -1,4 +1,4 @@
-// test_c_api_e2e.cpp — Tier 7 end-to-end through the C FFI.
+// test_c_api_e2e.cpp — end-to-end through the C FFI.
 //
 // test_e2e_two_clients.cpp exercises the same round-trips at the
 // ChatController level.  This file pins them at the peer2pear.h
@@ -8,21 +8,22 @@
 // p2p_platform vtable whose callbacks route through a shared
 // MockRelay that lives in this file.
 //
-// Reentrancy note: every p2p_* FFI call takes the ctx's ctrlMu
-// (C2 audit fix).  The platform vtable is invoked from *inside*
-// those FFI entry points — so synchronously calling p2p_ws_on_*
-// or p2p_http_response on the SAME ctx is a same-thread recursive
-// mutex acquire (std::mutex is non-recursive → undefined behaviour
-// / abort).  We therefore push every callback onto a per-platform
-// delivery queue and `pump()` it after each FFI call; by then the
-// entry point has released ctrlMu and the pump thread can acquire
-// it cleanly.  Cross-ctx delivery (e.g. alice → bob) lands on bob's
-// DIFFERENT ctrlMu and could in principle run inline, but we route
-// it through the same queue for uniformity + to match real platform
-// behaviour where WS deliveries are always async.
+// Reentrancy note: every p2p_* FFI call takes the ctx's ctrlMu.
+// The platform vtable is invoked from *inside* those FFI entry
+// points — so synchronously calling p2p_ws_on_* or p2p_http_response
+// on the SAME ctx is a same-thread recursive mutex acquire
+// (std::mutex is non-recursive → undefined behaviour / abort).  We
+// therefore push every callback onto a per-platform delivery queue
+// and `pump()` it after each FFI call; by then the entry point has
+// released ctrlMu and the pump thread can acquire it cleanly.
+// Cross-ctx delivery (e.g. alice → bob) lands on bob's DIFFERENT
+// ctrlMu and could in principle run inline, but we route it through
+// the same queue for uniformity + to match real platform behaviour
+// where WS deliveries are always async.
 
 #include "peer2pear.h"
 #include "CryptoEngine.hpp"
+#include "test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -44,20 +45,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-std::string makeTempDir(const char* tag) {
-    (void)sodium_init();
-    uint8_t rnd[8];
-    randombytes_buf(rnd, sizeof(rnd));
-    char buf[80];
-    std::snprintf(buf, sizeof(buf),
-                  "%s-%02x%02x%02x%02x%02x%02x%02x%02x",
-                  tag, rnd[0], rnd[1], rnd[2], rnd[3],
-                  rnd[4], rnd[5], rnd[6], rnd[7]);
-    const fs::path p = fs::temp_directory_path() / buf;
-    fs::remove_all(p);
-    fs::create_directories(p);
-    return p.string();
-}
+using p2p_test::makeTempDir;
 
 // ── Delivery queue ───────────────────────────────────────────────────────
 // FIFO of closures to run on the main (test) thread.  Platform callbacks
@@ -400,12 +388,12 @@ TEST_F(CApiE2ESuite, GroupTextRoundTripAliceToBob) {
 }
 
 // Helper: pre-seed a group's roster on `party` via the C API.
-// H2 audit-#2: control messages (rename / avatar / leave) are deny-by-
-// default until the recipient's ChatController has learned the group's
-// member set.  sendGroupText strips self from the declared members so
-// the receiver's cold-bootstrap check fails; real clients persist
-// their own roster and call p2p_set_known_group_members on startup.
-// This helper mirrors that for tests.
+// Control messages (rename / avatar / leave) are deny-by-default until
+// the recipient's ChatController has learned the group's member set.
+// sendGroupText strips self from the declared members so the receiver's
+// cold-bootstrap check fails; real clients persist their own roster and
+// call p2p_set_known_group_members on startup.  This helper mirrors
+// that for tests.
 static void seedGroup(p2p_context* ctx, const std::string& gid,
                       std::initializer_list<std::string> members) {
     std::vector<std::string> m(members);

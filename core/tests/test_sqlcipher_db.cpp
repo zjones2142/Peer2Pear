@@ -1,11 +1,10 @@
-// test_sqlcipher_db.cpp — Tier 2 tests for the vendored SQLCipher amalgamation.
+// test_sqlcipher_db.cpp — tests for the vendored SQLCipher amalgamation.
 //
-// The direct motivation is the regression that shipped on 2026-04-19: I
-// vendored SQLCipher 4.6.1 without the `-DSQLITE_EXTRA_INIT=sqlcipher_extra_init`
-// flag required by 4.14+.  The codec hooks never registered, the app wrote
-// plain-sqlite bytes into an encrypted DB, and the existing user DB was
-// corrupted on first launch.  A 50-ms round-trip test would have caught this
-// before the user ever saw "file is not a database".
+// The direct motivation: vendoring SQLCipher 4.6.1 without the
+// `-DSQLITE_EXTRA_INIT=sqlcipher_extra_init` flag (required by 4.14+)
+// silently skips codec registration, so the app writes plain-sqlite bytes
+// into an "encrypted" DB.  A 50-ms round-trip test catches this before
+// any user sees "file is not a database".
 //
 // So this file's top priority is: prove the build actually has a working
 // SQLCipher codec, end to end.  The cheapest such proof is:
@@ -96,7 +95,7 @@ TEST(SqlCipherDb, LinkedBuildIsSqlCipher) {
 }
 
 // ── 2. Round-trip: write row → close → reopen with same key → read back ──
-// This is the regression test for the 4.6.1-without-EXTRA_INIT bug.
+// Regression test for the 4.6.1-without-EXTRA_INIT silent-plaintext bug.
 
 TEST(SqlCipherDb, EncryptedRoundTripWithCorrectKey) {
     const std::string path = makeTempDbPath("sqlcipher-roundtrip");
@@ -122,8 +121,8 @@ TEST(SqlCipherDb, EncryptedRoundTripWithCorrectKey) {
 }
 
 // ── 3. Reopening with a different key must fail ───────────────────────────
-// If this test ever passes (i.e. a wrong key still opens the DB), the
-// codec is silently not doing anything — that's the 4.6.1 bug class.
+// If a wrong key still opens the DB, the codec is silently not doing
+// anything — the 4.6.1-without-EXTRA_INIT failure mode.
 
 TEST(SqlCipherDb, WrongKeyIsRejected) {
     const std::string path = makeTempDbPath("sqlcipher-wrongkey");

@@ -1,4 +1,4 @@
-// test_e2e_two_clients.cpp — Tier 7: end-to-end round-trip with a mock relay.
+// test_e2e_two_clients.cpp — end-to-end round-trip with a mock relay.
 //
 // Wires two ChatController instances to a hand-rolled in-process "relay":
 //
@@ -16,8 +16,8 @@
 //
 // This is the closest thing to a real client round-trip that can be
 // pinned down deterministically in a unit test.  It's also the place a
-// future regression in *any* of the earlier-tier modules is most likely
-// to show up as the user-visible failure "the message didn't arrive."
+// regression in any of the underlying modules is most likely to show up
+// as the user-visible failure "the message didn't arrive."
 
 #include "ChatController.hpp"
 #include "CryptoEngine.hpp"
@@ -25,6 +25,7 @@
 #include "ITimer.hpp"
 #include "IWebSocket.hpp"
 #include "SqlCipherDb.hpp"
+#include "test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -45,20 +46,7 @@ using Bytes = std::vector<uint8_t>;
 
 namespace {
 
-// Temp-path helper consistent with the other test binaries.
-std::string makeTempPath(const char* tag, const char* suffix) {
-    (void)sodium_init();
-    uint8_t rnd[8];
-    randombytes_buf(rnd, sizeof(rnd));
-    char buf[80];
-    std::snprintf(buf, sizeof(buf),
-                  "%s-%02x%02x%02x%02x%02x%02x%02x%02x%s",
-                  tag, rnd[0], rnd[1], rnd[2], rnd[3],
-                  rnd[4], rnd[5], rnd[6], rnd[7], suffix);
-    const fs::path p = fs::temp_directory_path() / buf;
-    fs::remove_all(p);
-    return p.string();
-}
+using p2p_test::makeTempPath;
 
 // ── MockTimer / MockTimerFactory ─────────────────────────────────────────
 // No-op timers.  ChatController's maintenance timer, RelayClient's
@@ -359,6 +347,20 @@ protected:
         ASSERT_TRUE(bob.ctrl->relay().isConnected());
     }
 
+    // Stamp the stored fingerprint row for `peerId` in `party`'s DB with
+    // a known-bad 32-byte blob.  Used by safety-number mismatch tests.
+    static void corruptStoredFingerprint(Party& party,
+                                          const std::string& peerId,
+                                          uint8_t fill) {
+        SqlCipherQuery q(*party.db);
+        ASSERT_TRUE(q.prepare(
+            "UPDATE verified_peers SET verified_fingerprint = :fp"
+            " WHERE peer_id = :pid;"));
+        q.bindValue(":fp", Bytes(32, fill));
+        q.bindValue(":pid", peerId);
+        ASSERT_TRUE(q.exec());
+    }
+
     void SetUp() override {
         ASSERT_GE(sodium_init(), 0);
         relay = std::make_unique<MockRelay>();
@@ -423,7 +425,7 @@ TEST_F(TwoClientSuite, BidirectionalConversation) {
 
 // ── 3. Relay-level replay is dropped at the envelope dedup layer ─────────
 // The mock relay delivers each send twice; Bob's ChatController dedups on
-// the envelopeId field baked into the sealed envelope (Fix #2).
+// the envelopeId field baked into the sealed envelope.
 
 TEST_F(TwoClientSuite, ReplayedEnvelopeDeduped) {
     connectBoth();
@@ -436,14 +438,13 @@ TEST_F(TwoClientSuite, ReplayedEnvelopeDeduped) {
     EXPECT_EQ(bob.received[0].text, "deliver me once, please");
 }
 
-// ── 3b. Replay across app restart is dropped (H5 audit fix) ─────────────
-// Before the fix, the envelope-ID dedup cache lived only in RAM — a relay
-// that stored sealed envelopes could replay them after Bob restarted and
-// his cache was cold.  The seen_envelopes SQLCipher table now makes the
-// dedup survive restart.  Exercise it end-to-end: send a message, record
-// the envelope bytes, rebuild Bob's ChatController on the same DB +
-// identity, and re-inject the captured envelope.  Bob's message callback
-// must NOT fire a second time.
+// ── 3b. Replay across app restart is dropped ─────────────────────────────
+// The envelope-ID dedup cache is persisted via the seen_envelopes
+// SQLCipher table, so a relay that stored sealed envelopes can't replay
+// them after Bob restarts and his in-memory cache is cold.  Exercise it
+// end-to-end: send a message, record the envelope bytes, rebuild Bob's
+// ChatController on the same DB + identity, and re-inject the captured
+// envelope.  Bob's message callback must NOT fire a second time.
 
 TEST_F(TwoClientSuite, PersistentEnvelopeDedupSurvivesRestart) {
     connectBoth();
@@ -533,15 +534,7 @@ TEST_F(TwoClientSuite, SafetyNumber_MismatchFiresCallbackOnceAndPersists) {
               ChatController::PeerTrust::Verified);
 
     // Simulate mismatch: corrupt the stored fingerprint in Alice's DB.
-    {
-        SqlCipherQuery q(*alice.db);
-        ASSERT_TRUE(q.prepare(
-            "UPDATE verified_peers SET verified_fingerprint = :fp"
-            " WHERE peer_id = :pid;"));
-        q.bindValue(":fp", Bytes(32, 0x11));  // definitely not the real FP
-        q.bindValue(":pid", bob.id);
-        ASSERT_TRUE(q.exec());
-    }
+    corruptStoredFingerprint(alice, bob.id, 0x11);
     EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
               ChatController::PeerTrust::Mismatch);
 
@@ -577,16 +570,7 @@ TEST_F(TwoClientSuite, SafetyNumber_HardBlockRefusesSend) {
     ASSERT_TRUE(alice.ctrl->markPeerVerified(bob.id));
     alice.ctrl->setHardBlockOnKeyChange(true);
 
-    // Corrupt Alice's stored fingerprint for Bob.
-    {
-        SqlCipherQuery q(*alice.db);
-        ASSERT_TRUE(q.prepare(
-            "UPDATE verified_peers SET verified_fingerprint = :fp"
-            " WHERE peer_id = :pid;"));
-        q.bindValue(":fp", Bytes(32, 0x22));
-        q.bindValue(":pid", bob.id);
-        ASSERT_TRUE(q.exec());
-    }
+    corruptStoredFingerprint(alice, bob.id, 0x22);
 
     const size_t before = bob.received.size();
     alice.ctrl->sendText(bob.id, "should be blocked");
@@ -628,11 +612,11 @@ TEST_F(TwoClientSuite, EnvelopeAddressedToStrangerIsDropped) {
 // These exercise the ChatController paths exposed as p2p_rename_group /
 // p2p_send_group_avatar / p2p_leave_group / p2p_send_group_file.  The
 // C API is a thin std::vector↔const char** shim; the interesting
-// invariants (dedup, H2 authorization, file chunk reassembly) all live
+// invariants (dedup, authorization, file chunk reassembly) all live
 // here.
 //
 // All four tests seed Bob's group roster via setKnownGroupMembers —
-// sendGroup* strips self from the declared members so the H2 cold-
+// sendGroup* strips self from the declared members so the cold-
 // bootstrap check ("sender must be in members") never fires for the
 // sender's own messages.  Real clients persist their roster and call
 // setKnownGroupMembers on startup; these tests mirror that.
@@ -650,8 +634,8 @@ TEST_F(TwoClientSuite, GroupRename_FiresCallbackOnPeer) {
     EXPECT_EQ(bob.renamed[0].newName, "Planning Crew");
 
     // Replay the exact same sealed envelope (MockRelay delivers each send
-    // twice) — B5 audit dedup on the msgId bounded inside the payload
-    // should suppress the duplicate callback.
+    // twice) — dedup on the msgId bounded inside the payload should
+    // suppress the duplicate callback.
     relay->setDeliverMultiplier(2);
     alice.ctrl->sendGroupRename(gid, "Even Newer Name", { alice.id, bob.id });
     EXPECT_EQ(bob.renamed.size(), 2u)

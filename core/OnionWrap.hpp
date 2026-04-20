@@ -7,15 +7,9 @@
 /*
  * Onion layer for multi-hop relay routing.
  *
- * PROBLEM the audit found (#7):
- *   The old /v1/forward endpoint was "single-layer" — the outer body still
- *   began with [0x01][recipientEdPub(32)], so the intermediate relay saw
- *   BOTH the sender's IP and the final recipient.  Worst of both worlds.
- *
- * FIX: real onion routing.  Each hop decrypts its own layer using its own
- * X25519 private key, learning ONLY the next-hop URL and an opaque blob.
- * Only the final hop sees the recipient pubkey (unavoidable — someone has
- * to route).
+ * Each hop decrypts its own layer using its own X25519 private key,
+ * learning ONLY the next-hop URL and an opaque blob.  Only the final
+ * hop sees the recipient pubkey (unavoidable — someone has to route).
  *
  * Wire format per hop:
  *
@@ -33,16 +27,11 @@
  *                                        wrap-for-relay envelope at the final hop
  *
  * The crypto is crypto_box_easy (X25519-XSalsa20-Poly1305) — the same
- * NaCl Box used on the Go relay via x/crypto/nacl/box.  (The previously-
- * shipped Python reference relay that also used pynacl.Box was retired
- * on 2026-04-20; see PROTOCOL.md §12.)
+ * NaCl Box used on the Go relay via x/crypto/nacl/box.
  *
  * Types:
  *   bytes → std::vector<uint8_t>       (binary buffers)
  *   url   → std::string                (UTF-8)
- *
- * Ported off Qt containers 2026-04 as part of the core/ mobile-portability
- * refactor.  See REFACTOR_PLAN.md.
  */
 
 class OnionWrap {

@@ -220,12 +220,12 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
     append(pendingBlob, counterBE, 4);
     append(pendingBlob, noise.serialize());
     m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, pendingBlob);
-    // L4 fix: zero the local private key copy now that it's persisted (encrypted)
+    // Zero the local private key copy now that it's persisted (encrypted).
     sodium_memzero(ratchetDhPriv.data(), ratchetDhPriv.size());
-    // C1 audit-#2 fix: cache the ephemeral DH private key in memory only.
-    // The serialized Noise blob no longer carries it, so this is where
-    // readMessage2 will pick it up on the msg2 path.  If we crash, the
-    // key dies with the process — next send starts a fresh handshake.
+    // Cache the ephemeral DH private key in memory only.  The serialized
+    // Noise blob does not carry it, so this is where readMessage2 picks it
+    // up on the msg2 path.  If we crash, the key dies with the process —
+    // next send starts a fresh handshake.
     m_pendingEk[peerIdB64u] = noise.ephemeralPriv();
     P2P_LOG("[SessionManager] Saved pending handshake + ratchet DH for " << peerPrefix(peerIdB64u));
 
@@ -239,8 +239,8 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
         return {};
     }
 
-    // B1 fix: expose the prekey-derived key so callers (e.g. sendFile) can use
-    // it as a file encryption key.  Both sides derive the same prekeyKey from
+    // Expose the prekey-derived key so callers (e.g. sendFile) can use it
+    // as a file encryption key.  Both sides derive the same prekeyKey from
     // the Noise chaining key, so the receiver's decryptFromPeer also has it.
     m_lastMessageKey = prekeyKey;
     CryptoEngine::secureZero(prekeyKey);
@@ -292,10 +292,9 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
             return {};
         }
 
-        // H1 audit-#2 fix: the responder's m_pendingCk used to linger
-        // indefinitely — once the ratchet is carrying messages we no
-        // longer need the Noise chaining key or the consumed-counters
-        // set, so drop both (zero the ck first).
+        // Once the ratchet is carrying messages we no longer need the
+        // Noise chaining key or the consumed-counters set on the
+        // responder side, so drop both (zero the ck first).
         if (auto ckIt = m_pendingCk.find(senderIdB64u); ckIt != m_pendingCk.end()) {
             CryptoEngine::secureZero(ckIt->second);
             m_pendingCk.erase(ckIt);
@@ -303,7 +302,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         m_consumedPreKeyCounters.erase(senderIdB64u);
 
         m_lastMessageKey = session->lastMessageKey();
-        if (msgKeyOut) *msgKeyOut = m_lastMessageKey;  // M3 fix: return key directly
+        if (msgKeyOut) *msgKeyOut = m_lastMessageKey;
         P2P_LOG("[SessionManager] Ratchet decrypt OK from " << peerPrefix(senderIdB64u)
                 << " | plaintext: " << int(pt.size()) << "B");
         persistSession(senderIdB64u);
@@ -370,7 +369,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
             noise.postMsg1ChainingKey(), strBytes("prekey-salt"), strBytes("prekey-payload"), 32);
         Bytes pt = m_crypto.aeadDecrypt(prekeyKey, encPayload);
         if (!pt.empty()) {
-            // B1 fix: expose prekey-derived key so file_key announcements work
+            // Expose prekey-derived key so file_key announcements work.
             m_lastMessageKey = prekeyKey;
             if (msgKeyOut) *msgKeyOut = m_lastMessageKey;
             P2P_LOG("[SessionManager] Pre-key payload decrypted OK | " << int(pt.size()) << "B");
@@ -425,18 +424,18 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         Bytes hsBlob        = tail(pendingBlob, 100);
 
         NoiseState noise = NoiseState::deserialize(hsBlob);
-        // C3 fix: re-inject static private key (not persisted since v3)
+        // Re-inject static private key (not persisted).
         noise.setStaticPrivateKey(m_crypto.curvePriv());
-        // Hybrid twin of C3: KEM priv isn't persisted either, so readMessage2
-        // would fail kemDecaps against an empty m_kemPriv.  Inject it when
-        // the reloaded Noise state declares itself hybrid.
+        // KEM priv isn't persisted either, so readMessage2 would fail
+        // kemDecaps against an empty m_kemPriv.  Inject it when the
+        // reloaded Noise state declares itself hybrid.
         if (noise.isHybrid() && m_crypto.hasPQKeys())
             noise.setKemPrivateKey(m_crypto.kemPriv());
-        // C1 audit-#2 fix: re-inject the ephemeral DH private key from
-        // the in-memory side-channel (never persisted).  Missing ek
-        // means either (a) the process crashed mid-handshake, or (b)
-        // this is a spurious msg2 for a handshake we didn't initiate —
-        // either way readMessage2 below will fail closed.
+        // Re-inject the ephemeral DH private key from the in-memory
+        // side-channel (never persisted).  Missing ek means either
+        // (a) the process crashed mid-handshake, or (b) this is a
+        // spurious msg2 for a handshake we didn't initiate — either
+        // way readMessage2 below will fail closed.
         auto ekIt = m_pendingEk.find(senderIdB64u);
         if (ekIt != m_pendingEk.end()) {
             noise.setEphemeralPrivateKey(ekIt->second);
@@ -444,10 +443,10 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         Bytes responsePayload;
         if (!noise.readMessage2(noiseMsg2, responsePayload)) {
             P2P_WARN("[SessionManager] Failed to process Noise msg2 from " << peerPrefix(senderIdB64u));
-            // C1 audit-#2 fix: m_ek is no longer persisted, so a crash
-            // mid-handshake makes readMessage2 fail deterministically on
-            // reload.  Delete the pending row so the next send starts a
-            // fresh handshake instead of looping on the corpse forever.
+            // m_ek is not persisted, so a crash mid-handshake makes
+            // readMessage2 fail deterministically on reload.  Delete the
+            // pending row so the next send starts a fresh handshake
+            // instead of looping on the corpse forever.
             m_store.deletePendingHandshake(senderIdB64u);
             if (ekIt != m_pendingEk.end()) {
                 CryptoEngine::secureZero(ekIt->second);
@@ -459,7 +458,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         HandshakeResult hr = noise.finish();
         m_store.deletePendingHandshake(senderIdB64u);
         m_pendingCk.erase(senderIdB64u);  // clean up chaining key (no longer needed)
-        // C1 audit-#2 fix: handshake completed — wipe the cached ek.
+        // Handshake completed — wipe the cached ek.
         if (auto it = m_pendingEk.find(senderIdB64u); it != m_pendingEk.end()) {
             CryptoEngine::secureZero(it->second);
             m_pendingEk.erase(it);
@@ -474,7 +473,7 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
             hr.recvCipher.key, responderEphPub,
             ratchetDhPub, ratchetDhPriv,
             noise.isHybrid());
-        // L4 fix: zero extracted private key now that ratchet owns it
+        // Zero extracted private key now that ratchet owns it.
         sodium_memzero(ratchetDhPriv.data(), ratchetDhPriv.size());
         sodium_memzero(pendingBlob.data(), pendingBlob.size());
 
@@ -503,11 +502,11 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
             return {};
         }
 
-        // H1 audit-#2 fix: reject replayed counters.  A relay that captures
-        // a 0x06 envelope could otherwise redeliver it; the chaining key
-        // hasn't advanced so the same counter would derive the same key
-        // and succeed.  Cap the per-peer set so a malicious flood can't
-        // grow unbounded memory.
+        // Reject replayed counters.  A relay that captures a 0x06
+        // envelope could otherwise redeliver it; the chaining key hasn't
+        // advanced so the same counter would derive the same key and
+        // succeed.  Cap the per-peer set so a malicious flood can't grow
+        // unbounded memory.
         auto& consumed = m_consumedPreKeyCounters[senderIdB64u];
         if (consumed.size() >= kMaxPreKeyCounters) {
             P2P_WARN("[SessionManager] Additional pre-key counter set overflow from "

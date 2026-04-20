@@ -175,12 +175,12 @@ private:
 // timers spawn a worker thread per timer that sleeps until the deadline (or
 // a cancellation signal arrives) and then fires the callback.
 //
-// C2 audit-#2 fix: every p2p_* entry point and every timer callback
-// serializes on p2p_context::ctrlMu (see p2p_guard below), so the host's
-// WS/HTTP callbacks and the maintenance timer can't race on ChatController
-// state.  The factory threads themselves still run in parallel — they just
-// take the lock before invoking the user's lambda, which is where the data
-// race lived.
+// Every p2p_* entry point and every timer callback serializes on
+// p2p_context::ctrlMu (see p2p_guard below), so the host's WS/HTTP
+// callbacks and the maintenance timer can't race on ChatController state.
+// The factory threads themselves still run in parallel — they just take
+// the lock before invoking the user's lambda, which is where the data
+// race would otherwise live.
 
 class StdTimer : public ITimer {
 public:
@@ -209,7 +209,7 @@ public:
             m_active = false;
             lk.unlock();
             if (fire && cb) {
-                // Serialize with p2p_* entry points (C2 audit fix).
+                // Serialize with p2p_* entry points.
                 if (ctrlMu) {
                     std::lock_guard<std::mutex> cg(*ctrlMu);
                     cb();
@@ -317,12 +317,12 @@ private:
 // ── p2p_context: the opaque handle ──────────────────────────────────────────
 
 struct p2p_context {
-    // C2 audit-#2 fix: every p2p_* entry point (and every timer callback)
-    // takes this mutex before touching controller / ws / http / cb.  This
+    // Every p2p_* entry point (and every timer callback) takes this
+    // mutex before touching controller / ws / http / cb.  This
     // serializes the maintenance timer against the host's WS/HTTP
-    // callbacks — they used to race on ChatController state (fields like
-    // m_envelopeCount, m_fileKeys, m_pendingIncomingFiles, m_sessionStore)
-    // because the timer fired on its own worker thread.
+    // callbacks — otherwise they race on ChatController state (fields
+    // like m_envelopeCount, m_fileKeys, m_pendingIncomingFiles,
+    // m_sessionStore) because the timer fires on its own worker thread.
     //
     // Mutex MUST be declared before timers/controller so it outlives any
     // callback thread they spawn: C++ destroys members in reverse order,
@@ -387,14 +387,14 @@ struct p2p_context {
         void (*on_avatar)(const char*, const char*, const char*, void*) = nullptr;
         void* avatar_ud = nullptr;
 
-        // Phase 2
+        // File consent / cancel.
         void (*on_file_request)(const char*, const char*, const char*, int64_t, void*) = nullptr;
         void* file_request_ud = nullptr;
 
         void (*on_file_canceled)(const char*, int, void*) = nullptr;
         void* file_canceled_ud = nullptr;
 
-        // Phase 3
+        // File delivery.
         void (*on_file_delivered)(const char*, void*) = nullptr;
         void* file_delivered_ud = nullptr;
 
@@ -419,14 +419,26 @@ struct p2p_context {
     {}
 };
 
-// Scope guard for C2: serializes every public p2p_* entry point.
+// Scope guard: serializes every public p2p_* entry point.
 // Recursive is overkill (we never re-enter), plain lock_guard suffices.
 #define P2P_CTX_GUARD(ctx) std::lock_guard<std::mutex> _p2p_lock((ctx)->ctrlMu)
 
 // ── Helper: assign ChatController callbacks → C FFI callbacks ──────────────
 //
-// ChatController is a plain class with std-typed callbacks (Phase 7c).
 // Each lambda just forwards arguments to the matching C function pointer.
+
+// Helper: build a NULL-terminated vector<const char*> from a vector of
+// strings, lifetimed to the caller's scope.  Shared by every C callback
+// bridge lambda that hands a member list across the FFI boundary.
+static std::vector<const char*> cPtrArrayFromStrings(
+    const std::vector<std::string>& src)
+{
+    std::vector<const char*> out;
+    out.reserve(src.size() + 1);
+    for (const std::string& s : src) out.push_back(s.c_str());
+    out.push_back(nullptr);
+    return out;
+}
 
 static void wire_signals(p2p_context* ctx)
 {
@@ -460,11 +472,7 @@ static void wire_signals(p2p_context* ctx)
                                       const std::string& text, int64_t tsSecs,
                                       const std::string& msgId) {
         if (ctx->cb.on_group_message) {
-            std::vector<const char*> memberPtrs;
-            memberPtrs.reserve(memberKeys.size() + 1);
-            for (const std::string& k : memberKeys) memberPtrs.push_back(k.c_str());
-            memberPtrs.push_back(nullptr);
-
+            auto memberPtrs = cPtrArrayFromStrings(memberKeys);
             ctx->cb.on_group_message(
                 from.c_str(), groupId.c_str(), groupName.c_str(),
                 memberPtrs.data(), text.c_str(),
@@ -480,11 +488,7 @@ static void wire_signals(p2p_context* ctx)
                                  int64_t tsSecs,
                                  const std::string& msgId) {
         if (ctx->cb.on_group_member_left) {
-            std::vector<const char*> memberPtrs;
-            memberPtrs.reserve(memberKeys.size() + 1);
-            for (const std::string& k : memberKeys) memberPtrs.push_back(k.c_str());
-            memberPtrs.push_back(nullptr);
-
+            auto memberPtrs = cPtrArrayFromStrings(memberKeys);
             ctx->cb.on_group_member_left(
                 from.c_str(), groupId.c_str(), groupName.c_str(),
                 memberPtrs.data(), tsSecs, msgId.c_str(),
@@ -595,11 +599,11 @@ p2p_context* p2p_create(const char* data_dir, p2p_platform platform)
 void p2p_destroy(p2p_context* ctx)
 {
     if (!ctx) return;
-    // C2 audit-#2 fix: drain timer worker threads *before* any other
-    // teardown.  A still-running singleShot cb holds captured references
-    // into ChatController; destroying it first would UAF.  Everything
-    // below runs under the ctrlMu so we serialize with any host-driven
-    // p2p_* entry points that might still be in flight.
+    // Drain timer worker threads *before* any other teardown.  A still-
+    // running singleShot cb holds captured references into
+    // ChatController; destroying it first would UAF.  Everything below
+    // runs under the ctrlMu so we serialize with any host-driven p2p_*
+    // entry points that might still be in flight.
     ctx->timers.shutdown();
     {
         std::lock_guard<std::mutex> lk(ctx->ctrlMu);
@@ -612,11 +616,11 @@ void p2p_set_passphrase(p2p_context* ctx, const char* passphrase)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    // M2 audit fix (2026-04-19): keep the passphrase copy in a named local
-    // so we can zero it on the way out.  Previously an implicit std::string
-    // temporary was created on-the-fly and destructed with the passphrase
-    // bytes still in its buffer.  The caller's own `passphrase` C string is
-    // out of our control — the header documents that they must zero it.
+    // Keep the passphrase copy in a named local so we can zero it on the
+    // way out.  An implicit std::string temporary would be destructed
+    // with the passphrase bytes still in its buffer.  The caller's own
+    // `passphrase` C string is out of our control — the header documents
+    // that they must zero it.
     std::string pass = passphrase ? passphrase : "";
     ctx->controller.setPassphrase(pass);
     CryptoEngine::secureZero(pass);
@@ -625,9 +629,9 @@ void p2p_set_passphrase(p2p_context* ctx, const char* passphrase)
 int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
 {
     if (!ctx || !passphrase || passphrase[0] == '\0') return -1;
-    // M3 audit fix: enforce the library-side strength floor.  Platform UIs
-    // should reject weak passphrases long before they reach this entry,
-    // but a byte-length check here keeps the core from ever accepting a
+    // Enforce the library-side strength floor.  Platform UIs should
+    // reject weak passphrases long before they reach this entry, but a
+    // byte-length check here keeps the core from ever accepting a
     // 1-char passphrase via a misconfigured FFI caller.
     if (std::strlen(passphrase) < P2P_MIN_PASSPHRASE_BYTES) return -1;
     if (ctx->dataDir.empty()) return -1;
@@ -642,9 +646,9 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
     Bytes salt = CryptoEngine::loadOrCreateSalt(saltPath);
     if (salt.size() != 16) return -1;
 
-    // M2 fix: route the passphrase through one named local we can zero
-    // on every exit path, so no intermediate std::string holds it after
-    // this function returns.
+    // Route the passphrase through one named local we can zero on every
+    // exit path, so no intermediate std::string holds it after this
+    // function returns.
     std::string pass = passphrase;
 
     Bytes masterKey = CryptoEngine::deriveMasterKey(pass, salt);
@@ -653,18 +657,30 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
         return -1;
     }
 
-    // HKDF info label must stay byte-identical to what the desktop
-    // onboarding flow uses (mainwindow.cpp:115) so v4→v5 migration
+    // HKDF info labels.  Must stay byte-identical to what the desktop
+    // onboarding flow uses (mainwindow.cpp:115 / :117) so v4→v5 migration
     // succeeds across frontends.
+    auto labelBytes = [](const char* s, size_t n) {
+        return Bytes(reinterpret_cast<const uint8_t*>(s),
+                      reinterpret_cast<const uint8_t*>(s) + n);
+    };
     static const char kIdentityInfo[] = "identity-unlock";
-    Bytes info(
-        reinterpret_cast<const uint8_t*>(kIdentityInfo),
-        reinterpret_cast<const uint8_t*>(kIdentityInfo)
-            + sizeof(kIdentityInfo) - 1);
+    static const char kDbInfo[]       = "sqlcipher-db-key";
 
-    Bytes identityKey = CryptoEngine::deriveSubkey(masterKey, info);
+    // Derive both subkeys from one master before zeroing it — Argon2id
+    // at MODERATE is ~150-300 ms, so running it twice on unlock is a
+    // real user-visible stall (and a memory spike under iOS jetsam
+    // pressure).  The master lives microseconds longer than it would if
+    // we zeroed between derivations — drastically shorter than the
+    // passphrase buffer itself, which we hold until the end.
+    Bytes identityKey = CryptoEngine::deriveSubkey(
+        masterKey, labelBytes(kIdentityInfo, sizeof(kIdentityInfo) - 1));
+    Bytes dbKey       = CryptoEngine::deriveSubkey(
+        masterKey, labelBytes(kDbInfo,       sizeof(kDbInfo) - 1));
     CryptoEngine::secureZero(masterKey);
-    if (identityKey.size() != 32) {
+    if (identityKey.size() != 32 || dbKey.size() != 32) {
+        CryptoEngine::secureZero(identityKey);
+        CryptoEngine::secureZero(dbKey);
         CryptoEngine::secureZero(pass);
         return -1;
     }
@@ -678,35 +694,18 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
     CryptoEngine::secureZero(identityKey);
 
     // SQLCipher session store — mirrors desktop mainwindow.cpp's flow.
-    // Derive a DB-specific subkey from the same master so the key
-    // on disk matches across identities + survives identity rotation.
     // Without this, `ctx->controller.m_sessionMgr` stays null and every
     // outbound send fails with "cannot seal" (mobile FFI regression
     // discovered during test_c_api_e2e round-trip writeup).
     if (rc == 0) {
-        // Re-derive masterKey (we zeroed the first copy above to prevent
-        // the passphrase bytes from surviving in memory longer than
-        // necessary).  Running Argon2 a second time is cheap compared to
-        // the session setup it unblocks.
-        Bytes master2 = CryptoEngine::deriveMasterKey(pass, salt);
-        if (master2.size() == 32) {
-            static const char kDbInfo[] = "sqlcipher-db-key";
-            Bytes dbInfo(
-                reinterpret_cast<const uint8_t*>(kDbInfo),
-                reinterpret_cast<const uint8_t*>(kDbInfo) + sizeof(kDbInfo) - 1);
-            Bytes dbKey = CryptoEngine::deriveSubkey(master2, dbInfo);
-            CryptoEngine::secureZero(master2);
-            const std::string dbPath = ctx->dataDir + "/peer2pear.db";
-            if (dbKey.size() == 32 && ctx->db.open(dbPath, dbKey)) {
-                ctx->controller.setDatabase(ctx->db);
-            } else {
-                rc = -1;
-            }
-            CryptoEngine::secureZero(dbKey);
+        const std::string dbPath = ctx->dataDir + "/peer2pear.db";
+        if (ctx->db.open(dbPath, dbKey)) {
+            ctx->controller.setDatabase(ctx->db);
         } else {
             rc = -1;
         }
     }
+    CryptoEngine::secureZero(dbKey);
 
     CryptoEngine::secureZero(pass);
     return rc;
@@ -790,6 +789,15 @@ int p2p_send_text(p2p_context* ctx, const char* peer_id, const char* text)
     return 0;
 }
 
+// Helper: materialize a NULL-terminated C array into a std::vector.  Used
+// by every group action that takes a member list.
+static std::vector<std::string> cStringArrayToVector(const char** arr) {
+    std::vector<std::string> out;
+    if (!arr) return out;
+    for (const char** p = arr; *p; ++p) out.emplace_back(*p);
+    return out;
+}
+
 int p2p_send_group_text(p2p_context* ctx,
                         const char* group_id,
                         const char* group_name,
@@ -798,23 +806,11 @@ int p2p_send_group_text(p2p_context* ctx,
 {
     if (!ctx || !group_id || !text || !member_ids) return -1;
     P2P_CTX_GUARD(ctx);
-    std::vector<std::string> members;
-    for (const char** p = member_ids; *p; ++p)
-        members.emplace_back(*p);
     ctx->controller.sendGroupMessageViaMailbox(
         group_id,
         group_name ? group_name : "",
-        members, text);
+        cStringArrayToVector(member_ids), text);
     return 0;
-}
-
-// Helper: materialize a NULL-terminated C array into a std::vector.  Used
-// by every group action below — same pattern as p2p_send_group_text.
-static std::vector<std::string> cStringArrayToVector(const char** arr) {
-    std::vector<std::string> out;
-    if (!arr) return out;
-    for (const char** p = arr; *p; ++p) out.emplace_back(*p);
-    return out;
 }
 
 const char* p2p_send_group_file(p2p_context* ctx,
@@ -908,7 +904,7 @@ const char* p2p_send_file(p2p_context* ctx,
     return ctx->scratch.c_str();
 }
 
-// ── Phase 2: file consent + cancel ──────────────────────────────────────────
+// ── File consent + cancel ───────────────────────────────────────────────────
 
 void p2p_respond_file_request(p2p_context* ctx,
                               const char* transfer_id,

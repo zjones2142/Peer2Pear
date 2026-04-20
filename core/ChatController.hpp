@@ -4,11 +4,10 @@
 class QuicConnection;  // forward declaration — full include in .cpp
 #endif
 
-// Qt is no longer part of ChatController's public surface.  All types are
-// std::* (string / vector / map / set) or Bytes (std::vector<uint8_t>).
-// QObject was stripped in Phase 7b; Qt::Core was dropped from core/ in
-// Phase 7c — desktop/ still uses Qt for UI but calls the std-typed surface
-// with toStdString()/fromStdString() at the boundary.
+// Qt is not part of ChatController's public surface.  All types are std::*
+// (string / vector / map / set) or Bytes (std::vector<uint8_t>).  desktop/
+// still uses Qt for UI but calls the std-typed surface with
+// toStdString()/fromStdString() at the boundary.
 
 #include <nlohmann/json.hpp>
 
@@ -102,20 +101,20 @@ public:
     void sendGroupAvatar(const std::string& groupId, const std::string& avatarB64, const std::vector<std::string>& memberKeys);
     void sendGroupMemberUpdate(const std::string& groupId, const std::string& groupName, const std::vector<std::string>& memberKeys);
 
-    // G3: Wipe ratchet session for a peer, forcing a fresh Noise IK handshake
+    // Wipe ratchet session for a peer, forcing a fresh Noise IK handshake.
     void resetSession(const std::string& peerIdB64u);
 
     // ── Safety numbers / out-of-band key verification ──────────────────────
     //
-    // Audit #1 called this out as the single biggest missing feature —
-    // without it, Alice has no way to confirm the peerId she received
-    // via any out-of-band channel (invite link, QR scan) wasn't MITM'd.
+    // Without safety numbers, Alice has no way to confirm the peerId she
+    // received via any out-of-band channel (invite link, QR scan) wasn't
+    // MITM'd.
     //
     // Trust states:
     //   Unverified — no record; first contact; messaging works with a
     //                soft "unverified" indicator in the UI.
-    //   Verified   — user previously compared safety numbers out-of-band
-    //                and confirmed.  Current fingerprint matches stored.
+    //   Verified   — user compared safety numbers out-of-band and
+    //                confirmed.  Current fingerprint matches stored.
     //   Mismatch   — stored fingerprint no longer matches current —
     //                usually means the local identity was regenerated
     //                (fresh install) and every verification is stale.
@@ -131,8 +130,8 @@ public:
     PeerTrust peerTrust(const std::string& peerIdB64u) const;
 
     /// Persist "user has compared safety numbers and confirmed".  The
-    /// current (self, peer) fingerprint is stored; mismatches surface
-    /// if either side changes.  Returns false on invalid peerId.
+    /// current (self, peer) fingerprint is stored; mismatches surface if
+    /// either side changes.  Returns false on invalid peerId.
     bool markPeerVerified(const std::string& peerIdB64u);
 
     /// Forget the verification for a peer — they become Unverified.
@@ -144,13 +143,13 @@ public:
     void setHardBlockOnKeyChange(bool on) { m_hardBlockOnKeyChange = on; }
     bool hardBlockOnKeyChange() const     { return m_hardBlockOnKeyChange; }
 
-    // GAP5: restore/persist group sequence counters across restarts
+    // Restore/persist group sequence counters across restarts.
     void setGroupSeqCounters(const std::map<std::string, int64_t>& seqOut,
                              const std::map<std::string, int64_t>& seqIn);
     const std::map<std::string, int64_t>& groupSeqOut() const { return m_groupSeqOut; }
     const std::map<std::string, int64_t>& groupSeqIn()  const { return m_groupSeqIn;  }
 
-    /// Fix #20: populate known-group-members state on startup from the UI's
+    /// Populate known-group-members state on startup from the UI's
     /// persisted group rosters.  ChatController rejects group_rename,
     /// group_avatar, group_member_update, and group_leave from peers who
     /// aren't currently members of the named group, defeating the spoof
@@ -160,12 +159,13 @@ public:
     /// Should be called once per known group after loading state at startup.
     void setKnownGroupMembers(const std::string& groupId, const std::vector<std::string>& members);
 
-    // ── Phase 2: file-transfer consent ──────────────────────────────────────
+    // ── File-transfer consent ───────────────────────────────────────────────
 
-    /// Accept a pending incoming file transfer. Installs the ratchet-derived
-    /// file key so subsequent chunks decrypt, and sends file_accept to the sender.
-    /// requireP2P tells the sender "I refuse relay fallback for this transfer"
-    /// (Phase 3 enforces it; for now just forwarded in the file_accept message).
+    /// Accept a pending incoming file transfer.  Installs the ratchet-
+    /// derived file key so subsequent chunks decrypt, and sends file_accept
+    /// to the sender.  requireP2P tells the sender "I refuse relay fallback
+    /// for this transfer" (for now just forwarded in the file_accept
+    /// message).
     void acceptFileTransfer(const std::string& transferId, bool requireP2P = false);
 
     /// Decline a pending incoming file transfer. Discards the stashed key and
@@ -182,8 +182,8 @@ public:
     void setFileHardMaxMB(int mb)       { m_fileHardMaxMB       = mb; }
     void setFileRequireP2P(bool on)     {
         m_fileRequireP2P = on;
-        // Fix #16: propagate live so in-flight streams upgrade to P2P-only
-        // on the next chunk rather than finishing under the old policy.
+        // Propagate live so in-flight streams upgrade to P2P-only on the
+        // next chunk rather than finishing under the prior policy.
         m_fileMgr.setSenderRequiresP2P(on);
     }
     int  fileAutoAcceptMaxMB() const    { return m_fileAutoAcceptMaxMB; }
@@ -226,20 +226,20 @@ public:
     std::function<void(const std::string& groupId, const std::string& avatarB64)>
         onGroupAvatarReceived;
 
-    /// SEC9: peer may be running an older client that doesn't support our
+    /// Peer may be running an older client that doesn't support our
     /// current hybrid-PQ Noise messages.
     std::function<void(const std::string& peerId)> onPeerMayNeedUpgrade;
 
-    /// Safety numbers: fires ONCE per session when a previously-verified
-    /// peer's fingerprint no longer matches (usually: local identity
-    /// regenerated, or DB tampering).  The UI should surface a banner.
-    /// `oldFingerprint` is the stored 32-byte BLAKE2b, `newFingerprint`
-    /// is the freshly-computed one.
+    /// Safety numbers: fires ONCE per session when a verified peer's
+    /// fingerprint no longer matches (usually: local identity regenerated,
+    /// or DB tampering).  The UI should surface a banner.  `oldFingerprint`
+    /// is the stored 32-byte BLAKE2b, `newFingerprint` is the freshly-
+    /// computed one.
     std::function<void(const std::string& peerId,
                        const Bytes&       oldFingerprint,
                        const Bytes&       newFingerprint)> onPeerKeyChanged;
 
-    // ── Phase 2: file consent / cancellation callbacks ──────────────────────
+    // ── File consent / cancellation callbacks ───────────────────────────────
     std::function<void(const std::string& from, const std::string& transferId,
                        const std::string& fileName, int64_t fileSize)>
         onFileAcceptRequested;
@@ -279,9 +279,9 @@ private:
     Bytes sealForPeer(const std::string& peerIdB64u, const Bytes& plaintext);
     void sendSealedPayload(const std::string& peerIdB64u, const nlohmann::json& payload);
 
-    // Fix #20: is `peerId` currently a known member of group `gid`?
-    // Returns true (permissively) only for groups we've never seen before;
-    // otherwise false unless peerId is in our roster.
+    // Is `peerId` currently a known member of group `gid`?  Returns true
+    // (permissively) only for groups we've never seen before; otherwise
+    // false unless peerId is in our roster.
     bool isAuthorizedGroupSender(const std::string& gid, const std::string& peerId) const;
 #ifdef PEER2PEAR_P2P
     QuicConnection* setupP2PConnection(const std::string& peerIdB64u, bool controlling);
@@ -296,12 +296,12 @@ private:
     std::vector<std::string> m_seenOrder;
     bool markSeen(const std::string& id); // true = first time; false = duplicate
 
-    // H5 fix (audit 2026-04-19): persistent envelope-ID dedup survives app
-    // restart.  Backs the in-memory LRU with a row in seen_envelopes so a
-    // malicious relay can't replay a sealed envelope after we restart and
-    // our RAM cache is cold.  Use this (not markSeen) for the outer env:
-    // check; msgIds inside the ratchet don't need persistence because the
-    // chain counter already rejects replays once a message key is consumed.
+    // Persistent envelope-ID dedup survives app restart.  Backs the
+    // in-memory LRU with a row in seen_envelopes so a malicious relay
+    // can't replay a sealed envelope after we restart and our RAM cache
+    // is cold.  Use this (not markSeen) for the outer env: check; msgIds
+    // inside the ratchet don't need persistence because the chain counter
+    // already rejects replays once a message key is consumed.
     bool markSeenPersistent(const std::string& id);
     void ensureSeenEnvelopesTable();
     void pruneSeenEnvelopes();
@@ -333,19 +333,18 @@ private:
     static constexpr int64_t kP2PCleanupGraceSecs = 120;
 #endif
 
-    // G5 fix: per-group outbound sequence counter (monotonic, not persisted)
+    // Per-group outbound sequence counter (monotonic, not persisted).
     std::map<std::string, int64_t> m_groupSeqOut;
-    // G5 fix: per-(group,sender) last-seen sequence — detects gaps
+    // Per-(group,sender) last-seen sequence — detects gaps.
     std::map<std::string, int64_t> m_groupSeqIn;  // key: "groupId:senderId"
 
-    // Fix #20: known members per group, bootstrapped by setKnownGroupMembers
-    // from persisted UI state and updated as trusted group messages arrive.
+    // Known members per group, bootstrapped by setKnownGroupMembers from
+    // persisted UI state and updated as trusted group messages arrive.
     // Used to authorize group_member_update / group_leave / group_rename /
     // group_avatar — messages from peers not in this set are dropped.
     std::map<std::string, std::set<std::string>> m_groupMembers;
-    // (m_groupBootstrapNeeded removed in LC5 cleanup — was never populated.)
 
-    // SEC9: count consecutive handshake timeouts per peer — 2+ suggests legacy client
+    // Count consecutive handshake timeouts per peer — 2+ suggests an older client.
     std::map<std::string, int> m_handshakeFailCount;
 
     // Peer ML-KEM-768 public keys: peerIdB64u -> 1184-byte KEM pub
@@ -355,11 +354,11 @@ private:
     Bytes lookupPeerKemPub(const std::string& peerIdB64u);
     void announceKemPub(const std::string& peerIdB64u);
 
-    // LC4 audit fix (2026-04-19): group file transfers now create a distinct
-    // per-member transferId internally so the sender honors each recipient's
-    // Phase 2 consent gate independently.  This map bundles those per-member
-    // transferIds under a single group-level id returned to the caller, so
-    // cancelFileTransfer() can fan out across all members.
+    // Group file transfers create a distinct per-member transferId internally
+    // so the sender honors each recipient's consent gate independently.
+    // This map bundles those per-member transferIds under a single group-
+    // level id returned to the caller, so cancelFileTransfer() can fan out
+    // across all members.
     std::map<std::string, std::vector<std::string>> m_groupFileMembers;
 
     // Safety-numbers state.
@@ -381,17 +380,18 @@ private:
     // continue based on m_hardBlockOnKeyChange.
     bool detectKeyChange(const std::string& peerIdB64u);
 
-    // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key
-    // Populated by file_key announcements (after consent), consumed by handleFileEnvelope().
-    // Lifetime bounded by FileTransferManager's 7-day partial-file purge — no
-    // separate in-memory TTL (Fix #4: the older 30-min TTL would expire keys
-    // while the DB still held the transfer, causing livelock resumptions).
+    // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key.
+    // Populated by file_key announcements (after consent), consumed by
+    // handleFileEnvelope().  Lifetime bounded by FileTransferManager's 7-day
+    // partial-file purge — no separate in-memory TTL (a short TTL would expire
+    // keys while the DB still held the transfer, causing livelock resumptions).
     std::map<std::string, Bytes> m_fileKeys;
 
-    // ── Phase 2: incoming file transfers awaiting user consent ──────────────
+    // ── Incoming file transfers awaiting user consent ───────────────────────
     // When a file_key arrives but policy says "prompt", we stash the key here
     // (instead of m_fileKeys) so chunks arriving before the user responds will
-    // drop silently. On accept → move into m_fileKeys. On decline → zero + drop.
+    // drop silently.  On accept → move into m_fileKeys.  On decline → zero +
+    // drop.
     struct PendingIncoming {
         std::string peerId;
         std::string fileName;
@@ -405,14 +405,14 @@ private:
         int64_t     announcedSecs = 0;
     };
     std::map<std::string, PendingIncoming> m_pendingIncomingFiles;
-    // H4 audit-#2 fix: cap the pending-prompt queue so a hostile peer
-    // flooding file_key announcements in the prompt-size band can't
-    // exhaust memory.  Matches the FileTransferManager::kMaxConcurrent
-    // bound so both queues share the same worst-case footprint.
+    // Cap the pending-prompt queue so a hostile peer flooding file_key
+    // announcements in the prompt-size band can't exhaust memory.  Matches
+    // the FileTransferManager::kMaxConcurrent bound so both queues share
+    // the same worst-case footprint.
     static constexpr size_t kMaxPendingIncomingFiles = 50;
 
     // Consent settings (persisted by the application via DatabaseManager).
-    // Defaults match v1 behavior: everything below hard-max auto-accepts.
+    // Defaults: everything below hard-max auto-accepts.
     int  m_fileAutoAcceptMaxMB = 100;  // everything ≤ this auto-accepts
     int  m_fileHardMaxMB       = 100;  // anything > this auto-declines
     bool m_fileRequireP2P      = false;
@@ -420,14 +420,14 @@ private:
     // Internal: construct and route control messages via ratchet.
     void sendFileControlMessage(const std::string& peerIdB64u, const nlohmann::json& msg);
 
-    // H3 fix: per-sender envelope rate limiting
+    // Per-sender envelope rate limiting.
     // Tracks (senderId -> count) within current poll cycle; reset each poll.
     std::map<std::string, int> m_envelopeCount;
     static constexpr int kMaxEnvelopesPerSenderPerPoll = 200;
 
-    // H3 audit-#2 fix: per-sender file_request rate limiting.  Same poll-
-    // reset model as m_envelopeCount — capped in the file_request handler,
-    // cleared in runMaintenance().
+    // Per-sender file_request rate limiting.  Same poll-reset model as
+    // m_envelopeCount — capped in the file_request handler, cleared in
+    // runMaintenance().
     std::map<std::string, int> m_fileRequestCount;
 
 #ifdef PEER2PEAR_P2P

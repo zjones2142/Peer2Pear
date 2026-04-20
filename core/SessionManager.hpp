@@ -28,8 +28,7 @@
  *   After:         [0x03][ratchet(payload)]
  *
  * Types: std::string for peer IDs (base64url-encoded), std::vector<uint8_t>
- * for byte blobs.  Migrated off Qt 2026-04.  SessionStore still speaks
- * QByteArray/QString until Phase 6 — we bridge internally.
+ * for byte blobs.
  */
 
 using Bytes = std::vector<uint8_t>;
@@ -40,8 +39,8 @@ public:
     static constexpr uint8_t kPreKeyMsg          = 0x01;
     static constexpr uint8_t kPreKeyResponse     = 0x02;
     static constexpr uint8_t kRatchetMsg         = 0x03;
-    static constexpr uint8_t kHybridPreKeyMsg    = 0x04;  // Phase 2: hybrid PQ handshake
-    static constexpr uint8_t kHybridPreKeyResp   = 0x05;  // Phase 2: hybrid PQ response
+    static constexpr uint8_t kHybridPreKeyMsg    = 0x04;  // hybrid PQ handshake
+    static constexpr uint8_t kHybridPreKeyResp   = 0x05;  // hybrid PQ response
     static constexpr uint8_t kAdditionalPreKey   = 0x06;  // Additional msg during pending handshake
 
     // Callback for sending handshake responses back to peers.
@@ -97,19 +96,19 @@ private:
     // Cleared when the ratchet session receives a normal ratchet message.
     std::map<std::string, Bytes> m_pendingCk;
 
-    // C1 audit-#2 fix: ephemeral DH private keys are held ONLY in memory
-    // between writeMessage1() and readMessage2().  If the process
-    // crashes mid-handshake the key dies with it and forward secrecy is
+    // Ephemeral DH private keys are held ONLY in memory between
+    // writeMessage1() and readMessage2().  If the process crashes
+    // mid-handshake the key dies with it and forward secrecy is
     // preserved.  Keyed by peerIdB64u; zeroed + erased on handshake
     // completion or abandonment.
     std::map<std::string, Bytes> m_pendingEk;
 
-    // H1 audit-#2 fix: track consumed counters on the responder side for
-    // the additional-pre-key path (type 0x06).  Each counter yields a
-    // deterministic key from the chaining key, so a relay that captures
-    // a 0x06 envelope could otherwise replay it.  Set is cleared when
-    // the first ratchet message arrives from this sender — at that
-    // point m_pendingCk is no longer used for derivation.
+    // Track consumed counters on the responder side for the additional-
+    // pre-key path (type 0x06).  Each counter yields a deterministic key
+    // from the chaining key, so a relay that captures a 0x06 envelope
+    // could otherwise replay it.  Set is cleared when the first ratchet
+    // message arrives from this sender — at that point m_pendingCk is no
+    // longer used for derivation.
     std::map<std::string, std::set<uint32_t>> m_consumedPreKeyCounters;
     // Bound per-peer counter set so a malicious flood can't grow memory.
     static constexpr size_t kMaxPreKeyCounters = 10000;

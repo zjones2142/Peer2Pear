@@ -47,8 +47,8 @@ static bool isValidPublicKey(const QString &key)
 }
 
 // ── ChatController boundary helpers ─────────────────────────────────────────
-// ChatController's public surface is std-typed (Phase 7c).  Convert at the
-// boundary; the desktop UI keeps using QString/QStringList internally.
+// ChatController's public surface is std-typed.  Convert at the boundary;
+// the desktop UI keeps using QString/QStringList internally.
 static std::vector<std::string> qListToStd(const QStringList& qs)
 {
     std::vector<std::string> out;
@@ -576,7 +576,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                 }
             });
 
-            // Reset Session — wipe ratchet state to force fresh handshake (G3 fix)
+            // Reset Session — wipe ratchet state to force fresh handshake.
             auto *resetBtn = new QPushButton("Reset Session", &dlg);
             resetBtn->setStyleSheet(destructiveStyle);
             actionRow->addWidget(resetBtn);
@@ -1279,14 +1279,12 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         return;
     }
 
-    // ── Bug #1 fix: first-contact avatar from unknown peer ──────────────────
+    // ── First-contact avatar from unknown peer ──────────────────────────────
     //
-    // If we fall through, no matching contact exists.  Previously the avatar
-    // was silently dropped, so when the follow-up text message arrived
-    // onIncomingMessage would create an "Unknown contact" entry with no name
-    // and no avatar.  Instead, create the contact here using the peer's
-    // announced display name + avatar so the chat list shows them correctly
-    // from the first message.
+    // If we fall through, no matching contact exists.  Create the contact
+    // here using the peer's announced display name + avatar so the chat
+    // list shows them correctly from the first message (otherwise the
+    // follow-up text would create an "Unknown contact" row with no name).
     ChatData nc;
     nc.name        = displayName.isEmpty() ? "Unknown contact" : displayName;
     nc.subtitle    = "Secure chat";
@@ -2006,7 +2004,7 @@ void ChatView::onEditContact(int index)
         rebuildChatList();
 
     } else if (result == ContactEditorResult::SessionReset) {
-        // G3 fix: wipe ratchet state so next message triggers a fresh handshake
+        // Wipe ratchet state so next message triggers a fresh handshake.
         const QString peerId = m_chats[index].peerIdB64u;
         if (!peerId.isEmpty())
             m_controller->resetSession(peerId.toStdString());

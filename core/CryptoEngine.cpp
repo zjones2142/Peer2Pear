@@ -465,7 +465,7 @@ bool CryptoEngine::saveIdentityToDisk() const {
 
 // ── v5 unified-key save: one pre-derived key, domain-tagged nonces ────────
 //
-// H1 defense-in-depth: all three private keys share the same identityKey.
+// Defense-in-depth: all three private keys share the same identityKey.
 // Security depends on nonce uniqueness (24-byte random, collision at ~2^96).
 // As extra protection against OS RNG failure or VM snapshot rollback, we
 // XOR a 1-byte key-index tag into the first byte of each random nonce.
@@ -906,12 +906,10 @@ std::string CryptoEngine::signB64u(const Bytes& msgUtf8) const {
     return toBase64Url(s);
 }
 
-// CryptoEngine::deriveSharedKey32 was removed in the H1 fix (2026-04-19).
-// It computed a static X25519 shared secret from the peer's long-term
-// Ed25519 identity key, which the legacy FROM: and P2P-fallback paths
-// used to AEAD-encrypt messages with no forward secrecy.  Every sender
-// now routes through the Noise IK + Double Ratchet session, so the
-// static-ECDH helper is no longer reachable from anywhere in the tree.
+// CryptoEngine::deriveSharedKey32 was removed.  It computed a static X25519
+// shared secret from the peer's long-term Ed25519 identity key — no forward
+// secrecy.  Every sender now routes through the Noise IK + Double Ratchet
+// session, so no static-ECDH helper is reachable from anywhere in the tree.
 
 Bytes CryptoEngine::aeadEncrypt(const Bytes& key32,
                                 const Bytes& plaintext,
@@ -986,23 +984,23 @@ std::pair<Bytes, Bytes> CryptoEngine::generateEphemeralX25519() {
 // ---------------------------
 
 namespace {
-// Lexicographic compare on two 32-byte pubkeys; memcmp-style.  Kept
-// local so the sort order is explicit at every call site.
-inline bool edLess(const Bytes& a, const Bytes& b) {
-    return std::lexicographical_compare(
-        a.begin(), a.end(), b.begin(), b.end());
+// Build the 64-byte sort-invariant input used by both safety-number
+// entry points.  `std::vector<uint8_t>` already has lexicographic
+// `operator<`, so a dedicated compare helper isn't needed.
+Bytes safetyInput(const Bytes& edA, const Bytes& edB) {
+    const Bytes& first  = (edA < edB) ? edA : edB;
+    const Bytes& second = (edA < edB) ? edB : edA;
+    Bytes input;
+    input.reserve(64);
+    input.insert(input.end(), first.begin(),  first.end());
+    input.insert(input.end(), second.begin(), second.end());
+    return input;
 }
 }  // namespace
 
 Bytes CryptoEngine::safetyFingerprint(const Bytes& edA, const Bytes& edB) {
     if (edA.size() != 32 || edB.size() != 32) return {};
-    const Bytes& first  = edLess(edA, edB) ? edA : edB;
-    const Bytes& second = edLess(edA, edB) ? edB : edA;
-
-    Bytes input;
-    input.reserve(64);
-    input.insert(input.end(), first.begin(),  first.end());
-    input.insert(input.end(), second.begin(), second.end());
+    const Bytes input = safetyInput(edA, edB);
 
     unsigned char out[32];
     if (crypto_generichash(out, sizeof(out),
@@ -1015,13 +1013,7 @@ Bytes CryptoEngine::safetyFingerprint(const Bytes& edA, const Bytes& edB) {
 
 std::string CryptoEngine::safetyNumber(const Bytes& edA, const Bytes& edB) {
     if (edA.size() != 32 || edB.size() != 32) return {};
-    const Bytes& first  = edLess(edA, edB) ? edA : edB;
-    const Bytes& second = edLess(edA, edB) ? edB : edA;
-
-    Bytes input;
-    input.reserve(64);
-    input.insert(input.end(), first.begin(),  first.end());
-    input.insert(input.end(), second.begin(), second.end());
+    const Bytes input = safetyInput(edA, edB);
 
     // BLAKE2b-512 gives 64 bytes — plenty for 12 groups × 5 bytes = 60.
     unsigned char h[64];
@@ -1052,9 +1044,9 @@ std::string CryptoEngine::safetyNumber(const Bytes& edA, const Bytes& edB) {
 
 // ---------------------------
 // HKDF-style KDF — keyed BLAKE2b, NOT RFC 5869 HMAC-HKDF.  See the header
-// comment for the exact construction and the audit-M4 deviations.  The
-// name "hkdf" is retained because the callers all use it, and a rename
-// would churn the ratchet / envelope / identity derivation call sites.
+// comment for the exact construction.  The name "hkdf" is retained because
+// the callers all use it, and a rename would churn the ratchet / envelope /
+// identity derivation call sites.
 // ---------------------------
 
 Bytes CryptoEngine::hkdf(const Bytes& ikm, const Bytes& salt,
@@ -1117,9 +1109,8 @@ Bytes CryptoEngine::deriveMasterKey(const std::string& passphrase, const Bytes& 
     std::string passCopy = passphrase;
     Bytes masterKey(32, 0);
 
-    // L1 audit fix (2026-04-19): raise the mobile Argon2 floor above
-    // libsodium's INTERACTIVE tier (2 ops, 64 MiB — flagged as potentially
-    // brute-forceable for short passphrases).  The new mobile tier uses
+    // Mobile Argon2 tier sits above libsodium's INTERACTIVE (2 ops, 64 MiB
+    // — flagged as potentially brute-forceable for short passphrases):
     //   - 3 iterations (MODERATE-level opslimit)
     //   - 128 MiB memory  (halfway between INTERACTIVE and MODERATE)
     // which roughly triples attacker cost per guess while staying inside

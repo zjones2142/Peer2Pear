@@ -115,11 +115,11 @@ RelayClient::~RelayClient()
 }
 
 void RelayClient::setRelayUrl(const std::string& url) {
-    // M7 audit-#2 fix: refuse non-TLS relay URLs.  An http:// / ws:// URL
-    // would silently downgrade the WebSocket and HTTP paths to cleartext,
-    // exposing auth signatures and envelope ciphertexts in-flight.  The
-    // only exception is the empty string (used by tests + the reset
-    // pattern) and localhost for dev, which we accept with a loud log.
+    // Refuse non-TLS relay URLs.  An http:// / ws:// URL would silently
+    // downgrade the WebSocket and HTTP paths to cleartext, exposing auth
+    // signatures and envelope ciphertexts in-flight.  The only exceptions
+    // are the empty string (used by tests + the reset pattern) and
+    // localhost for dev, which we accept with a loud log.
     auto parsed = parseUrl(url);
     const std::string& s = parsed.scheme;
     const bool isTls = (s == "https" || s == "wss");
@@ -450,15 +450,15 @@ void RelayClient::sendCoverEnvelope()
     for (const std::string& pid : m_knownPeers)
         if (m_onlinePeers.count(pid)) onlinePool.push_back(pid);
 
-    // M5 audit fix (2026-04-19): when no contacts are online (or the user
-    // simply has no contacts yet), fall back to a self-addressed cover
-    // envelope instead of going silent.  Before the fix, a relay operator
-    // observing a steady cover-traffic rate suddenly drop to zero could
-    // infer "all this user's contacts just went offline," and the
-    // cover↔silence transitions themselves leaked online-state changes.
-    // Routing the packet to our own mailbox keeps the outbound profile
-    // constant regardless of peer presence; the envelope lands back in
-    // our own inbox, fails unseal (random body), and is discarded.
+    // When no contacts are online (or the user has no contacts yet), fall
+    // back to a self-addressed cover envelope instead of going silent.
+    // Otherwise a relay operator observing a steady cover-traffic rate
+    // suddenly drop to zero could infer "all this user's contacts just
+    // went offline," and cover↔silence transitions themselves would leak
+    // online-state changes.  Routing the packet to our own mailbox keeps
+    // the outbound profile constant regardless of peer presence; the
+    // envelope lands back in our own inbox, fails unseal (random body),
+    // and is discarded.
     Bytes recipientPub;
     if (!onlinePool.empty()) {
         const std::string& peerId =
@@ -522,12 +522,12 @@ void RelayClient::setMultiHopEnabled(bool enabled) { m_multiHop = enabled; }
 
 std::string RelayClient::pickSendRelay()
 {
-    // M5 audit-#2 fix: pick uniformly at random rather than strict
-    // round-robin.  Deterministic rotation lets a traffic analyst
-    // observing multiple relays fingerprint a single client by matching
-    // the N-step pattern.  Uniform random sampling over the configured
-    // relays removes that signal; the expected per-relay load is the
-    // same as round-robin, just without the identifying cadence.
+    // Pick uniformly at random rather than strict round-robin.
+    // Deterministic rotation lets a traffic analyst observing multiple
+    // relays fingerprint a single client by matching the N-step pattern.
+    // Uniform random sampling over the configured relays removes that
+    // signal; the expected per-relay load is the same as round-robin,
+    // just without the identifying cadence.
     //
     // Uses randombytes_uniform from libsodium — crypto-grade RNG (not
     // math/rand) so observers can't predict future picks from past ones.
@@ -591,14 +591,12 @@ void RelayClient::forwardEnvelope(const std::string& viaRelay, const std::string
         }
     }
 
-    // M4 audit-#2 fix: the legacy /v1/forward fallback hands the full
-    // routing envelope (including the plaintext recipientPub) to the
-    // entry relay via X-Forward-To, defeating multi-hop privacy.  We
-    // used to do that implicitly when the onion pubkey wasn't cached;
-    // now we refuse the fallback entirely, trigger a pubkey refresh,
-    // and surface the situation to the caller.  The envelope stays in
-    // the retry queue pending the refresh — the next send will onion-
-    // wrap properly.
+    // Refuse the /v1/forward fallback: it hands the full routing envelope
+    // (including the plaintext recipientPub) to the entry relay via
+    // X-Forward-To, defeating multi-hop privacy.  Trigger a pubkey
+    // refresh and surface the situation to the caller.  The envelope
+    // stays in the retry queue pending the refresh — the next send will
+    // onion-wrap properly.
     emitStatus("multi-hop send deferred — entry relay X25519 pubkey not cached yet");
     P2P_WARN("[Relay] refusing /v1/forward fallback for " << baseOf(viaRelay)
               << " — pubkey not cached (M4)");

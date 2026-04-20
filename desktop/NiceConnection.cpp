@@ -17,7 +17,7 @@ NiceConnection::~NiceConnection() {
         g_main_context_unref(m_context);
     }
     if (m_agent) g_object_unref(m_agent);
-    // G7 fix: zero TURN credentials in memory.
+    // Zero TURN credentials in memory.
     if (!m_turnUser.empty()) {
         sodium_memzero(m_turnUser.data(), m_turnUser.size());
         m_turnUser.clear();

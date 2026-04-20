@@ -13,7 +13,6 @@
  * private-key material via identity.json in the app data directory.
  *
  * Types: std::vector<uint8_t> for bytes, std::string (UTF-8) for text.
- * Migrated off Qt on 2026-04-18.
  */
 
 using Bytes = std::vector<uint8_t>;
@@ -94,7 +93,7 @@ public:
     // Extract: PRK = BLAKE2b-256(key=salt, input=ikm)   // 32-byte PRK
     // Expand : out = BLAKE2b(key=PRK, input=info||0x01) // single block
     //
-    // Known deviations from RFC 5869 (audit M4):
+    // Known deviations from RFC 5869:
     //   - RFC 5869 specifies HMAC-SHA-256; we use keyed BLAKE2b-256 as the PRF.
     //   - PRK is 32 bytes, not HashLen (64 for BLAKE2b-512).
     //   - Expand emits one block, so `outputLen` is capped at 64 bytes —
@@ -108,9 +107,8 @@ public:
     static Bytes hkdf(const Bytes& ikm, const Bytes& salt,
                       const Bytes& info, int outputLen = 32);
 
-    // (deriveSharedKey32 removed in H1 fix — it produced a static-ECDH key
-    // with no forward secrecy.  Use the Noise IK + Double Ratchet path in
-    // SessionManager instead.)
+    // No static-ECDH helper — it would produce a key with no forward
+    // secrecy.  Use the Noise IK + Double Ratchet path in SessionManager.
 
     // AEAD (XChaCha20-Poly1305). Output = nonce(24) || ciphertext
     Bytes aeadEncrypt(const Bytes& key32, const Bytes& plaintext,
@@ -148,9 +146,8 @@ public:
     // ── Safety numbers (out-of-band key verification) ────────────────────
     //
     // Signal-style fingerprint derived from both peers' Ed25519 identity
-    // keys.  The audit called this out as the single biggest missing
-    // feature — without it, the crypto is correct but users have no way
-    // to confirm the peerId they received via any out-of-band channel
+    // keys.  Without it, the crypto is correct but users have no way to
+    // confirm the peerId they received via any out-of-band channel
     // (invite link, QR scan) wasn't substituted by a MITM.
     //
     // safetyNumber() returns a 60-digit display string (12 groups of 5

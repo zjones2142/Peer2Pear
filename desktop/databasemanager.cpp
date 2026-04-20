@@ -405,7 +405,7 @@ void DatabaseManager::createTables()
         ");"
         );
 
-    // GAP5 fix: persistent group sequence counters
+    // Persistent group sequence counters — survive app restart.
     q.exec(
         "CREATE TABLE IF NOT EXISTS group_seq_counters ("
         "  seq_key    TEXT PRIMARY KEY,"
@@ -668,7 +668,7 @@ QString DatabaseManager::loadSetting(const QString &key, const QString &def) con
     return def;
 }
 
-// ── GAP5: Persistent group sequence counters ───────────────────────────────
+// ── Persistent group sequence counters ─────────────────────────────────────
 
 static void saveSeqMap(SqlCipherDb& db, int direction, const QMap<QString, qint64>& map)
 {

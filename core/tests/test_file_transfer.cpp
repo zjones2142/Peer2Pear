@@ -1,8 +1,8 @@
-// test_file_transfer.cpp — Tier 6 tests for FileTransferManager.
+// test_file_transfer.cpp — tests for FileTransferManager.
 //
 // FileTransferManager streams a file in 240 KB chunks, each one encrypted
 // with a per-file AEAD key and tagged with a BLAKE2b-256 file hash.  This
-// tier locks in the *end-to-end* receiver contract:
+// file locks in the *end-to-end* receiver contract:
 //
 //   - Streaming hash (blake2b256File) matches the one-shot version over
 //     the same bytes, including empty files and multi-chunk files.
@@ -26,6 +26,7 @@
 #include "FileTransferManager.hpp"
 #include "CryptoEngine.hpp"
 #include "SqlCipherDb.hpp"
+#include "test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -47,19 +48,7 @@ using Bytes = std::vector<uint8_t>;
 
 namespace {
 
-std::string makeTempPath(const char* tag, const char* suffix) {
-    (void)sodium_init();
-    uint8_t rnd[8];
-    randombytes_buf(rnd, sizeof(rnd));
-    char buf[64];
-    std::snprintf(buf, sizeof(buf),
-                  "%s-%02x%02x%02x%02x%02x%02x%02x%02x%s",
-                  tag, rnd[0], rnd[1], rnd[2], rnd[3],
-                  rnd[4], rnd[5], rnd[6], rnd[7], suffix);
-    const fs::path p = fs::temp_directory_path() / buf;
-    fs::remove_all(p);
-    return p.string();
-}
+using p2p_test::makeTempPath;
 
 Bytes randomBytes(size_t n) {
     Bytes b(n);
@@ -177,7 +166,7 @@ protected:
         sender = std::make_unique<FileTransferManager>(crypto);
         sender->setPartialFileDir(partialDir);
         sender->setSealFn([](const std::string&, const Bytes& inner) {
-            // Identity "seal" — the wire-level sealing is tested in Tier 3.
+            // Identity "seal" — the wire-level sealing is tested elsewhere.
             return inner;
         });
         sender->setSendFn([this](const std::string& peer, const Bytes& env) {

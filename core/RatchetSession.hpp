@@ -17,7 +17,7 @@
  *
  * Skipped message keys are cached (bounded) for out-of-order delivery.
  *
- * Types: std::vector<uint8_t> for all buffers (migrated off Qt 2026-04).
+ * Types: std::vector<uint8_t> for all buffers.
  */
 
 using Bytes = std::vector<uint8_t>;

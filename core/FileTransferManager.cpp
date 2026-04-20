@@ -41,8 +41,7 @@ std::string defaultDownloadsDir() { return {}; }
 
 // ── Wire helpers ────────────────────────────────────────────────────────────
 
-// kFilePrefix (FROMFC:) was removed in the H1 fix (2026-04-19).  FTM
-// only emits sealed chunks now — the ChatController-provided m_sealFn
+// FTM only emits sealed chunks — the ChatController-provided m_sealFn
 // wraps them in SEALEDFC: envelopes before handing them to m_sendFn.
 
 namespace {
@@ -212,11 +211,10 @@ bool FileTransferManager::dispatchChunk(const std::string& /*senderIdB64u*/,
 
     // 2. Sealed relay envelope (metadata privacy + sender anonymity).
     //
-    // The H1 fix (2026-04-19) removed the "legacy FROMFC: plaintext-prefix
-    // fallback" that used to live below this block.  If no seal callback is
-    // installed, we now refuse to send rather than emit a FROMFC: envelope
-    // that leaks the sender's pubkey on the wire.  ChatController installs
-    // m_sealFn as part of setDatabase(), so this is normally always set.
+    // If no seal callback is installed, refuse to send rather than emit
+    // a plaintext-prefix envelope that leaks the sender's pubkey on the
+    // wire.  ChatController installs m_sealFn as part of setDatabase(),
+    // so this is normally always set.
     if (!m_sealFn) {
         P2P_WARN("[FileTransfer] No seal callback set — chunk BLOCKED (H1 fix: sealed-only)");
         return false;
@@ -260,7 +258,7 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
     chunk.reserve(size_t(kChunkBytes));
 
     for (int i = 0; i < totalChunks; ++i) {
-        // Fix #12: sender-side cancel check.
+        // Sender-side cancel check.
         if (m_abortedTransfers.count(transferId)) {
             P2P_LOG("[FileTransfer] aborted mid-stream at chunk" << i
                      << "of" << idPrefix(transferId));
@@ -268,7 +266,7 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
             return;
         }
 
-        // Fix #16: live privacy-level upgrade.
+        // Live privacy-level upgrade.
         const RoutingMode effectiveMode =
             (mode == RoutingMode::P2POnly || m_senderRequiresP2PLive)
                 ? RoutingMode::P2POnly
@@ -384,7 +382,7 @@ std::string FileTransferManager::sendFileWithKey(const std::string& senderIdB64u
     return transferId;
 }
 
-// ── Announce-first: lock metadata at file_key time (Fix #3) ─────────────────
+// ── Announce-first: lock metadata at file_key time ──────────────────────────
 
 bool FileTransferManager::announceIncoming(const std::string& fromId,
                                             const std::string& transferId,
@@ -451,7 +449,7 @@ bool FileTransferManager::announceIncoming(const std::string& fromId,
 
     m_incomingTransfers[transferId] = xferPtr;
 
-    // Phase 4: persist so we can resume after a crash before any chunk arrives.
+    // Persist so we can resume after a crash before any chunk arrives.
     persistIncomingFull(transferId, xfer, fileKey);
     return true;
 }
@@ -471,7 +469,7 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
     const Bytes encMeta  = slice(payload, 4, metaLen);
     const Bytes encChunk = tail (payload, 4 + size_t(metaLen));
 
-    // ── Key selection: ratchet keys only (L8 fix) ──────────────────────────
+    // ── Key selection: ratchet keys only ───────────────────────────────────
     Bytes metaJson;
     Bytes key32;
 
@@ -571,7 +569,7 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
     xfer.receivedChunks[chunkIndex] = true;
     xfer.chunksReceivedCount++;
 
-    // Phase 4: update DB bitmap after each successful write so we can resume.
+    // Update DB bitmap after each successful write so we can resume.
     persistIncomingFull(transferId, xfer, key32);
 
     const int received    = xfer.chunksReceivedCount;
@@ -599,7 +597,7 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
     const std::string finalPath   = xfer.finalPath;
 
     m_incomingTransfers.erase(itXfer);
-    if (onTransferCompleted) onTransferCompleted(transferId);  // M1: let ChatController zero the key
+    if (onTransferCompleted) onTransferCompleted(transferId);  // let ChatController zero the key
 
     // Verify integrity by streaming the completed file from disk.
     if (!expected.empty()) {
@@ -629,7 +627,7 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
         return true;
     }
 
-    // Phase 4: transfer done + hash verified — drop persistent state.
+    // Transfer done + hash verified — drop persistent state.
     deleteIncomingRow(transferId);
 
     if (onFileChunkReceived) onFileChunkReceived(fromId, transferId, fileName,
@@ -671,7 +669,7 @@ void FileTransferManager::purgeStaleTransfers()
     }
 }
 
-// ── Phase 2: outbound consent gate ──────────────────────────────────────────
+// ── Outbound consent gate ───────────────────────────────────────────────────
 
 void FileTransferManager::queueOutboundFile(const std::string& senderIdB64u,
                                              const std::string& peerIdB64u,
@@ -893,7 +891,7 @@ void FileTransferManager::purgeStaleOutbound()
 {
     const int64_t now = nowSecs();
     for (auto it = m_outboundPending.begin(); it != m_outboundPending.end(); ) {
-        // Phase 3: WaitingForP2P entries have their own shorter deadline.
+        // WaitingForP2P entries have their own shorter deadline.
         if (it->second.stage == OutboundStage::WaitingForP2P &&
             it->second.waitStartedSecs > 0 &&
             (now - it->second.waitStartedSecs) > kP2PReadyWaitSecs) {
@@ -954,7 +952,7 @@ void FileTransferManager::purgeStaleOutbound()
     }
 }
 
-// ── Phase 4: Persistence + resumption ───────────────────────────────────────
+// ── Persistence + resumption ────────────────────────────────────────────────
 
 void FileTransferManager::setDatabase(SqlCipherDb* db)
 {
@@ -1215,7 +1213,7 @@ void FileTransferManager::loadPersistedTransfers()
 
                 m_incomingTransfers[tid] = xferPtr;
 
-                // Fix #5: hand the restored fileKey back to ChatController.
+                // Hand the restored fileKey back to ChatController.
                 if (fkey.size() == 32) {
                     if (onIncomingFileKeyRestored) onIncomingFileKeyRestored(peerId, tid, fkey);
                 }
@@ -1353,8 +1351,8 @@ void FileTransferManager::purgeStalePartialFiles()
 {
     if (!m_dbPtr || !m_dbPtr->isOpen()) return;
     const int64_t now = nowSecs();
-    const int64_t cutoffIn  = now - kPartialFileMaxAgeSecs;   // L6: 3 days for receiver
-    const int64_t cutoffOut = now - kSentTransferMaxAgeSecs;  // L6: 12h for sender
+    const int64_t cutoffIn  = now - kPartialFileMaxAgeSecs;   // 3 days for receiver
+    const int64_t cutoffOut = now - kSentTransferMaxAgeSecs;  // 12h for sender
 
     SqlCipherQuery qSel(*m_dbPtr);
     std::vector<std::string> toDelete;

@@ -17,13 +17,12 @@ const (
 	defaultTTLMs  = 7 * 24 * 60 * 60 * 1000 // 7 days
 	maxTTLMs      = 7 * 24 * 60 * 60 * 1000
 	maxQueueItems = 5000
-	// M6 audit fix (2026-04-20): two-phase delivery.  FetchAll marks rows
-	// as in-flight (delivered_at = now) instead of deleting; the caller
-	// DELETEs each row only after the WS write succeeds.  If the relay
-	// crashes between mark and confirm, the mark ages out and the next
-	// FetchAll for that peer re-sends the envelope — client-side
-	// envelope-ID dedup (ChatController::markSeenPersistent) catches any
-	// duplicate delivery after the crash.
+	// Two-phase delivery: FetchAll marks rows as in-flight (delivered_at =
+	// now) instead of deleting; the caller DELETEs each row only after the
+	// WS write succeeds.  If the relay crashes between mark and confirm,
+	// the mark ages out and the next FetchAll for that peer re-sends the
+	// envelope — client-side envelope-ID dedup (ChatController::
+	// markSeenPersistent) catches any duplicate delivery after the crash.
 	staleDeliveryMarkMs = 60 * 1000 // 60s
 )
 
@@ -62,10 +61,8 @@ func NewMailbox(dbPath string) (*Mailbox, error) {
 		CREATE INDEX IF NOT EXISTS idx_env_recipient
 		ON envelopes (recipient_id, created_ms);
 
-		-- L4 audit fix (2026-04-20): persist seen auth nonces so a relay
-		-- restart within the 30s replay window can't re-enable a captured
-		-- auth tuple.  Before this table, seenAuth was a hot map cleared
-		-- on every restart.
+		-- Persist seen auth nonces so a relay restart within the 30s
+		-- replay window can't re-enable a captured auth tuple.
 		CREATE TABLE IF NOT EXISTS seen_auth_nonces (
 			key        TEXT PRIMARY KEY,
 			expiry_ms  INTEGER NOT NULL
@@ -78,11 +75,10 @@ func NewMailbox(dbPath string) (*Mailbox, error) {
 		return nil, fmt.Errorf("create tables: %w", err)
 	}
 
-	// M6 audit fix (2026-04-20): ensure the envelopes table has the
-	// delivered_at column.  Idempotent: newly-created DBs need the ADD,
-	// pre-M6 DBs get it added on startup.  Ignore any "duplicate column"
-	// error — the only way ALTER fails here is if the column already
-	// exists from a previous startup.
+	// Ensure the envelopes table has the delivered_at column.  Idempotent:
+	// newly-created DBs need the ADD, older DBs get it added on startup.
+	// Ignore any "duplicate column" error — the only way ALTER fails here
+	// is if the column already exists from a previous startup.
 	_, _ = db.Exec("ALTER TABLE envelopes ADD COLUMN delivered_at INTEGER")
 
 	return &Mailbox{db: db}, nil
@@ -90,7 +86,7 @@ func NewMailbox(dbPath string) (*Mailbox, error) {
 
 // RegisterAuthNonce records `key` as seen with `expiryMs`.  Returns true if
 // the nonce was new (auth proceeds), false if it was already seen (replay).
-// Survives relay restart — the L4 fix.
+// Survives relay restart.
 func (m *Mailbox) RegisterAuthNonce(key string, expiryMs int64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,7 +150,7 @@ func (m *Mailbox) Store(recipientID string, payload []byte) error {
 		return fmt.Errorf("mailbox full")
 	}
 
-	// M5 fix: check global capacity to prevent disk exhaustion
+	// Check global capacity to prevent disk exhaustion.
 	var globalCount int
 	m.db.QueryRow("SELECT COUNT(*) FROM envelopes").Scan(&globalCount)
 	if globalCount >= maxGlobalEnvelopes {
@@ -176,12 +172,9 @@ func (m *Mailbox) Store(recipientID string, payload []byte) error {
 // a successful WS write to remove the row; if the caller crashes before
 // confirming, the mark ages out after staleDeliveryMarkMs and the next
 // FetchAll on reconnect will re-deliver.  Client-side envelope-ID dedup
-// catches duplicate deliveries across that window.
-//
-// Before the M6 fix this function deleted rows in a transaction — a
-// crash between the commit and the WS write loop silently lost every
-// queued envelope.  Now no data goes missing on the relay side; the
-// worst case is a duplicate delivery the client dedups.
+// catches duplicate deliveries across that window.  No data goes missing
+// on the relay side; the worst case is a duplicate delivery the client
+// dedups.
 func (m *Mailbox) FetchAll(recipientID string) []StoredEnvelope {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -241,7 +234,7 @@ func (m *Mailbox) FetchAll(recipientID string) []StoredEnvelope {
 		return nil
 	}
 
-	// Fix #18: shuffle delivery order so the relay operator can't correlate
+	// Shuffle delivery order so the relay operator can't correlate
 	// sender-enqueue-time with recipient-fetch-time by matching ordinals.
 	// Uses crypto/rand (Fisher–Yates with rejection sampling).
 	secureShuffleEnv(out)
@@ -327,9 +320,7 @@ func (m *Mailbox) StoreWithTTL(recipientID string, payload []byte, ttlMs int64) 
 		return "", fmt.Errorf("mailbox full")
 	}
 
-	// Parity fix: the legacy path skipped the global-envelope cap that /v1/send
-	// enforces. A client hammering /mbox/enqueue could exhaust the 500k
-	// ceiling.  Align with Store().
+	// Enforce the same global-envelope cap that /v1/send uses.
 	var globalCount int
 	m.db.QueryRow("SELECT COUNT(*) FROM envelopes").Scan(&globalCount)
 	if globalCount >= maxGlobalEnvelopes {

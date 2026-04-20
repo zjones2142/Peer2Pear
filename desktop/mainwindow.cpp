@@ -120,9 +120,7 @@ MainWindow::MainWindow(QWidget *parent)
             p2p::bridge::secureZeroQ(masterKey);
 
             // ── Identity unlock (uses identityKey instead of separate Argon2) ─
-            // setPassphrase(pass, identityKey) still needs pass for legacy v4
-            // migration (deriveKeyFromPassphrase inside loadIdentityFromDisk).
-            // Once migrated to v5, the passphrase is never used for identity.
+            // Once migrated, the passphrase is never used for identity.
             m_controller.setPassphrase(pass.toStdString(), p2p::bridge::toBytes(identityKey));
             p2p::bridge::secureZeroQ(identityKey);
 
@@ -139,13 +137,11 @@ MainWindow::MainWindow(QWidget *parent)
             p2p::bridge::secureZeroQ(dbKey);
 
             // Set per-field encryption key (backward compat with ENC: fields).
-            // Legacy keys cover all previous key derivation generations:
+            // Legacy keys cover previous key derivation generations:
             //   Gen 1: BLAKE2b(publicId + "peer2pear-dbkey")
             //   Gen 2: BLAKE2b(passphrase + "peer2pear-dbkey")
             // decryptField() tries the primary key first, then each legacy
             // key in order until one succeeds.
-            // ChatController::blake2b256 now takes Bytes, not QByteArray — build
-            // the legacy key inputs as byte vectors directly.
             auto bytesConcat = [](const std::string& a, const char* b) {
                 Bytes out(a.begin(), a.end());
                 out.insert(out.end(), b, b + std::strlen(b));
@@ -163,7 +159,7 @@ MainWindow::MainWindow(QWidget *parent)
             // Wire DB to ChatController for Noise/Ratchet session persistence
             m_controller.setDatabase(m_db.database());
 
-            // GAP5: restore persisted group sequence counters
+            // Restore persisted group sequence counters.
             auto qMapToStd = [](const QMap<QString, qint64>& qm) {
                 std::map<std::string, int64_t> out;
                 for (auto it = qm.cbegin(); it != qm.cend(); ++it)
@@ -292,7 +288,7 @@ MainWindow::MainWindow(QWidget *parent)
     });
 
     // ── Wire callbacks ────────────────────────────────────────────────────────
-    // ChatController is a plain class (Phase 7b); direct assignment replaces
+    // ChatController is a plain class; direct assignment replaces
     // QObject::connect.  The lambdas bounce into ChatView's slots, converting
     // std:: types to Qt at the boundary.  MainWindow owns both halves so
     // lifetimes match.
@@ -465,7 +461,7 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow() {
     m_controller.disconnectFromRelay();
 
-    // GAP5: persist group sequence counters before shutdown
+    // Persist group sequence counters before shutdown.
     auto stdToQ = [](const std::map<std::string, int64_t>& m) {
         QMap<QString, qint64> out;
         for (const auto& kv : m)

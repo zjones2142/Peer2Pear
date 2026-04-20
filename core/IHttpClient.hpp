@@ -16,7 +16,6 @@
  *   Android:        OkHttpHttpClient wrapping OkHttpClient
  *
  * Types: std::string for URLs/headers/errors, std::vector<uint8_t> for bytes.
- * Migrated off Qt 2026-04.
  */
 class IHttpClient {
 public:
@@ -33,15 +32,15 @@ public:
 
     using Callback = std::function<void(const Response&)>;
 
-    /// POST binary data to a URL. Headers are optional (e.g., X-To for legacy).
+    /// POST binary data to a URL.  Headers are optional.
     /// The callback is invoked when the request completes (success or failure).
     virtual void post(const std::string& url,
                       const Bytes& body,
                       const Headers& headers,
                       Callback cb) = 0;
 
-    /// GET a URL. Used by RelayClient to fetch /v1/relay_info (Fix #7 —
-    /// onion routing needs the relay's X25519 pubkey).
+    /// GET a URL.  Used by RelayClient to fetch /v1/relay_info (onion
+    /// routing needs the relay's X25519 pubkey).
     virtual void get(const std::string& url,
                      const Headers& headers,
                      Callback cb) = 0;

@@ -227,8 +227,8 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
     m_notificationsEnabled = (saved == "true");
     applyNotificationState();
 
-    // Phase 2: load file-transfer consent settings. Defaults preserve v1
-    // behavior (everything ≤100 MB accepts, no relay requirement).
+    // Load file-transfer consent settings.  Defaults: everything ≤100 MB
+    // accepts, no relay requirement.
     const int softMB = m_db->loadSetting("fileAutoAcceptMaxMB", "100").toInt();
     const int hardMB = m_db->loadSetting("fileHardMaxMB",       "100").toInt();
     if (m_fileAutoAcceptSpin) {
@@ -799,7 +799,7 @@ QWidget *SettingsPanel::makeAboutHelpSection()
     return card;
 }
 
-// ── Phase 2: File transfer consent ───────────────────────────────────────────
+// ── File transfer consent ───────────────────────────────────────────────────
 
 QWidget *SettingsPanel::makeFileTransferSection()
 {

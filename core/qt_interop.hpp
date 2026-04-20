@@ -2,12 +2,9 @@
 //
 // Qt ↔ std interop helpers — permanent boundary layer between Qt-typed
 // callers (desktop UI, QuicConnection signals) and the std-typed core API.
-//
-// History: this file was qt_bridge_temp.hpp during Phase 7's Qt-strip
-// refactor.  After Phase 7c landed, the conversions moved from "transitional"
-// to "structural" — the desktop UI is intentionally Qt-native and the core
-// API is intentionally std-native, so a translation layer is the right
-// long-term shape.  The file got renamed to drop the "TEMP" lie.
+// The desktop UI is intentionally Qt-native and the core API is
+// intentionally std-native, so a translation layer is the right long-term
+// shape.
 //
 // Scope:
 //   - `toBytes(QByteArray)` / `toQByteArray(Bytes)` — pure type conversions,

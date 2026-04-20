@@ -26,7 +26,7 @@ class CryptoEngine;
  *
  * Types: std::string URL + peer IDs, Bytes envelopes.
  * Async: ITimer for scheduling, std::function callbacks for events.
- * No Qt — core/ is Qt-free as of Phase 7.
+ * No Qt — core/ is Qt-free.
  */
 class RelayClient {
 public:

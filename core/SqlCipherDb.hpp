@@ -20,7 +20,7 @@ struct sqlite3_stmt;
  * is transparently AES-256-encrypted at the page level.
  *
  * Types: std::string (UTF-8) for paths/SQL/text, std::vector<uint8_t>
- * (Bytes) for keys and blob columns.  Migrated off Qt types on 2026-04-18.
+ * (Bytes) for keys and blob columns.
  */
 class SqlCipherDb {
 public:

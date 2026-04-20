@@ -33,10 +33,8 @@ const (
 	envelopeVersion  = 0x01
 	envelopeMinSize  = 33        // version + 32-byte pubkey
 	maxEnvelopeBytes = 256 << 10 // 256 KiB
-	// Fix #19: auth nonces are in-memory only, so a relay restart within the
-	// replay window lets an attacker replay a captured auth tuple and drain
-	// a victim's mailbox.  A 30-second window is long enough for clock skew
-	// but short enough that a crash-restart race is minimal.
+	// Auth replay window: 30 seconds is long enough for clock skew but
+	// short enough that a crash-restart race is minimal.
 	replayWindowMs = 30 * 1000
 	wsWriteTimeout = 10 * time.Second
 	wsReadTimeout  = 60 * time.Second
@@ -48,24 +46,24 @@ const (
 	rateLimitPerMin = 60 // max envelopes per IP per minute
 	rateLimitWindow = 60 // window in seconds
 
-	// Fix #10: per-recipient ingress rate limit.  Per-IP alone can be bypassed
-	// by rotating source IPs (cheap with a VPS + multiple egresses).  This
+	// Per-recipient ingress rate limit.  Per-IP alone can be bypassed by
+	// rotating source IPs (cheap with a VPS + multiple egresses).  This
 	// second limiter caps inbound envelopes per recipient pubkey regardless
 	// of origin.  Sealed-sender means we can't rate-limit per-sender at the
 	// /v1/send boundary, but recipient pubkey IS visible in the envelope header.
 	recipientRateLimitPerMin = 300
 
-	// H4: max peer IDs a single peer can subscribe to for presence
+	// Max peer IDs a single peer can subscribe to for presence.
 	maxPresenceSubs = 200
 
-	// L2 audit-#2: per-connection presence_query rate limit.  Window
-	// is generous (1 minute / 60 queries) so a real client's
-	// reconnect-burst sees no friction, but a malicious peer can't
-	// enumerate the social graph at arbitrary speed.
+	// Per-connection presence_query rate limit.  Window is generous
+	// (1 minute / 60 queries) so a real client's reconnect-burst sees no
+	// friction, but a malicious peer can't enumerate the social graph at
+	// arbitrary speed.
 	presenceQueryWindow     = 60 // seconds
 	maxPresenceQueriesPerWin = 60
 
-	// M5: global max envelopes stored in mailbox
+	// Global max envelopes stored in mailbox.
 	maxGlobalEnvelopes = 500_000
 
 	// DAITA: relay-side traffic analysis defense
@@ -106,8 +104,8 @@ func (rl *rateLimiter) allow(ip string) bool {
 }
 
 // allowWithLimit applies a caller-specified per-key cap. Same sliding window.
-// Fix #10: lets us reuse the struct for per-recipient limiting with a
-// different (higher) ceiling than the per-IP one.
+// Lets us reuse the struct for per-recipient limiting with a different
+// (higher) ceiling than the per-IP one.
 func (rl *rateLimiter) allowWithLimit(key string, limit int) bool {
 	now := time.Now().Unix()
 	rl.mu.Lock()
@@ -140,11 +138,11 @@ type Peer struct {
 	Conn *websocket.Conn
 	Send chan []byte // buffered outbound channel
 
-	// L2 audit-#2 fix: per-connection presence-query rate limit.  The
-	// subscription-size cap (maxPresenceSubs = 200) already exists, but
-	// presence_query was frequency-unbounded: an authenticated peer
-	// could hammer arbitrary peer_ids for online status.  Counts reset
-	// each presenceQueryWindow seconds; over the cap → drop silently.
+	// Per-connection presence-query rate limit.  The subscription-size cap
+	// (maxPresenceSubs = 200) limits breadth; this bounds depth.  An
+	// authenticated peer can't hammer arbitrary peer_ids for online status.
+	// Counts reset each presenceQueryWindow seconds; over the cap → drop
+	// silently.
 	presenceQueryCount   int
 	presenceQueryResetAt int64 // unix seconds
 }
@@ -156,14 +154,15 @@ type Hub struct {
 	peers      map[string]*Peer           // peer_id → *Peer
 	subs       map[string]map[string]bool // subscriber_id → set of watched peer_ids
 	mbox       *Mailbox
-	rl         *rateLimiter // per-IP ingress (Fix #8 now also covers legacy)
-	rlRecip    *rateLimiter // Fix #10: per-recipient ingress cap
-	trustProxy bool         // H2 fix: only trust X-Forwarded-For when behind a reverse proxy
+	rl         *rateLimiter // per-IP ingress
+	rlRecip    *rateLimiter // per-recipient ingress cap
+	trustProxy bool         // only trust X-Forwarded-For when behind a reverse proxy
 
-	// Seen-auth-nonce dedup now lives in SQLite (L4 audit fix).  The Hub no
-	// longer owns a map — every check / register flows through m.mbox.
+	// Seen-auth-nonce dedup lives in SQLite (see Mailbox.RegisterAuthNonce).
+	// The Hub no longer owns a map — every check / register flows through
+	// m.mbox so the dedup survives a relay restart within the replay window.
 
-	// Fix #7: persistent X25519 keypair for onion routing.
+	// Persistent X25519 keypair for onion routing.
 	// Advertised via GET /v1/relay_info; used to peel POST /v1/forward-onion.
 	relayX25519Pub  *[32]byte
 	relayX25519Priv *[32]byte
@@ -185,9 +184,9 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
 	}
-	// L4 fix: periodically purge expired auth nonces from the persistent
-	// table.  RegisterAuthNonce() also cleans up opportunistically; this
-	// just bounds table size in steady state.
+	// Periodically purge expired auth nonces from the persistent table.
+	// RegisterAuthNonce() also cleans up opportunistically; this just
+	// bounds table size in steady state.
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
@@ -233,9 +232,7 @@ func (h *Hub) register(p *Peer) {
 // can verify identity: if a second connection for the same ID replaced
 // us in `register`, that call already closed our Send channel and
 // installed the new peer; we must NOT wipe the new peer's state when
-// our own HandleReceive finally exits.  Pre-audit-#2 this bug existed:
-// `unregister(peerID)` would happily close the replacement conn's Send
-// channel because it lookup-by-ID only.
+// our own HandleReceive finally exits.
 func (h *Hub) unregister(self *Peer) {
 	h.mu.Lock()
 	cur, ok := h.peers[self.ID]
@@ -259,13 +256,9 @@ func (h *Hub) unregister(self *Peer) {
 // deliverOrStore tries WebSocket push first, falls back to mailbox storage.
 // DAITA: delivery jitter (see writer goroutine in HandleReceive) breaks
 // the timing correlation between "relay received POST from IP X" and
-// "relay pushed to peer Y".
-//
-// L4 audit-#2 fix: the jitter sleep used to run inline here, blocking
-// the HTTP handler goroutine for up to deliveryJitterMs per request.
-// Under load that multiplied per-goroutine memory.  Jitter has moved
-// to the per-peer writer goroutine, which sleeps before WriteMessage —
-// same wire-level timing, zero cost to handlers.
+// "relay pushed to peer Y".  Jitter lives on the per-peer writer goroutine
+// (which sleeps before WriteMessage) rather than inline here, so HTTP
+// handlers don't pay the latency.
 func (h *Hub) deliverOrStore(recipientID string, envelope []byte) (delivered bool, err error) {
 	h.mu.RLock()
 	p, online := h.peers[recipientID]
@@ -318,7 +311,7 @@ func (h *Hub) notifyPresence(peerID string, online bool) {
 
 // generateDummyEnvelope creates a random-looking envelope with version byte 0x00
 // that the client recognizes and discards. Uses standard bucket sizes.
-// Fix #17: crypto/rand for bucket selection too — observable from the wire.
+// Bucket selection uses crypto/rand because it's observable from the wire.
 func generateDummyEnvelope() []byte {
 	buckets := []int{2048, 16384, 262144}
 	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(buckets))))
@@ -376,7 +369,7 @@ func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fix #10: per-recipient ingress limit — independent of source IP.
+	// Per-recipient ingress limit — independent of source IP.
 	// An attacker rotating IPs can no longer flood a specific victim's mailbox.
 	if !h.rlRecip.allowWithLimit(recipientID, recipientRateLimitPerMin) {
 		httpError(w, http.StatusTooManyRequests, "recipient rate limit exceeded")
@@ -401,10 +394,10 @@ func (h *Hub) HandleSend(w http.ResponseWriter, r *http.Request) {
 // ── WS /v1/receive — Authenticated receive channel ──────────────────────────
 
 func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
-	// Fix #22: rate-limit ws auth attempts per IP.  Without this, the
-	// per-identity presence-sub cap (200) can be bypassed by rotating
-	// keypairs: auth → subscribe 200 → disconnect → new keypair → repeat.
-	// Capping auth attempts bounds how fast an attacker can enumerate.
+	// Rate-limit ws auth attempts per IP.  Without this, the per-identity
+	// presence-sub cap (200) can be bypassed by rotating keypairs: auth →
+	// subscribe 200 → disconnect → new keypair → repeat.  Capping auth
+	// attempts bounds how fast an attacker can enumerate.
 	if !h.rl.allow(hashIP(h.clientIP(r))) {
 		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
@@ -445,8 +438,8 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// H3 + L4 fix: reject replayed auth messages.  Backed by SQLite so a
-	// relay restart within the replay window doesn't re-open the attack.
+	// Reject replayed auth messages.  Backed by SQLite so a relay restart
+	// within the replay window doesn't re-open the attack.
 	authNonce := fmt.Sprintf("%s|%d", auth.PeerID, auth.Ts)
 	if !h.mbox.RegisterAuthNonce(authNonce, nowMs+replayWindowMs) {
 		conn.WriteJSON(map[string]string{"error": "auth replay"})
@@ -463,7 +456,7 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 	h.register(peer)
 	defer h.unregister(peer)
 
-	// Step 3: Deliver stored envelopes (M6 mark-and-confirm — each row is
+	// Step 3: Deliver stored envelopes (mark-and-confirm — each row is
 	// deleted only after its WS write returns nil, so a crash partway
 	// through leaves the unsent envelopes in the mailbox for the next
 	// reconnect.  Rows that landed on the wire but whose confirm never
@@ -488,11 +481,11 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 
 	// Step 4: Start writer goroutine (sends from the Send channel).
 	//
-	// L4 audit-#2: delivery jitter lives here (was inline in
-	// deliverOrStore, blocking HTTP handlers).  Only binary envelopes
-	// get jittered — JSON control frames (presence, pong, etc.) fire
-	// immediately because their timing is not information the relay
-	// operator can correlate to /v1/send traffic.
+	// Delivery jitter lives here rather than inline in deliverOrStore so
+	// HTTP handlers don't block.  Only binary envelopes get jittered —
+	// JSON control frames (presence, pong, etc.) fire immediately because
+	// their timing is not information the relay operator can correlate
+	// to /v1/send traffic.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -572,8 +565,8 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 
 		switch msg["type"] {
 		case "presence_query":
-			// L2 audit-#2 fix: cap query frequency per connection.  The
-			// subscription-size cap limits breadth; this bounds depth.
+			// Cap query frequency per connection.  The subscription-size
+			// cap limits breadth; this bounds depth.
 			now := time.Now().Unix()
 			if now >= peer.presenceQueryResetAt {
 				peer.presenceQueryCount = 0
@@ -602,7 +595,7 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 
 		case "presence_subscribe":
 			peerIDs := toStringSlice(msg["peer_ids"])
-			// H4 fix: cap subscription size to prevent social graph enumeration
+			// Cap subscription size to prevent social graph enumeration.
 			if len(peerIDs) > maxPresenceSubs {
 				peerIDs = peerIDs[:maxPresenceSubs]
 			}
@@ -652,11 +645,10 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fix #11: SSRF hardening — resolve DNS, reject any resolved IP that
-	// lands in loopback/private/link-local/ULA/CGNAT.  The previous check
-	// did string-prefix comparisons on the raw host (fooled by bracketed
-	// IPv6 like `[::1]:443` → `strings.Split(host, ":")[0] == "["`) and
-	// skipped DNS resolution entirely (allowing rebinding attacks).
+	// SSRF hardening — resolve DNS, reject any resolved IP that lands in
+	// loopback/private/link-local/ULA/CGNAT.  A simple string-prefix check
+	// on the raw host would be fooled by bracketed IPv6 like `[::1]:443`
+	// and would skip DNS resolution entirely (allowing rebinding attacks).
 	if reason, ok := forwardHostSafe(forwardTo); !ok {
 		httpError(w, http.StatusForbidden,
 			"forwarding not allowed: "+reason)
@@ -678,10 +670,10 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Forward to the target relay's /v1/send.  M8 audit-#2: the custom
-	// dialer re-validates every resolved IP at connect time, so DNS
-	// rebinding between our pre-check and the actual Post can't land
-	// the request on a loopback/private address.
+	// Forward to the target relay's /v1/send.  The custom dialer
+	// re-validates every resolved IP at connect time, so DNS rebinding
+	// between our pre-check and the actual Post can't land the request
+	// on a loopback/private address.
 	client := safeForwardClient()
 	url := fmt.Sprintf("https://%s/v1/send", forwardTo)
 	resp, err := client.Post(url, "application/octet-stream",
@@ -704,7 +696,7 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 // ipSafe returns ("", true) when ip is a routable public address, or
 // (reason, false) otherwise.  Single source of truth for the SSRF guard —
 // used both by the pre-check in forwardHostSafe and by the custom
-// DialContext that closes the DNS-rebinding TOCTOU (M8 audit-#2).
+// DialContext that closes the DNS-rebinding TOCTOU.
 func ipSafe(ip net.IP) (string, bool) {
 	if ip.IsLoopback() || ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
@@ -726,13 +718,13 @@ func ipSafe(ip net.IP) (string, bool) {
 	return "", true
 }
 
-// Fix #11: SSRF guard.  Parses host[:port], resolves DNS, and rejects any
-// resolved IP that lands in loopback / private / link-local / ULA / CGNAT.
-// Returns (reason, true=safe).
+// forwardHostSafe is the SSRF pre-check.  Parses host[:port], resolves DNS,
+// and rejects any resolved IP that lands in loopback / private / link-local
+// / ULA / CGNAT.  Returns (reason, true=safe).
 //
 // NOTE: this is a PRE-check — between this call and the HTTP Post, DNS
-// could rebind (M8 audit-#2).  `safeForwardClient` installs a custom
-// DialContext that re-validates at connect time, closing the window.
+// could rebind.  `safeForwardClient` installs a custom DialContext that
+// re-validates at connect time, closing the window.
 func forwardHostSafe(forwardTo string) (string, bool) {
 	// Split host[:port].  If no port, treat the whole thing as host.
 	host, _, err := net.SplitHostPort(forwardTo)
@@ -768,10 +760,10 @@ func forwardHostSafe(forwardTo string) (string, bool) {
 
 // safeForwardClient returns an http.Client whose DialContext re-resolves
 // the destination host itself and verifies every candidate IP against
-// ipSafe() *before* connecting.  This closes the DNS-rebinding TOCTOU
-// that M8 flagged: forwardHostSafe resolved + validated, but the default
-// http client then resolved again at connect time and could land on a
-// different (now-malicious) IP.
+// ipSafe() *before* connecting.  This closes the DNS-rebinding TOCTOU:
+// forwardHostSafe resolved + validated, but the default http client
+// would resolve again at connect time and could land on a different
+// (now-malicious) IP.
 //
 // Connects to the resolved IP directly (not the hostname) so the OS
 // resolver is never consulted twice.  If the URL supplies a bare IP we

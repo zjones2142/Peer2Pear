@@ -1,4 +1,4 @@
-// test_crypto_engine.cpp — Tier 1 tests for CryptoEngine primitives.
+// test_crypto_engine.cpp — tests for CryptoEngine primitives.
 //
 // These exercise the pure/static crypto helpers (Ed25519, X25519, XChaCha20-
 // Poly1305 AEAD, HKDF, ML-KEM-768, ML-DSA-65) without touching disk or
@@ -7,9 +7,6 @@
 //   2. libsodium + liboqs are actually linked into the test binary (if they
 //      aren't, these tests won't even compile).
 //   3. Future refactors don't silently break the crypto layer.
-//
-// Not exhaustive — KAT vectors (FIPS 203 / 204, RFC 8032, etc.) should come
-// in later tiers alongside the full session-level round-trip tests.
 
 #include "CryptoEngine.hpp"
 
@@ -215,9 +212,9 @@ TEST(CryptoEngine, HkdfIsDeterministic) {
 }
 
 // ── 6. HKDF: different info → different output ────────────────────────────
-// This is the "domain separation" property.  A future audit fix (M1) may
-// tighten SealedEnvelope to bind a protocol-version context; this test
-// protects against silent regressions in the KDF itself.
+// This is the "domain separation" property.  Protects against silent
+// regressions in the KDF itself when SealedEnvelope binds additional
+// context into the info parameter.
 
 TEST(CryptoEngine, HkdfDifferentInfoProducesDifferentOutput) {
     const Bytes ikm  = bytesOf("same-ikm");

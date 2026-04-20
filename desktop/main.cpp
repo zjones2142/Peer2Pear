@@ -13,8 +13,8 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationName("Peer2Pear");
     QCoreApplication::setApplicationName("Peer2Pear");
 
-    // H2 fix: single-instance guard — prevents concurrent DB migration
-    // corruption and duplicate polling connections.
+    // Single-instance guard — prevents concurrent DB migration corruption
+    // and duplicate polling connections.
     const QString lockDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(lockDir);
     QLockFile lockFile(lockDir + "/peer2pear.lock");

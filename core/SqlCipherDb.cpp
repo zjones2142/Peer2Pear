@@ -3,9 +3,7 @@
 #include <sodium.h>
 #include <cstring>
 
-// Debug logging uses QDebug temporarily for consistency with the rest of
-// core/.  Phase 7 swaps this for a std::cerr macro alongside the QObject
-// strip.
+// Debug logging — see log.hpp.
 #include "log.hpp"
 
 // ─── SqlCipherDb ─────────────────────────────────────────────────────────────

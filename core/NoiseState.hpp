@@ -27,7 +27,7 @@
  *   Hash: BLAKE2b-256 (crypto_generichash)
  *   AEAD: XChaCha20-Poly1305 (crypto_aead_xchacha20poly1305_ietf)
  *
- * Types: std::vector<uint8_t> for all buffers (migrated off Qt 2026-04).
+ * Types: std::vector<uint8_t> for all buffers.
  */
 
 using Bytes = std::vector<uint8_t>;
@@ -103,12 +103,12 @@ public:
     const Bytes& remoteStaticPub() const { return m_rs; }
 
     // Serialization for persisting mid-handshake state.
-    // C3 fix: static private key (m_sk) is NOT serialized — it must be
+    // The static private key (m_sk) is NOT serialized — it must be
     // re-injected via setStaticPrivateKey() after deserialization.
     Bytes serialize() const;
     static NoiseState deserialize(const Bytes& data);
 
-    // Re-inject the static private key after deserialization (C3 fix).
+    // Re-inject the static private key after deserialization.
     // Must be called before readMessage2() if this is an initiator.
     void setStaticPrivateKey(const Bytes& curvePriv) { m_sk = curvePriv; }
 
@@ -120,12 +120,12 @@ public:
     void setKemPrivateKey(const Bytes& kemPriv) { m_kemPriv = kemPriv; }
 
     // Re-inject the ephemeral DH private key after deserialization.
-    // C1 audit-#2 fix: m_ek is no longer persisted — the serialized blob
-    // would have leaked forward secrecy for any in-progress handshake
-    // recovered from disk.  SessionManager keeps m_ek in a memory-only
-    // side-channel between writeMessage1() and readMessage2(), and
-    // injects it here before processing msg2.  If the caller didn't
-    // stash an ek (e.g. after a crash), readMessage2() fails closed.
+    // m_ek is NOT persisted — storing it in the serialized blob would
+    // leak forward secrecy for any in-progress handshake recovered from
+    // disk.  SessionManager keeps m_ek in a memory-only side-channel
+    // between writeMessage1() and readMessage2(), and injects it here
+    // before processing msg2.  If the caller didn't stash an ek
+    // (e.g. after a crash), readMessage2() fails closed.
     void setEphemeralPrivateKey(const Bytes& ek) { m_ek = ek; }
 
     Role role() const { return m_role; }

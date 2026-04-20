@@ -189,9 +189,8 @@ RatchetSession RatchetSession::initAsInitiator(const Bytes& rootKey,
         s.m_kemPriv = std::move(kp.second);
     }
 
-    // H2 audit-#2 fix: reject all-zeros remote pubkey (low-order check
-    // is also performed by crypto_scalarmult itself via its non-zero
-    // return).
+    // Reject all-zeros remote pubkey (low-order check is also performed
+    // by crypto_scalarmult itself via its non-zero return).
     if (remoteDhPub.size() != 32 ||
         sodium_is_zero(remoteDhPub.data(), remoteDhPub.size())) {
         return {};
@@ -212,10 +211,10 @@ RatchetSession RatchetSession::initAsInitiator(const Bytes& rootKey,
     s.m_rootKey      = newRoot;
     s.m_sendChainKey = sendChain;
 
-    // H3 fix (2026-04-19): wipe the DH shared-secret and the chain-key
-    // intermediates now that they've been copied into the RatchetSession.
-    // Under std::vector value semantics the copy is a real buffer copy, so
-    // zeroing the locals doesn't touch the stored members.
+    // Wipe the DH shared-secret and the chain-key intermediates now that
+    // they've been copied into the RatchetSession.  Under std::vector
+    // value semantics the copy is a real buffer copy, so zeroing the
+    // locals doesn't touch the stored members.
     zeroBytes(dhOutput);
     zeroBytes(newRoot);
     zeroBytes(sendChain);
@@ -235,8 +234,7 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     s.m_hybrid = hybrid;
     s.m_remoteDhPub = remoteDhPub;
 
-    // H2 audit-#2 fix: reject all-zeros remote pubkey before the first
-    // scalarmult.
+    // Reject all-zeros remote pubkey before the first scalarmult.
     if (remoteDhPub.size() != 32 ||
         sodium_is_zero(remoteDhPub.data(), remoteDhPub.size())) {
         return {};
@@ -256,7 +254,7 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     auto [rk1, recvChain] = kdfRootKey(rootKey, dhOutput);
     s.m_rootKey      = rk1;
     s.m_recvChainKey = recvChain;
-    // H3 fix: wipe intermediates post-copy.
+    // Wipe intermediates post-copy.
     zeroBytes(dhOutput);
     zeroBytes(rk1);
     zeroBytes(recvChain);
@@ -286,7 +284,7 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     auto [rk2, sendChain] = kdfRootKey(s.m_rootKey, dhOutput);
     s.m_rootKey      = rk2;
     s.m_sendChainKey = sendChain;
-    // H3 fix: wipe intermediates post-copy.
+    // Wipe intermediates post-copy.
     zeroBytes(dhOutput);
     zeroBytes(rk2);
     zeroBytes(sendChain);
@@ -303,12 +301,11 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
 
 void RatchetSession::dhRatchetStep(const Bytes& remoteDhPub,
                                     const Bytes& kemCt) {
-    // H2 audit-#2 fix: reject all-zeros or low-order remote DH pubkeys.
-    // Without this check a peer (or malicious relay swapping bytes in
-    // the header) could force the scalarmult to land on a known shared
-    // secret.  SealedEnvelope::unseal already does this; the ratchet
-    // did not.  sodium_is_zero catches the all-zero case; crypto_scalarmult
-    // itself returns non-zero on low-order inputs and we propagate that.
+    // Reject all-zeros or low-order remote DH pubkeys.  Without this
+    // check a peer (or malicious relay swapping bytes in the header)
+    // could force the scalarmult to land on a known shared secret.
+    // sodium_is_zero catches the all-zero case; crypto_scalarmult itself
+    // returns non-zero on low-order inputs and we propagate that.
     if (remoteDhPub.size() != 32 ||
         sodium_is_zero(remoteDhPub.data(), remoteDhPub.size())) {
         return;
@@ -343,7 +340,7 @@ void RatchetSession::dhRatchetStep(const Bytes& remoteDhPub,
     zeroBytes(dhOutput);
     m_rootKey      = rk1;
     m_recvChainKey = recvChain;
-    // H3 fix: wipe chain-key intermediates post-copy.
+    // Wipe chain-key intermediates post-copy.
     zeroBytes(rk1);
     zeroBytes(recvChain);
 
@@ -393,7 +390,7 @@ void RatchetSession::dhRatchetStep(const Bytes& remoteDhPub,
     zeroBytes(dhOutput);
     m_rootKey      = rk2;
     m_sendChainKey = sendChain;
-    // H3 fix: wipe chain-key intermediates post-copy.
+    // Wipe chain-key intermediates post-copy.
     zeroBytes(rk2);
     zeroBytes(sendChain);
 }
@@ -408,7 +405,7 @@ Bytes RatchetSession::encrypt(const Bytes& plaintext) {
         return {};
     }
 
-    // H1 fix: prevent nonce reuse from counter overflow.
+    // Prevent nonce reuse from counter overflow.
     // uint32_t wraps at 2^32. Force a session reset well before that.
     if (m_sendMsgNum >= 0xFFFFFFF0u) {
         P2P_WARN("[Ratchet] encrypt: message counter near overflow — refusing to encrypt");
@@ -418,8 +415,8 @@ Bytes RatchetSession::encrypt(const Bytes& plaintext) {
     auto [newChain, msgKey] = kdfChainKey(m_sendChainKey);
     m_sendChainKey = newChain;
     // Deep copy (explicit — std::vector doesn't COW, so a copy-assign is
-    // already fine, but we keep a dedicated local to mirror the old behavior
-    // and the zero-after-use pattern below).
+    // already fine, but we keep a dedicated local for the zero-after-use
+    // pattern below).
     m_lastMessageKey = Bytes(msgKey.begin(), msgKey.end());
 
     RatchetHeader header;
@@ -478,10 +475,10 @@ Bytes RatchetSession::trySkippedKeys(const RatchetHeader& header,
     auto it = m_skippedKeys.find(key);
     if (it == m_skippedKeys.end()) return {};
 
-    // M2 audit-#2 fix: zero the value inside the map before we erase
-    // its node, then zero our local copy on every exit path.  Previously
-    // std::map::erase freed the buffer without wiping it, leaving the
-    // message key in the heap until the allocator reused the slot.
+    // Zero the value inside the map before we erase its node, then zero
+    // our local copy on every exit path.  A plain std::map::erase would
+    // free the buffer without wiping it, leaving the message key in the
+    // heap until the allocator reused the slot.
     Bytes msgKey = it->second;
     zeroBytes(it->second);
     m_skippedKeys.erase(it);
@@ -513,7 +510,7 @@ Bytes RatchetSession::trySkippedKeys(const RatchetHeader& header,
     }
 
     pt.resize(plen);
-    // L7 fix: store message key so callers can extract it for file sub-keys
+    // Store message key so callers can extract it for file sub-keys.
     m_lastMessageKey = Bytes(msgKey.begin(), msgKey.end());
     zeroBytes(msgKey);
     return pt;
@@ -527,15 +524,15 @@ bool RatchetSession::skipMessageKeys(const Bytes& dhPub, uint32_t until) {
         auto [newChain, msgKey] = kdfChainKey(m_recvChainKey);
         m_recvChainKey = newChain;
         m_skippedKeys[std::make_pair(dhPub, m_recvMsgNum)] = msgKey;
-        // M2 audit-#2 fix: the local msgKey's buffer would otherwise
-        // outlive this iteration on the heap (the map copy is independent).
+        // Local msgKey's buffer would otherwise outlive this iteration
+        // on the heap (the map copy is independent).
         zeroBytes(msgKey);
         zeroBytes(newChain);
         ++m_recvMsgNum;
     }
 
     // Prune if over limit — std::map erase first is O(log n).
-    // M2: zero the evicted value before destructing the node.
+    // Zero the evicted value before destructing the node.
     while (m_skippedKeys.size() > static_cast<size_t>(kMaxSkipped)) {
         auto victim = m_skippedKeys.begin();
         zeroBytes(victim->second);

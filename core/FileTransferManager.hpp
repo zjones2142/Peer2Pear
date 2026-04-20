@@ -30,8 +30,6 @@ class SqlCipherDb;
  *
  * Types: std::string (UTF-8) for paths/IDs/names, std::vector<uint8_t>
  * (Bytes) for byte blobs, int64_t Unix seconds for timestamps.
- * Migrated off Qt types on 2026-04-18 (Phase 4b).  QObject + signals
- * retained; stripped in Phase 7 alongside other async machinery.
  */
 class FileTransferManager {
 public:
@@ -57,14 +55,14 @@ public:
     /// Downloads/Peer2Pear/.peer2pear-partial/ — can be overridden per platform.
     void setPartialFileDir(const std::string& dir);
 
-    /// Phase 4: attach a shared DB for persisting partial-transfer state.
+    /// Attach a shared DB for persisting partial-transfer state.
     void setDatabase(SqlCipherDb* db);
 
-    /// Phase 4: restore in-flight incoming transfers from the DB on startup.
+    /// Restore in-flight incoming transfers from the DB on startup.
     void loadPersistedTransfers();
 
-    /// Phase 4: receiver-side resumption — list of incomplete transfers and
-    /// their missing chunk indices.
+    /// Receiver-side resumption — list of incomplete transfers and their
+    /// missing chunk indices.
     struct PendingResumption {
         std::string           transferId;
         std::string           peerId;
@@ -72,12 +70,12 @@ public:
     };
     std::vector<PendingResumption> pendingResumptions() const;
 
-    /// Phase 4: sender-side — re-read specific chunks from the original file
-    /// and re-dispatch them. Called when a file_request arrives.
+    /// Sender-side: re-read specific chunks from the original file and
+    /// re-dispatch them.  Called when a file_request arrives.
     bool resendChunks(const std::string& transferId,
                       const std::vector<uint32_t>& chunkIndices);
 
-    /// Phase 4: sender records a transfer for later resumption.
+    /// Sender records a transfer for later resumption.
     void registerSentTransfer(const std::string& senderIdB64u,
                                const std::string& peerIdB64u,
                                const std::string& transferId,
@@ -89,13 +87,13 @@ public:
                                const std::string& groupId = {},
                                const std::string& groupName = {});
 
-    /// Phase 4: sender drops its record of a delivered transfer.
+    /// Sender drops its record of a delivered transfer.
     void forgetSentTransfer(const std::string& transferId);
 
-    /// Phase 4: delete partial files older than kPartialFileMaxAgeSecs.
+    /// Delete partial files older than kPartialFileMaxAgeSecs.
     void purgeStalePartialFiles();
 
-    /// Fix #16: toggle live sender-side privacy.
+    /// Toggle live sender-side privacy.
     void setSenderRequiresP2P(bool require);
 
     // ── Size knobs ──────────────────────────────────────────────────────────
@@ -107,14 +105,12 @@ public:
     static constexpr int     kP2PReadyWaitSecs           = 10;
     static constexpr int64_t kOutboundPendingTimeoutSecs = 10LL * 60;
     static constexpr int64_t kMaxTransferAgeSecs         = 30LL * 60;
-    // L6 audit fix (2026-04-19): shortened both at-rest file-key TTLs so a
-    // device compromise exposes fewer in-flight keys.  Receiver window was
-    // 7 days — cut to 3, which is still long enough for a weekend-away
-    // resumption while cutting at-rest surface by ~2.3×.  Sender window
-    // was 24 h — cut to 12 h, since senders are typically active around
-    // the transfer.  Both values are the DB-row TTL; the in-memory
-    // IncomingTransfer is still purged after kMaxTransferAgeSecs (30 min)
-    // of inactivity.
+    // At-rest file-key TTLs kept short so a device compromise exposes
+    // fewer in-flight keys.  Receiver window (3 days) is long enough for
+    // a weekend-away resumption; sender window (12 h) assumes senders
+    // are typically active around the transfer.  Both values are the
+    // DB-row TTL; the in-memory IncomingTransfer is still purged after
+    // kMaxTransferAgeSecs (30 min) of inactivity.
     static constexpr int64_t kSentTransferMaxAgeSecs     = 12LL * 60 * 60;
     static constexpr int64_t kPartialFileMaxAgeSecs      = 3LL * 24 * 60 * 60;
 
@@ -130,7 +126,7 @@ public:
                                  const std::string& groupId = {},
                                  const std::string& groupName = {});
 
-    // ── Phase 2: outbound consent gate ──────────────────────────────────────
+    // ── Outbound consent gate ───────────────────────────────────────────────
     void queueOutboundFile(const std::string& senderIdB64u,
                            const std::string& peerIdB64u,
                            const Bytes& fileKey,
@@ -184,7 +180,7 @@ public:
 
     // ── Event callbacks — set from outside; fire on the main/event thread ──
     //
-    // All signals → std::function in Phase 7.  Callers assign directly:
+    // Callers assign directly:
     //   ftm.onStatus = [](const std::string& s) { ... };
 
     std::function<void(const std::string&)> onStatus;
@@ -204,12 +200,12 @@ public:
     std::function<void(const std::string& transferId,
                        const std::string& peerId)>     onInboundCanceled;
 
-    /// Phase 3: outbound blocked by P2P-only policy.
+    /// Outbound blocked by P2P-only policy.
     std::function<void(const std::string& transferId,
                        const std::string& peerId,
                        bool byReceiver)>               onOutboundBlockedByPolicy;
 
-    /// Phase 4/Fix #5: repopulate ChatController's m_fileKeys for resumed transfers.
+    /// Repopulate ChatController's m_fileKeys for resumed transfers.
     std::function<void(const std::string& fromPeerIdB64u,
                        const std::string& transferId,
                        const Bytes&       fileKey)>    onIncomingFileKeyRestored;
@@ -344,7 +340,7 @@ private:
 
     SqlCipherDb* m_dbPtr = nullptr;
 
-    // ── Phase 4: DB helpers ─────────────────────────────────────────────────
+    // ── DB helpers ──────────────────────────────────────────────────────────
     void ensurePhase4Tables();
     void persistIncomingFull(const std::string& transferId,
                               const IncomingTransfer& xfer,

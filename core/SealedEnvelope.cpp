@@ -9,18 +9,14 @@
 static constexpr uint8_t kVersionClassicalV2 = 0x02;
 static constexpr uint8_t kVersionHybridV2    = 0x03;
 
-// M1 audit fix (2026-04-19): domain-separation label mixed into the
-// envelope-key derivation as the BLAKE2b *key*.  Before the fix, the key
-// was BLAKE2b-256(ecdh || kem) with no protocol binding — a future variant
-// that reused the same ECDH/KEM output in another context would derive the
+// Domain-separation label mixed into the envelope-key derivation as the
+// BLAKE2b *key*.  Without a protocol binding, any future variant that
+// reused the same ECDH/KEM output in another context would derive the
 // same envelope key, breaking key separation.  Binding this label to the
 // hash makes each context provably distinct.
 //
-// Wire compat: every envelope key derivation changes.  Envelopes produced
-// by pre-M1 builds can no longer be decrypted; the sender's ratchet state
-// is unaffected, so a retry under the new code succeeds.  Do NOT rename
-// this label without bumping the envelope version bytes — the exact byte
-// sequence is part of the wire protocol.
+// Do NOT rename this label without bumping the envelope version bytes —
+// the exact byte sequence is part of the wire protocol.
 static constexpr char   kEnvelopeKeyLabel[]   = "Peer2Pear-SealedEnvelope-v2";
 static constexpr size_t kEnvelopeKeyLabelLen  = sizeof(kEnvelopeKeyLabel) - 1;
 
@@ -330,7 +326,7 @@ UnsealResult SealedEnvelope::unseal(const Bytes& recipientCurvePriv,
     Bytes ephPub(sealedBytes.begin() + offset, sealedBytes.begin() + offset + kPubLen);
     offset += kPubLen;
 
-    // C2 fix: reject all-zeros or low-order ephemeral keys
+    // Reject all-zeros or low-order ephemeral keys.
     if (sodium_is_zero(ephPub.data(), ephPub.size())) return result;
 
     // 2. ECDH
@@ -341,7 +337,7 @@ UnsealResult SealedEnvelope::unseal(const Bytes& recipientCurvePriv,
         return result;
     }
 
-    // C2 fix: verify contributory shared secret
+    // Verify contributory shared secret.
     if (sodium_is_zero(ecdhShared, sizeof(ecdhShared))) {
         sodium_memzero(ecdhShared, sizeof(ecdhShared));
         return result;

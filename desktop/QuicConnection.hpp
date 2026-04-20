@@ -2,9 +2,8 @@
 //
 // QuicConnection — QUIC transport layered over ICE/libnice.
 //
-// Plain C++ class.  No Qt inheritance, no Qt types — the Phase 7d Qt strip
-// (2026-04-18) replaced the former QObject base + signals with a
-// std::function callbacks pattern, matching NiceConnection.
+// Plain C++ class.  No Qt inheritance, no Qt types — uses a std::function
+// callbacks pattern, matching NiceConnection.
 //
 // Wraps NiceConnection (composition) for NAT traversal, then upgrades to a
 // QUIC connection for reliable, framed, multiplexed P2P transport.
@@ -75,7 +74,7 @@ public:
     std::function<void(const Bytes& data)>          onDataReceived;     // message stream
     std::function<void(const Bytes& data)>          onFileDataReceived; // file stream
 
-    // Public statics for atexit cleanup (S5 fix).
+    // Public statics for atexit cleanup.
     static const QUIC_API_TABLE* s_msquic;
     static HQUIC s_registration;
 

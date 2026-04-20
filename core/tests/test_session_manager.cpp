@@ -1,13 +1,10 @@
-// test_session_manager.cpp — Tier 5 tests for SessionManager.
+// test_session_manager.cpp — tests for SessionManager.
 //
-// SessionManager ties together three pieces that have been tested in
-// isolation in earlier tiers:
-//   - CryptoEngine identities (Tier 1)
-//   - SQLCipher-backed SessionStore (Tier 2, via DatabaseManager tables)
-//   - RatchetSession double-ratchet (Tier 4)
-// plus the Noise IK handshake on top.  This tier verifies the whole stack
-// works end-to-end between two *independent* SessionManager instances —
-// the thing a real Alice ↔ Bob exchange actually looks like.
+// SessionManager ties together CryptoEngine identities, the SQLCipher-
+// backed SessionStore, and the RatchetSession double-ratchet, plus the
+// Noise IK handshake on top.  This verifies the whole stack works end-
+// to-end between two *independent* SessionManager instances — the thing
+// a real Alice ↔ Bob exchange actually looks like.
 //
 // Identities are expensive to bootstrap (~1.3 s of Argon2 each), so the
 // fixture creates them once in SetUpTestSuite and reuses them across cases.
@@ -17,6 +14,7 @@
 #include "SessionStore.hpp"
 #include "SqlCipherDb.hpp"
 #include "CryptoEngine.hpp"
+#include "test_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -31,20 +29,7 @@
 
 namespace {
 
-std::string makeTempPath(const char* tag, const char* suffix) {
-    namespace fs = std::filesystem;
-    (void)sodium_init();
-    uint8_t rnd[8];
-    randombytes_buf(rnd, sizeof(rnd));
-    char buf[64];
-    std::snprintf(buf, sizeof(buf),
-                  "%s-%02x%02x%02x%02x%02x%02x%02x%02x%s",
-                  tag, rnd[0], rnd[1], rnd[2], rnd[3],
-                  rnd[4], rnd[5], rnd[6], rnd[7], suffix);
-    const fs::path p = fs::temp_directory_path() / buf;
-    fs::remove_all(p);
-    return p.string();
-}
+using p2p_test::makeTempPath;
 
 SqlCipherDb::Bytes randomKey32() {
     SqlCipherDb::Bytes k(32);
@@ -363,11 +348,10 @@ TEST_F(SessionManagerSuite, AdditionalPreKeyMessagesDeliverInOrder) {
     EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, m2), bytesOf("m2"));
 }
 
-// ── 9. H1 audit-#2: replayed additional pre-key (0x06) is rejected ───────
-// Before the fix, the counter-derived key was deterministic and nothing
-// tracked which counters had been consumed — a relay could redeliver a
-// captured 0x06 envelope and it would decrypt + fire the onMessage
-// callback twice.
+// ── 9. Replayed additional pre-key (0x06) is rejected ────────────────────
+// The counter used for the additional-prekey key derivation is tracked so
+// that a relay redelivering a captured 0x06 envelope does not decrypt and
+// fire the onMessage callback twice.
 
 TEST_F(SessionManagerSuite, AdditionalPreKeyReplayIsRejected) {
     const Bytes m1 = alice.mgr->encryptForPeer(bob.peerId, bytesOf("first"));
@@ -377,20 +361,20 @@ TEST_F(SessionManagerSuite, AdditionalPreKeyReplayIsRejected) {
     EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, m1), bytesOf("first"));
     EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, m2), bytesOf("second"));
 
-    // Relay replays the exact same m2 envelope.  With H1 in place Bob
-    // MUST drop it — the counter is recorded as consumed.
+    // Relay replays the exact same m2 envelope.  Bob MUST drop it —
+    // the counter is recorded as consumed.
     EXPECT_TRUE(bob.mgr->decryptFromPeer(alice.peerId, m2).empty())
-        << "replayed additional pre-key must be dropped (H1 regression)";
+        << "replayed additional pre-key must be dropped";
 }
 
-// ── 10. C1 audit-#2: Noise ephemeral priv doesn't survive to disk ────────
+// ── 10. Noise ephemeral priv doesn't survive to disk ─────────────────────
 // After writeMessage1() the sender persists its pending handshake.  The
 // serialized blob MUST NOT contain the ephemeral DH private key.  We
 // deserialize the saved blob and assert the loaded NoiseState's
 // ephemeralPriv() is empty — confirming the key lives only in the
-// in-memory SessionManager side-channel now.
+// in-memory SessionManager side-channel.
 
-TEST_F(SessionManagerSuite, C1_EphemeralPrivIsNotPersisted) {
+TEST_F(SessionManagerSuite, EphemeralPrivIsNotPersisted) {
     // Alice kicks off a handshake but Bob never replies.  Alice's
     // SessionStore now contains a pending_handshakes row for Bob.
     const Bytes m1 = alice.mgr->encryptForPeer(bob.peerId, bytesOf("hello"));
@@ -408,16 +392,16 @@ TEST_F(SessionManagerSuite, C1_EphemeralPrivIsNotPersisted) {
     const Bytes noiseBlob(pendingBlob.begin() + 100, pendingBlob.end());
     const NoiseState noise = NoiseState::deserialize(noiseBlob);
     EXPECT_TRUE(noise.ephemeralPriv().empty())
-        << "NoiseState ephemeralPriv() must be empty after deserialize (C1)";
+        << "NoiseState ephemeralPriv() must be empty after deserialize";
 }
 
-// ── 11. M1 audit-#2: SessionStore AAD binds the row identity ─────────────
+// ── 11. SessionStore AAD binds the row identity ──────────────────────────
 // If an attacker can swap blobs between peer rows (DB write access), the
 // decrypt must fail.  We install a legitimate session, then manually
 // re-bind its encrypted blob under a different peer_id — loadSession
 // for that peer_id must refuse to decrypt.
 
-TEST_F(SessionManagerSuite, M1_SessionStoreAadRejectsBlobSwap) {
+TEST_F(SessionManagerSuite, SessionStoreAadRejectsBlobSwap) {
     // Complete a handshake so Alice's store has one session row for Bob.
     const Bytes first = alice.mgr->encryptForPeer(bob.peerId, bytesOf("hi"));
     EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, first), bytesOf("hi"));
@@ -455,7 +439,7 @@ TEST_F(SessionManagerSuite, M1_SessionStoreAadRejectsBlobSwap) {
     // cross-peer blob — the AAD (bound to attackerId) no longer matches.
     auto fresh = std::make_unique<SessionManager>(*s_aliceCrypto, *alice.store);
     EXPECT_FALSE(fresh->hasSession(attackerId))
-        << "cross-row blob swap must fail decrypt via AAD mismatch (M1)";
+        << "cross-row blob swap must fail decrypt via AAD mismatch";
     // Sanity: the legitimate row under Bob's id still loads.
     EXPECT_TRUE(fresh->hasSession(bob.peerId));
 }

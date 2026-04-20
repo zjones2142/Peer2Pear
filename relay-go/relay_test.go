@@ -5,12 +5,12 @@
 //
 //   - HandleSend happy path (store when offline, push when online).
 //   - Envelope validation (size cap, version byte, too-short).
-//   - Per-recipient rate limit (the audit-relevant one — an attacker
-//     rotating IPs can't bypass this).
-//   - WS auth: signature, timestamp freshness, replay, and L4
-//     cross-restart replay protection.
-//   - M6 end-to-end: queued envelopes survive a simulated relay
-//     restart AND an incomplete delivery.
+//   - Per-recipient rate limit (an attacker rotating IPs can't bypass
+//     this).
+//   - WS auth: signature, timestamp freshness, replay, and cross-restart
+//     replay protection.
+//   - End-to-end: queued envelopes survive a simulated relay restart AND
+//     an incomplete delivery.
 //   - /healthz sanity.
 
 package main
@@ -18,7 +18,6 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
-	"crypto/rand"
 	cryptorand "crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -310,7 +309,7 @@ func TestHandleSend_RejectsMalformedEnvelope(t *testing.T) {
 	}
 }
 
-// ── 5. Per-recipient rate limit (audit Fix #10) ───────────────────────
+// ── 5. Per-recipient rate limit ──────────────────────────────────────
 // trustProxy=true so distinct X-Forwarded-For IPs bypass the per-IP cap;
 // that's the threat model the per-recipient cap exists to address.
 
@@ -411,9 +410,9 @@ func TestWsAuth_RejectsReplay(t *testing.T) {
 	}
 }
 
-// ── 9. L4: auth replay survives relay restart ─────────────────────────
-// The audit's actual concern — pre-L4 this succeeded because seenAuth
-// was an in-memory map.  Now the row persists in SQLite.
+// ── 9. Auth replay survives relay restart ─────────────────────────────
+// With the seenAuth row persisted in SQLite, a relay restart within the
+// replay window still rejects captured auth tuples.
 
 func TestWsAuth_ReplayPersistsAcrossRelayRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "relay.db")
@@ -448,11 +447,11 @@ func TestWsAuth_ReplayPersistsAcrossRelayRestart(t *testing.T) {
 	defer r2.Close()
 	_, rep2 := dialAndAuth(t, r2, p, ts)
 	if e, _ := rep2.Reply["error"].(string); !strings.Contains(e, "auth replay") {
-		t.Fatalf("replay across restart: got %v — L4 regression", rep2.Reply)
+		t.Fatalf("replay across restart: got %v — regression", rep2.Reply)
 	}
 }
 
-// ── 10. M6 end-to-end: queued envelopes survive relay restart ─────────
+// ── 10. End-to-end: queued envelopes survive relay restart ────────────
 
 func TestMailboxDelivery_SurvivesRelayRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "relay.db")
@@ -502,7 +501,7 @@ func TestMailboxDelivery_SurvivesRelayRestart(t *testing.T) {
 		t.Fatalf("auth after restart: %v", result.Reply)
 	}
 	if len(result.Stored) != 2 {
-		t.Fatalf("stored envelopes delivered: %d, want 2 (M6 regression)", len(result.Stored))
+		t.Fatalf("stored envelopes delivered: %d, want 2", len(result.Stored))
 	}
 	// Content check: the set of delivered payloads matches what we POSTed
 	// (order may differ thanks to secureShuffleEnv).
@@ -517,11 +516,11 @@ func TestMailboxDelivery_SurvivesRelayRestart(t *testing.T) {
 	}
 }
 
-// ── 11. M6: incomplete delivery (WS drops mid-loop) leaves rest queued ─
+// ── 11. Incomplete delivery (WS drops mid-loop) leaves rest queued ────
 // We can't easily force a crash mid-loop in-process, but the mailbox-
-// level test TestMailbox_M6_PartialConfirmLeavesRestForRedelivery
-// covers that case.  This integration test validates the *end state*:
-// after a successful full delivery, the mailbox is empty.
+// level test TestMailbox_PartialConfirmLeavesRestForRedelivery covers
+// that case.  This integration test validates the *end state*: after a
+// successful full delivery, the mailbox is empty.
 
 func TestMailboxDelivery_EmptiesAfterSuccessfulDelivery(t *testing.T) {
 	r := newTestRelay(t)
@@ -652,7 +651,7 @@ func TestHandleForward_RejectsBadInputs(t *testing.T) {
 	resp.Body.Close()
 }
 
-// ── 15. M8 audit-#2: safeForwardClient blocks rebinding to loopback ───
+// ── 15. safeForwardClient blocks rebinding to loopback ────────────────
 // Even if the pre-check passed (hostname resolves to a public IP), the
 // connect-time dialer re-validates every candidate IP against ipSafe.
 // We force the dialer to see a loopback IP via a synthetic resolver
@@ -665,7 +664,7 @@ func TestSafeForwardClient_RefusesLoopbackAtConnect(t *testing.T) {
 	// Spin up a local HTTP server — the DialContext under test must
 	// refuse to connect to 127.0.0.1:* even though the listener is alive.
 	bg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("safeForwardClient connected to loopback — M8 regression")
+		t.Fatalf("safeForwardClient connected to loopback — regression")
 	}))
 	defer bg.Close()
 
@@ -673,7 +672,7 @@ func TestSafeForwardClient_RefusesLoopbackAtConnect(t *testing.T) {
 	// http://127.0.0.1:<port>/... should be blocked by the dialer.
 	_, err := client.Get(bg.URL + "/anything")
 	if err == nil {
-		t.Fatalf("GET to loopback succeeded (M8 regression)")
+		t.Fatalf("GET to loopback succeeded (regression)")
 	}
 	if !strings.Contains(err.Error(), "SSRF") {
 		t.Fatalf("expected SSRF error, got: %v", err)
@@ -710,7 +709,7 @@ func TestIpSafe(t *testing.T) {
 	}
 }
 
-// ── 16b. L1 audit-#2: --cert + --key path uses ListenAndServeTLS ──────
+// ── 16b. --cert + --key path uses ListenAndServeTLS ───────────────────
 // Spin up a relay listening on TLS with a self-signed cert and verify
 // that an HTTPS client (configured to trust the test cert) reaches
 // /healthz.  A plain HTTP client against the same port must fail.
@@ -780,7 +779,7 @@ func TestRelay_NativeTlsEndpointServes(t *testing.T) {
 		// Hard check: status must NOT be 200, and body must NOT contain
 		// our healthz JSON keys.
 		if plainResp.StatusCode == http.StatusOK {
-			t.Fatalf("plain HTTP got 200 from TLS endpoint (L1 regression)")
+			t.Fatalf("plain HTTP got 200 from TLS endpoint (regression)")
 		}
 		var body bytes.Buffer
 		_, _ = body.ReadFrom(plainResp.Body)
@@ -799,7 +798,7 @@ func makeSelfSignedCertPEM(t *testing.T) (cert []byte, key []byte) {
 	if err != nil {
 		t.Fatalf("rsa.GenerateKey: %v", err)
 	}
-	serial, _ := rand.Int(cryptorand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	serial, _ := cryptorand.Int(cryptorand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "peer2pear-test"},
@@ -842,9 +841,9 @@ func TestHealthz(t *testing.T) {
 }
 
 // ── 18. GET /v1/relay_info publishes the onion X25519 pubkey ─────────
-// Fix #7 prereq: clients need the relay's pubkey to wrap onions for it.
-// The handler must return the SAME key the hub holds in relayX25519Pub,
-// not a random placeholder.
+// Clients need the relay's pubkey to wrap onions for it.  The handler
+// must return the SAME key the hub holds in relayX25519Pub, not a random
+// placeholder.
 
 func TestHandleRelayInfo_PublishesX25519PubKey(t *testing.T) {
 	r := newTestRelay(t)
@@ -1117,7 +1116,7 @@ func TestPresence_QueryReturnsSnapshot(t *testing.T) {
 	}
 }
 
-// ── 24. L2 audit-#2: presence_query is rate-limited per connection ────
+// ── 24. presence_query is rate-limited per connection ─────────────────
 // After maxPresenceQueriesPerWin queries, further queries are silently
 // dropped.  The attacker model: authenticated peer trying to enumerate
 // the social graph at arbitrary speed.
@@ -1164,12 +1163,12 @@ func TestPresence_QueryRateLimitDropsAfterCap(t *testing.T) {
 		}
 		var msg map[string]any
 		if json.Unmarshal(data, &msg) == nil && msg["type"] == "presence_result" {
-			t.Fatalf("presence_result after cap — L2 regression: %v", msg)
+			t.Fatalf("presence_result after cap — regression: %v", msg)
 		}
 	}
 }
 
-// ── 25. H4: presence_subscribe caps the watched-set size ─────────────
+// ── 25. presence_subscribe caps the watched-set size ─────────────────
 
 func TestPresence_SubscribeCapsAtMaxSize(t *testing.T) {
 	r := newTestRelay(t)
@@ -1197,7 +1196,7 @@ func TestPresence_SubscribeCapsAtMaxSize(t *testing.T) {
 	got := len(r.hub.subs[alice.idB64])
 	r.hub.mu.RUnlock()
 	if got != maxPresenceSubs {
-		t.Fatalf("subs count %d, want %d (H4 cap)", got, maxPresenceSubs)
+		t.Fatalf("subs count %d, want %d (cap)", got, maxPresenceSubs)
 	}
 }
 
@@ -1220,7 +1219,7 @@ func TestHub_SecondConnectionReplacesFirst(t *testing.T) {
 		t.Fatalf("first auth: %v", rep1.Reply)
 	}
 
-	// Distinct ts so the L4 nonce store sees a different row.
+	// Distinct ts so the nonce store sees a different row.
 	conn2, rep2 := dialAndAuth(t, r, alice, time.Now().UnixMilli()+1)
 	defer conn2.Close()
 	if rep2.Reply["type"] != "auth_ok" {
