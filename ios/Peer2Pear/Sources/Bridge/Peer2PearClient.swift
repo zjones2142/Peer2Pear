@@ -38,16 +38,28 @@ struct P2PFileRequest: Identifiable {
     let fileSize: Int64
 }
 
+/// Direction of a file transfer — inbound means WE'RE receiving, outbound
+/// means WE'RE sending.  Lets a single `fileProgress` dict carry both
+/// halves and lets views filter by counterparty without care for which
+/// direction the bytes are flowing.
+enum P2PTransferDirection {
+    case inbound
+    case outbound
+}
+
 /// Progress event from an in-flight transfer.  `savedPath` is non-nil
-/// only when `chunksReceived == chunksTotal` (transfer complete).
+/// only when `chunksDone == chunksTotal` AND direction == .inbound
+/// (sender never has a savedPath — the file already lives at its
+/// original path on their disk).
 struct P2PFileProgress: Identifiable {
-    let id: String       // transferId
-    let from: String
+    let id: String             // transferId
+    let peerId: String         // the OTHER party (sender if inbound, recipient if outbound)
     let fileName: String
     let fileSize: Int64
-    let chunksReceived: Int
+    let chunksDone: Int
     let chunksTotal: Int
     let savedPath: String?
+    let direction: P2PTransferDirection
     let timestamp: Date
 }
 
@@ -420,7 +432,7 @@ final class Peer2PearClient: ObservableObject {
             DispatchQueue.main.async { client.peerAvatars[av.from] = av }
         }, selfPtr)
 
-        // ── File transfer: progress + completion ───────────────────────
+        // ── File transfer: inbound progress + completion ──────────────
         p2p_set_on_file_progress(ctx, {
             from, tid, fileName, fileSize,
             chunksReceived, chunksTotal, savedPath, ts, ud in
@@ -428,12 +440,36 @@ final class Peer2PearClient: ObservableObject {
                   let from, let tid, let fileName else { return }
             let progress = P2PFileProgress(
                 id: String(cString: tid),
-                from: String(cString: from),
+                peerId: String(cString: from),
                 fileName: String(cString: fileName),
                 fileSize: fileSize,
-                chunksReceived: Int(chunksReceived),
+                chunksDone: Int(chunksReceived),
                 chunksTotal: Int(chunksTotal),
                 savedPath: savedPath.flatMap { String(cString: $0) },
+                direction: .inbound,
+                timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
+            )
+            DispatchQueue.main.async { client.fileProgress[progress.id] = progress }
+        }, selfPtr)
+
+        // ── File transfer: outbound (sender-side) progress ────────────
+        // Fires after every outbound chunk dispatches.  savedPath stays
+        // nil here — the sender already has the source file at the path
+        // they passed to p2p_send_file.
+        p2p_set_on_file_sent_progress(ctx, {
+            to, tid, fileName, fileSize,
+            chunksSent, chunksTotal, ts, ud in
+            guard let client = Peer2PearClient.from(ud),
+                  let to, let tid, let fileName else { return }
+            let progress = P2PFileProgress(
+                id: String(cString: tid),
+                peerId: String(cString: to),
+                fileName: String(cString: fileName),
+                fileSize: fileSize,
+                chunksDone: Int(chunksSent),
+                chunksTotal: Int(chunksTotal),
+                savedPath: nil,
+                direction: .outbound,
                 timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
             )
             DispatchQueue.main.async { client.fileProgress[progress.id] = progress }

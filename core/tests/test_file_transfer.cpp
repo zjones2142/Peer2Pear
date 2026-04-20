@@ -236,6 +236,46 @@ protected:
 
 // ── 4. Full round-trip, chunks delivered in order ─────────────────────────
 
+// ── Sender-side progress: fires once per dispatched chunk ─────────────────
+// onFileChunkSent must fire exactly totalChunks times with a monotonically
+// increasing chunksSent counter, ending at chunksSent == totalChunks.  This
+// is what UIs use to draw a progress bar for files THEY send — inbound
+// progress already has onFileChunkReceived coverage above.
+
+TEST_F(FileTransferRoundTrip, SenderSideProgressFiresOncePerChunk) {
+    std::vector<std::pair<int, int>> progress; // (sent, total)
+    std::string lastTo;
+    std::string lastTid;
+    sender->onFileChunkSent =
+        [&](const std::string& to, const std::string& tid,
+            const std::string&, int64_t, int sent, int total,
+            int64_t, const std::string&, const std::string&) {
+            lastTo  = to;
+            lastTid = tid;
+            progress.emplace_back(sent, total);
+        };
+
+    const Bytes fileKey  = randomBytes(32);
+    const Bytes bytes    = prepareSource(size_t(FileTransferManager::kChunkBytes) * 3 + 128);
+    const Bytes fileHash = FileTransferManager::blake2b256(bytes);
+    const int   totalChunks = int((bytes.size() + FileTransferManager::kChunkBytes - 1)
+                                  / FileTransferManager::kChunkBytes);
+
+    ASSERT_EQ(runSend(fileKey, fileHash, int64_t(bytes.size()), "sent-progress.bin"),
+              transferId);
+
+    // Exactly one callback per chunk.
+    ASSERT_EQ(int(progress.size()), totalChunks);
+
+    // chunksSent runs 1..totalChunks monotonically; chunksTotal is constant.
+    for (int i = 0; i < totalChunks; ++i) {
+        EXPECT_EQ(progress[i].first,  i + 1);
+        EXPECT_EQ(progress[i].second, totalChunks);
+    }
+    EXPECT_EQ(lastTo,  receiverPeerId);
+    EXPECT_EQ(lastTid, transferId);
+}
+
 TEST_F(FileTransferRoundTrip, FileRoundTripInOrderReassembles) {
     const Bytes fileKey  = randomBytes(32);
     const Bytes bytes    = prepareSource(size_t(FileTransferManager::kChunkBytes) + 1024);

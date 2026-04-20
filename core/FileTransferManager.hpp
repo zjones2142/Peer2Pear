@@ -227,6 +227,25 @@ public:
                        const std::string& groupId,
                        const std::string& groupName)>  onFileChunkReceived;
 
+    /// Sender-side progress.  Fires after each outbound chunk dispatches
+    /// successfully (after dispatchChunk returns true).  Terminal events —
+    /// completion, cancel, block — come via their own callbacks
+    /// (onTransferCompleted / onOutboundAbandoned / onOutboundBlockedByPolicy);
+    /// this one is purely the running count.
+    ///
+    /// chunksSent == chunksTotal is the last progress callback of a
+    /// successful transfer; onTransferCompleted fires separately (and later,
+    /// after the receiver's delivery confirmation).
+    std::function<void(const std::string& toPeerIdB64u,
+                       const std::string& transferId,
+                       const std::string& fileName,
+                       int64_t            fileSize,
+                       int                chunksSent,
+                       int                chunksTotal,
+                       int64_t            timestampSec,
+                       const std::string& groupId,
+                       const std::string& groupName)>  onFileChunkSent;
+
 private:
     /// Per-incoming-transfer state. Backed by a file on disk.
     struct IncomingTransfer {

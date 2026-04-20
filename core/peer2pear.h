@@ -365,6 +365,27 @@ void p2p_set_on_file_progress(p2p_context* ctx,
                void* ud),
     void* ud);
 
+/**
+ * Sender-side per-chunk progress.  Fires after each outbound chunk
+ * dispatches (relay or P2P).  Terminal events (delivered / canceled /
+ * blocked) come via their own callbacks; this one is the running count
+ * so UIs can draw progress bars for outbound transfers.
+ *
+ * When chunks_sent == chunks_total, the sender has dispatched the last
+ * chunk — delivery confirmation still arrives separately via
+ * p2p_set_on_file_delivered.
+ */
+void p2p_set_on_file_sent_progress(p2p_context* ctx,
+    void (*cb)(const char* to_peer_id,
+               const char* transfer_id,
+               const char* file_name,
+               int64_t file_size,
+               int chunks_sent,
+               int chunks_total,
+               int64_t timestamp_sec,
+               void* ud),
+    void* ud);
+
 void p2p_set_on_avatar(p2p_context* ctx,
     void (*cb)(const char* peer_id,
                const char* display_name,

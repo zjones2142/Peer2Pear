@@ -81,6 +81,19 @@ public slots:
                              const QString &groupId = {},
                              const QString &groupName = {});
 
+    // Fired for every outbound chunk dispatched.  Sender-side counterpart
+    // to onFileChunkReceived; drives the progress indicator on the
+    // file card the sender sees while their file is being transmitted.
+    void onFileChunkSent(const QString &toPeerIdB64u,
+                         const QString &transferId,
+                         const QString &fileName,
+                         qint64         fileSize,
+                         int            chunksSent,
+                         int            chunksTotal,
+                         const QDateTime  &timestamp,
+                         const QString &groupId = {},
+                         const QString &groupName = {});
+
     // Phase 2: a peer is offering a file and needs consent.
     void onFileAcceptRequested(const QString &fromPeerIdB64u,
                                const QString &transferId,

@@ -321,6 +321,16 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
             if (onStatus) onStatus(std::string("Transfer interrupted: direct connection lost."));
             return;
         }
+
+        // Sender-side progress emission.  Fires for every successful
+        // dispatch so UIs can draw a running progress bar for files they
+        // send, not just files they receive.  Inbound progress comes from
+        // onFileChunkReceived; we mirror the shape here (chunksSent vs.
+        // chunksReceived) so UI code can share most of its rendering path.
+        if (onFileChunkSent) {
+            onFileChunkSent(peerIdB64u, transferId, fileName, fileSize,
+                            i + 1, totalChunks, ts, groupId, groupName);
+        }
     }
 
     // Kick off P2P for future messages

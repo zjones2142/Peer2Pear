@@ -12,14 +12,12 @@ struct ConversationView: View {
         client.messages.filter { $0.from == peerId }
     }
 
-    /// Inbound transfers from this peer.  The core only emits
-    /// `on_file_progress` for received chunks today — sender-side sees
-    /// `on_file_delivered` (binary done-or-not, no progress %).  When
-    /// the core grows an onFileChunkSent hook, extend this filter to
-    /// cover outbound transfers too.
+    /// Transfers with this peer — inbound or outbound.  Both halves land
+    /// in `client.fileProgress` keyed by transferId; the counterparty is
+    /// `peerId` regardless of direction, so filtering is uniform.
     private var activeTransfers: [P2PFileProgress] {
         client.fileProgress.values
-            .filter { $0.from == peerId }
+            .filter { $0.peerId == peerId }
             .sorted(by: { $0.timestamp > $1.timestamp })
     }
 
@@ -260,6 +258,15 @@ struct FileTransferRow: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            } else if isComplete {
+                // Outbound finished — note delivery confirmation lives in
+                // client.deliveredTransferIds (arrives when the receiver acks).
+                Text(client.deliveredTransferIds.contains(progress.id)
+                     ? "Sent · Delivered"
+                     : "Sent · Awaiting confirmation")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             } else if let blocked = client.blockedTransfers[progress.id] {
                 Text(blocked ? "Blocked by recipient (P2P required)"
                              : "Blocked: P2P unavailable")
@@ -283,21 +290,28 @@ struct FileTransferRow: View {
 
     private var fraction: Double {
         guard progress.chunksTotal > 0 else { return 0 }
-        return Double(progress.chunksReceived) / Double(progress.chunksTotal)
+        return Double(progress.chunksDone) / Double(progress.chunksTotal)
+    }
+    /// Outbound transfers complete when the last chunk dispatches
+    /// (chunksDone == chunksTotal) — sender delivery confirmation arrives
+    /// separately via onFileTransferDelivered / deliveredTransferIds.
+    private var isComplete: Bool {
+        if progress.direction == .inbound { return progress.savedPath != nil }
+        return progress.chunksDone >= progress.chunksTotal && progress.chunksTotal > 0
     }
     private var isTerminal: Bool {
-        progress.savedPath != nil
+        isComplete
         || client.blockedTransfers[progress.id] != nil
         || client.canceledTransfers[progress.id] != nil
     }
     private var iconName: String {
-        if progress.savedPath != nil { return "checkmark.circle.fill" }
+        if isComplete { return "checkmark.circle.fill" }
         if client.blockedTransfers[progress.id] != nil { return "nosign" }
         if client.canceledTransfers[progress.id] != nil { return "xmark.circle" }
-        return "arrow.down.circle"
+        return progress.direction == .inbound ? "arrow.down.circle" : "arrow.up.circle"
     }
     private var tint: Color {
-        if progress.savedPath != nil { return .green }
+        if isComplete { return .green }
         if client.blockedTransfers[progress.id] != nil { return .red }
         if client.canceledTransfers[progress.id] != nil { return .secondary }
         return .blue

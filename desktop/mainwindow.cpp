@@ -343,6 +343,14 @@ MainWindow::MainWindow(QWidget *parent)
             cv->onFileChunkReceived(toQ(from), toQ(tid), toQ(fn), fsize, rcvd, total,
                                      toQ(saved), toDT(tsSecs), toQ(gid), toQ(gn));
         };
+    m_controller.onFileChunkSent =
+        [cv = m_chatView, toQ, toDT](const std::string& to, const std::string& tid,
+                                     const std::string& fn, int64_t fsize,
+                                     int sent, int total, int64_t tsSecs,
+                                     const std::string& gid, const std::string& gn) {
+            cv->onFileChunkSent(toQ(to), toQ(tid), toQ(fn), fsize, sent, total,
+                                 toDT(tsSecs), toQ(gid), toQ(gn));
+        };
     m_controller.onPresenceChanged =
         [cv = m_chatView, toQ](const std::string& peerId, bool online) {
             cv->onPresenceChanged(toQ(peerId), online);

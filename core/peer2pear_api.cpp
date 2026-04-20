@@ -360,6 +360,10 @@ struct p2p_context {
                                  int64_t, int, int, const char*, int64_t, void*) = nullptr;
         void* file_progress_ud = nullptr;
 
+        void (*on_file_sent_progress)(const char*, const char*, const char*,
+                                       int64_t, int, int, int64_t, void*) = nullptr;
+        void* file_sent_progress_ud = nullptr;
+
         void (*on_avatar)(const char*, const char*, const char*, void*) = nullptr;
         void* avatar_ud = nullptr;
 
@@ -461,6 +465,18 @@ static void wire_signals(p2p_context* ctx)
                 savedPath.empty() ? nullptr : savedPath.c_str(),
                 tsSecs,
                 ctx->cb.file_progress_ud);
+        }
+    };
+
+    c.onFileChunkSent = [ctx](const std::string& to, const std::string& transferId,
+                               const std::string& fileName, int64_t fileSize,
+                               int chunksSent, int chunksTotal, int64_t tsSecs,
+                               const std::string&, const std::string&) {
+        if (ctx->cb.on_file_sent_progress) {
+            ctx->cb.on_file_sent_progress(
+                to.c_str(), transferId.c_str(), fileName.c_str(),
+                fileSize, chunksSent, chunksTotal, tsSecs,
+                ctx->cb.file_sent_progress_ud);
         }
     };
 
@@ -903,6 +919,17 @@ void p2p_set_on_file_progress(p2p_context* ctx,
     P2P_CTX_GUARD(ctx);
     ctx->cb.on_file_progress = cb;
     ctx->cb.file_progress_ud = ud;
+}
+
+void p2p_set_on_file_sent_progress(p2p_context* ctx,
+    void (*cb)(const char*, const char*, const char*,
+               int64_t, int, int, int64_t, void*),
+    void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_file_sent_progress = cb;
+    ctx->cb.file_sent_progress_ud = ud;
 }
 
 void p2p_set_on_avatar(p2p_context* ctx,

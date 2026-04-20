@@ -257,6 +257,17 @@ public:
                        const std::string& groupId, const std::string& groupName)>
         onFileChunkReceived;
 
+    /// Sender-side per-chunk progress.  Fires after every outbound chunk
+    /// dispatches (relay or P2P).  UIs use this to draw a progress bar
+    /// for files THEY send; onFileChunkReceived covers inbound.
+    /// `to` is the recipient peer ID (b64url).
+    std::function<void(const std::string& to, const std::string& transferId,
+                       const std::string& fileName, int64_t fileSize,
+                       int chunksSent, int chunksTotal,
+                       int64_t tsSecs,
+                       const std::string& groupId, const std::string& groupName)>
+        onFileChunkSent;
+
 private:
     void onEnvelope(const Bytes& body);
 #ifdef PEER2PEAR_P2P

@@ -1160,6 +1160,60 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
         rebuildFilesTab();
 }
 
+// ── File chunk sent (sender-side progress) ────────────────────────────────────
+// Updates the outbound FileTransferRecord created in onAttachFile to show
+// the running chunk count.  On the last chunk we flip status → Complete.
+// Delivery confirmation arrives separately via onFileTransferDelivered.
+
+void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
+                                const QString &transferId,
+                                const QString & /*fileName*/,
+                                qint64         /*fileSize*/,
+                                int            chunksSent,
+                                int            chunksTotal,
+                                const QDateTime & /*timestamp*/,
+                                const QString &groupId,
+                                const QString & /*groupName*/)
+{
+    // Locate the chat — group or 1:1.  For groups we key off groupId
+    // (the transfer is per-group even though chunks fan out per-member).
+    int chatIndex = -1;
+    if (!groupId.isEmpty()) {
+        for (int i = 0; i < m_chats.size(); ++i)
+            if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { chatIndex = i; break; }
+    } else {
+        const QString to = toPeerIdB64u.trimmed();
+        for (int i = 0; i < m_chats.size(); ++i) {
+            if (m_chats[i].isGroup) continue;
+            if (m_chats[i].keys.contains(to) || m_chats[i].peerIdB64u == to) {
+                chatIndex = i; break;
+            }
+        }
+    }
+    if (chatIndex < 0) return;
+
+    const QString key = chatKey(m_chats[chatIndex]);
+    auto &records = m_filesByKey[key];
+    FileTransferRecord *rec = nullptr;
+    for (auto &r : records) {
+        if (r.transferId == transferId && r.sent) { rec = &r; break; }
+    }
+    // No record yet?  onAttachFile creates the Sending record before chunks
+    // fly, so this shouldn't happen — but guard against group fan-out races
+    // where a second member's chunk arrives before the record was saved.
+    if (!rec) return;
+
+    rec->chunksComplete = chunksSent;
+    rec->chunksTotal    = chunksTotal;
+    if (chunksSent >= chunksTotal && chunksTotal > 0) {
+        rec->status = FileTransferStatus::Complete;
+        if (m_db) m_db->saveFileRecord(key, *rec);
+    }
+
+    if (chatIndex == m_currentChat)
+        rebuildFilesTab();
+}
+
 // ── Avatar received ───────────────────────────────────────────────────────────
 
 void ChatView::onAvatarReceived(const QString &peerIdB64u,
@@ -1366,7 +1420,12 @@ void ChatView::onAttachFile()
 
     if (localTransferId.isEmpty()) return; // all keys failed
 
-    // Record sent transfer. savedPath = original path so the Download button re-opens it.
+    // Record the outbound transfer as IN-FLIGHT.  Chunks don't fly until
+    // the receiver ack's the file_key announcement (Phase 2), so marking
+    // Complete here would be a lie — we track real progress via
+    // onFileChunkSent callbacks instead and flip to Complete on the last
+    // chunk.  savedPath = original path so the Download/Open button
+    // always points at the still-local source file.
     const QString key = chatKey(chat);
     FileTransferRecord rec;
     rec.transferId     = localTransferId;
@@ -1376,16 +1435,17 @@ void ChatView::onAttachFile()
     rec.peerName       = chat.name;
     rec.timestamp      = QDateTime::currentDateTime();
     rec.sent           = true;
-    rec.status         = FileTransferStatus::Complete;
+    rec.status         = FileTransferStatus::Sending;
     rec.chunksTotal    = totalChunks;
-    rec.chunksComplete = totalChunks;
+    rec.chunksComplete = 0;
     rec.savedPath      = path;
     m_filesByKey[key].append(rec);
     if (m_db) m_db->saveFileRecord(key, rec);
 
     rebuildFilesTab();
 
-    // Delivery notice bubble in chat
+    // "You sent <file>" bubble in the chat transcript.  Progress still
+    // animates on the file card in the Files tab via onFileChunkSent.
     addFileBubble(fileName, fileSize, true);
 }
 

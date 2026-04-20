@@ -82,6 +82,22 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
         if (onStatus) onStatus(s);
     };
 
+    // Sender-side per-chunk progress passthrough.  FTM fires this after
+    // every successful dispatchChunk; we just forward it — no file_ack
+    // composition here because acks flow the other way (receiver → sender).
+    m_fileMgr.onFileChunkSent = [this](const std::string& toPeerId,
+                                        const std::string& transferId,
+                                        const std::string& fileName,
+                                        int64_t fileSize,
+                                        int chunksSent, int chunksTotal,
+                                        int64_t tsSecs,
+                                        const std::string& groupId,
+                                        const std::string& groupName) {
+        if (onFileChunkSent) onFileChunkSent(
+            toPeerId, transferId, fileName, fileSize,
+            chunksSent, chunksTotal, tsSecs, groupId, groupName);
+    };
+
     // fileChunkReceived fires from TWO callsites in FTM — one for progress/save,
     // one for the file_ack nudge.  Compose them into a single callback.
     m_fileMgr.onFileChunkReceived = [this](const std::string& fromPeerId,
