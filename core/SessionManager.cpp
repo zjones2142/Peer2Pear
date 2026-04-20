@@ -87,6 +87,12 @@ bool SessionManager::hasSession(const std::string& peerIdB64u) const {
 void SessionManager::deleteSession(const std::string& peerIdB64u) {
     m_sessions.erase(peerIdB64u);
     m_store.deleteSession(peerIdB64u);
+    m_store.deletePendingHandshake(peerIdB64u);
+    m_pendingCk.erase(peerIdB64u);
+    if (auto it = m_pendingEk.find(peerIdB64u); it != m_pendingEk.end()) {
+        CryptoEngine::secureZero(it->second);
+        m_pendingEk.erase(it);
+    }
 }
 
 // ---------------------------
@@ -216,6 +222,11 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
     m_store.savePendingHandshake(peerIdB64u, NoiseState::Initiator, pendingBlob);
     // L4 fix: zero the local private key copy now that it's persisted (encrypted)
     sodium_memzero(ratchetDhPriv.data(), ratchetDhPriv.size());
+    // C1 audit-#2 fix: cache the ephemeral DH private key in memory only.
+    // The serialized Noise blob no longer carries it, so this is where
+    // readMessage2 will pick it up on the msg2 path.  If we crash, the
+    // key dies with the process — next send starts a fresh handshake.
+    m_pendingEk[peerIdB64u] = noise.ephemeralPriv();
     P2P_LOG("[SessionManager] Saved pending handshake + ratchet DH for " << peerPrefix(peerIdB64u));
 
     // Derive a one-shot key from the Noise chaining key after msg1 (shared by both sides)
@@ -280,6 +291,16 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
             P2P_WARN("[SessionManager] Ratchet decrypt failed from " << peerPrefix(senderIdB64u));
             return {};
         }
+
+        // H1 audit-#2 fix: the responder's m_pendingCk used to linger
+        // indefinitely — once the ratchet is carrying messages we no
+        // longer need the Noise chaining key or the consumed-counters
+        // set, so drop both (zero the ck first).
+        if (auto ckIt = m_pendingCk.find(senderIdB64u); ckIt != m_pendingCk.end()) {
+            CryptoEngine::secureZero(ckIt->second);
+            m_pendingCk.erase(ckIt);
+        }
+        m_consumedPreKeyCounters.erase(senderIdB64u);
 
         m_lastMessageKey = session->lastMessageKey();
         if (msgKeyOut) *msgKeyOut = m_lastMessageKey;  // M3 fix: return key directly
@@ -411,15 +432,38 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         // the reloaded Noise state declares itself hybrid.
         if (noise.isHybrid() && m_crypto.hasPQKeys())
             noise.setKemPrivateKey(m_crypto.kemPriv());
+        // C1 audit-#2 fix: re-inject the ephemeral DH private key from
+        // the in-memory side-channel (never persisted).  Missing ek
+        // means either (a) the process crashed mid-handshake, or (b)
+        // this is a spurious msg2 for a handshake we didn't initiate —
+        // either way readMessage2 below will fail closed.
+        auto ekIt = m_pendingEk.find(senderIdB64u);
+        if (ekIt != m_pendingEk.end()) {
+            noise.setEphemeralPrivateKey(ekIt->second);
+        }
         Bytes responsePayload;
         if (!noise.readMessage2(noiseMsg2, responsePayload)) {
             P2P_WARN("[SessionManager] Failed to process Noise msg2 from " << peerPrefix(senderIdB64u));
+            // C1 audit-#2 fix: m_ek is no longer persisted, so a crash
+            // mid-handshake makes readMessage2 fail deterministically on
+            // reload.  Delete the pending row so the next send starts a
+            // fresh handshake instead of looping on the corpse forever.
+            m_store.deletePendingHandshake(senderIdB64u);
+            if (ekIt != m_pendingEk.end()) {
+                CryptoEngine::secureZero(ekIt->second);
+                m_pendingEk.erase(ekIt);
+            }
             return {};
         }
 
         HandshakeResult hr = noise.finish();
         m_store.deletePendingHandshake(senderIdB64u);
         m_pendingCk.erase(senderIdB64u);  // clean up chaining key (no longer needed)
+        // C1 audit-#2 fix: handshake completed — wipe the cached ek.
+        if (auto it = m_pendingEk.find(senderIdB64u); it != m_pendingEk.end()) {
+            CryptoEngine::secureZero(it->second);
+            m_pendingEk.erase(it);
+        }
         P2P_LOG("[SessionManager] Noise IK handshake complete (initiator) for " << peerPrefix(senderIdB64u));
 
         // Initialize ratchet with our saved fresh ratchet DH keypair
@@ -456,6 +500,23 @@ Bytes SessionManager::decryptFromPeer(const std::string& senderIdB64u,
         if (ckIt == m_pendingCk.end() || ckIt->second.empty()) {
             P2P_WARN("[SessionManager] Additional pre-key msg from " << peerPrefix(senderIdB64u)
                     << " but no chaining key on record (initial handshake not yet received?)");
+            return {};
+        }
+
+        // H1 audit-#2 fix: reject replayed counters.  A relay that captures
+        // a 0x06 envelope could otherwise redeliver it; the chaining key
+        // hasn't advanced so the same counter would derive the same key
+        // and succeed.  Cap the per-peer set so a malicious flood can't
+        // grow unbounded memory.
+        auto& consumed = m_consumedPreKeyCounters[senderIdB64u];
+        if (consumed.size() >= kMaxPreKeyCounters) {
+            P2P_WARN("[SessionManager] Additional pre-key counter set overflow from "
+                    << peerPrefix(senderIdB64u) << " — dropping");
+            return {};
+        }
+        if (!consumed.insert(counter).second) {
+            P2P_WARN("[SessionManager] Replayed additional pre-key counter #" << counter
+                    << " from " << peerPrefix(senderIdB64u) << " — dropping");
             return {};
         }
 

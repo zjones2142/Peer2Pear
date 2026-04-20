@@ -327,6 +327,11 @@ private:
         int64_t     announcedSecs = 0;
     };
     std::map<std::string, PendingIncoming> m_pendingIncomingFiles;
+    // H4 audit-#2 fix: cap the pending-prompt queue so a hostile peer
+    // flooding file_key announcements in the prompt-size band can't
+    // exhaust memory.  Matches the FileTransferManager::kMaxConcurrent
+    // bound so both queues share the same worst-case footprint.
+    static constexpr size_t kMaxPendingIncomingFiles = 50;
 
     // Consent settings (persisted by the application via DatabaseManager).
     // Defaults match v1 behavior: everything below hard-max auto-accepts.
@@ -341,6 +346,11 @@ private:
     // Tracks (senderId -> count) within current poll cycle; reset each poll.
     std::map<std::string, int> m_envelopeCount;
     static constexpr int kMaxEnvelopesPerSenderPerPoll = 200;
+
+    // H3 audit-#2 fix: per-sender file_request rate limiting.  Same poll-
+    // reset model as m_envelopeCount — capped in the file_request handler,
+    // cleared in runMaintenance().
+    std::map<std::string, int> m_fileRequestCount;
 
 #ifdef PEER2PEAR_P2P
     // TURN relay config for symmetric NAT fallback

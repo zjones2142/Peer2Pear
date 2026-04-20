@@ -189,6 +189,14 @@ RatchetSession RatchetSession::initAsInitiator(const Bytes& rootKey,
         s.m_kemPriv = std::move(kp.second);
     }
 
+    // H2 audit-#2 fix: reject all-zeros remote pubkey (low-order check
+    // is also performed by crypto_scalarmult itself via its non-zero
+    // return).
+    if (remoteDhPub.size() != 32 ||
+        sodium_is_zero(remoteDhPub.data(), remoteDhPub.size())) {
+        return {};
+    }
+
     // Perform initial DH and derive sending chain
     unsigned char shared[crypto_scalarmult_BYTES];
     if (crypto_scalarmult(shared,
@@ -226,6 +234,13 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     RatchetSession s;
     s.m_hybrid = hybrid;
     s.m_remoteDhPub = remoteDhPub;
+
+    // H2 audit-#2 fix: reject all-zeros remote pubkey before the first
+    // scalarmult.
+    if (remoteDhPub.size() != 32 ||
+        sodium_is_zero(remoteDhPub.data(), remoteDhPub.size())) {
+        return {};
+    }
 
     // Step 1: Derive receiving chain from DH(our priv, initiator's pub)
     // This matches the initiator's sending chain
@@ -288,12 +303,25 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
 
 void RatchetSession::dhRatchetStep(const Bytes& remoteDhPub,
                                     const Bytes& kemCt) {
+    // H2 audit-#2 fix: reject all-zeros or low-order remote DH pubkeys.
+    // Without this check a peer (or malicious relay swapping bytes in
+    // the header) could force the scalarmult to land on a known shared
+    // secret.  SealedEnvelope::unseal already does this; the ratchet
+    // did not.  sodium_is_zero catches the all-zero case; crypto_scalarmult
+    // itself returns non-zero on low-order inputs and we propagate that.
+    if (remoteDhPub.size() != 32 ||
+        sodium_is_zero(remoteDhPub.data(), remoteDhPub.size())) {
+        return;
+    }
+
     m_prevChainLen = m_sendMsgNum;
     m_sendMsgNum = 0;
     m_recvMsgNum = 0;
     m_remoteDhPub = remoteDhPub;
 
-    // DH with our current private + new remote public -> receiving chain
+    // DH with our current private + new remote public -> receiving chain.
+    // crypto_scalarmult returns non-zero on low-order points (libsodium
+    // rejects them explicitly) — the if-return below propagates that.
     unsigned char shared[crypto_scalarmult_BYTES];
     if (crypto_scalarmult(shared,
                           m_dhPriv.data(),
@@ -450,14 +478,21 @@ Bytes RatchetSession::trySkippedKeys(const RatchetHeader& header,
     auto it = m_skippedKeys.find(key);
     if (it == m_skippedKeys.end()) return {};
 
+    // M2 audit-#2 fix: zero the value inside the map before we erase
+    // its node, then zero our local copy on every exit path.  Previously
+    // std::map::erase freed the buffer without wiping it, leaving the
+    // message key in the heap until the allocator reused the slot.
     Bytes msgKey = it->second;
+    zeroBytes(it->second);
     m_skippedKeys.erase(it);
 
     // Decrypt with the skipped key
     Bytes headerBytes = header.serialize();
     if (ciphertext.size() < (crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-                              crypto_aead_xchacha20poly1305_ietf_ABYTES))
+                              crypto_aead_xchacha20poly1305_ietf_ABYTES)) {
+        zeroBytes(msgKey);
         return {};
+    }
 
     const unsigned char* nonce = ciphertext.data();
     const unsigned char* c = ciphertext.data() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
@@ -473,6 +508,7 @@ Bytes RatchetSession::trySkippedKeys(const RatchetHeader& header,
             static_cast<unsigned long long>(headerBytes.size()),
             nonce,
             msgKey.data()) != 0) {
+        zeroBytes(msgKey);
         return {};
     }
 
@@ -491,12 +527,19 @@ bool RatchetSession::skipMessageKeys(const Bytes& dhPub, uint32_t until) {
         auto [newChain, msgKey] = kdfChainKey(m_recvChainKey);
         m_recvChainKey = newChain;
         m_skippedKeys[std::make_pair(dhPub, m_recvMsgNum)] = msgKey;
+        // M2 audit-#2 fix: the local msgKey's buffer would otherwise
+        // outlive this iteration on the heap (the map copy is independent).
+        zeroBytes(msgKey);
+        zeroBytes(newChain);
         ++m_recvMsgNum;
     }
 
-    // Prune if over limit — std::map erase first is O(log n)
+    // Prune if over limit — std::map erase first is O(log n).
+    // M2: zero the evicted value before destructing the node.
     while (m_skippedKeys.size() > static_cast<size_t>(kMaxSkipped)) {
-        m_skippedKeys.erase(m_skippedKeys.begin());
+        auto victim = m_skippedKeys.begin();
+        zeroBytes(victim->second);
+        m_skippedKeys.erase(victim);
     }
 
     return true;

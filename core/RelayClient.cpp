@@ -114,7 +114,29 @@ RelayClient::~RelayClient()
     m_ws.close();
 }
 
-void RelayClient::setRelayUrl(const std::string& url) { m_relayUrl = url; }
+void RelayClient::setRelayUrl(const std::string& url) {
+    // M7 audit-#2 fix: refuse non-TLS relay URLs.  An http:// / ws:// URL
+    // would silently downgrade the WebSocket and HTTP paths to cleartext,
+    // exposing auth signatures and envelope ciphertexts in-flight.  The
+    // only exception is the empty string (used by tests + the reset
+    // pattern) and localhost for dev, which we accept with a loud log.
+    auto parsed = parseUrl(url);
+    const std::string& s = parsed.scheme;
+    const bool isTls = (s == "https" || s == "wss");
+    const bool isDev = (s == "http" || s == "ws") &&
+                       (parsed.host == "localhost" ||
+                        parsed.host == "127.0.0.1" ||
+                        parsed.host == "::1");
+    if (!url.empty() && !isTls && !isDev) {
+        emitStatus("relay URL rejected — only https:// / wss:// are allowed");
+        P2P_WARN("[Relay] setRelayUrl rejected non-TLS url: " << url);
+        return;
+    }
+    if (!url.empty() && !isTls) {
+        P2P_WARN("[Relay] allowing non-TLS localhost url for dev: " << url);
+    }
+    m_relayUrl = url;
+}
 
 bool RelayClient::isConnected() const
 {
@@ -500,9 +522,20 @@ void RelayClient::setMultiHopEnabled(bool enabled) { m_multiHop = enabled; }
 
 std::string RelayClient::pickSendRelay()
 {
+    // M5 audit-#2 fix: pick uniformly at random rather than strict
+    // round-robin.  Deterministic rotation lets a traffic analyst
+    // observing multiple relays fingerprint a single client by matching
+    // the N-step pattern.  Uniform random sampling over the configured
+    // relays removes that signal; the expected per-relay load is the
+    // same as round-robin, just without the identifying cadence.
+    //
+    // Uses randombytes_uniform from libsodium — crypto-grade RNG (not
+    // math/rand) so observers can't predict future picks from past ones.
     if (m_sendRelays.empty()) return m_relayUrl;
-    m_sendRelayIdx = (m_sendRelayIdx + 1) % m_sendRelays.size();
-    return m_sendRelays[m_sendRelayIdx];
+    const uint32_t idx = randombytes_uniform(
+        static_cast<uint32_t>(m_sendRelays.size()));
+    m_sendRelayIdx = idx;  // kept for diagnostics / compat; no longer load-bearing
+    return m_sendRelays[idx];
 }
 
 int RelayClient::pickJitterMs() const
@@ -558,19 +591,22 @@ void RelayClient::forwardEnvelope(const std::string& viaRelay, const std::string
         }
     }
 
-    // Legacy path
-    const std::string fwdUrl = urlWithPath(viaRelay, "/v1/forward");
-    IHttpClient::Headers headers;
-    headers["X-Forward-To"] = hostPort(toRelay);
-
-    const int jitterMs = pickJitterMs();
-    if (jitterMs <= 0) {
-        m_http.post(fwdUrl, envelope, headers, std::move(cb));
-    } else {
-        m_timers.singleShot(jitterMs,
-            [this, fwdUrl, envelope, headers, cb = std::move(cb)]() mutable {
-                m_http.post(fwdUrl, envelope, headers, std::move(cb));
-            });
+    // M4 audit-#2 fix: the legacy /v1/forward fallback hands the full
+    // routing envelope (including the plaintext recipientPub) to the
+    // entry relay via X-Forward-To, defeating multi-hop privacy.  We
+    // used to do that implicitly when the onion pubkey wasn't cached;
+    // now we refuse the fallback entirely, trigger a pubkey refresh,
+    // and surface the situation to the caller.  The envelope stays in
+    // the retry queue pending the refresh — the next send will onion-
+    // wrap properly.
+    emitStatus("multi-hop send deferred — entry relay X25519 pubkey not cached yet");
+    P2P_WARN("[Relay] refusing /v1/forward fallback for " << baseOf(viaRelay)
+              << " — pubkey not cached (M4)");
+    if (cb) {
+        IHttpClient::Response r;
+        r.status = 0;
+        r.error  = "entry relay pubkey not cached; retry after refreshRelayInfo";
+        cb(r);
     }
     const_cast<RelayClient*>(this)->refreshRelayInfo();
 }

@@ -52,8 +52,11 @@ public:
 
 private:
     // Encrypt/decrypt a BLOB using XChaCha20-Poly1305 and m_storeKey.
-    Bytes encryptBlob(const Bytes& plaintext) const;
-    Bytes decryptBlob(const Bytes& ciphertext) const;
+    // AAD (M1 audit-#2 fix) binds the row identity into the tag —
+    // callers supply a stable string per logical slot (see the static
+    // sessionAad() / handshakeAad() helpers in SessionStore.cpp).
+    Bytes encryptBlob(const Bytes& plaintext, const std::string& aad) const;
+    Bytes decryptBlob(const Bytes& ciphertext, const std::string& aad) const;
 
     SqlCipherDb& m_db;
     Bytes        m_storeKey; // 32-byte at-rest encryption key; zeroed in destructor

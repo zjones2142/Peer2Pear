@@ -258,6 +258,41 @@ TEST(CryptoEngine, HkdfDifferentSaltProducesDifferentOutput) {
     EXPECT_NE(a, b);
 }
 
+// ── 6d. HKDF KAT: locks the "info || 0x01" counter byte ──────────────────
+// PROTOCOL.md §10.2 specifies HKDF-BLAKE2b as:
+//   PRK = BLAKE2b-256(key=salt, input=ikm)
+//   out = BLAKE2b-L(key=PRK, input=info || 0x01)
+// Third-party implementations MUST reproduce this byte-for-byte.  This
+// test pins the construction: a hand-computed PRK and Expand run against
+// libsodium's raw crypto_generichash, compared against what CryptoEngine
+// produces.  A refactor that drops the 0x01 counter (or changes the
+// length of PRK) would break this KAT loudly.
+
+TEST(CryptoEngine, HkdfMatchesSpecifiedConstruction) {
+    const Bytes ikm  = bytesOf("the input key material");
+    const Bytes salt = bytesOf("a-salt");
+    const Bytes info = bytesOf("label");
+
+    // Manual compute PRK = BLAKE2b-256(key=salt, ikm).
+    unsigned char prk[32];
+    ASSERT_EQ(0, crypto_generichash(prk, sizeof(prk),
+                                     ikm.data(), ikm.size(),
+                                     salt.data(), salt.size()));
+
+    // Manual compute out = BLAKE2b-32(key=PRK, input=info || 0x01).
+    Bytes expandInput = info;
+    expandInput.push_back(0x01);
+    unsigned char expected[32];
+    ASSERT_EQ(0, crypto_generichash(expected, sizeof(expected),
+                                     expandInput.data(), expandInput.size(),
+                                     prk, sizeof(prk)));
+
+    const Bytes got = CryptoEngine::hkdf(ikm, salt, info, 32);
+    ASSERT_EQ(got.size(), 32u);
+    EXPECT_EQ(Bytes(expected, expected + 32), got)
+        << "HKDF-BLAKE2b construction diverged from PROTOCOL.md §10.2";
+}
+
 // ── 7. ML-KEM-768 encaps / decaps round-trip ──────────────────────────────
 
 TEST(CryptoEngine, MlKem768EncapsDecapsRoundTrip) {

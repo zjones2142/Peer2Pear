@@ -173,6 +173,7 @@ void ChatController::runMaintenance()
 {
     // H3 fix: reset per-sender rate limit counters
     m_envelopeCount.clear();
+    m_fileRequestCount.clear();  // H3 audit-#2 fix: same poll-reset model
 
     // Purge stale incomplete transfers
     m_fileMgr.purgeStaleTransfers();
@@ -1241,18 +1242,33 @@ void ChatController::onEnvelope(const Bytes& body)
         } else if (type == "group_msg") {
             if (!msgId.empty() && !markSeen(msgId)) return;
 
-            // G5 fix: sequence gap detection
+            // G5 fix: sequence gap detection + L3 audit-#2 fix: reject
+            // regressions.  Before L3, seq <= last_seen was silently
+            // accepted — a relay that captured an old group_msg could
+            // replay it after the msgId LRU evicted the original, and
+            // the receiver would fire onGroupMessageReceived again.
+            // Now any non-monotonic seq from a given (group, sender)
+            // is dropped loudly.
             const std::string gid = o.value("groupId", std::string());
             if (o.contains("seq")) {
                 const int64_t seq = o.value("seq", int64_t(0));
                 const std::string seqKey = gid + ":" + senderId;
                 auto sit = m_groupSeqIn.find(seqKey);
                 if (sit != m_groupSeqIn.end()) {
-                    const int64_t expected = sit->second + 1;
-                    if (seq > expected)
+                    const int64_t lastSeen = sit->second;
+                    if (seq <= lastSeen) {
+                        P2P_WARN("[GROUP] dropping non-monotonic seq from "
+                                 << senderId.substr(0, 8) << "... in "
+                                 << gid.substr(0, 8) << "... (got " << seq
+                                 << ", last " << lastSeen << ") — L3 replay guard");
+                        return;
+                    }
+                    const int64_t expected = lastSeen + 1;
+                    if (seq > expected) {
                         P2P_WARN("[GROUP] seq gap from " << senderId.substr(0, 8) << "..."
                                    << " in " << gid.substr(0, 8) << "..."
                                    << " expected " << expected << " got " << seq);
+                    }
                 }
                 m_groupSeqIn[seqKey] = seq;
             }
@@ -1267,6 +1283,19 @@ void ChatController::onEnvelope(const Bytes& body)
             // truth because the message is already authenticated.  We still
             // require sender ∈ members to avoid rogue "I'm messaging this
             // group but I'm not in it" bootstraps.
+            //
+            // H5 audit-#2 KNOWN LIMITATION: first-mover attack.  An
+            // attacker who learns a groupId (e.g. by observing a shared
+            // invite link) can race a legit sender by sending a
+            // group_msg with themselves in the roster *before* the
+            // legitimate creator's first message lands.  We accept the
+            // first plausible roster and subsequent messages layer on
+            // top.  The proper fix is a creator-signed genesis message
+            // + signed invite chain (Sender Keys / MLS style — listed
+            // under §11 Future extensions in PROTOCOL.md).  Mitigation
+            // in the meantime: the UI should call setKnownGroupMembers()
+            // on startup from its own persisted roster, which beats the
+            // bootstrap path (isAuthorizedGroupSender checks that set).
             if (!gid.empty() && !senderId.empty()) {
                 auto gmit = m_groupMembers.find(gid);
                 if (gmit == m_groupMembers.end()) {
@@ -1498,6 +1527,26 @@ void ChatController::onEnvelope(const Bytes& body)
                     return;
                 }
 
+                // H4 audit-#2 fix: cap the pending-incoming queue so a
+                // flood of file_key messages in the prompt-size range
+                // can't exhaust memory.  Drops the oldest entry (and
+                // zeroes its stashed file key) when the cap is hit; in
+                // practice the user's UI surface is already overloaded
+                // long before this bound.
+                if (m_pendingIncomingFiles.size() >= kMaxPendingIncomingFiles) {
+                    auto oldest = m_pendingIncomingFiles.begin();
+                    for (auto it = m_pendingIncomingFiles.begin();
+                         it != m_pendingIncomingFiles.end(); ++it) {
+                        if (it->second.announcedSecs < oldest->second.announcedSecs)
+                            oldest = it;
+                    }
+                    sodium_memzero(oldest->second.fileKey.data(),
+                                   oldest->second.fileKey.size());
+                    P2P_WARN("[FILE] pending-incoming cap hit — evicting "
+                             << oldest->first.substr(0, 8) << "... to make room");
+                    m_pendingIncomingFiles.erase(oldest);
+                }
+
                 PendingIncoming p;
                 p.peerId         = senderId;
                 p.fileName       = fileName;
@@ -1575,6 +1624,32 @@ void ChatController::onEnvelope(const Bytes& body)
             const std::string transferId = o.value("transferId", std::string());
             const bool hasChunks = o.contains("chunks") && o["chunks"].is_array();
             if (transferId.empty() || !hasChunks || o["chunks"].empty()) return;
+
+            // H3 audit-#2 fix: cap chunk-index arrays + rate-limit per
+            // peer.  Before the cap, a malicious peer could request
+            // thousands of chunks in a single message and force N disk
+            // reads + AEAD encryptions.  Both bounds are conservative
+            // ceilings — a legitimate resumption after a 100 MB transfer
+            // is ≤ 416 chunks (100 MiB / 240 KiB), and legitimate clients
+            // send file_request at most a few times per session.
+            const size_t kMaxChunksPerRequest = 1024;
+            if (o["chunks"].size() > kMaxChunksPerRequest) {
+                P2P_WARN("[FILE] file_request from " << senderId.substr(0, 8) << "..."
+                           << " has " << int(o["chunks"].size())
+                           << " indices (cap " << int(kMaxChunksPerRequest) << ") — dropping");
+                return;
+            }
+            constexpr int kMaxFileRequestsPerPoll = 4;
+            int& rcount = m_fileRequestCount[senderId];
+            if (++rcount > kMaxFileRequestsPerPoll) {
+                if (rcount == kMaxFileRequestsPerPoll + 1) {
+                    P2P_WARN("[FILE] file_request rate limit hit for "
+                             << senderId.substr(0, 8) << "... — dropping further"
+                             << " requests this cycle");
+                }
+                return;
+            }
+
             std::vector<uint32_t> indices;
             indices.reserve(o["chunks"].size());
             for (const auto& v : o["chunks"]) {

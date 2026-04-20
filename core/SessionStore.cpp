@@ -57,7 +57,19 @@ void SessionStore::createTables() {
 // Blob encryption helpers
 // ---------------------------
 
-SessionStore::Bytes SessionStore::encryptBlob(const Bytes& plaintext) const {
+// M1 audit-#2 fix: both helpers now take a string `aad` that's bound
+// into the AEAD.  Ratchet-session rows encrypt with aad="ratchet|<peer>"
+// and pending-handshake rows with aad="handshake|<peer>|<role>".  An
+// attacker with DB write access can no longer swap encrypted blobs
+// across tables or across peers — the AAD mismatch trips the AEAD tag.
+//
+// Wire-compat: rows encrypted by a pre-M1 build used aad=nullptr, so
+// they fail to decrypt after the upgrade.  Callers see an empty Bytes
+// and treat the session as missing (re-handshake on next send).  Pre-
+// production trade-off documented at the call sites.
+
+SessionStore::Bytes SessionStore::encryptBlob(const Bytes& plaintext,
+                                               const std::string& aad) const {
     if (m_storeKey.size() != 32) return {};  // no valid key — refuse to store plaintext
 
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
@@ -66,18 +78,23 @@ SessionStore::Bytes SessionStore::encryptBlob(const Bytes& plaintext) const {
     Bytes out(sizeof(nonce) + plaintext.size() +
               crypto_aead_xchacha20poly1305_ietf_ABYTES);
     unsigned long long clen = 0;
+    const unsigned char* aadPtr = aad.empty()
+        ? nullptr
+        : reinterpret_cast<const unsigned char*>(aad.data());
     crypto_aead_xchacha20poly1305_ietf_encrypt(
         out.data() + sizeof(nonce), &clen,
         plaintext.data(),
         static_cast<unsigned long long>(plaintext.size()),
-        nullptr, 0, nullptr, nonce,
+        aadPtr, static_cast<unsigned long long>(aad.size()),
+        nullptr, nonce,
         m_storeKey.data());
     std::memcpy(out.data(), nonce, sizeof(nonce));
     out.resize(sizeof(nonce) + clen);
     return out;
 }
 
-SessionStore::Bytes SessionStore::decryptBlob(const Bytes& ciphertext) const {
+SessionStore::Bytes SessionStore::decryptBlob(const Bytes& ciphertext,
+                                               const std::string& aad) const {
     const size_t kMinSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
                             crypto_aead_xchacha20poly1305_ietf_ABYTES;
     if (m_storeKey.size() != 32) return {};     // no valid key — fail safe
@@ -87,17 +104,32 @@ SessionStore::Bytes SessionStore::decryptBlob(const Bytes& ciphertext) const {
     const size_t ctLen = ciphertext.size() - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
     Bytes pt(ctLen - crypto_aead_xchacha20poly1305_ietf_ABYTES);
     unsigned long long plen = 0;
+    const unsigned char* aadPtr = aad.empty()
+        ? nullptr
+        : reinterpret_cast<const unsigned char*>(aad.data());
     if (crypto_aead_xchacha20poly1305_ietf_decrypt(
             pt.data(), &plen,
             nullptr,
             ciphertext.data() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
             static_cast<unsigned long long>(ctLen),
-            nullptr, 0, nonce,
+            aadPtr, static_cast<unsigned long long>(aad.size()),
+            nonce,
             m_storeKey.data()) != 0) {
         return {}; // authentication failed — invalid or old plaintext blob
     }
     pt.resize(plen);
     return pt;
+}
+
+// AAD helpers — keep these byte-identical between encrypt + decrypt
+// call sites.  String format is table|peer_id[|role]; role is folded
+// into the pending-handshake AAD so a row swap between roles (initiator
+// vs responder) also trips the tag.
+static std::string sessionAad(const std::string& peerId) {
+    return "ratchet_session|" + peerId;
+}
+static std::string handshakeAad(const std::string& peerId, int role) {
+    return "pending_handshake|" + peerId + "|" + std::to_string(role);
 }
 
 // ---------------------------
@@ -113,7 +145,7 @@ void SessionStore::saveSession(const std::string& peerId, const Bytes& stateBlob
         " ON CONFLICT(peer_id) DO UPDATE SET state_blob=excluded.state_blob, updated_at=excluded.updated_at;"
     );
     q.bindValue(":pid", peerId);
-    q.bindValue(":blob", encryptBlob(stateBlob));
+    q.bindValue(":blob", encryptBlob(stateBlob, sessionAad(peerId)));
     q.bindValue(":now", now);
     if (!q.exec())
         P2P_WARN("SessionStore::saveSession: " << q.lastError());
@@ -123,7 +155,7 @@ SessionStore::Bytes SessionStore::loadSession(const std::string& peerId) const {
     SqlCipherQuery q(m_db.handle());
     q.prepare("SELECT state_blob FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
-    if (q.exec() && q.next()) return decryptBlob(q.valueBlob(0));
+    if (q.exec() && q.next()) return decryptBlob(q.valueBlob(0), sessionAad(peerId));
     return {};
 }
 
@@ -162,7 +194,7 @@ void SessionStore::savePendingHandshake(const std::string& peerId, int role,
     );
     q.bindValue(":pid", peerId);
     q.bindValue(":role", role);
-    q.bindValue(":blob", encryptBlob(handshakeBlob));
+    q.bindValue(":blob", encryptBlob(handshakeBlob, handshakeAad(peerId, role)));
     q.bindValue(":now", now);
     if (!q.exec())
         P2P_WARN("SessionStore::savePendingHandshake: " << q.lastError());
@@ -175,7 +207,9 @@ SessionStore::Bytes SessionStore::loadPendingHandshake(const std::string& peerId
     q.bindValue(":pid", peerId);
     if (q.exec() && q.next()) {
         roleOut = q.valueInt(0);
-        return decryptBlob(q.valueBlob(1));
+        // AAD includes role so a blob swap between initiator/responder
+        // rows also trips the tag.
+        return decryptBlob(q.valueBlob(1), handshakeAad(peerId, roleOut));
     }
     return {};
 }

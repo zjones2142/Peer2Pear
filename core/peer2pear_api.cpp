@@ -175,27 +175,18 @@ private:
 // timers spawn a worker thread per timer that sleeps until the deadline (or
 // a cancellation signal arrives) and then fires the callback.
 //
-// **Threading caveat:** callbacks fire on the timer's worker thread, not on
-// any host main thread.  ChatController's maintenance routine (the only
-// internal user) reads/writes m_envelopeCount, m_handshakeFailCount, etc.
-// while the relay's WebSocket callbacks may also be touching them on
-// whatever thread the host's WS impl runs on.  This is acceptable because:
-//   1. The desktop binary does NOT route through this C API — it uses
-//      QtTimerFactory directly (desktop/QtTimer.hpp), which keeps everything
-//      on the Qt main thread.
-//   2. Mobile hosts (iOS/Android) typically marshal all p2p_* callbacks back
-//      to their main/UI thread before invoking them, so the host's
-//      observable behavior is single-threaded.
-//   3. The internal racy fields (envelope counters, fail counters) are
-//      tolerant of dirty reads — worst case is a missed reset cycle.
-//
-// Phase 8 will likely add a host-provided "post to event loop" hook so
-// callbacks are guaranteed to fire on a known thread.  For now, this is
-// good enough to get iOS linking and running smoke tests.
+// C2 audit-#2 fix: every p2p_* entry point and every timer callback
+// serializes on p2p_context::ctrlMu (see p2p_guard below), so the host's
+// WS/HTTP callbacks and the maintenance timer can't race on ChatController
+// state.  The factory threads themselves still run in parallel — they just
+// take the lock before invoking the user's lambda, which is where the data
+// race lived.
 
 class StdTimer : public ITimer {
 public:
-    StdTimer() = default;
+    // ctrlMu must outlive every callback we fire.  In practice the
+    // p2p_context owns both this timer and the mutex, destroyed together.
+    explicit StdTimer(std::mutex* ctrlMu) : m_ctrlMu(ctrlMu) {}
     ~StdTimer() override { cancelAndJoin(); }
 
     StdTimer(const StdTimer&) = delete;
@@ -208,18 +199,24 @@ public:
             m_canceled = false;
             m_active = true;
         }
-        m_thread = std::thread([this, delayMs, cb = std::move(cb)]() {
+        auto* ctrlMu = m_ctrlMu;
+        m_thread = std::thread([this, delayMs, ctrlMu, cb = std::move(cb)]() {
             std::unique_lock<std::mutex> lk(m_mu);
-            // wait_for(predicate) returns true if the predicate became true,
-            // false if the timeout elapsed without it.  We want to fire on
-            // timeout, skip on cancel.
             const bool gotCancel = m_cv.wait_for(
                 lk, std::chrono::milliseconds(delayMs),
                 [this] { return m_canceled; });
             const bool fire = !gotCancel;
             m_active = false;
             lk.unlock();
-            if (fire && cb) cb();
+            if (fire && cb) {
+                // Serialize with p2p_* entry points (C2 audit fix).
+                if (ctrlMu) {
+                    std::lock_guard<std::mutex> cg(*ctrlMu);
+                    cb();
+                } else {
+                    cb();
+                }
+            }
         });
     }
 
@@ -245,23 +242,94 @@ private:
     bool                    m_canceled = false;
     bool                    m_active   = false;
     std::thread             m_thread;
+    std::mutex*             m_ctrlMu   = nullptr;
 };
 
 class StdTimerFactory : public ITimerFactory {
 public:
-    std::unique_ptr<ITimer> create() override { return std::make_unique<StdTimer>(); }
-    void singleShot(int delayMs, std::function<void()> cb) override {
-        // Fire-and-forget detached worker.  Same threading caveat as StdTimer.
-        std::thread([delayMs, cb = std::move(cb)]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
-            if (cb) cb();
-        }).detach();
+    explicit StdTimerFactory(std::mutex* ctrlMu) : m_ctrlMu(ctrlMu) {}
+
+    ~StdTimerFactory() override { shutdown(); }
+
+    // Drain any still-pending singleShot worker threads.  MUST be called
+    // by p2p_destroy BEFORE tearing down the ChatController — otherwise a
+    // cb mid-execution can dereference the already-destroyed controller
+    // (the cb captured references to it).  Idempotent.
+    void shutdown() {
+        std::vector<std::thread> pending;
+        {
+            std::lock_guard<std::mutex> lk(m_bagMu);
+            if (m_shuttingDown) return;
+            m_shuttingDown = true;
+            pending.swap(m_bag);
+        }
+        for (auto& t : pending) {
+            if (t.joinable()) t.join();
+        }
     }
+
+    std::unique_ptr<ITimer> create() override {
+        return std::make_unique<StdTimer>(m_ctrlMu);
+    }
+
+    void singleShot(int delayMs, std::function<void()> cb) override {
+        auto* ctrlMu = m_ctrlMu;
+        auto* self = this;
+        std::thread t([self, delayMs, ctrlMu, cb = std::move(cb)]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            if (!cb) return;
+            // If the factory is being torn down by now, the p2p_context
+            // is mid-destruction — skip the callback; the shutdown path
+            // will join this thread.
+            {
+                std::lock_guard<std::mutex> lk(self->m_bagMu);
+                if (self->m_shuttingDown) return;
+            }
+            if (ctrlMu) {
+                std::lock_guard<std::mutex> cg(*ctrlMu);
+                cb();
+            } else {
+                cb();
+            }
+        });
+        // Stash the handle so the dtor can join it.  The bag grows for
+        // the session lifetime (bounded by call count — jitter timers
+        // etc.); process teardown drains it.  A more aggressive GC could
+        // track "done" flags per thread, but the simplest-correct shape
+        // is to just keep handles until shutdown.
+        std::lock_guard<std::mutex> lk(m_bagMu);
+        if (m_shuttingDown) {
+            // Racing with destruction — detach and let the thread's own
+            // m_shuttingDown re-check skip the cb.
+            t.detach();
+        } else {
+            m_bag.push_back(std::move(t));
+        }
+    }
+
+private:
+    std::mutex*              m_ctrlMu = nullptr;
+    std::mutex               m_bagMu;
+    std::vector<std::thread> m_bag;
+    bool                     m_shuttingDown = false;
 };
 
 // ── p2p_context: the opaque handle ──────────────────────────────────────────
 
 struct p2p_context {
+    // C2 audit-#2 fix: every p2p_* entry point (and every timer callback)
+    // takes this mutex before touching controller / ws / http / cb.  This
+    // serializes the maintenance timer against the host's WS/HTTP
+    // callbacks — they used to race on ChatController state (fields like
+    // m_envelopeCount, m_fileKeys, m_pendingIncomingFiles, m_sessionStore)
+    // because the timer fired on its own worker thread.
+    //
+    // Mutex MUST be declared before timers/controller so it outlives any
+    // callback thread they spawn: C++ destroys members in reverse order,
+    // so the timers / controller tear down first and their worker threads
+    // join while ctrlMu is still alive.
+    std::mutex        ctrlMu;
+
     CWebSocket        ws;
     CHttpClient       http;
     StdTimerFactory   timers;
@@ -315,9 +383,14 @@ struct p2p_context {
     p2p_context(p2p_platform platform)
         : ws(platform)
         , http(platform)
+        , timers(&ctrlMu)
         , controller(ws, http, timers)
     {}
 };
+
+// Scope guard for C2: serializes every public p2p_* entry point.
+// Recursive is overkill (we never re-enter), plain lock_guard suffices.
+#define P2P_CTX_GUARD(ctx) std::lock_guard<std::mutex> _p2p_lock((ctx)->ctrlMu)
 
 // ── Helper: assign ChatController callbacks → C FFI callbacks ──────────────
 //
@@ -433,15 +506,24 @@ p2p_context* p2p_create(const char* data_dir, p2p_platform platform)
 
 void p2p_destroy(p2p_context* ctx)
 {
-    if (ctx) {
+    if (!ctx) return;
+    // C2 audit-#2 fix: drain timer worker threads *before* any other
+    // teardown.  A still-running singleShot cb holds captured references
+    // into ChatController; destroying it first would UAF.  Everything
+    // below runs under the ctrlMu so we serialize with any host-driven
+    // p2p_* entry points that might still be in flight.
+    ctx->timers.shutdown();
+    {
+        std::lock_guard<std::mutex> lk(ctx->ctrlMu);
         ctx->controller.disconnectFromRelay();
-        delete ctx;
     }
+    delete ctx;
 }
 
 void p2p_set_passphrase(p2p_context* ctx, const char* passphrase)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     // M2 audit fix (2026-04-19): keep the passphrase copy in a named local
     // so we can zero it on the way out.  Previously an implicit std::string
     // temporary was created on-the-fly and destructed with the passphrase
@@ -461,6 +543,7 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
     // 1-char passphrase via a misconfigured FFI caller.
     if (std::strlen(passphrase) < P2P_MIN_PASSPHRASE_BYTES) return -1;
     if (ctx->dataDir.empty()) return -1;
+    P2P_CTX_GUARD(ctx);
 
     namespace fs = std::filesystem;
     const std::string keysDir = ctx->dataDir + "/keys";
@@ -512,6 +595,7 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
 const char* p2p_my_id(p2p_context* ctx)
 {
     if (!ctx) return "";
+    P2P_CTX_GUARD(ctx);
     ctx->scratch = ctx->controller.myIdB64u();
     return ctx->scratch.c_str();
 }
@@ -519,22 +603,28 @@ const char* p2p_my_id(p2p_context* ctx)
 void p2p_set_relay_url(p2p_context* ctx, const char* url)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->controller.setRelayUrl(url ? url : "");
 }
 
 void p2p_connect(p2p_context* ctx)
 {
-    if (ctx) ctx->controller.connectToRelay();
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.connectToRelay();
 }
 
 void p2p_disconnect(p2p_context* ctx)
 {
-    if (ctx) ctx->controller.disconnectFromRelay();
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.disconnectFromRelay();
 }
 
 int p2p_send_text(p2p_context* ctx, const char* peer_id, const char* text)
 {
     if (!ctx || !peer_id || !text) return -1;
+    P2P_CTX_GUARD(ctx);
     ctx->controller.sendText(peer_id, text);
     return 0;
 }
@@ -546,6 +636,7 @@ int p2p_send_group_text(p2p_context* ctx,
                         const char* text)
 {
     if (!ctx || !group_id || !text || !member_ids) return -1;
+    P2P_CTX_GUARD(ctx);
     std::vector<std::string> members;
     for (const char** p = member_ids; *p; ++p)
         members.emplace_back(*p);
@@ -562,6 +653,7 @@ const char* p2p_send_file(p2p_context* ctx,
                           const char* file_path)
 {
     if (!ctx || !peer_id || !file_name || !file_path) return nullptr;
+    P2P_CTX_GUARD(ctx);
     std::string tid = ctx->controller.sendFile(peer_id, file_name, file_path);
     if (tid.empty()) return nullptr;
     ctx->scratch = std::move(tid);
@@ -576,6 +668,7 @@ void p2p_respond_file_request(p2p_context* ctx,
                               int require_p2p)
 {
     if (!ctx || !transfer_id) return;
+    P2P_CTX_GUARD(ctx);
     const std::string tid = transfer_id;
     if (accept) {
         ctx->controller.acceptFileTransfer(tid, require_p2p != 0);
@@ -587,27 +680,35 @@ void p2p_respond_file_request(p2p_context* ctx,
 void p2p_cancel_transfer(p2p_context* ctx, const char* transfer_id)
 {
     if (!ctx || !transfer_id) return;
+    P2P_CTX_GUARD(ctx);
     ctx->controller.cancelFileTransfer(transfer_id);
 }
 
 void p2p_set_file_auto_accept_mb(p2p_context* ctx, int mb)
 {
-    if (ctx) ctx->controller.setFileAutoAcceptMaxMB(mb);
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.setFileAutoAcceptMaxMB(mb);
 }
 
 void p2p_set_file_hard_max_mb(p2p_context* ctx, int mb)
 {
-    if (ctx) ctx->controller.setFileHardMaxMB(mb);
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.setFileHardMaxMB(mb);
 }
 
 void p2p_set_file_require_p2p(p2p_context* ctx, int enabled)
 {
-    if (ctx) ctx->controller.setFileRequireP2P(enabled != 0);
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.setFileRequireP2P(enabled != 0);
 }
 
 void p2p_check_presence(p2p_context* ctx, const char** peer_ids, int count)
 {
     if (!ctx || !peer_ids) return;
+    P2P_CTX_GUARD(ctx);
     std::vector<std::string> ids;
     ids.reserve(count);
     for (int i = 0; i < count; i++)
@@ -618,6 +719,7 @@ void p2p_check_presence(p2p_context* ctx, const char** peer_ids, int count)
 void p2p_subscribe_presence(p2p_context* ctx, const char** peer_ids, int count)
 {
     if (!ctx || !peer_ids) return;
+    P2P_CTX_GUARD(ctx);
     std::vector<std::string> ids;
     ids.reserve(count);
     for (int i = 0; i < count; i++)
@@ -628,12 +730,14 @@ void p2p_subscribe_presence(p2p_context* ctx, const char** peer_ids, int count)
 void p2p_add_send_relay(p2p_context* ctx, const char* url)
 {
     if (!ctx || !url) return;
+    P2P_CTX_GUARD(ctx);
     ctx->controller.relay().addSendRelay(url ? std::string(url) : std::string());
 }
 
 void p2p_set_privacy_level(p2p_context* ctx, int level)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->controller.relay().setPrivacyLevel(level);
 }
 
@@ -641,17 +745,23 @@ void p2p_set_privacy_level(p2p_context* ctx, int level)
 
 void p2p_ws_on_connected(p2p_context* ctx)
 {
-    if (ctx && ctx->ws.onConnected) ctx->ws.onConnected();
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    if (ctx->ws.onConnected) ctx->ws.onConnected();
 }
 
 void p2p_ws_on_disconnected(p2p_context* ctx)
 {
-    if (ctx && ctx->ws.onDisconnected) ctx->ws.onDisconnected();
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    if (ctx->ws.onDisconnected) ctx->ws.onDisconnected();
 }
 
 void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len)
 {
-    if (ctx && ctx->ws.onBinaryMessage) {
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    if (ctx->ws.onBinaryMessage) {
         IWebSocket::Bytes buf(data, data + len);
         ctx->ws.onBinaryMessage(buf);
     }
@@ -659,7 +769,9 @@ void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len)
 
 void p2p_ws_on_text(p2p_context* ctx, const char* message)
 {
-    if (ctx && ctx->ws.onTextMessage)
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    if (ctx->ws.onTextMessage)
         ctx->ws.onTextMessage(message ? std::string(message) : std::string());
 }
 
@@ -667,8 +779,9 @@ void p2p_http_response(p2p_context* ctx, int request_id,
                        int status, const uint8_t* body, int body_len,
                        const char* error)
 {
-    if (ctx)
-        ctx->http.onResponse(request_id, status, body, body_len, error);
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->http.onResponse(request_id, status, body, body_len, error);
 }
 
 // ── Event callback setters ──────────────────────────────────────────────────
@@ -677,6 +790,7 @@ void p2p_set_on_status(p2p_context* ctx,
     void (*cb)(const char*, void*), void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_status = cb;
     ctx->cb.status_ud = ud;
 }
@@ -685,6 +799,7 @@ void p2p_set_on_connected(p2p_context* ctx,
     void (*cb)(void*), void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_connected = cb;
     ctx->cb.connected_ud = ud;
 }
@@ -694,6 +809,7 @@ void p2p_set_on_message(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_message = cb;
     ctx->cb.message_ud = ud;
 }
@@ -704,6 +820,7 @@ void p2p_set_on_group_message(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_group_message = cb;
     ctx->cb.group_message_ud = ud;
 }
@@ -712,6 +829,7 @@ void p2p_set_on_presence(p2p_context* ctx,
     void (*cb)(const char*, int, void*), void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_presence = cb;
     ctx->cb.presence_ud = ud;
 }
@@ -722,6 +840,7 @@ void p2p_set_on_file_progress(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_file_progress = cb;
     ctx->cb.file_progress_ud = ud;
 }
@@ -731,6 +850,7 @@ void p2p_set_on_avatar(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_avatar = cb;
     ctx->cb.avatar_ud = ud;
 }
@@ -740,6 +860,7 @@ void p2p_set_on_file_request(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_file_request    = cb;
     ctx->cb.file_request_ud    = ud;
 }
@@ -749,6 +870,7 @@ void p2p_set_on_file_canceled(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_file_canceled    = cb;
     ctx->cb.file_canceled_ud    = ud;
 }
@@ -758,6 +880,7 @@ void p2p_set_on_file_delivered(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_file_delivered    = cb;
     ctx->cb.file_delivered_ud    = ud;
 }
@@ -767,6 +890,7 @@ void p2p_set_on_file_blocked(p2p_context* ctx,
     void* ud)
 {
     if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
     ctx->cb.on_file_blocked    = cb;
     ctx->cb.file_blocked_ud    = ud;
 }

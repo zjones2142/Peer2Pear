@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -56,6 +57,13 @@ const (
 
 	// H4: max peer IDs a single peer can subscribe to for presence
 	maxPresenceSubs = 200
+
+	// L2 audit-#2: per-connection presence_query rate limit.  Window
+	// is generous (1 minute / 60 queries) so a real client's
+	// reconnect-burst sees no friction, but a malicious peer can't
+	// enumerate the social graph at arbitrary speed.
+	presenceQueryWindow     = 60 // seconds
+	maxPresenceQueriesPerWin = 60
 
 	// M5: global max envelopes stored in mailbox
 	maxGlobalEnvelopes = 500_000
@@ -131,6 +139,14 @@ type Peer struct {
 	ID   string
 	Conn *websocket.Conn
 	Send chan []byte // buffered outbound channel
+
+	// L2 audit-#2 fix: per-connection presence-query rate limit.  The
+	// subscription-size cap (maxPresenceSubs = 200) already exists, but
+	// presence_query was frequency-unbounded: an authenticated peer
+	// could hammer arbitrary peer_ids for online status.  Counts reset
+	// each presenceQueryWindow seconds; over the cap → drop silently.
+	presenceQueryCount   int
+	presenceQueryResetAt int64 // unix seconds
 }
 
 // ── Hub: manages all connected peers ─────────────────────────────────────────
@@ -228,23 +244,21 @@ func (h *Hub) unregister(peerID string) {
 }
 
 // deliverOrStore tries WebSocket push first, falls back to mailbox storage.
-// DAITA: adds random jitter before delivery to break timing correlation between
-// "relay received POST from IP X" and "relay pushed to peer Y".
+// DAITA: delivery jitter (see writer goroutine in HandleReceive) breaks
+// the timing correlation between "relay received POST from IP X" and
+// "relay pushed to peer Y".
+//
+// L4 audit-#2 fix: the jitter sleep used to run inline here, blocking
+// the HTTP handler goroutine for up to deliveryJitterMs per request.
+// Under load that multiplied per-goroutine memory.  Jitter has moved
+// to the per-peer writer goroutine, which sleeps before WriteMessage —
+// same wire-level timing, zero cost to handlers.
 func (h *Hub) deliverOrStore(recipientID string, envelope []byte) (delivered bool, err error) {
 	h.mu.RLock()
 	p, online := h.peers[recipientID]
 	h.mu.RUnlock()
 
 	if online {
-		// DAITA: random delivery jitter (0-200ms).
-		// Fix #17: use crypto/rand so the jitter can't be predicted from
-		// observing past samples — delivery-jitter is a timing defense and
-		// math/rand's state can be inferred after a few dozen observations.
-		if deliveryJitterMs > 0 {
-			jn, _ := rand.Int(rand.Reader, big.NewInt(int64(deliveryJitterMs)))
-			jitter := time.Duration(jn.Int64()) * time.Millisecond
-			time.Sleep(jitter)
-		}
 		select {
 		case p.Send <- envelope:
 			return true, nil
@@ -459,19 +473,29 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 	// Send auth confirmation
 	conn.WriteJSON(map[string]any{"type": "auth_ok", "peer_id": peer.ID})
 
-	// Step 4: Start writer goroutine (sends from the Send channel)
+	// Step 4: Start writer goroutine (sends from the Send channel).
+	//
+	// L4 audit-#2: delivery jitter lives here (was inline in
+	// deliverOrStore, blocking HTTP handlers).  Only binary envelopes
+	// get jittered — JSON control frames (presence, pong, etc.) fire
+	// immediately because their timing is not information the relay
+	// operator can correlate to /v1/send traffic.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for msg := range peer.Send {
-			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-
 			// Determine message type: JSON messages start with '{', envelopes start with 0x01
 			msgType := websocket.BinaryMessage
 			if len(msg) > 0 && msg[0] == '{' {
 				msgType = websocket.TextMessage
 			}
 
+			if msgType == websocket.BinaryMessage && deliveryJitterMs > 0 {
+				jn, _ := rand.Int(rand.Reader, big.NewInt(int64(deliveryJitterMs)))
+				time.Sleep(time.Duration(jn.Int64()) * time.Millisecond)
+			}
+
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := conn.WriteMessage(msgType, msg); err != nil {
 				return
 			}
@@ -535,6 +559,21 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 
 		switch msg["type"] {
 		case "presence_query":
+			// L2 audit-#2 fix: cap query frequency per connection.  The
+			// subscription-size cap limits breadth; this bounds depth.
+			now := time.Now().Unix()
+			if now >= peer.presenceQueryResetAt {
+				peer.presenceQueryCount = 0
+				peer.presenceQueryResetAt = now + presenceQueryWindow
+			}
+			peer.presenceQueryCount++
+			if peer.presenceQueryCount > maxPresenceQueriesPerWin {
+				if peer.presenceQueryCount == maxPresenceQueriesPerWin+1 {
+					log.Printf("presence query rate limit hit for %s…",
+						truncID(peer.ID))
+				}
+				continue
+			}
 			peerIDs := toStringSlice(msg["peer_ids"])
 			results := make(map[string]bool, len(peerIDs))
 			h.mu.RLock()
@@ -626,8 +665,11 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Forward to the target relay's /v1/send
-	client := &http.Client{Timeout: forwardTimeout}
+	// Forward to the target relay's /v1/send.  M8 audit-#2: the custom
+	// dialer re-validates every resolved IP at connect time, so DNS
+	// rebinding between our pre-check and the actual Post can't land
+	// the request on a loopback/private address.
+	client := safeForwardClient()
 	url := fmt.Sprintf("https://%s/v1/send", forwardTo)
 	resp, err := client.Post(url, "application/octet-stream",
 		io.NopCloser(strings.NewReader(string(body))))
@@ -646,9 +688,38 @@ func (h *Hub) HandleForward(w http.ResponseWriter, r *http.Request) {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// ipSafe returns ("", true) when ip is a routable public address, or
+// (reason, false) otherwise.  Single source of truth for the SSRF guard —
+// used both by the pre-check in forwardHostSafe and by the custom
+// DialContext that closes the DNS-rebinding TOCTOU (M8 audit-#2).
+func ipSafe(ip net.IP) (string, bool) {
+	if ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified() ||
+		ip.IsInterfaceLocalMulticast() {
+		return fmt.Sprintf("blocked address %s", ip.String()), false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// CGNAT 100.64.0.0/10 — not covered by IsPrivate.
+		if v4[0] == 100 && (v4[1]&0xC0) == 64 {
+			return "CGNAT range blocked", false
+		}
+		// IPv4-mapped IPv6 to loopback (e.g., ::ffff:127.0.0.1).  IsLoopback
+		// on modern Go already catches this, belt-and-braces here.
+		if v4.IsLoopback() {
+			return "ipv4-mapped loopback blocked", false
+		}
+	}
+	return "", true
+}
+
 // Fix #11: SSRF guard.  Parses host[:port], resolves DNS, and rejects any
 // resolved IP that lands in loopback / private / link-local / ULA / CGNAT.
 // Returns (reason, true=safe).
+//
+// NOTE: this is a PRE-check — between this call and the HTTP Post, DNS
+// could rebind (M8 audit-#2).  `safeForwardClient` installs a custom
+// DialContext that re-validates at connect time, closing the window.
 func forwardHostSafe(forwardTo string) (string, bool) {
 	// Split host[:port].  If no port, treat the whole thing as host.
 	host, _, err := net.SplitHostPort(forwardTo)
@@ -675,26 +746,72 @@ func forwardHostSafe(forwardTo string) (string, bool) {
 	}
 
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsPrivate() ||
-			ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-			ip.IsMulticast() || ip.IsUnspecified() ||
-			ip.IsInterfaceLocalMulticast() {
-			return fmt.Sprintf("blocked address %s", ip.String()), false
-		}
-		// CGNAT 100.64.0.0/10 — not covered by IsPrivate.
-		if v4 := ip.To4(); v4 != nil {
-			if v4[0] == 100 && (v4[1]&0xC0) == 64 {
-				return "CGNAT range blocked", false
-			}
-		}
-		// Reject IPv4-mapped IPv6 to loopback/private (e.g., ::ffff:127.0.0.1)
-		// — IsLoopback/IsPrivate already catches these on modern Go, but
-		// an explicit belt-and-braces.
-		if v4 := ip.To4(); v4 != nil && v4.IsLoopback() {
-			return "ipv4-mapped loopback blocked", false
+		if reason, ok := ipSafe(ip); !ok {
+			return reason, false
 		}
 	}
 	return "", true
+}
+
+// safeForwardClient returns an http.Client whose DialContext re-resolves
+// the destination host itself and verifies every candidate IP against
+// ipSafe() *before* connecting.  This closes the DNS-rebinding TOCTOU
+// that M8 flagged: forwardHostSafe resolved + validated, but the default
+// http client then resolved again at connect time and could land on a
+// different (now-malicious) IP.
+//
+// Connects to the resolved IP directly (not the hostname) so the OS
+// resolver is never consulted twice.  If the URL supplies a bare IP we
+// skip resolution entirely.
+func safeForwardClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout: forwardTimeout,
+	}
+	return &http.Client{
+		Timeout: forwardTimeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+
+				// If addr already contains an IP literal, use it directly;
+				// otherwise resolve now.
+				var candidates []net.IP
+				if ip := net.ParseIP(host); ip != nil {
+					candidates = []net.IP{ip}
+				} else {
+					resolved, err := (&net.Resolver{}).LookupIPAddr(ctx, host)
+					if err != nil {
+						return nil, err
+					}
+					candidates = make([]net.IP, 0, len(resolved))
+					for _, r := range resolved {
+						candidates = append(candidates, r.IP)
+					}
+				}
+
+				var lastErr error
+				for _, ip := range candidates {
+					if reason, ok := ipSafe(ip); !ok {
+						lastErr = fmt.Errorf("SSRF: %s", reason)
+						continue
+					}
+					conn, err := dialer.DialContext(ctx, network,
+						net.JoinHostPort(ip.String(), port))
+					if err == nil {
+						return conn, nil
+					}
+					lastErr = err
+				}
+				if lastErr == nil {
+					lastErr = fmt.Errorf("no safe IP for %s", host)
+				}
+				return nil, lastErr
+			},
+		},
+	}
 }
 
 func parseRecipient(envelope []byte) (string, error) {

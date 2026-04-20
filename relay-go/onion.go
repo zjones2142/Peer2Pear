@@ -183,8 +183,10 @@ func (h *Hub) HandleForwardOnion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Forward the inner blob as raw bytes to the next hop.
-	client := &http.Client{Timeout: forwardTimeout}
+	// Forward the inner blob as raw bytes to the next hop.  M8 audit-#2:
+	// use the TOCTOU-safe client so DNS can't rebind between the SSRF
+	// check above and the actual connect.
+	client := safeForwardClient()
 	resp, err := client.Post(nextHopURL, "application/octet-stream",
 		bytes.NewReader(innerBlob))
 	if err != nil {

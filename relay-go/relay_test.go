@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -564,7 +565,142 @@ func TestHandleSend_RoutesToCorrectRecipient(t *testing.T) {
 	}
 }
 
-// ── 13. /healthz returns 200 + version tag ────────────────────────────
+// ── 13. /v1/forward SSRF pre-check rejects private / loopback hosts ───
+
+func TestHandleForward_RejectsSsrfTargets(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	bob := newTestPeer(t)
+	env := buildEnvelope(bob, 128)
+
+	cases := []struct {
+		name string
+		host string
+	}{
+		{"localhost-name", "localhost:8443"},
+		{"ip6-localhost",  "ip6-localhost:8443"},
+		{"loopback-ip",    "127.0.0.1:8443"},
+		{"private-10",     "10.0.0.1:8443"},
+		{"private-192",    "192.168.1.1:8443"},
+		{"cgnat",          "100.64.0.1:8443"},
+		{"link-local",     "169.254.0.1:8443"},
+		{"ipv6-loopback",  "[::1]:8443"},
+		{"unspecified",    "0.0.0.0:8443"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req, _ := http.NewRequest("POST", r.srv.URL+"/v1/forward",
+				bytes.NewReader(env))
+			req.Header.Set("X-Forward-To", c.host)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("POST: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("status %d for %s, want 403", resp.StatusCode, c.host)
+			}
+		})
+	}
+}
+
+// ── 14. /v1/forward bad-input handling ────────────────────────────────
+
+func TestHandleForward_RejectsBadInputs(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	bob := newTestPeer(t)
+	env := buildEnvelope(bob, 128)
+
+	// Missing X-Forward-To.
+	req, _ := http.NewRequest("POST", r.srv.URL+"/v1/forward", bytes.NewReader(env))
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("no header: status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Header with illegal characters (slash / space).
+	req, _ = http.NewRequest("POST", r.srv.URL+"/v1/forward", bytes.NewReader(env))
+	req.Header.Set("X-Forward-To", "evil.example.com/../admin")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad chars: status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Unresolvable hostname — should 403 via "cannot resolve host".  Use
+	// the RFC 2606 test TLD .invalid which MUST NOT resolve.
+	req, _ = http.NewRequest("POST", r.srv.URL+"/v1/forward", bytes.NewReader(env))
+	req.Header.Set("X-Forward-To", "nonexistent-host-for-tests.invalid:8443")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("unresolvable: status %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// ── 15. M8 audit-#2: safeForwardClient blocks rebinding to loopback ───
+// Even if the pre-check passed (hostname resolves to a public IP), the
+// connect-time dialer re-validates every candidate IP against ipSafe.
+// We force the dialer to see a loopback IP via a synthetic resolver
+// shim (by passing it addr="127.0.0.1:port") and assert it errors out
+// with an SSRF reason.  That's the path an actual DNS rebinding attack
+// would exercise: DNS A record flips to 127.0.0.1 between pre-check
+// and dial.
+
+func TestSafeForwardClient_RefusesLoopbackAtConnect(t *testing.T) {
+	// Spin up a local HTTP server — the DialContext under test must
+	// refuse to connect to 127.0.0.1:* even though the listener is alive.
+	bg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("safeForwardClient connected to loopback — M8 regression")
+	}))
+	defer bg.Close()
+
+	client := safeForwardClient()
+	// http://127.0.0.1:<port>/... should be blocked by the dialer.
+	_, err := client.Get(bg.URL + "/anything")
+	if err == nil {
+		t.Fatalf("GET to loopback succeeded (M8 regression)")
+	}
+	if !strings.Contains(err.Error(), "SSRF") {
+		t.Fatalf("expected SSRF error, got: %v", err)
+	}
+}
+
+// ── 16. ipSafe: rejects every private address family ──────────────────
+
+func TestIpSafe(t *testing.T) {
+	bad := []string{
+		"127.0.0.1",
+		"10.0.0.1",
+		"172.16.0.1",
+		"192.168.1.1",
+		"169.254.0.1",
+		"0.0.0.0",
+		"100.64.0.1",
+		"::1",
+		"fe80::1",
+		"::ffff:127.0.0.1",
+	}
+	good := []string{"1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"}
+	for _, ipStr := range bad {
+		ip := net.ParseIP(ipStr)
+		if _, ok := ipSafe(ip); ok {
+			t.Fatalf("ipSafe(%q) = safe, want unsafe", ipStr)
+		}
+	}
+	for _, ipStr := range good {
+		ip := net.ParseIP(ipStr)
+		if _, ok := ipSafe(ip); !ok {
+			t.Fatalf("ipSafe(%q) = unsafe, want safe", ipStr)
+		}
+	}
+}
+
+// ── 17. /healthz returns 200 + version tag ────────────────────────────
 
 func TestHealthz(t *testing.T) {
 	r := newTestRelay(t)

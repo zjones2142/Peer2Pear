@@ -192,7 +192,16 @@ Any other value MUST cause the unseal to fail.
 ### 3.3 Versions rejected
 
 Envelope versions 0x00 and 0x01 existed in earlier drafts and are now
-REJECTED. They lacked recipient AAD binding and envelope IDs.
+REJECTED at the unseal path — they lacked recipient AAD binding and
+envelope IDs.
+
+Note that the relay layer uses **`0x00` as a wire-internal "dummy"
+marker** for cover traffic: when DAITA is enabled, the relay may push
+random-bytes envelopes with byte[0] = `0x00` as a client-side signal
+("ignore this frame").  Conforming clients MUST discard any binary
+frame whose first byte is `0x00` without attempting to unseal it.
+This reuse is safe because all real sealed envelopes start at `0x02`,
+and the client checks the dummy marker before any cryptographic work.
 
 ---
 
@@ -244,26 +253,51 @@ On connect, the client MUST send a first text frame containing JSON:
 The relay verifies:
 - `|ts - now| < 30_000` (30-second replay window)
 - `sig` validates against `peer_id`
-- `(peer_id, ts)` has not been seen before (bounded LRU)
+- `(peer_id, ts)` has not been seen before (persistent store — survives
+  relay restart within the replay window; audit L4)
 
 On success, the relay:
 
-1. Delivers all stored envelopes for `peer_id` (shuffled, not oldest-first).
-2. Registers the connection as active for `peer_id`.
-3. Thereafter, pushes new envelopes as binary frames as they arrive via
+1. Delivers all stored envelopes for `peer_id` (shuffled, not oldest-first)
+   as binary frames — these MUST arrive **before** the `auth_ok` text
+   frame (audit #2 M3).  Clients MUST be prepared to buffer binary
+   frames from the moment `open()` succeeds; a naive "wait for auth_ok
+   before reading" client would miss the drain.
+2. Sends a confirmation text frame: `{"type":"auth_ok","peer_id":"..."}`.
+3. Registers the connection as active for `peer_id`.
+4. Thereafter, pushes new envelopes as binary frames as they arrive via
    `/v1/send`.
+
+Stored envelopes use a two-phase delivery: the row is marked in-flight
+inside the mailbox when fetched, and only deleted after the WS write
+returns nil.  A crash between those two points leaves the row still
+claimable after `staleDeliveryMarkMs` (60 s), so at-least-once delivery
+survives relay restart at the cost of the client receiving an occasional
+duplicate (which envelope-ID dedup on the client side drops).
 
 The client may send additional frames as JSON messages:
 
 ```json
-{ "type": "presence_query", "peer_ids": ["<id1>", "<id2>"] }
+{ "type": "presence_query",     "peer_ids": ["<id1>", "<id2>"] }
+{ "type": "presence_subscribe", "peer_ids": ["<id1>", "<id2>"] }
 ```
 
-→ Server responds:
+`presence_query` returns a single aggregated result:
 
 ```json
-{ "type": "presence", "peers": { "<id1>": true, "<id2>": false } }
+{ "type": "presence_result", "peers": { "<id1>": true, "<id2>": false } }
 ```
+
+`presence_subscribe` registers the client for push updates; each later
+state change arrives as:
+
+```json
+{ "type": "presence", "peer_id": "<id>", "online": true|false }
+```
+
+Note the two shapes: `presence_result` is the aggregated reply to a
+query, `presence` is an individual push notification.  Subscription
+sizes are capped at 200 peer IDs per connection (audit H4).
 
 No other client-originated frames are defined. Servers MUST reject
 unknown `type`s or garbage frames.
@@ -505,7 +539,38 @@ the future, recovering past session keys requires also breaking ML-KEM-768.
 Sessions are serialized and stored locally. Recommended (not required)
 format: versioned struct containing root key, sending chain, receiving
 chain, skipped message keys, and both peers' identity pubkeys. The
-reference implementation stores sessions in SQLCipher-encrypted rows.
+reference implementation stores sessions in SQLCipher-encrypted rows
+with per-row AEAD AAD = `"ratchet_session|"||peer_id` so a DB-level
+attacker with write access can't swap encrypted blobs between rows.
+Pending-handshake rows use AAD = `"pending_handshake|"||peer_id||"|"||role`.
+
+Ephemeral Noise private keys (`ek` in the Noise IK state) are held
+ONLY in memory between `writeMessage1()` and `readMessage2()`.  If the
+client process crashes mid-handshake, the cached `ek` dies with it and
+the next send restarts a fresh handshake — forward secrecy for the
+discarded handshake is preserved.  (Audit #2 C1.)
+
+### 6.5 Session-layer framing
+
+After sealed-envelope unsealing (§3.2), the innermost byte sequence
+handed to the session layer is a framed Noise/ratchet message.  The
+first byte is the **session-layer type**:
+
+| Byte | Direction | Name | Payload |
+|---|---|---|---|
+| `0x01` | initiator → responder | `PREKEY_MSG`        | `u32 msg1_len‖noise_msg1‖ratchet_dh_pub(32)‖AEAD(prekey_key, initial_payload)` |
+| `0x02` | responder → initiator | `PREKEY_RESPONSE`   | `u32 msg2_len‖noise_msg2` |
+| `0x03` | either                | `RATCHET_MSG`       | `ratchet_header‖AEAD(message_key, plaintext)` |
+| `0x04` | initiator → responder | `HYBRID_PREKEY_MSG` | identical wire to 0x01, negotiates hybrid Noise IK + ratchet |
+| `0x05` | responder → initiator | `HYBRID_PREKEY_RESP`| identical wire to 0x02, confirms hybrid |
+| `0x06` | initiator → responder | `ADDITIONAL_PREKEY` | `u32 counter‖AEAD(hkdf(ck,"prekey-additional-"||counter), payload)`; sent while a pre-key handshake is still pending so the sender can pipeline messages |
+
+The prekey key is `HKDF(ck_after_msg1, salt="prekey-salt",
+info="prekey-payload", 32)`.  Additional-prekey counters are monotonic
+per handshake and MUST be tracked by the responder to reject replays
+(audit #2 H1).  Once the first `RATCHET_MSG` arrives from a peer, the
+responder MUST drop the cached chaining key + consumed-counter set for
+that peer — they're no longer load-bearing.
 
 ---
 
@@ -738,14 +803,23 @@ relay. Falls back to the relay on any failure.
 Three layers of replay protection are REQUIRED:
 
 1. **Envelope-level:** 16-byte `envelope_id` (§3.2) bound into AEAD
-   plaintext. Receivers maintain a bounded LRU of seen IDs.
+   plaintext. Receivers maintain a **persistent** dedup store (the
+   reference impl uses a SQLCipher-backed table with a 30-day TTL) so
+   a relay cannot resurrect replays after the client restarts.  An
+   in-memory LRU in front of the DB is fine as a hot cache.
 2. **Ratchet-level:** the Double Ratchet counters inherently detect
    replays of ratchet ciphertext. Out-of-order messages within a chain
-   are buffered via skipped-message-keys; duplicates are dropped.
-3. **Application-level:** `msgId` field in JSON payloads provides a
+   are buffered via skipped-message-keys; duplicates are dropped.  The
+   cap on skipped keys per chain is 1000 (§6.3 `Max skipped keys`).
+3. **Pre-key counter:** the responder MUST track consumed counters
+   for type `0x06` additional-pre-key messages (§6.5) until the first
+   ratchet message arrives — the key for each counter is deterministic
+   from the chaining key, so replay protection cannot rely on the
+   ratchet chain there (audit #2 H1).
+4. **Application-level:** `msgId` field in JSON payloads provides a
    final dedup point for types that bypass the ratchet (e.g., `file_chunk`).
 
-Implementations MUST apply all three.
+Implementations MUST apply all four.
 
 ---
 

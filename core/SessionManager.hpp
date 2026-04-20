@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,23 @@ private:
     // pre-key messages (type 0x06) that arrived while the handshake was pending.
     // Cleared when the ratchet session receives a normal ratchet message.
     std::map<std::string, Bytes> m_pendingCk;
+
+    // C1 audit-#2 fix: ephemeral DH private keys are held ONLY in memory
+    // between writeMessage1() and readMessage2().  If the process
+    // crashes mid-handshake the key dies with it and forward secrecy is
+    // preserved.  Keyed by peerIdB64u; zeroed + erased on handshake
+    // completion or abandonment.
+    std::map<std::string, Bytes> m_pendingEk;
+
+    // H1 audit-#2 fix: track consumed counters on the responder side for
+    // the additional-pre-key path (type 0x06).  Each counter yields a
+    // deterministic key from the chaining key, so a relay that captures
+    // a 0x06 envelope could otherwise replay it.  Set is cleared when
+    // the first ratchet message arrives from this sender — at that
+    // point m_pendingCk is no longer used for derivation.
+    std::map<std::string, std::set<uint32_t>> m_consumedPreKeyCounters;
+    // Bound per-peer counter set so a malicious flood can't grow memory.
+    static constexpr size_t kMaxPreKeyCounters = 10000;
 
     SendResponseFn m_sendResponse;
 };

@@ -271,3 +271,81 @@ TEST(RatchetSession, MalformedInputRejected) {
         EXPECT_TRUE(p.responder.decrypt(Bytes(n, 0x00)).empty()) << "len=" << n;
     }
 }
+
+// ── 11. H2 audit-#2: all-zeros remote DH pub is rejected ──────────────────
+// Before the fix, a peer (or malicious relay) could substitute an all-
+// zeros remote DH pubkey and force the scalarmult to land on a known
+// shared secret.  initAsInitiator / initAsResponder + dhRatchetStep all
+// get the same check.
+
+TEST(RatchetSession, InitAsInitiatorRejectsAllZeroRemotePub) {
+    const Party alice = makeParty();
+    const Bytes zeros(32, 0x00);
+    const Bytes root  = randomRootKey();
+
+    RatchetSession s = RatchetSession::initAsInitiator(
+        root, zeros, alice.dhPub, alice.dhPriv);
+    EXPECT_FALSE(s.isValid())
+        << "initiator must refuse an all-zeros remote DH public key";
+}
+
+TEST(RatchetSession, InitAsResponderRejectsAllZeroRemotePub) {
+    const Party bob = makeParty();
+    const Bytes zeros(32, 0x00);
+    const Bytes root = randomRootKey();
+
+    RatchetSession s = RatchetSession::initAsResponder(
+        root, bob.dhPub, bob.dhPriv, zeros);
+    EXPECT_FALSE(s.isValid())
+        << "responder must refuse an all-zeros remote DH public key";
+}
+
+TEST(RatchetSession, DhRatchetStepRejectsAllZeroRemotePub) {
+    auto p = makePair();
+
+    // Drive one round-trip so the responder's first DH ratchet step
+    // would fire on the NEXT received message from the initiator — we
+    // synthesize that message with a zeroed dhPub in the header.
+    const Bytes wire = p.initiator.encrypt(bytesOf("hello"));
+    ASSERT_EQ(p.responder.decrypt(wire), bytesOf("hello"));
+
+    // Tamper: set the 32-byte DH pub in the header to all zeros.  The
+    // header layout is dhPub(32) || prevChainLen(4) || msgNum(4) for a
+    // classical envelope.  We encrypt a fresh message, then zero its
+    // dhPub slot before handing to the peer.
+    Bytes tampered = p.initiator.encrypt(bytesOf("second"));
+    ASSERT_GE(tampered.size(), 32u);
+    std::fill(tampered.begin(), tampered.begin() + 32, uint8_t(0x00));
+
+    const Bytes rt = p.responder.decrypt(tampered);
+    EXPECT_TRUE(rt.empty())
+        << "ratchet must refuse to step into an all-zeros remote DH pub";
+}
+
+// ── 12. Max-skip-key exhaustion bounded by kMaxSkipped ───────────────────
+// A hostile peer could claim a message counter far beyond the current
+// chain head to force the receiver to derive thousands of keys in one
+// call.  skipMessageKeys caps the gap at kMaxSkipped (1000) and returns
+// a failure signal — decrypt then returns empty rather than looping.
+
+TEST(RatchetSession, MaxSkipKeysRefusesOverflow) {
+    auto p = makePair();
+
+    // Send one legitimate message to establish the receiver's chain.
+    const Bytes m1 = p.initiator.encrypt(bytesOf("m1"));
+    ASSERT_EQ(p.responder.decrypt(m1), bytesOf("m1"));
+
+    // Fabricate a message claiming a wildly-high counter (kMaxSkipped+500).
+    // Encrypt a real message, then overwrite its msgNum field.  The dhPub
+    // header is identical to m1's (same chain), so the skip path is taken.
+    Bytes bogus = p.initiator.encrypt(bytesOf("bogus"));
+    ASSERT_GE(bogus.size(), 40u);
+    const uint32_t huge = static_cast<uint32_t>(RatchetSession::kMaxSkipped) + 500;
+    bogus[36] = uint8_t((huge >> 24) & 0xFF);
+    bogus[37] = uint8_t((huge >> 16) & 0xFF);
+    bogus[38] = uint8_t((huge >>  8) & 0xFF);
+    bogus[39] = uint8_t( huge        & 0xFF);
+
+    EXPECT_TRUE(p.responder.decrypt(bogus).empty())
+        << "attempting to skip > kMaxSkipped keys must fail closed";
+}

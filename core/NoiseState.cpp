@@ -511,8 +511,17 @@ HandshakeResult NoiseState::finish() {
 Bytes NoiseState::serialize() const {
     p2p::BinaryWriter w;
 
-    // v4: adds hybrid PQ fields. m_sk and m_kemPriv NOT persisted (C3 fix).
-    w.u8(4);                         // version
+    // v5: C1 audit-#2 fix — m_ek (the ephemeral DH private key) is no
+    // longer persisted.  Previously it was written to disk inside the
+    // encrypted pending-handshake blob; recovery of that blob would
+    // expose forward secrecy for the handshake.  We write an empty
+    // Bytes in its slot to preserve the wire shape.  Deserialize
+    // restores empty → readMessage2 fails closed → SessionManager
+    // deletes the pending blob and the next send restarts the
+    // handshake cleanly.
+    //
+    // v4 (prior): m_sk + m_kemPriv not persisted (C3 fix from audit #1).
+    w.u8(5);                         // version
     w.u8(static_cast<uint8_t>(m_role));
     w.boolean(m_complete);
     w.boolean(m_hybrid);
@@ -523,7 +532,7 @@ Bytes NoiseState::serialize() const {
     w.bytes(m_s);
     w.bytes(m_rs);
     w.bytes(m_e);
-    w.bytes(m_ek);
+    w.bytes(Bytes{});                // m_ek — intentionally empty
     w.bytes(m_re);
     w.bytes(m_ckAfterMsg1);
     // v4 PQ fields (may be empty for classical handshakes)
@@ -538,7 +547,7 @@ NoiseState NoiseState::deserialize(const Bytes& data) {
     p2p::BinaryReader r(data);
 
     const uint8_t version = r.u8();
-    if (!r.ok() || version < 1 || version > 4) return ns;
+    if (!r.ok() || version < 1 || version > 5) return ns;
 
     ns.m_role = static_cast<Role>(r.u8());
     ns.m_complete = r.boolean();
@@ -546,6 +555,11 @@ NoiseState NoiseState::deserialize(const Bytes& data) {
     if (version >= 4) {
         ns.m_hybrid = r.boolean();
     }
+
+    // C1 fix (v5): m_ek is intentionally written as empty by v5 encoders,
+    // but a v4 blob from an older install might still carry its bytes.
+    // We read whatever is in the slot and then zero it unconditionally
+    // below so no ephemeral private key survives into the running state.
 
     ns.m_ck = r.bytes();
     ns.m_h  = r.bytes();
@@ -564,7 +578,15 @@ NoiseState NoiseState::deserialize(const Bytes& data) {
     }
 
     ns.m_e  = r.bytes();
-    ns.m_ek = r.bytes();
+    {
+        // Read and immediately discard m_ek from the wire.  v5 encoders
+        // write empty; v4 encoders wrote the real key.  Either way the
+        // deserialized state holds nothing — readMessage2 will fail
+        // closed for any initiator that reloads a pending handshake
+        // across a crash, and SessionManager purges the stale row.
+        Bytes legacyEk = r.bytes();
+        if (!legacyEk.empty()) sodium_memzero(legacyEk.data(), legacyEk.size());
+    }
     ns.m_re = r.bytes();
 
     if (version >= 2) {

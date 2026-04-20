@@ -140,7 +140,10 @@ public:
 
 class SimpleWebSocket : public IWebSocket {
 public:
-    void open(const std::string& /*url*/) override {
+    std::string lastOpenUrl;
+
+    void open(const std::string& url) override {
+        lastOpenUrl = url;
         m_connected = true;
         if (onConnected) onConnected();
     }
@@ -216,4 +219,70 @@ TEST(RelayCoverTraffic, SelfAddressedFallbackWhenNoPeersOnline) {
     // Stop the cover timer so teardown doesn't leave callbacks pending.
     relay.setCoverTrafficInterval(0);
     fs::remove_all(dataDir);
+}
+
+// ── M7 audit-#2: setRelayUrl refuses non-TLS URLs ────────────────────────
+// An http:// or ws:// URL would silently downgrade the transport to
+// cleartext.  Only https:// / wss:// are accepted for production URLs;
+// http:// / ws:// on localhost is tolerated for dev convenience.
+//
+// The observable: connectToRelay() asks the IWebSocket to open the
+// configured URL.  A rejected URL leaves m_relayUrl empty, so ws.open
+// is called with an empty-ish path — we check the scheme on what the
+// ws actually received.
+
+TEST(RelayUrlScheme, RejectsNonTlsUrls) {
+    struct Case { const char* url; bool shouldAccept; };
+    const Case cases[] = {
+        {"https://relay.peer2pear.org",   true },
+        {"wss://relay.peer2pear.org",     true },
+        {"http://relay.peer2pear.org",    false},  // silent downgrade
+        {"ws://relay.peer2pear.org",      false},
+        {"ftp://relay.peer2pear.org",     false},
+        {"http://localhost:8443",         true },  // dev exception
+        {"ws://127.0.0.1:8443",           true },
+    };
+
+    for (const auto& c : cases) {
+        FireableTimerFactory timers;
+        CapturingHttpClient  http;
+        SimpleWebSocket      ws;
+        CryptoEngine         crypto;
+        RelayClient          relay(ws, http, timers, &crypto);
+
+        // Detach the onConnected callback so RelayClient::authenticate()
+        // never runs (it would try to sign with an uninitialised identity
+        // and crash).  We only need to observe the URL passed to open().
+        ws.onConnected = nullptr;
+
+        relay.setRelayUrl(c.url);
+        relay.connectToRelay();
+
+        const bool sawTlsOpen =
+            ws.lastOpenUrl.rfind("wss://",  0) == 0 ||
+            ws.lastOpenUrl.rfind("https://", 0) == 0;
+        const bool sawAnyOpen = !ws.lastOpenUrl.empty();
+        const bool sawDevOpen =
+            ws.lastOpenUrl.rfind("ws://localhost",  0) == 0 ||
+            ws.lastOpenUrl.rfind("ws://127.0.0.1",  0) == 0 ||
+            ws.lastOpenUrl.rfind("http://localhost", 0) == 0;
+
+        if (c.shouldAccept) {
+            EXPECT_TRUE(sawAnyOpen) << "accepted url=\"" << c.url << "\" but WS.open never fired";
+            EXPECT_TRUE(sawTlsOpen || sawDevOpen)
+                << "accepted url=\"" << c.url << "\" produced ws.open(\""
+                << ws.lastOpenUrl << "\")";
+        } else {
+            // A rejected URL leaves m_relayUrl empty.  connectToRelay
+            // would then ws.open("ws:///v1/receive") or similar path-
+            // only garbage — we want NO host in the opened URL.
+            const bool hostlessOrEmpty =
+                ws.lastOpenUrl.empty() ||
+                ws.lastOpenUrl.find("://") == std::string::npos ||
+                ws.lastOpenUrl.find("://relay.peer2pear.org") == std::string::npos;
+            EXPECT_TRUE(hostlessOrEmpty)
+                << "rejected url=\"" << c.url
+                << "\" leaked through to ws.open(\"" << ws.lastOpenUrl << "\")";
+        }
+    }
 }

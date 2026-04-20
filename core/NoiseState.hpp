@@ -119,6 +119,15 @@ public:
     // readMessage2() can decapsulate the KEM ciphertext the responder sent.
     void setKemPrivateKey(const Bytes& kemPriv) { m_kemPriv = kemPriv; }
 
+    // Re-inject the ephemeral DH private key after deserialization.
+    // C1 audit-#2 fix: m_ek is no longer persisted — the serialized blob
+    // would have leaked forward secrecy for any in-progress handshake
+    // recovered from disk.  SessionManager keeps m_ek in a memory-only
+    // side-channel between writeMessage1() and readMessage2(), and
+    // injects it here before processing msg2.  If the caller didn't
+    // stash an ek (e.g. after a crash), readMessage2() fails closed.
+    void setEphemeralPrivateKey(const Bytes& ek) { m_ek = ek; }
+
     Role role() const { return m_role; }
     bool isComplete() const { return m_complete; }
 

@@ -362,3 +362,146 @@ TEST_F(SessionManagerSuite, AdditionalPreKeyMessagesDeliverInOrder) {
     // Then the additional pre-key message (same chaining key, different counter).
     EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, m2), bytesOf("m2"));
 }
+
+// ── 9. H1 audit-#2: replayed additional pre-key (0x06) is rejected ───────
+// Before the fix, the counter-derived key was deterministic and nothing
+// tracked which counters had been consumed — a relay could redeliver a
+// captured 0x06 envelope and it would decrypt + fire the onMessage
+// callback twice.
+
+TEST_F(SessionManagerSuite, AdditionalPreKeyReplayIsRejected) {
+    const Bytes m1 = alice.mgr->encryptForPeer(bob.peerId, bytesOf("first"));
+    const Bytes m2 = alice.mgr->encryptForPeer(bob.peerId, bytesOf("second"));
+    ASSERT_EQ(m2[0], SessionManager::kAdditionalPreKey);
+
+    EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, m1), bytesOf("first"));
+    EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, m2), bytesOf("second"));
+
+    // Relay replays the exact same m2 envelope.  With H1 in place Bob
+    // MUST drop it — the counter is recorded as consumed.
+    EXPECT_TRUE(bob.mgr->decryptFromPeer(alice.peerId, m2).empty())
+        << "replayed additional pre-key must be dropped (H1 regression)";
+}
+
+// ── 10. C1 audit-#2: Noise ephemeral priv doesn't survive to disk ────────
+// After writeMessage1() the sender persists its pending handshake.  The
+// serialized blob MUST NOT contain the ephemeral DH private key.  We
+// deserialize the saved blob and assert the loaded NoiseState's
+// ephemeralPriv() is empty — confirming the key lives only in the
+// in-memory SessionManager side-channel now.
+
+TEST_F(SessionManagerSuite, C1_EphemeralPrivIsNotPersisted) {
+    // Alice kicks off a handshake but Bob never replies.  Alice's
+    // SessionStore now contains a pending_handshakes row for Bob.
+    const Bytes m1 = alice.mgr->encryptForPeer(bob.peerId, bytesOf("hello"));
+    ASSERT_FALSE(m1.empty());
+
+    int role = 0;
+    const Bytes pendingBlob = alice.store->loadPendingHandshake(bob.peerId, role);
+    ASSERT_FALSE(pendingBlob.empty()) << "no pending handshake was written";
+    ASSERT_EQ(role, static_cast<int>(NoiseState::Initiator));
+
+    // Pending blob layout:
+    //   [ratchetDhPub(32)][ratchetDhPriv(32)][ckAfterMsg1(32)]
+    //   [prekeyCounter(4 BE)][noise serialized bytes...]
+    ASSERT_GT(pendingBlob.size(), 100u);
+    const Bytes noiseBlob(pendingBlob.begin() + 100, pendingBlob.end());
+    const NoiseState noise = NoiseState::deserialize(noiseBlob);
+    EXPECT_TRUE(noise.ephemeralPriv().empty())
+        << "NoiseState ephemeralPriv() must be empty after deserialize (C1)";
+}
+
+// ── 11. M1 audit-#2: SessionStore AAD binds the row identity ─────────────
+// If an attacker can swap blobs between peer rows (DB write access), the
+// decrypt must fail.  We install a legitimate session, then manually
+// re-bind its encrypted blob under a different peer_id — loadSession
+// for that peer_id must refuse to decrypt.
+
+TEST_F(SessionManagerSuite, M1_SessionStoreAadRejectsBlobSwap) {
+    // Complete a handshake so Alice's store has one session row for Bob.
+    const Bytes first = alice.mgr->encryptForPeer(bob.peerId, bytesOf("hi"));
+    EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, first), bytesOf("hi"));
+    ASSERT_EQ(bob.outgoing.size(), 1u);
+    (void)alice.mgr->decryptFromPeer(bob.peerId, bob.outgoing[0]);
+    ASSERT_TRUE(alice.mgr->hasSession(bob.peerId));
+
+    // Reach past the SessionStore API to grab the encrypted blob and
+    // re-insert it under a different peer_id (simulating a DB-level
+    // swap).  Use SqlCipherQuery directly against the session table.
+    Bytes blob;
+    {
+        SqlCipherQuery q(*alice.db);
+        ASSERT_TRUE(q.prepare(
+            "SELECT state_blob FROM ratchet_sessions WHERE peer_id=:pid;"));
+        q.bindValue(":pid", bob.peerId);
+        ASSERT_TRUE(q.exec());
+        ASSERT_TRUE(q.next());
+        blob = q.valueBlob(0);
+        ASSERT_FALSE(blob.empty());
+    }
+    const std::string attackerId = "attacker_peer_id_for_swap_test";
+    {
+        SqlCipherQuery ins(*alice.db);
+        ASSERT_TRUE(ins.prepare(
+            "INSERT INTO ratchet_sessions (peer_id, state_blob, created_at, updated_at)"
+            " VALUES (:pid, :blob, :now, :now);"));
+        ins.bindValue(":pid", attackerId);
+        ins.bindValue(":blob", blob);
+        ins.bindValue(":now", int64_t(1234567890));
+        ASSERT_TRUE(ins.exec());
+    }
+
+    // A fresh SessionManager on the same store must refuse to load the
+    // cross-peer blob — the AAD (bound to attackerId) no longer matches.
+    auto fresh = std::make_unique<SessionManager>(*s_aliceCrypto, *alice.store);
+    EXPECT_FALSE(fresh->hasSession(attackerId))
+        << "cross-row blob swap must fail decrypt via AAD mismatch (M1)";
+    // Sanity: the legitimate row under Bob's id still loads.
+    EXPECT_TRUE(fresh->hasSession(bob.peerId));
+}
+
+// ── 12. Noise handshake corruption: truncated msg1 drops cleanly ─────
+// A malicious relay (or transport noise) can clip bytes off a pre-key
+// envelope.  The responder MUST return empty rather than crash, and
+// MUST NOT install a ratchet session.
+
+TEST_F(SessionManagerSuite, Corruption_TruncatedPreKeyMsgDropped) {
+    const Bytes m1 = alice.mgr->encryptForPeer(bob.peerId, bytesOf("hi"));
+    ASSERT_FALSE(m1.empty());
+
+    // Clip so aggressively that the msg1-length prefix claims bytes we
+    // don't have — SessionManager's size check (§6.5 wire) must refuse
+    // to process the blob without creating a ratchet session.
+    ASSERT_GT(m1.size(), 40u);
+    Bytes truncatedInsideMsg1(m1.begin(), m1.begin() + 40);
+    EXPECT_TRUE(bob.mgr->decryptFromPeer(alice.peerId, truncatedInsideMsg1).empty());
+    EXPECT_FALSE(bob.mgr->hasSession(alice.peerId));
+
+    // Also try clipping before the u32 msg1Len can even be parsed.
+    Bytes tinyHeader;
+    tinyHeader.push_back(SessionManager::kPreKeyMsg);
+    tinyHeader.push_back(0x00);  // incomplete u32 length
+    EXPECT_TRUE(bob.mgr->decryptFromPeer(alice.peerId, tinyHeader).empty());
+    EXPECT_FALSE(bob.mgr->hasSession(alice.peerId));
+
+    // The original un-clipped message still works (proves we didn't
+    // corrupt Alice's own state by touching the wire).
+    EXPECT_EQ(bob.mgr->decryptFromPeer(alice.peerId, m1), bytesOf("hi"));
+    EXPECT_TRUE(bob.mgr->hasSession(alice.peerId));
+}
+
+// ── 13. Noise handshake corruption: flipped bit in msg1 body drops ───
+
+TEST_F(SessionManagerSuite, Corruption_FlippedBitInMsg1Dropped) {
+    Bytes m1 = alice.mgr->encryptForPeer(bob.peerId, bytesOf("hi"));
+    ASSERT_FALSE(m1.empty());
+
+    // Flip a bit deep in the payload — past the type byte + msg1 length
+    // header (1 + 4 = 5 bytes).  Noise's AEAD tags on the internal
+    // handshake msg should refuse the tampered input.
+    ASSERT_GT(m1.size(), 30u);
+    m1[30] ^= 0x01;
+
+    EXPECT_TRUE(bob.mgr->decryptFromPeer(alice.peerId, m1).empty());
+    EXPECT_FALSE(bob.mgr->hasSession(alice.peerId));
+}
