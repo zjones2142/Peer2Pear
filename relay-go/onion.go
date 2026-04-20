@@ -3,13 +3,14 @@
 // relay's /v1/send sees the recipient pubkey (unavoidable — someone has to
 // route).
 //
-// Wire format (must match core/OnionWrap.cpp and relay/server.py):
+// Wire format (must match core/OnionWrap.cpp):
 //   [version(1)=0x01][ephPub(32)][nonce(24)][Box ciphertext]
 //   Box plaintext = [nextHopUrlLen(2 BE)][nextHopUrl][innerBlob]
 //
 // This relies on the standard NaCl Box construction (X25519 +
 // XSalsa20-Poly1305) via golang.org/x/crypto/nacl/box, which is wire-
-// compatible with libsodium's crypto_box_easy and pynacl's Box.
+// compatible with libsodium's crypto_box_easy (the Python reference
+// relay that also used pynacl.Box was retired on 2026-04-20).
 //
 // Usage: once vendored, run `go mod tidy` to fetch x/crypto.
 

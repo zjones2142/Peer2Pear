@@ -144,9 +144,8 @@ type Hub struct {
 	rlRecip    *rateLimiter // Fix #10: per-recipient ingress cap
 	trustProxy bool         // H2 fix: only trust X-Forwarded-For when behind a reverse proxy
 
-	// H3 fix: track seen auth nonces to prevent replay within the 5-min window
-	authMu   sync.Mutex
-	seenAuth map[string]int64 // "peer_id|ts" → expiry unix ms
+	// Seen-auth-nonce dedup now lives in SQLite (L4 audit fix).  The Hub no
+	// longer owns a map — every check / register flows through m.mbox.
 
 	// Fix #7: persistent X25519 keypair for onion routing.
 	// Advertised via GET /v1/relay_info; used to peel POST /v1/forward-onion.
@@ -164,26 +163,20 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 		rl:         newRateLimiter(),
 		rlRecip:    newRateLimiter(),
 		trustProxy: trustProxy,
-		seenAuth:   make(map[string]int64),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  maxEnvelopeBytes,
 			WriteBufferSize: maxEnvelopeBytes,
 			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
 	}
-	// H3 fix: periodically purge expired auth nonces
+	// L4 fix: periodically purge expired auth nonces from the persistent
+	// table.  RegisterAuthNonce() also cleans up opportunistically; this
+	// just bounds table size in steady state.
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			now := time.Now().UnixMilli()
-			h.authMu.Lock()
-			for k, exp := range h.seenAuth {
-				if now > exp {
-					delete(h.seenAuth, k)
-				}
-			}
-			h.authMu.Unlock()
+			mbox.PurgeExpiredAuthNonces()
 		}
 	}()
 	return h
@@ -425,17 +418,14 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// H3 fix: reject replayed auth messages
+	// H3 + L4 fix: reject replayed auth messages.  Backed by SQLite so a
+	// relay restart within the replay window doesn't re-open the attack.
 	authNonce := fmt.Sprintf("%s|%d", auth.PeerID, auth.Ts)
-	h.authMu.Lock()
-	if _, seen := h.seenAuth[authNonce]; seen {
-		h.authMu.Unlock()
+	if !h.mbox.RegisterAuthNonce(authNonce, nowMs+replayWindowMs) {
 		conn.WriteJSON(map[string]string{"error": "auth replay"})
 		conn.Close()
 		return
 	}
-	h.seenAuth[authNonce] = nowMs + replayWindowMs
-	h.authMu.Unlock()
 
 	// Step 2: Register peer
 	peer := &Peer{
@@ -446,16 +436,24 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 	h.register(peer)
 	defer h.unregister(peer.ID)
 
-	// Step 3: Deliver stored envelopes
+	// Step 3: Deliver stored envelopes (M6 mark-and-confirm — each row is
+	// deleted only after its WS write returns nil, so a crash partway
+	// through leaves the unsent envelopes in the mailbox for the next
+	// reconnect.  Rows that landed on the wire but whose confirm never
+	// ran age out after staleDeliveryMarkMs and get re-sent too — client
+	// envelope-ID dedup takes care of the resulting duplicates.)
 	stored := h.mbox.FetchAll(peer.ID)
+	delivered := 0
 	for _, env := range stored {
 		conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-		if err := conn.WriteMessage(websocket.BinaryMessage, env); err != nil {
+		if err := conn.WriteMessage(websocket.BinaryMessage, env.Payload); err != nil {
 			return
 		}
+		h.mbox.ConfirmDelivered(env.EnvID)
+		delivered++
 	}
-	if len(stored) > 0 {
-		log.Printf("delivered %d stored envelope(s) to %s…", len(stored), truncID(peer.ID))
+	if delivered > 0 {
+		log.Printf("delivered %d stored envelope(s) to %s…", delivered, truncID(peer.ID))
 	}
 
 	// Send auth confirmation

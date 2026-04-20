@@ -320,7 +320,7 @@ IP and the final recipient.
 Returns the relay's X25519 public key for onion addressing:
 
 ```json
-{ "x25519_pub": "<base64url(32 bytes)>", "impl": "go" | "python" | ... }
+{ "x25519_pub": "<base64url(32 bytes)>", "impl": "go" | ... }
 ```
 
 Clients MUST cache this value and re-fetch on reconnect.
@@ -328,7 +328,7 @@ Clients MUST cache this value and re-fetch on reconnect.
 ### 4.7 GET /healthz
 
 ```json
-{ "ok": true, "version": "2.0.0", "impl": "go" | "python" | ... }
+{ "ok": true, "version": "2.0.0", "impl": "go" | ... }
 ```
 
 `version` is the protocol version — identical across conforming impls.
@@ -872,13 +872,17 @@ are deliberately NOT part of v2.0:
 
 ## 12. Reference implementations
 
-- **Relay (Go):** `relay-go/` — ~1500 LOC, single binary, SQLite mailbox.
-- **Relay (Python):** `relay/` — FastAPI + uvicorn, API-compatible alt.
-- **Client (Qt/C++):** `desktop/` + `core/` — reference client. The
+- **Relay (Go):** `relay-go/` — ~1500 LOC, single static binary, SQLite
+  mailbox.  Currently the only reference server.
+- **Client (Qt/C++):** `desktop/` + `core/` — reference client.  The
   `core/` static library is reusable for mobile ports.
 
-Both relays expose `/healthz → version: "2.0.0", impl: …` for operator
-diagnostics.
+The relay exposes `/healthz → {version: "2.0.0", impl: …}` for operator
+diagnostics.  A previous Python (FastAPI) reference relay at `relay/`
+was retired on 2026-04-20: maintaining behavioural parity between two
+impls was itself an audit finding (LC1/LC2 — jitter RNG drift,
+cover-traffic ordering drift), and the spec here is the single source
+of truth a future second implementation would hold itself to.
 
 ---
 

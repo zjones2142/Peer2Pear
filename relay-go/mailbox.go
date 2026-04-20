@@ -17,7 +17,22 @@ const (
 	defaultTTLMs  = 7 * 24 * 60 * 60 * 1000 // 7 days
 	maxTTLMs      = 7 * 24 * 60 * 60 * 1000
 	maxQueueItems = 5000
+	// M6 audit fix (2026-04-20): two-phase delivery.  FetchAll marks rows
+	// as in-flight (delivered_at = now) instead of deleting; the caller
+	// DELETEs each row only after the WS write succeeds.  If the relay
+	// crashes between mark and confirm, the mark ages out and the next
+	// FetchAll for that peer re-sends the envelope — client-side
+	// envelope-ID dedup (ChatController::markSeenPersistent) catches any
+	// duplicate delivery after the crash.
+	staleDeliveryMarkMs = 60 * 1000 // 60s
 )
+
+// StoredEnvelope bundles an env_id with its payload so the caller can
+// confirm delivery per-envelope after a successful WS write.
+type StoredEnvelope struct {
+	EnvID   string
+	Payload []byte
+}
 
 // Mailbox provides store-and-forward storage for sealed envelopes.
 // Envelopes are stored as raw bytes (BLOBs) — no base64 encoding overhead.
@@ -46,13 +61,74 @@ func NewMailbox(dbPath string) (*Mailbox, error) {
 		);
 		CREATE INDEX IF NOT EXISTS idx_env_recipient
 		ON envelopes (recipient_id, created_ms);
+
+		-- L4 audit fix (2026-04-20): persist seen auth nonces so a relay
+		-- restart within the 30s replay window can't re-enable a captured
+		-- auth tuple.  Before this table, seenAuth was a hot map cleared
+		-- on every restart.
+		CREATE TABLE IF NOT EXISTS seen_auth_nonces (
+			key        TEXT PRIMARY KEY,
+			expiry_ms  INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_seen_auth_expiry
+		ON seen_auth_nonces (expiry_ms);
 	`)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create tables: %w", err)
 	}
 
+	// M6 audit fix (2026-04-20): ensure the envelopes table has the
+	// delivered_at column.  Idempotent: newly-created DBs need the ADD,
+	// pre-M6 DBs get it added on startup.  Ignore any "duplicate column"
+	// error — the only way ALTER fails here is if the column already
+	// exists from a previous startup.
+	_, _ = db.Exec("ALTER TABLE envelopes ADD COLUMN delivered_at INTEGER")
+
 	return &Mailbox{db: db}, nil
+}
+
+// RegisterAuthNonce records `key` as seen with `expiryMs`.  Returns true if
+// the nonce was new (auth proceeds), false if it was already seen (replay).
+// Survives relay restart — the L4 fix.
+func (m *Mailbox) RegisterAuthNonce(key string, expiryMs int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Clean up stale rows opportunistically.  O(1) amortized when the index
+	// on expiry_ms is used; avoids a background sweep lagging behind a flood.
+	m.db.Exec("DELETE FROM seen_auth_nonces WHERE expiry_ms < ?", nowMs())
+
+	res, err := m.db.Exec(
+		"INSERT OR IGNORE INTO seen_auth_nonces (key, expiry_ms) VALUES (?, ?)",
+		key, expiryMs,
+	)
+	if err != nil {
+		log.Printf("RegisterAuthNonce insert error: %v", err)
+		// Fail closed: treat DB error as "already seen" so we don't silently
+		// accept replays if the insert never landed.
+		return false
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("RegisterAuthNonce rowcount error: %v", err)
+		return false
+	}
+	return n == 1
+}
+
+// PurgeExpiredAuthNonces drops any seen-nonce row whose expiry has passed.
+// Called periodically by the Hub to keep the table bounded.
+func (m *Mailbox) PurgeExpiredAuthNonces() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	res, err := m.db.Exec("DELETE FROM seen_auth_nonces WHERE expiry_ms < ?", nowMs())
+	if err != nil {
+		return 0
+	}
+	n, _ := res.RowsAffected()
+	return int(n)
 }
 
 func (m *Mailbox) Close() {
@@ -95,17 +171,33 @@ func (m *Mailbox) Store(recipientID string, payload []byte) error {
 	return err
 }
 
-// FetchAll retrieves and deletes all pending envelopes for a recipient.
-// Returns the raw envelope bytes, oldest first.
-func (m *Mailbox) FetchAll(recipientID string) [][]byte {
+// FetchAll returns all pending envelopes for a recipient, marking each
+// one as in-flight.  The caller MUST call ConfirmDelivered(envID) after
+// a successful WS write to remove the row; if the caller crashes before
+// confirming, the mark ages out after staleDeliveryMarkMs and the next
+// FetchAll on reconnect will re-deliver.  Client-side envelope-ID dedup
+// catches duplicate deliveries across that window.
+//
+// Before the M6 fix this function deleted rows in a transaction — a
+// crash between the commit and the WS write loop silently lost every
+// queued envelope.  Now no data goes missing on the relay side; the
+// worst case is a duplicate delivery the client dedups.
+func (m *Mailbox) FetchAll(recipientID string) []StoredEnvelope {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := nowMs()
 	m.db.Exec("DELETE FROM envelopes WHERE expiry_ms < ?", now)
 
+	// Reset stale in-flight marks so a crashed previous delivery attempt
+	// doesn't leave envelopes permanently stuck.
+	m.db.Exec(
+		"UPDATE envelopes SET delivered_at = NULL WHERE delivered_at IS NOT NULL AND delivered_at < ?",
+		now-staleDeliveryMarkMs,
+	)
+
 	rows, err := m.db.Query(
-		"SELECT env_id, payload FROM envelopes WHERE recipient_id=? ORDER BY created_ms ASC",
+		"SELECT env_id, payload FROM envelopes WHERE recipient_id=? AND delivered_at IS NULL ORDER BY created_ms ASC",
 		recipientID,
 	)
 	if err != nil {
@@ -114,9 +206,8 @@ func (m *Mailbox) FetchAll(recipientID string) [][]byte {
 	}
 	defer rows.Close()
 
+	var out []StoredEnvelope
 	var envIDs []string
-	var payloads [][]byte
-
 	for rows.Next() {
 		var envID string
 		var payload []byte
@@ -124,39 +215,52 @@ func (m *Mailbox) FetchAll(recipientID string) [][]byte {
 			continue
 		}
 		envIDs = append(envIDs, envID)
-		payloads = append(payloads, payload)
+		out = append(out, StoredEnvelope{EnvID: envID, Payload: payload})
 	}
 
 	if len(envIDs) == 0 {
 		return nil
 	}
 
-	// H5 fix: delete in a transaction, only return payloads if commit succeeds
+	// Mark each returned row as in-flight.  Use a transaction so the whole
+	// batch flips atomically — if the commit fails, the rows stay NULL and
+	// a follow-up FetchAll re-tries them.  We don't want to return these
+	// rows without a persistent mark, because then a second FetchAll (from
+	// e.g. a reconnect race) could also grab them.
 	tx, err := m.db.Begin()
 	if err != nil {
 		log.Printf("fetchAll tx begin error: %v", err)
 		return nil
 	}
 	for _, id := range envIDs {
-		tx.Exec("DELETE FROM envelopes WHERE env_id=?", id)
+		tx.Exec("UPDATE envelopes SET delivered_at = ? WHERE env_id = ?", now, id)
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("fetchAll tx commit error: %v", err)
 		tx.Rollback()
-		return nil // don't deliver if we can't confirm deletion
+		return nil
 	}
 
 	// Fix #18: shuffle delivery order so the relay operator can't correlate
 	// sender-enqueue-time with recipient-fetch-time by matching ordinals.
 	// Uses crypto/rand (Fisher–Yates with rejection sampling).
-	secureShuffle(payloads)
+	secureShuffleEnv(out)
 
-	return payloads
+	return out
 }
 
-// secureShuffle does a Fisher–Yates shuffle with crypto/rand so the permutation
-// isn't predictable from past samples.
-func secureShuffle(xs [][]byte) {
+// ConfirmDelivered removes one envelope after a successful WS write.
+// Safe to call on already-deleted rows (no-op).
+func (m *Mailbox) ConfirmDelivered(envID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.db.Exec("DELETE FROM envelopes WHERE env_id = ?", envID)
+}
+
+// secureShuffleEnv does a Fisher–Yates shuffle with crypto/rand so the
+// permutation isn't predictable from past samples.  Operates in place on
+// a slice of StoredEnvelope.
+func secureShuffleEnv(xs []StoredEnvelope) {
 	for i := len(xs) - 1; i > 0; i-- {
 		j := cryptoRandIntn(i + 1)
 		xs[i], xs[j] = xs[j], xs[i]

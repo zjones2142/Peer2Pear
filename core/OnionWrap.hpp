@@ -32,8 +32,10 @@
  *   [innerBlob]                       — the next layer (another onion) or the
  *                                        wrap-for-relay envelope at the final hop
  *
- * The crypto is crypto_box_easy (X25519-XSalsa20-Poly1305) — the same NaCl
- * Box used on both Go (x/crypto/nacl/box) and Python (pynacl.Box) relays.
+ * The crypto is crypto_box_easy (X25519-XSalsa20-Poly1305) — the same
+ * NaCl Box used on the Go relay via x/crypto/nacl/box.  (The previously-
+ * shipped Python reference relay that also used pynacl.Box was retired
+ * on 2026-04-20; see PROTOCOL.md §12.)
  *
  * Types:
  *   bytes → std::vector<uint8_t>       (binary buffers)

@@ -7,7 +7,6 @@ This repository contains:
 - **`core/`** — portable C++ protocol core (crypto, handshake, ratchet, sealed sender, relay client)
 - **`desktop/`** — Qt 5/6 desktop client for Linux, macOS, and Windows
 - **`relay-go/`** — reference Go relay server (single static binary, SQLite mailbox, onion-capable)
-- **`relay/`** — reference Python (FastAPI) relay server with identical wire protocol
 
 ---
 
@@ -116,7 +115,6 @@ core/libpeer2pear-core.a      ← portable protocol core
   └── peer2pear.h             (C FFI for mobile / third-party clients)
 
 relay-go/                     ← reference Go relay (single binary)
-relay/                        ← reference Python (FastAPI) relay
 ```
 
 ## Running a relay
@@ -127,9 +125,7 @@ A relay is a WebSocket forwarder plus a SQLite mailbox. It never sees plaintext 
 
 ```bash
 # At repository root
-docker compose --profile go  up    # Go relay on :8443
-docker compose --profile py  up    # Python relay on :8443
-docker compose --profile ab  up    # Both, side-by-side on :8443 and :8444
+docker compose up relay-go
 ```
 
 ### Go relay (from source)
@@ -138,14 +134,6 @@ docker compose --profile ab  up    # Both, side-by-side on :8443 and :8444
 cd relay-go
 go mod tidy
 go run .
-```
-
-### Python relay (from source)
-
-```bash
-cd relay
-pip install -r requirements.txt
-uvicorn server:app --host 0.0.0.0 --port 8443
 ```
 
 ### Relay endpoints
@@ -159,7 +147,12 @@ uvicorn server:app --host 0.0.0.0 --port 8443
 | `GET /v1/relay_info` | This relay's X25519 pubkey for onion wrapping |
 | `GET /healthz` | Returns `{ok, version, impl}` |
 
-Both relay implementations speak the identical wire protocol. Clients can rotate between them freely.
+`relay-go` is the only supported server implementation. The Python
+reference relay that previously lived at `relay/` was removed on
+2026-04-20 — the behavioural divergence between the two impls (jitter
+RNG, cover-traffic ordering, SSRF guard details) was itself an audit
+finding (LC1/LC2), and consolidating on one impl eliminated the class
+while keeping node hosting as a single static binary.
 
 ## Dependencies
 
@@ -179,10 +172,6 @@ Client dependencies are managed via [vcpkg](https://vcpkg.io/). SQLCipher is ven
 ### Go relay
 
 `gorilla/websocket`, `golang.org/x/crypto/nacl/box`, `mattn/go-sqlite3` (all via `go.mod`).
-
-### Python relay
-
-`fastapi`, `uvicorn`, `pynacl`, `httpx` (all via `requirements.txt`).
 
 ## Building the client
 
