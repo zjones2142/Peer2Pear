@@ -250,6 +250,10 @@ final class Peer2PearClient: ObservableObject {
     /// There's no network round-trip here — groups exist only in the
     /// client.  Members learn about the group the first time they
     /// receive a message tagged with this groupId.
+    ///
+    /// Also seeds the core's in-memory roster for this group so
+    /// subsequent control messages (rename / avatar / leave) from
+    /// other members pass the H2 authorization check.
     @discardableResult
     func createGroup(name: String, memberPeerIds: [String]) -> String {
         let gid = UUID().uuidString.lowercased()
@@ -259,7 +263,29 @@ final class Peer2PearClient: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.groups[gid] = group
         }
+        // Seed the core's roster with self + members so we'll accept
+        // inbound rename/avatar/leave from any of them.
+        if let ctx = rawContext {
+            var roster = memberPeerIds
+            if !roster.contains(myPeerId) {
+                roster.append(myPeerId)
+            }
+            withCStringArray(roster) { ptr in
+                p2p_set_known_group_members(ctx, gid, ptr)
+            }
+        }
         return gid
+    }
+
+    /// Seed the core's roster for a group that was either (a) loaded
+    /// from local persistence on startup or (b) learned about via an
+    /// inbound message.  Call on every known group after start() so
+    /// the H2 check admits control messages from other members.
+    func setKnownGroupMembers(groupId: String, memberPeerIds: [String]) {
+        guard let ctx = rawContext else { return }
+        withCStringArray(memberPeerIds) { ptr in
+            p2p_set_known_group_members(ctx, groupId, ptr)
+        }
     }
 
     /// Send a text message to every member of a group.  `memberPeerIds`
@@ -561,9 +587,16 @@ final class Peer2PearClient: ObservableObject {
                 // a group by receiving a message tagged with its ID.
                 // If the creator renames the group later, we also pick
                 // that up here (last-write-wins on name + members).
+                // Always add the SENDER to the roster (sendGroupText
+                // strips self from the declared members so members ==
+                // recipients) — otherwise subsequent control messages
+                // from the sender would fail the H2 authorization check.
                 var roster = gm.members
                 if !roster.contains(client.myPeerId) {
                     roster.append(client.myPeerId)
+                }
+                if !roster.contains(gm.from) {
+                    roster.append(gm.from)
                 }
                 var g = client.groups[gm.groupId]
                     ?? P2PGroup(id: gm.groupId, name: gm.groupName,
@@ -572,6 +605,10 @@ final class Peer2PearClient: ObservableObject {
                 g.memberIds = roster
                 g.lastActivity = max(g.lastActivity, gm.timestamp)
                 client.groups[gm.groupId] = g
+                // Seed core's roster too so inbound control messages
+                // from this group's members are admitted.
+                client.setKnownGroupMembers(groupId: gm.groupId,
+                                             memberPeerIds: roster)
             }
         }, selfPtr)
 

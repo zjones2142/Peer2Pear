@@ -281,6 +281,25 @@ int p2p_update_group_members(p2p_context* ctx,
                              const char* group_name,
                              const char** member_ids);
 
+/**
+ * Seed the core's in-memory group roster for `group_id` with `member_ids`.
+ * Apps should call this on startup for every group the user is a member
+ * of, using their own persisted roster.
+ *
+ * Without this call the core uses a cold-start bootstrap (H2 audit fix):
+ * the first inbound group_msg is accepted only if the sender included
+ * themselves in the message's declared member list.  sendGroupText on
+ * the sender side strips self from that list (so the list reflects
+ * recipients), meaning peers that don't already have a roster for this
+ * group will drop subsequent control messages (rename / avatar / leave)
+ * as "from non-member".
+ *
+ * Call this once per known group after p2p_set_passphrase_v2 succeeds.
+ */
+void p2p_set_known_group_members(p2p_context* ctx,
+                                  const char* group_id,
+                                  const char** member_ids);
+
 /* ── File transfer ─────────────────────────────────────────────────────── */
 
 /**

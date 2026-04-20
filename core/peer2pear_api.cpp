@@ -333,6 +333,15 @@ struct p2p_context {
     CWebSocket        ws;
     CHttpClient       http;
     StdTimerFactory   timers;
+
+    // SQLCipher DB for Noise/Ratchet session persistence + file-transfer
+    // state.  Opened lazily inside p2p_set_passphrase_v2 once the
+    // identity is unlocked.  MUST be declared before `controller` so
+    // the controller's SessionStore/FileTransferManager — which hold a
+    // reference into db — destruct first (C++ destroys members in
+    // reverse declaration order).
+    SqlCipherDb       db;
+
     ChatController    controller;
 
     // Scratch buffer for returning strings (valid until next call)
@@ -667,6 +676,38 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
         rc = -1;  // wrong passphrase or corrupted identity.json
     }
     CryptoEngine::secureZero(identityKey);
+
+    // SQLCipher session store — mirrors desktop mainwindow.cpp's flow.
+    // Derive a DB-specific subkey from the same master so the key
+    // on disk matches across identities + survives identity rotation.
+    // Without this, `ctx->controller.m_sessionMgr` stays null and every
+    // outbound send fails with "cannot seal" (mobile FFI regression
+    // discovered during test_c_api_e2e round-trip writeup).
+    if (rc == 0) {
+        // Re-derive masterKey (we zeroed the first copy above to prevent
+        // the passphrase bytes from surviving in memory longer than
+        // necessary).  Running Argon2 a second time is cheap compared to
+        // the session setup it unblocks.
+        Bytes master2 = CryptoEngine::deriveMasterKey(pass, salt);
+        if (master2.size() == 32) {
+            static const char kDbInfo[] = "sqlcipher-db-key";
+            Bytes dbInfo(
+                reinterpret_cast<const uint8_t*>(kDbInfo),
+                reinterpret_cast<const uint8_t*>(kDbInfo) + sizeof(kDbInfo) - 1);
+            Bytes dbKey = CryptoEngine::deriveSubkey(master2, dbInfo);
+            CryptoEngine::secureZero(master2);
+            const std::string dbPath = ctx->dataDir + "/peer2pear.db";
+            if (dbKey.size() == 32 && ctx->db.open(dbPath, dbKey)) {
+                ctx->controller.setDatabase(ctx->db);
+            } else {
+                rc = -1;
+            }
+            CryptoEngine::secureZero(dbKey);
+        } else {
+            rc = -1;
+        }
+    }
+
     CryptoEngine::secureZero(pass);
     return rc;
 }
@@ -842,6 +883,16 @@ int p2p_update_group_members(p2p_context* ctx,
         group_id, group_name ? group_name : "",
         cStringArrayToVector(member_ids));
     return 0;
+}
+
+void p2p_set_known_group_members(p2p_context* ctx,
+                                  const char* group_id,
+                                  const char** member_ids)
+{
+    if (!ctx || !group_id || !member_ids) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.setKnownGroupMembers(
+        group_id, cStringArrayToVector(member_ids));
 }
 
 const char* p2p_send_file(p2p_context* ctx,

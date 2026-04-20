@@ -477,17 +477,22 @@ std::string ChatController::sendFile(const std::string& peerIdB64u,
         return {};
     }
 
-    m_relay.sendEnvelope(sealedEnv);
-
+    // Queue the outbound state BEFORE we put the file_key announce on the
+    // wire.  Otherwise Bob's file_accept can race back faster than the
+    // queue call completes and FTM sees "startOutboundStream: unknown
+    // transferId" — a race latent in production (masked by network
+    // RTT) and reliably exposed by in-process test mocks.  The read of
+    // lastMessageKey() is safe here because sealForPeer has already
+    // populated it via encryptForPeer above.
     Bytes fileKey = m_sessionMgr->lastMessageKey();
-    P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
-             << " to " << peerIdB64u.substr(0, 8) << "... size=" << fileSize);
-
-    // Phase 2: queue outbound state. Chunks don't fly until file_accept arrives.
     m_fileMgr.queueOutboundFile(myIdB64u(), peerIdB64u,
                                  fileKey, transferId, fileName, filePath,
                                  fileSize, fileHash);
     sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
+
+    m_relay.sendEnvelope(sealedEnv);
+    P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
+             << " to " << peerIdB64u.substr(0, 8) << "... size=" << fileSize);
     return transferId;
 }
 
@@ -562,18 +567,17 @@ std::string ChatController::sendGroupFile(const std::string& groupId,
             continue;
         }
 
-        m_relay.sendEnvelope(sealedEnv);
-
+        // Queue BEFORE send so a fast-ack file_accept can find us ready.
+        // See sendFile() for the full rationale on the ordering.
         Bytes fileKey = m_sessionMgr->lastMessageKey();
-        P2P_LOG("[FILE] file_key announced for " << memberTid.substr(0, 8) << "..."
-                 << " to " << peerId.substr(0, 8) << "... (group)");
-
-        // Queue — do not stream.  Chunks for this member fly only after that
-        // member's file_accept arrives, identical to the 1:1 flow.
         m_fileMgr.queueOutboundFile(myId, peerId, fileKey, memberTid, fileName,
                                      filePath, fileSize, fileHash,
                                      groupId, groupName);
         sodium_memzero(fileKey.data(), fileKey.size());  // L6 fix
+
+        m_relay.sendEnvelope(sealedEnv);
+        P2P_LOG("[FILE] file_key announced for " << memberTid.substr(0, 8) << "..."
+                 << " to " << peerId.substr(0, 8) << "... (group)");
 
         memberTids.push_back(memberTid);
     }

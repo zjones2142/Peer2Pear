@@ -1,5 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import PhotosUI
+import UIKit
 
 struct ConversationView: View {
     @ObservedObject var client: Peer2PearClient
@@ -336,51 +338,34 @@ struct GroupRosterSheet: View {
     @State private var showRename = false
     @State private var newName = ""
     @State private var confirmLeave = false
+    @State private var avatarSelection: PhotosPickerItem?
+    @State private var showAddMember = false
+    @State private var isEditing = false
+
+    /// Non-self members — self is always rendered separately at the top
+    /// and can never be the target of "remove member".  Filtering here
+    /// keeps the swipe-actions + ForEach indexing simple.
+    private var otherMembers: [String] {
+        group.memberIds.filter { $0 != client.myPeerId }
+    }
 
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    ForEach(group.memberIds, id: \.self) { peerId in
-                        HStack {
-                            Image(systemName: peerId == client.myPeerId
-                                   ? "person.fill" : "person")
-                                .foregroundStyle(.secondary)
-                            Text(peerId == client.myPeerId
-                                 ? "You"
-                                 : String(peerId.prefix(12)) + "...")
-                            Spacer()
-                            if peerId != client.myPeerId {
-                                if client.peerPresence[peerId] == true {
-                                    Circle().fill(.green).frame(width: 8, height: 8)
-                                }
-                                TrustBadge(trust: client.peerTrust(for: peerId))
-                            }
-                        }
-                    }
-                } header: {
-                    Text("Members (\(group.memberIds.count))")
-                }
-
-                Section {
-                    Button {
-                        newName = group.name
-                        showRename = true
-                    } label: {
-                        Label("Rename Group", systemImage: "pencil")
-                    }
-                    Button(role: .destructive) {
-                        confirmLeave = true
-                    } label: {
-                        Label("Leave Group", systemImage: "rectangle.portrait.and.arrow.right")
-                    }
-                }
+                avatarSection
+                membersSection
+                actionsSection
             }
             .navigationTitle(group.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(isEditing ? "Done" : "Edit") {
+                        isEditing.toggle()
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button("Close") { dismiss() }
                 }
             }
             .alert("Rename Group", isPresented: $showRename) {
@@ -410,6 +395,248 @@ struct GroupRosterSheet: View {
             } message: {
                 Text("Other members will see you left.  Your local messages will be cleared.")
             }
+            .sheet(isPresented: $showAddMember) {
+                AddGroupMemberSheet(client: client, group: group)
+            }
+            .onChange(of: avatarSelection) {
+                Task { await handleAvatarPicked(avatarSelection) }
+            }
+        }
+    }
+
+    // MARK: - Sections
+
+    @ViewBuilder private var avatarSection: some View {
+        Section {
+            HStack {
+                Spacer()
+                VStack(spacing: 8) {
+                    GroupAvatarThumbnail(
+                        avatarB64: client.groupAvatars[group.id],
+                        fallbackInitials: String(group.name.prefix(2)).uppercased(),
+                        size: 72)
+                    PhotosPicker(selection: $avatarSelection,
+                                 matching: .images) {
+                        Text("Change Group Photo")
+                            .font(.caption)
+                    }
+                }
+                Spacer()
+            }
+            .listRowBackground(Color.clear)
+        }
+    }
+
+    @ViewBuilder private var membersSection: some View {
+        Section {
+            // Self pinned at the top so users always recognise themselves.
+            HStack {
+                Image(systemName: "person.fill").foregroundStyle(.secondary)
+                Text("You")
+                Spacer()
+            }
+            ForEach(otherMembers, id: \.self) { peerId in
+                HStack {
+                    Image(systemName: "person").foregroundStyle(.secondary)
+                    Text(peerId.prefix(12) + "...")
+                    Spacer()
+                    if client.peerPresence[peerId] == true {
+                        Circle().fill(.green).frame(width: 8, height: 8)
+                    }
+                    TrustBadge(trust: client.peerTrust(for: peerId))
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    if isEditing {
+                        Button(role: .destructive) {
+                            removeMember(peerId)
+                        } label: {
+                            Label("Remove", systemImage: "person.badge.minus")
+                        }
+                    }
+                }
+            }
+            if isEditing {
+                Button {
+                    showAddMember = true
+                } label: {
+                    Label("Add Member", systemImage: "person.badge.plus")
+                        .foregroundStyle(.blue)
+                }
+            }
+        } header: {
+            Text("Members (\(group.memberIds.count))")
+        } footer: {
+            if isEditing {
+                Text("Swipe a member to remove them.  Changes are broadcast immediately to the rest of the group.")
+                    .font(.caption)
+            }
+        }
+    }
+
+    @ViewBuilder private var actionsSection: some View {
+        Section {
+            Button {
+                newName = group.name
+                showRename = true
+            } label: {
+                Label("Rename Group", systemImage: "pencil")
+            }
+            Button(role: .destructive) {
+                confirmLeave = true
+            } label: {
+                Label("Leave Group", systemImage: "rectangle.portrait.and.arrow.right")
+            }
+        }
+    }
+
+    // MARK: - Handlers
+
+    private func removeMember(_ peerId: String) {
+        let newRoster = group.memberIds.filter { $0 != peerId }
+        _ = client.updateGroupMembers(groupId: group.id,
+                                       groupName: group.name,
+                                       memberPeerIds: newRoster)
+    }
+
+    /// Downscale to 256×256, JPEG-encode, base64.  Keeps group avatars
+    /// under ~20 KB so they fit comfortably in a single sealed envelope
+    /// and don't dominate the relay's recipient-rate-limit budget.
+    private func handleAvatarPicked(_ item: PhotosPickerItem?) async {
+        guard let item else { return }
+        guard let data = try? await item.loadTransferable(type: Data.self),
+              let image = UIImage(data: data) else { return }
+        let resized = image.peer2pearResized(to: CGSize(width: 256, height: 256))
+        guard let jpeg = resized.jpegData(compressionQuality: 0.8) else { return }
+        let b64 = jpeg.base64EncodedString()
+        _ = client.sendGroupAvatar(groupId: group.id,
+                                    avatarB64: b64,
+                                    memberPeerIds: group.memberIds)
+        // Clear selection so picking the same photo twice in a row works.
+        avatarSelection = nil
+    }
+}
+
+// MARK: - Group avatar thumbnail
+// Decodes base64 → UIImage and shows it in a circle.  Falls back to
+// initials when there's no avatar yet.
+
+struct GroupAvatarThumbnail: View {
+    let avatarB64: String?
+    let fallbackInitials: String
+    let size: CGFloat
+
+    private var image: UIImage? {
+        guard let avatarB64,
+              let data = Data(base64Encoded: avatarB64),
+              let img = UIImage(data: data) else { return nil }
+        return img
+    }
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Circle()
+                    .fill(.indigo)
+                    .overlay {
+                        Text(fallbackInitials)
+                            .font(.system(size: size * 0.4, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+    }
+}
+
+// MARK: - Add member sheet
+// Reuses the known-peers list from NewGroupSheet — anyone we've DM'd
+// is a valid candidate.  Excludes existing members + self.
+
+struct AddGroupMemberSheet: View {
+    @ObservedObject var client: Peer2PearClient
+    let group: P2PGroup
+    @Environment(\.dismiss) private var dismiss
+    @State private var selected: Set<String> = []
+
+    private var candidates: [String] {
+        let existing = Set(group.memberIds)
+        let known = Set(client.messages.map(\.from))
+            .union(Set(client.peerPresence.keys))
+        return known
+            .subtracting(existing)
+            .filter { $0 != client.myPeerId }
+            .sorted()
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if candidates.isEmpty {
+                    Text("No other contacts to add.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(candidates, id: \.self) { peerId in
+                        Button {
+                            if selected.contains(peerId) {
+                                selected.remove(peerId)
+                            } else {
+                                selected.insert(peerId)
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: selected.contains(peerId)
+                                      ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(selected.contains(peerId)
+                                                     ? .green : .secondary)
+                                Text(peerId.prefix(12) + "...")
+                                Spacer()
+                                TrustBadge(trust: client.peerTrust(for: peerId))
+                            }
+                        }
+                        .foregroundStyle(.primary)
+                    }
+                }
+            }
+            .navigationTitle("Add Members")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add") {
+                        let newRoster = group.memberIds + Array(selected)
+                        _ = client.updateGroupMembers(groupId: group.id,
+                                                       groupName: group.name,
+                                                       memberPeerIds: newRoster)
+                        dismiss()
+                    }
+                    .disabled(selected.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - UIImage resize helper (iOS-only)
+
+private extension UIImage {
+    /// Aspect-fill resize to `target` using UIGraphicsImageRenderer.  Used
+    /// by the avatar picker to normalise images before base64-encoding.
+    func peer2pearResized(to target: CGSize) -> UIImage {
+        let ratio = max(target.width / size.width, target.height / size.height)
+        let scaled = CGSize(width: size.width * ratio, height: size.height * ratio)
+        let origin = CGPoint(x: (target.width - scaled.width) / 2,
+                             y: (target.height - scaled.height) / 2)
+        let renderer = UIGraphicsImageRenderer(size: target)
+        return renderer.image { _ in
+            draw(in: CGRect(origin: origin, size: scaled))
         }
     }
 }

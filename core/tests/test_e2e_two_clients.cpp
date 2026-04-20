@@ -244,6 +244,38 @@ protected:
             std::string msgId;
         };
         std::vector<Received> received;
+
+        // Group-control capture.
+        struct Renamed {
+            std::string groupId;
+            std::string newName;
+        };
+        std::vector<Renamed> renamed;
+
+        struct GroupAvatar {
+            std::string groupId;
+            std::string avatarB64;
+        };
+        std::vector<GroupAvatar> groupAvatars;
+
+        struct MemberLeft {
+            std::string from;
+            std::string groupId;
+            std::string groupName;
+            std::vector<std::string> members;
+        };
+        std::vector<MemberLeft> memberLeft;
+
+        // File-transfer capture (receiver side).  savedPath is non-empty
+        // only on the final progress event; we stash only the last frame
+        // per transferId so tests can check completion cleanly.
+        struct FileDone {
+            std::string transferId;
+            std::string fileName;
+            std::string savedPath;
+            int chunksTotal = 0;
+        };
+        std::map<std::string, FileDone> fileDone;
     };
 
     std::unique_ptr<MockRelay> relay;
@@ -281,6 +313,36 @@ protected:
                                           int64_t ts,
                                           const std::string& msgId) {
             p.received.push_back({from, text, ts, msgId});
+        };
+
+        p.ctrl->onGroupRenamed = [&p](const std::string& groupId,
+                                       const std::string& newName) {
+            p.renamed.push_back({groupId, newName});
+        };
+        p.ctrl->onGroupAvatarReceived = [&p](const std::string& groupId,
+                                              const std::string& avatarB64) {
+            p.groupAvatars.push_back({groupId, avatarB64});
+        };
+        p.ctrl->onGroupMemberLeft = [&p](const std::string& from,
+                                          const std::string& gid,
+                                          const std::string& gname,
+                                          const std::vector<std::string>& members,
+                                          int64_t /*ts*/, const std::string& /*msgId*/) {
+            p.memberLeft.push_back({from, gid, gname, members});
+        };
+        p.ctrl->onFileChunkReceived = [&p](const std::string& /*from*/,
+                                            const std::string& tid,
+                                            const std::string& fileName,
+                                            int64_t /*fileSize*/,
+                                            int /*rcvd*/, int total,
+                                            const std::string& savedPath,
+                                            int64_t /*ts*/,
+                                            const std::string& /*gid*/,
+                                            const std::string& /*gname*/) {
+            // Only capture the terminal frame (the one with savedPath).
+            if (!savedPath.empty()) {
+                p.fileDone[tid] = {tid, fileName, savedPath, total};
+            }
         };
     }
 
@@ -560,4 +622,139 @@ TEST_F(TwoClientSuite, EnvelopeAddressedToStrangerIsDropped) {
 
     EXPECT_EQ(alice.received.size(), 0u);
     EXPECT_EQ(bob.received.size(),   0u);
+}
+
+// ── Group-control round-trips ────────────────────────────────────────────
+// These exercise the ChatController paths exposed as p2p_rename_group /
+// p2p_send_group_avatar / p2p_leave_group / p2p_send_group_file.  The
+// C API is a thin std::vector↔const char** shim; the interesting
+// invariants (dedup, H2 authorization, file chunk reassembly) all live
+// here.
+//
+// All four tests seed Bob's group roster via setKnownGroupMembers —
+// sendGroup* strips self from the declared members so the H2 cold-
+// bootstrap check ("sender must be in members") never fires for the
+// sender's own messages.  Real clients persist their roster and call
+// setKnownGroupMembers on startup; these tests mirror that.
+
+TEST_F(TwoClientSuite, GroupRename_FiresCallbackOnPeer) {
+    connectBoth();
+
+    const std::string gid = "grp-rename-abc";
+    bob.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+
+    alice.ctrl->sendGroupRename(gid, "Planning Crew", { alice.id, bob.id });
+
+    ASSERT_EQ(bob.renamed.size(), 1u);
+    EXPECT_EQ(bob.renamed[0].groupId, gid);
+    EXPECT_EQ(bob.renamed[0].newName, "Planning Crew");
+
+    // Replay the exact same sealed envelope (MockRelay delivers each send
+    // twice) — B5 audit dedup on the msgId bounded inside the payload
+    // should suppress the duplicate callback.
+    relay->setDeliverMultiplier(2);
+    alice.ctrl->sendGroupRename(gid, "Even Newer Name", { alice.id, bob.id });
+    EXPECT_EQ(bob.renamed.size(), 2u)
+        << "replayed envelope fired the rename callback a second time "
+        << "— group_rename msgId dedup regression";
+}
+
+TEST_F(TwoClientSuite, GroupAvatar_FiresCallbackOnPeer) {
+    connectBoth();
+
+    const std::string gid = "grp-avatar-def";
+    const std::string avatarB64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+    bob.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+
+    alice.ctrl->sendGroupAvatar(gid, avatarB64, { alice.id, bob.id });
+
+    ASSERT_EQ(bob.groupAvatars.size(), 1u);
+    EXPECT_EQ(bob.groupAvatars[0].groupId,   gid);
+    EXPECT_EQ(bob.groupAvatars[0].avatarB64, avatarB64);
+
+    // Replay check: double-delivery must not double-fire.
+    relay->setDeliverMultiplier(2);
+    alice.ctrl->sendGroupAvatar(gid, avatarB64 + "2", { alice.id, bob.id });
+    EXPECT_EQ(bob.groupAvatars.size(), 2u)
+        << "group_avatar msgId dedup regression";
+}
+
+TEST_F(TwoClientSuite, GroupMemberLeft_FiresCallbackOnPeer) {
+    connectBoth();
+
+    const std::string gid = "grp-leave-ghi";
+    bob.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+
+    alice.ctrl->sendGroupLeaveNotification(gid, "Planning Crew",
+                                            { alice.id, bob.id });
+
+    ASSERT_EQ(bob.memberLeft.size(), 1u);
+    EXPECT_EQ(bob.memberLeft[0].from,      alice.id);
+    EXPECT_EQ(bob.memberLeft[0].groupId,   gid);
+    EXPECT_EQ(bob.memberLeft[0].groupName, "Planning Crew");
+}
+
+// ── Group file round-trip ────────────────────────────────────────────────
+// Fanout + chunk reassembly + hash verify end-to-end.  We write a small
+// source file, sendGroupFile to bob as the single member, and assert
+// the final savedPath exists with the expected bytes.  Default auto-
+// accept threshold is 100 MB so no consent prompt fires for our tiny file.
+
+TEST_F(TwoClientSuite, GroupFile_RoundTripDeliversAllChunks) {
+    connectBoth();
+
+    const std::string gid = "grp-file-jkl";
+    // Bootstrap session + roster so the group_file fanout is authorized.
+    alice.ctrl->sendText(bob.id, "handshake");
+    bob.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+    ASSERT_EQ(bob.received.size(), 1u);
+
+    // Write a source file spanning a couple chunks + change (cover the
+    // boundary logic in sendChunkEnvelopes).
+    const size_t size = size_t(FileTransferManager::kChunkBytes) * 2 + 2048;
+    std::vector<uint8_t> contents(size);
+    randombytes_buf(contents.data(), contents.size());
+    const std::string srcPath = makeTempPath("p2p-e2e-grpfile-src", ".bin");
+    {
+        std::ofstream ofs(srcPath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+        ofs.write(reinterpret_cast<const char*>(contents.data()),
+                  std::streamsize(contents.size()));
+    }
+
+    const std::string groupTid = alice.ctrl->sendGroupFile(
+        gid, "Planning Crew", { alice.id, bob.id },
+        "payload.bin", srcPath);
+    ASSERT_FALSE(groupTid.empty())
+        << "sendGroupFile returned empty — check session / roster setup";
+
+    // sendGroupFile returns a group-level id for caller-side cancellation;
+    // per-member transfers have their own UUIDs used on the wire and in
+    // onFileChunkReceived.  Look the file up by name instead (only one
+    // transfer in-flight in this test).
+    const Party::FileDone* done = nullptr;
+    for (const auto& [tid, fd] : bob.fileDone) {
+        (void)tid;
+        if (fd.fileName == "payload.bin") { done = &fd; break; }
+    }
+    ASSERT_NE(done, nullptr)
+        << "no completed file on Bob — chunks didn't land or "
+        << "hash-verify failed";
+    EXPECT_FALSE(done->savedPath.empty());
+    EXPECT_TRUE(fs::exists(done->savedPath));
+
+    // Byte-for-byte fidelity check on the reassembled file.
+    std::ifstream rfs(done->savedPath, std::ios::binary);
+    ASSERT_TRUE(rfs.is_open());
+    std::vector<uint8_t> got((std::istreambuf_iterator<char>(rfs)),
+                              std::istreambuf_iterator<char>());
+    EXPECT_EQ(got, contents)
+        << "reassembled file differs from source — chunk ordering "
+        << "or hash verification regression in FileTransferManager";
+
+    // Cleanup.
+    std::error_code ec;
+    fs::remove(srcPath, ec);
+    fs::remove(done->savedPath, ec);
 }

@@ -123,14 +123,10 @@ struct GroupRow: View {
 
     var body: some View {
         HStack {
-            Circle()
-                .fill(.indigo)
-                .frame(width: 40, height: 40)
-                .overlay {
-                    Image(systemName: "person.3.fill")
-                        .foregroundStyle(.white)
-                        .font(.subheadline)
-                }
+            GroupAvatarThumbnail(
+                avatarB64: client.groupAvatars[group.id],
+                fallbackInitials: String(group.name.prefix(2)).uppercased(),
+                size: 40)
             VStack(alignment: .leading, spacing: 2) {
                 Text(group.name)
                     .font(.headline)

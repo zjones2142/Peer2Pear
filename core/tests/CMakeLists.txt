@@ -48,16 +48,18 @@ peer2pear_add_test(test_session_manager)
 peer2pear_add_test(test_file_transfer)
 peer2pear_add_test(test_e2e_two_clients)
 peer2pear_add_test(test_c_api)
+peer2pear_add_test(test_c_api_e2e)
 peer2pear_add_test(test_relay_cover_traffic)
 
-# test_c_api + test_e2e_two_clients both instantiate ChatController, which — when built with
-# PEER2PEAR_P2P=ON — has ctor/dtor paths that reference QuicConnection and
-# NiceConnection.  Those .cpp files live in desktop/, not core/, so the
-# static library alone leaves the symbols unresolved at link time.  Pull
-# them in (and their msquic / libnice / glib deps) just for this binary.
-# Mobile builds set PEER2PEAR_P2P=OFF and this block compiles out.
+# test_c_api + test_c_api_e2e + test_e2e_two_clients all instantiate
+# ChatController, which — when built with PEER2PEAR_P2P=ON — has
+# ctor/dtor paths that reference QuicConnection and NiceConnection.
+# Those .cpp files live in desktop/, not core/, so the static library
+# alone leaves the symbols unresolved at link time.  Pull them in (and
+# their msquic / libnice / glib deps) just for these binaries.  Mobile
+# builds set PEER2PEAR_P2P=OFF and this block compiles out.
 if(PEER2PEAR_P2P)
-    foreach(_p2p_test test_e2e_two_clients test_c_api)
+    foreach(_p2p_test test_e2e_two_clients test_c_api test_c_api_e2e)
         target_sources(${_p2p_test} PRIVATE
             ${CMAKE_SOURCE_DIR}/desktop/QuicConnection.cpp
             ${CMAKE_SOURCE_DIR}/desktop/NiceConnection.cpp
