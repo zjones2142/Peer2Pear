@@ -1,0 +1,118 @@
+#
+# xcodegen input for the Peer2Pear iOS app.
+#
+# Regenerate the .xcodeproj with ./generate.sh (which auto-installs xcodegen
+# via Homebrew if needed).  The generated Peer2Pear.xcodeproj is NOT checked
+# in — everyone regenerates from this file.
+#
+# Prereq: build libpeer2pear-core.a + deps for iOS first with
+# `./build-ios.sh --both` from the repo root, so the static libraries
+# referenced below exist under ../build-ios-sim/ and ../build-ios-device/.
+#
+
+name: Peer2Pear
+options:
+  bundleIdPrefix: com.peer2pear
+  minimumXcodeGenVersion: "2.38.0"
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+
+# Per-project defaults.  Swift 5.9+ / C++17.  Treat warnings seriously.
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    # Don't enable bitcode — deprecated by Apple in Xcode 14+.
+    ENABLE_BITCODE: NO
+    # The static libraries from CMake are pre-built.  Xcode sees them as
+    # "other linker flags" — don't try to rebuild them.
+    ALWAYS_SEARCH_USER_PATHS: NO
+
+targets:
+  Peer2Pear:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+
+    sources:
+      - path: Peer2Pear/Sources
+      - path: Peer2Pear/Resources
+        optional: true
+
+    info:
+      # xcodegen auto-generates Info.plist.  Minimal config — everything else
+      # falls back to Xcode defaults.
+      path: Peer2Pear/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Peer2Pear
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # iOS 14+ requires this to call local network APIs.  Even though we
+        # relay through a server for now, Bonjour/ICE may come later.
+        NSLocalNetworkUsageDescription: >-
+          Peer2Pear may use your local network to establish direct peer-to-peer
+          connections for faster, more private messaging.
+        # QRScannerView opens AVCaptureSession to read peer-ID QR codes from
+        # MyKeyView on a counterpart device.  iOS hard-aborts capture-session
+        # start without this string.
+        NSCameraUsageDescription: >-
+          Peer2Pear uses the camera to scan other users' QR codes so you can
+          add them as contacts without typing a 43-character key.
+
+    # Code signing config lives in an xcconfig so per-developer Team IDs
+    # never enter the committed pbxproj.  See ios/README.md for the
+    # "copy template → fill in Team ID" first-time setup; before that,
+    # builds fail at link/sign time with a "no team selected" error.
+    configFiles:
+      Debug:   Peer2Pear/Configs/Signing.xcconfig
+      Release: Peer2Pear/Configs/Signing.xcconfig
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.peer2pear.Peer2Pear
+        SWIFT_OBJC_BRIDGING_HEADER: $(SRCROOT)/Peer2Pear/Sources/Bridge/Peer2Pear-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../core
+
+        # Simulator vs device library search paths.  CMake emits to
+        # ../build-ios-sim (simulator, arm64) and ../build-ios-device
+        # (device, arm64) — Xcode picks the right one via $(PLATFORM_NAME).
+        LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]:
+          - $(SRCROOT)/../build-ios-sim/core
+          - $(SRCROOT)/../build-ios-sim/third_party/sqlcipher
+          - $(SRCROOT)/../build-ios-sim/vcpkg_installed/arm64-ios-simulator/lib
+        LIBRARY_SEARCH_PATHS[sdk=iphoneos*]:
+          - $(SRCROOT)/../build-ios-device/core
+          - $(SRCROOT)/../build-ios-device/third_party/sqlcipher
+          - $(SRCROOT)/../build-ios-device/vcpkg_installed/arm64-ios/lib
+
+        # We only ship arm64 (Apple Silicon simulator + device).  iOS 26 is
+        # arm64-only anyway — no Intel simulator support to worry about.
+        ARCHS: arm64
+        VALID_ARCHS: arm64
+        ONLY_ACTIVE_ARCH: YES
+
+        # Static C++ deps need libc++ linked and C++ standard library enabled.
+        OTHER_LDFLAGS:
+          - -ObjC
+          - -lc++
+          - -lpeer2pear-core
+          - -lsqlcipher
+          - -lsodium
+          - -loqs
+          - -lssl
+          - -lcrypto
+
+    dependencies:
+      # System frameworks used by the Swift adapters.
+      - sdk: Foundation.framework
+      - sdk: Security.framework
+      - sdk: SwiftUI.framework
+      # AVFoundation backs QRScannerView's AVCaptureMetadataOutput.
+      - sdk: AVFoundation.framework

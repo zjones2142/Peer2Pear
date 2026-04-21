@@ -1,9 +1,0 @@
-{
-  "name": "peer2pear",
-  "version": "0.1.0",
-  "dependencies": [
-    "libsodium",
-    "libnice",
-    "glib"
-  ]
-}

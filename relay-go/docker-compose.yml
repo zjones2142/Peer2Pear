@@ -1,0 +1,22 @@
+# Peer2Pear Relay — one-command deploy
+#
+# Run:   docker compose up -d
+# Stop:  docker compose down
+# Logs:  docker compose logs -f
+#
+# Data is persisted in a Docker volume (survives container restarts).
+# The relay listens on port 8443 by default.
+
+services:
+  relay:
+    build: .
+    ports:
+      - "8443:8443"
+    volumes:
+      - relay-data:/data
+    environment:
+      - DB_PATH=/data/peer2pear_relay.db
+    restart: unless-stopped
+
+volumes:
+  relay-data:

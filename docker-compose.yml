@@ -1,0 +1,21 @@
+# Peer2Pear — Go relay in Docker.
+#
+# Run:  docker compose up
+#
+# The Python reference relay was retired on 2026-04-20 (see
+# README.md "Running a relay" and PROTOCOL.md §12).  There is now a
+# single supported server implementation.
+
+services:
+  relay-go:
+    build: ./relay-go
+    ports:
+      - "8443:8443"
+    volumes:
+      - relay-go-data:/data
+    environment:
+      - DB_PATH=/data/peer2pear_relay.db
+    restart: unless-stopped
+
+volumes:
+  relay-go-data:
