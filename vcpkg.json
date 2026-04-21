@@ -1,0 +1,32 @@
+{
+  "name": "peer2pear",
+  "version": "0.2.0",
+  "dependencies": [
+    "libsodium",
+    "liboqs",
+    {
+      "name": "openssl",
+      "$comment": "libcrypto is linked by third_party/sqlcipher (amalgamation) and comes in transitively via liboqs anyway. Declared explicitly so it doesn't depend on the transitive graph."
+    },
+    {
+      "name": "nlohmann-json",
+      "$comment": "Header-only JSON used by core/ (replaces QJsonDocument/QJsonObject). Cross-platform, tiny."
+    }
+  ],
+  "features": {
+    "p2p": {
+      "description": "Direct peer-to-peer transport (QUIC over ICE). On Windows this adds an MSVC dependency via msquic.",
+      "dependencies": [
+        "msquic",
+        "libnice",
+        "glib"
+      ]
+    },
+    "tests": {
+      "description": "Unit + integration tests for core/. Pulls GoogleTest. Enabled when -DBUILD_TESTS=ON (default for desktop, OFF for iOS).",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
+}
