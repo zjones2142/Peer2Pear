@@ -231,7 +231,7 @@ protected:
 // is what UIs use to draw a progress bar for files THEY send — inbound
 // progress already has onFileChunkReceived coverage above.
 
-TEST_F(FileTransferRoundTrip, SenderSideProgressFiresOncePerChunk) {
+TEST_F(FileTransferRoundTrip, SenderSideProgressEmitsFirstLastAndStride) {
     std::vector<std::pair<int, int>> progress; // (sent, total)
     std::string lastTo;
     std::string lastTid;
@@ -244,23 +244,40 @@ TEST_F(FileTransferRoundTrip, SenderSideProgressFiresOncePerChunk) {
             progress.emplace_back(sent, total);
         };
 
+    // Pick a chunk count that exercises the stride logic meaningfully —
+    // 10 chunks with stride=4 should emit at sent={1, 4, 8, 10}.
     const Bytes fileKey  = randomBytes(32);
-    const Bytes bytes    = prepareSource(size_t(FileTransferManager::kChunkBytes) * 3 + 128);
+    const Bytes bytes    = prepareSource(size_t(FileTransferManager::kChunkBytes) * 10 + 128);
     const Bytes fileHash = FileTransferManager::blake2b256(bytes);
     const int   totalChunks = int((bytes.size() + FileTransferManager::kChunkBytes - 1)
                                   / FileTransferManager::kChunkBytes);
+    const int   stride = FileTransferManager::kSenderProgressChunkStride;
 
     ASSERT_EQ(runSend(fileKey, fileHash, int64_t(bytes.size()), "sent-progress.bin"),
               transferId);
 
-    // Exactly one callback per chunk.
-    ASSERT_EQ(int(progress.size()), totalChunks);
+    ASSERT_FALSE(progress.empty());
 
-    // chunksSent runs 1..totalChunks monotonically; chunksTotal is constant.
-    for (int i = 0; i < totalChunks; ++i) {
-        EXPECT_EQ(progress[i].first,  i + 1);
-        EXPECT_EQ(progress[i].second, totalChunks);
+    // First emission is always sent=1 (start-of-transfer signal).
+    EXPECT_EQ(progress.front().first,  1);
+    EXPECT_EQ(progress.front().second, totalChunks);
+
+    // Last emission is always sent=totalChunks (done-dispatching signal).
+    EXPECT_EQ(progress.back().first,  totalChunks);
+    EXPECT_EQ(progress.back().second, totalChunks);
+
+    // Intermediate emissions land on stride boundaries only.
+    for (size_t k = 1; k + 1 < progress.size(); ++k) {
+        EXPECT_EQ(progress[k].first % stride, 0)
+            << "intermediate emission at sent=" << progress[k].first
+            << " should be a multiple of stride=" << stride;
     }
+
+    // sent values are strictly increasing.
+    for (size_t k = 1; k < progress.size(); ++k) {
+        EXPECT_GT(progress[k].first, progress[k - 1].first);
+    }
+
     EXPECT_EQ(lastTo,  receiverPeerId);
     EXPECT_EQ(lastTid, transferId);
 }

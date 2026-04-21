@@ -320,14 +320,19 @@ void FileTransferManager::sendChunkEnvelopes(const std::string& senderIdB64u,
             return;
         }
 
-        // Sender-side progress emission.  Fires for every successful
-        // dispatch so UIs can draw a running progress bar for files they
-        // send, not just files they receive.  Inbound progress comes from
-        // onFileChunkReceived; we mirror the shape here (chunksSent vs.
-        // chunksReceived) so UI code can share most of its rendering path.
+        // Sender-side progress emission.  Throttled — see the stride
+        // constant in the header.  Always fires for the first chunk
+        // (start-of-transfer signal) and the last chunk (done-dispatching
+        // signal) so UIs get bookends regardless of file size.
         if (onFileChunkSent) {
-            onFileChunkSent(peerIdB64u, transferId, fileName, fileSize,
-                            i + 1, totalChunks, ts, groupId, groupName);
+            const int sent = i + 1;
+            const bool isFirst  = (i == 0);
+            const bool isLast   = (sent == totalChunks);
+            const bool onStride = (sent % kSenderProgressChunkStride) == 0;
+            if (isFirst || isLast || onStride) {
+                onFileChunkSent(peerIdB64u, transferId, fileName, fileSize,
+                                sent, totalChunks, ts, groupId, groupName);
+            }
         }
     }
 

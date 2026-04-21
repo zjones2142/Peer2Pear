@@ -1895,6 +1895,12 @@ void ChatController::saveVerifiedFingerprint(const std::string& peerIdB64u,
     q.bindValue(":at",  nowSecs());
     q.bindValue(":fp",  fingerprint);
     q.exec();
+
+    // Drop the cached entry so the next trust check picks up the new
+    // stored fingerprint from disk.  Doing this inside the low-level DB
+    // helper (rather than only at the markPeerVerified call site) means
+    // any future caller that writes through here is automatically safe.
+    invalidatePeerKeyCache(peerIdB64u);
 }
 
 void ChatController::deleteVerifiedPeer(const std::string& peerIdB64u)
@@ -1905,6 +1911,12 @@ void ChatController::deleteVerifiedPeer(const std::string& peerIdB64u)
         return;
     q.bindValue(":pid", peerIdB64u);
     q.exec();
+
+    // Same reasoning as saveVerifiedFingerprint: belt-and-braces
+    // invalidation at the DB-write layer so no caller can forget.
+    // A stale "stored" entry here would silently report a now-unverified
+    // peer as Verified — the one direction that IS a security regression.
+    invalidatePeerKeyCache(peerIdB64u);
 }
 
 std::string ChatController::safetyNumber(const std::string& peerIdB64u) const
@@ -1914,27 +1926,45 @@ std::string ChatController::safetyNumber(const std::string& peerIdB64u) const
     return CryptoEngine::safetyNumber(m_crypto.identityPub(), peerEd);
 }
 
+const ChatController::PeerKeyCacheEntry&
+ChatController::fingerprintsFor(const std::string& peerIdB64u) const
+{
+    auto it = m_peerKeyCache.find(peerIdB64u);
+    if (it != m_peerKeyCache.end()) return it->second;
+
+    PeerKeyCacheEntry e;
+    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEd.size() == 32) {
+        // `current` is stable for the lifetime of this ChatController:
+        // it depends only on identityPub() (set once in setPassphrase)
+        // and the peerIdB64u key we're indexed on.
+        e.current = CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
+    }
+    e.stored = loadVerifiedFingerprint(peerIdB64u);
+    auto [ins, _] = m_peerKeyCache.emplace(peerIdB64u, std::move(e));
+    return ins->second;
+}
+
+void ChatController::invalidatePeerKeyCache(const std::string& peerIdB64u) const
+{
+    m_peerKeyCache.erase(peerIdB64u);
+}
+
 ChatController::PeerTrust ChatController::peerTrust(const std::string& peerIdB64u) const
 {
-    const Bytes stored = loadVerifiedFingerprint(peerIdB64u);
-    if (stored.size() != 32) return PeerTrust::Unverified;
-
-    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
-    if (peerEd.size() != 32) return PeerTrust::Unverified;
-
-    const Bytes current =
-        CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
-    return (current == stored) ? PeerTrust::Verified : PeerTrust::Mismatch;
+    const auto& c = fingerprintsFor(peerIdB64u);
+    if (c.stored.size() != 32)  return PeerTrust::Unverified;
+    if (c.current.size() != 32) return PeerTrust::Unverified;  // invalid peerId
+    return (c.current == c.stored) ? PeerTrust::Verified : PeerTrust::Mismatch;
 }
 
 bool ChatController::markPeerVerified(const std::string& peerIdB64u)
 {
-    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
-    if (peerEd.size() != 32) return false;
-    const Bytes fp =
-        CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
-    if (fp.size() != 32) return false;
-    saveVerifiedFingerprint(peerIdB64u, fp);
+    const auto& c = fingerprintsFor(peerIdB64u);
+    if (c.current.size() != 32) return false;
+    // saveVerifiedFingerprint invalidates the cache on write, so the
+    // next read repopulates with stored == current.
+    saveVerifiedFingerprint(peerIdB64u, c.current);
     // A fresh mark clears the once-per-session warning so if the user
     // re-verifies and we later detect ANOTHER change they'll see it.
     m_keyChangeWarned.erase(peerIdB64u);
@@ -1949,19 +1979,14 @@ void ChatController::unverifyPeer(const std::string& peerIdB64u)
 
 bool ChatController::detectKeyChange(const std::string& peerIdB64u)
 {
-    const Bytes stored = loadVerifiedFingerprint(peerIdB64u);
-    if (stored.size() != 32) return false;  // Unverified — not a mismatch
-
-    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
-    if (peerEd.size() != 32) return false;
-
-    const Bytes current =
-        CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
-    if (current == stored) return false;
+    const auto& c = fingerprintsFor(peerIdB64u);
+    if (c.stored.size() != 32)  return false;  // Unverified — not a mismatch
+    if (c.current.size() != 32) return false;  // peerId didn't decode
+    if (c.current == c.stored)  return false;
 
     // Mismatch.  Fire the callback at most once per session per peer.
     if (m_keyChangeWarned.insert(peerIdB64u).second) {
-        if (onPeerKeyChanged) onPeerKeyChanged(peerIdB64u, stored, current);
+        if (onPeerKeyChanged) onPeerKeyChanged(peerIdB64u, c.stored, c.current);
         P2P_WARN("[SAFETY] key-change detected for " << peerIdB64u.substr(0, 8)
                  << "... (hardBlock=" << (m_hardBlockOnKeyChange ? "on" : "off") << ")");
     }

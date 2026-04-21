@@ -1182,13 +1182,7 @@ void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
         for (int i = 0; i < m_chats.size(); ++i)
             if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { chatIndex = i; break; }
     } else {
-        const QString to = toPeerIdB64u.trimmed();
-        for (int i = 0; i < m_chats.size(); ++i) {
-            if (m_chats[i].isGroup) continue;
-            if (m_chats[i].keys.contains(to) || m_chats[i].peerIdB64u == to) {
-                chatIndex = i; break;
-            }
-        }
+        chatIndex = findChatForPeer(toPeerIdB64u.trimmed());
     }
     if (chatIndex < 0) return;
 
@@ -1826,10 +1820,16 @@ void ChatView::onEditProfile()
         "QPushButton{background:#1a2e1c;color:#5dd868;border:1px solid #2e5e30;"
         "border-radius:8px;padding:8px 14px;font-size:12px;}"
         "QPushButton:hover{background:#223a24;}");
-    QObject::connect(copyBtn, &QPushButton::clicked, [&dlg, myKey, copyBtn]() {
+    QObject::connect(copyBtn, &QPushButton::clicked, [myKey, copyBtn]() {
         QApplication::clipboard()->setText(myKey);
         copyBtn->setText("Copied!");
-        QTimer::singleShot(1500, [copyBtn]() { copyBtn->setText("Copy"); });
+        // Pass copyBtn as the QTimer context so Qt auto-disconnects
+        // if the button is destroyed first (the dialog is modal and
+        // stack-allocated — clicking Cancel inside the 1.5 s window
+        // otherwise dangles the captured raw pointer and crashes).
+        QTimer::singleShot(1500, copyBtn, [copyBtn]() {
+            copyBtn->setText("Copy");
+        });
     });
     keyRow->addWidget(copyBtn);
     root->addLayout(keyRow);
@@ -2165,7 +2165,7 @@ void ChatView::onAddContact()
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
+int ChatView::findChatForPeer(const QString &peerIdB64u) const
 {
     for (int i = 0; i < m_chats.size(); ++i) {
         if (m_chats[i].isGroup) continue;
@@ -2173,7 +2173,15 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
         for (const QString &k : std::as_const(m_chats[i].keys))
             if (k.trimmed() == peerIdB64u) return i;
     }
-    // Unknown sender — auto-create
+    return -1;
+}
+
+int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
+{
+    const int existing = findChatForPeer(peerIdB64u);
+    if (existing >= 0) return existing;
+
+    // Unknown sender — auto-create at the top of the list.
     ChatData nc; nc.name = "Unknown contact"; nc.subtitle = "Secure chat";
     nc.peerIdB64u = peerIdB64u; nc.keys.append(peerIdB64u);
     m_chats.prepend(nc);
@@ -2353,7 +2361,7 @@ void ChatView::rebuildChatList()
     m_emptyLabel->resize(m_ui->contentWidget->size());
     m_emptyLabel->move(0,0); m_emptyLabel->raise();
     if (m_chats.isEmpty()) {
-        QTimer::singleShot(0,[this](){ if(m_emptyLabel){
+        QTimer::singleShot(0, this, [this](){ if(m_emptyLabel){
             m_emptyLabel->resize(m_ui->contentWidget->size());
             m_emptyLabel->raise(); m_emptyLabel->show(); } });
     } else {
@@ -2569,7 +2577,7 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
     auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
     if (!layout) return;
     layout->insertWidget(layout->count()-1, row);
-    QTimer::singleShot(5,[this](){
+    QTimer::singleShot(5, this, [this](){
         m_ui->messageScroll->verticalScrollBar()->setValue(
             m_ui->messageScroll->verticalScrollBar()->maximum());
     });
@@ -2624,7 +2632,7 @@ void ChatView::addFileBubble(const QString &fileName, qint64 fileSize, bool sent
     }
 
     layout->insertWidget(layout->count() - 1, row);
-    QTimer::singleShot(5, [this]{
+    QTimer::singleShot(5, this, [this]{
         m_ui->messageScroll->verticalScrollBar()->setValue(
             m_ui->messageScroll->verticalScrollBar()->maximum());
     });

@@ -51,7 +51,7 @@ struct P2PFileRequest: Identifiable {
 }
 
 /// Direction of a file transfer — inbound means WE'RE receiving, outbound
-/// means WE'RE sending.  Lets a single `fileProgress` dict carry both
+/// means WE'RE sending.  Lets a single `transfers` dict carry both
 /// halves and lets views filter by counterparty without care for which
 /// direction the bytes are flowing.
 enum P2PTransferDirection {
@@ -59,20 +59,50 @@ enum P2PTransferDirection {
     case outbound
 }
 
-/// Progress event from an in-flight transfer.  `savedPath` is non-nil
-/// only when `chunksDone == chunksTotal` AND direction == .inbound
+/// Lifecycle state of a transfer.  Replaces the pre-unification trio of
+/// `deliveredTransferIds` / `canceledTransfers` / `blockedTransfers`
+/// that each views had to cross-reference to figure out status.
+enum P2PTransferStatus: Equatable {
+    /// Chunks are still being dispatched / received.
+    case inFlight
+    /// Inbound: receiver reassembled the file and wrote savedPath.
+    case completed
+    /// Outbound: receiver sent the file_ack confirming delivery.
+    case delivered
+    /// Transfer was canceled.  `byReceiver == true` means the recipient
+    /// canceled; false means we (sender or otherwise) canceled.
+    case canceled(byReceiver: Bool)
+    /// Transfer was blocked by transport policy (P2P required, P2P
+    /// unavailable).  `byReceiver == true` when the receiver's policy
+    /// is what blocked it.
+    case blocked(byReceiver: Bool)
+}
+
+/// Single source of truth for per-transfer state.  Mutates in place as
+/// chunk-progress / ack / cancel / block events arrive.  `savedPath`
+/// is non-nil only for .inbound transfers that reached .completed
 /// (sender never has a savedPath — the file already lives at its
 /// original path on their disk).
-struct P2PFileProgress: Identifiable {
+struct P2PTransferRecord: Identifiable {
     let id: String             // transferId
     let peerId: String         // the OTHER party (sender if inbound, recipient if outbound)
     let fileName: String
     let fileSize: Int64
-    let chunksDone: Int
-    let chunksTotal: Int
-    let savedPath: String?
     let direction: P2PTransferDirection
-    let timestamp: Date
+    var chunksDone: Int
+    var chunksTotal: Int
+    var savedPath: String?
+    var status: P2PTransferStatus
+    var timestamp: Date
+
+    /// True for .completed / .delivered / .canceled / .blocked —
+    /// i.e. the transfer is no longer in-flight and won't change further.
+    var isTerminal: Bool {
+        switch status {
+        case .inFlight: return false
+        default:        return true
+        }
+    }
 }
 
 /// Trust state for a peer — mirrors `P2P_PEER_*` in peer2pear.h.
@@ -123,17 +153,11 @@ final class Peer2PearClient: ObservableObject {
     /// Transfers waiting on user consent (see `respondToFileRequest`).
     @Published var pendingFileRequests: [P2PFileRequest] = []
 
-    /// Transfer progress / completion events, keyed by transferId.
-    @Published var fileProgress: [String: P2PFileProgress] = [:]
-
-    /// Transfers the sender confirmed landed intact.
-    @Published var deliveredTransferIds: Set<String> = []
-
-    /// Transfers that got canceled — maps transferId → `byReceiver` flag.
-    @Published var canceledTransfers: [String: Bool] = [:]
-
-    /// Transport policy blocked these transfers (P2P required, P2P failed).
-    @Published var blockedTransfers: [String: Bool] = [:]
+    /// All known file transfers (in-flight and terminal), keyed by
+    /// transferId.  Unified from what was previously four parallel
+    /// dicts (progress / delivered / canceled / blocked) — see
+    /// `P2PTransferRecord` + `P2PTransferStatus`.
+    @Published var transfers: [String: P2PTransferRecord] = [:]
 
     /// Safety-number mismatches surfaced since this session started.
     /// Views use this to render a warning banner; clear entries after
@@ -423,6 +447,48 @@ final class Peer2PearClient: ObservableObject {
             i += 1
         }
         return out
+    }
+
+    // MARK: - Transfer state mutators (called from callbacks on the main queue)
+
+    /// Upsert an in-progress transfer record.  Preserves existing
+    /// terminal status (.completed / .delivered / .canceled / .blocked)
+    /// — a late-arriving chunk event shouldn't flip a completed
+    /// transfer back to .inFlight.
+    fileprivate func upsertTransfer(id: String, peerId: String,
+                                     fileName: String, fileSize: Int64,
+                                     direction: P2PTransferDirection,
+                                     chunksDone: Int, chunksTotal: Int,
+                                     savedPath: String?,
+                                     status: P2PTransferStatus,
+                                     timestamp: Date) {
+        if var existing = transfers[id] {
+            existing.chunksDone  = max(existing.chunksDone, chunksDone)
+            existing.chunksTotal = chunksTotal > 0 ? chunksTotal : existing.chunksTotal
+            if let savedPath { existing.savedPath = savedPath }
+            if !existing.isTerminal {
+                existing.status = status
+            }
+            existing.timestamp = max(existing.timestamp, timestamp)
+            transfers[id] = existing
+        } else {
+            transfers[id] = P2PTransferRecord(
+                id: id, peerId: peerId, fileName: fileName, fileSize: fileSize,
+                direction: direction,
+                chunksDone: chunksDone, chunksTotal: chunksTotal,
+                savedPath: savedPath, status: status, timestamp: timestamp)
+        }
+    }
+
+    /// Flip the status on an existing record (delivered / canceled /
+    /// blocked events).  No-op if the transferId is unknown — not
+    /// every cancel / block necessarily has a prior progress event on
+    /// record (e.g. the transfer was blocked before the first chunk).
+    fileprivate func markTransferStatus(id: String, status: P2PTransferStatus) {
+        guard var existing = transfers[id] else { return }
+        existing.status = status
+        existing.timestamp = Date()
+        transfers[id] = existing
     }
 
     // MARK: - File transfer actions
@@ -716,46 +782,59 @@ final class Peer2PearClient: ObservableObject {
         }, selfPtr)
 
         // ── File transfer: inbound progress + completion ──────────────
+        // Sets status = .completed once the core hands us a savedPath
+        // (receiver reassembled + hash-verified the file).
         p2p_set_on_file_progress(ctx, {
             from, tid, fileName, fileSize,
             chunksReceived, chunksTotal, savedPath, ts, ud in
             guard let client = Peer2PearClient.from(ud),
                   let from, let tid, let fileName else { return }
-            let progress = P2PFileProgress(
-                id: String(cString: tid),
-                peerId: String(cString: from),
-                fileName: String(cString: fileName),
-                fileSize: fileSize,
-                chunksDone: Int(chunksReceived),
-                chunksTotal: Int(chunksTotal),
-                savedPath: savedPath.flatMap { String(cString: $0) },
-                direction: .inbound,
-                timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
-            )
-            DispatchQueue.main.async { client.fileProgress[progress.id] = progress }
+            let idStr   = String(cString: tid)
+            let fromStr = String(cString: from)
+            let nameStr = String(cString: fileName)
+            let saved   = savedPath.flatMap { String(cString: $0) }
+            let when    = Date(timeIntervalSince1970: TimeInterval(ts))
+            DispatchQueue.main.async {
+                client.upsertTransfer(
+                    id: idStr, peerId: fromStr, fileName: nameStr,
+                    fileSize: fileSize,
+                    direction: .inbound,
+                    chunksDone: Int(chunksReceived),
+                    chunksTotal: Int(chunksTotal),
+                    savedPath: saved,
+                    // Inbound reaches .completed only once the file has
+                    // been written to disk AND hash-verified — core
+                    // signals that by populating savedPath.
+                    status: (saved != nil && !saved!.isEmpty) ? .completed : .inFlight,
+                    timestamp: when)
+            }
         }, selfPtr)
 
         // ── File transfer: outbound (sender-side) progress ────────────
         // Fires after every outbound chunk dispatches.  savedPath stays
         // nil here — the sender already has the source file at the path
-        // they passed to p2p_send_file.
+        // they passed to p2p_send_file.  The .delivered status arrives
+        // later via on_file_delivered once the receiver acks.
         p2p_set_on_file_sent_progress(ctx, {
             to, tid, fileName, fileSize,
             chunksSent, chunksTotal, ts, ud in
             guard let client = Peer2PearClient.from(ud),
                   let to, let tid, let fileName else { return }
-            let progress = P2PFileProgress(
-                id: String(cString: tid),
-                peerId: String(cString: to),
-                fileName: String(cString: fileName),
-                fileSize: fileSize,
-                chunksDone: Int(chunksSent),
-                chunksTotal: Int(chunksTotal),
-                savedPath: nil,
-                direction: .outbound,
-                timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
-            )
-            DispatchQueue.main.async { client.fileProgress[progress.id] = progress }
+            let idStr   = String(cString: tid)
+            let toStr   = String(cString: to)
+            let nameStr = String(cString: fileName)
+            let when    = Date(timeIntervalSince1970: TimeInterval(ts))
+            DispatchQueue.main.async {
+                client.upsertTransfer(
+                    id: idStr, peerId: toStr, fileName: nameStr,
+                    fileSize: fileSize,
+                    direction: .outbound,
+                    chunksDone: Int(chunksSent),
+                    chunksTotal: Int(chunksTotal),
+                    savedPath: nil,
+                    status: .inFlight,
+                    timestamp: when)
+            }
         }, selfPtr)
 
         // ── File transfer: user-consent prompt (Phase 2) ───────────────
@@ -777,13 +856,17 @@ final class Peer2PearClient: ObservableObject {
         }, selfPtr)
 
         // ── File transfer: cancellation ────────────────────────────────
+        // Flip status → .canceled and drop the pending-request entry if
+        // we never accepted.  We KEEP the transfer in the `transfers`
+        // dict (with terminal status) so the UI can show "Canceled" on
+        // the card instead of silently removing it.
         p2p_set_on_file_canceled(ctx, { tid, byReceiver, ud in
             guard let client = Peer2PearClient.from(ud), let tid else { return }
             let id = String(cString: tid)
+            let byRcv = byReceiver != 0
             DispatchQueue.main.async {
-                client.canceledTransfers[id] = (byReceiver != 0)
                 client.pendingFileRequests.removeAll { $0.id == id }
-                client.fileProgress.removeValue(forKey: id)
+                client.markTransferStatus(id: id, status: .canceled(byReceiver: byRcv))
             }
         }, selfPtr)
 
@@ -791,15 +874,18 @@ final class Peer2PearClient: ObservableObject {
         p2p_set_on_file_delivered(ctx, { tid, ud in
             guard let client = Peer2PearClient.from(ud), let tid else { return }
             let id = String(cString: tid)
-            DispatchQueue.main.async { client.deliveredTransferIds.insert(id) }
+            DispatchQueue.main.async {
+                client.markTransferStatus(id: id, status: .delivered)
+            }
         }, selfPtr)
 
         // ── File transfer: blocked by transport policy ─────────────────
         p2p_set_on_file_blocked(ctx, { tid, byReceiver, ud in
             guard let client = Peer2PearClient.from(ud), let tid else { return }
             let id = String(cString: tid)
+            let byRcv = byReceiver != 0
             DispatchQueue.main.async {
-                client.blockedTransfers[id] = (byReceiver != 0)
+                client.markTransferStatus(id: id, status: .blocked(byReceiver: byRcv))
             }
         }, selfPtr)
 

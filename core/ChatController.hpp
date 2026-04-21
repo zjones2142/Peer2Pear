@@ -25,6 +25,7 @@ class QuicConnection;  // forward declaration — full include in .cpp
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 
@@ -128,6 +129,14 @@ public:
 
     /// Current verification state for peer.  Computed fresh each call.
     PeerTrust peerTrust(const std::string& peerIdB64u) const;
+
+    // Wipe the in-memory fingerprint cache.  Production callers shouldn't
+    // need this — the cache invalidates itself whenever `verified_peers`
+    // is written through saveVerifiedFingerprint / deleteVerifiedPeer.
+    // Exposed for (a) test fixtures that mutate the DB directly to
+    // simulate tampering / restart, and (b) future migration / admin
+    // tooling that might write verified_peers out of band.
+    void clearPeerKeyCache() { m_peerKeyCache.clear(); }
 
     /// Persist "user has compared safety numbers and confirmed".  The
     /// current (self, peer) fingerprint is stored; mismatches surface if
@@ -368,9 +377,39 @@ private:
     // mismatched peer.  Cleared when a peer is re-verified or explicitly
     // unverified.
     std::set<std::string> m_keyChangeWarned;
+
+    // Per-peer fingerprint cache.  Eliminates the SQLCipher SELECT +
+    // BLAKE2b recompute that `peerTrust` and `detectKeyChange` used to
+    // do on every send + receive.  For a group fan-out to N members
+    // that was N round-trips per message; now it's O(1) after warmup.
+    //
+    // Source of truth is still the `verified_peers` DB table — the
+    // cache only shortcuts reads.  Writes (via saveVerifiedFingerprint /
+    // deleteVerifiedPeer) invalidate the matching entry, so the next
+    // read repopulates from disk.
+    //
+    // Invariant: `current` depends on `m_crypto.identityPub()`, which is
+    // set once by setPassphrase during ChatController startup and does
+    // not change for the lifetime of the controller.  If identity
+    // rotation is ever added, the entire cache must be cleared.
+    struct PeerKeyCacheEntry {
+        Bytes stored;   // verified_peers row (32 B); empty = not verified
+        Bytes current;  // BLAKE2b(me, peer) (32 B); empty if peerId was invalid
+    };
+    mutable std::unordered_map<std::string, PeerKeyCacheEntry> m_peerKeyCache;
+
+    // Populates + returns the cache entry for a peer.  All trust checks
+    // go through this; never read the DB directly.
+    const PeerKeyCacheEntry& fingerprintsFor(const std::string& peerIdB64u) const;
+    // Drop a cached entry after writing through to DB.  Const because
+    // the cache itself is mutable — the observable state of the class
+    // (the DB contents) isn't changed by invalidation.
+    void invalidatePeerKeyCache(const std::string& peerIdB64u) const;
+
     // DB-backed helpers (defined in ChatController.cpp).
     void ensureVerifiedPeersTable();
-    // Returns stored 32-byte fingerprint, or empty if no row.
+    // Returns stored 32-byte fingerprint, or empty if no row.  Kept as
+    // the one SQL-touching helper so cache misses fan back in here.
     Bytes loadVerifiedFingerprint(const std::string& peerIdB64u) const;
     void  saveVerifiedFingerprint(const std::string& peerIdB64u,
                                    const Bytes& fingerprint);

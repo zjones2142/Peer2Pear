@@ -101,6 +101,15 @@ public:
     static constexpr int64_t kMaxFileBytes   = 100LL * 1024 * 1024;
     static constexpr int64_t kLargeFileBytes = 5LL * 1024 * 1024;
 
+    // Throttle for onFileChunkSent.  One callback per 4 chunks (~960 KB)
+    // caps UI update rate to ~25 Hz on a 100 Mbps link — SwiftUI / Qt
+    // can't redraw faster than a few times per second anyway, and the
+    // FFI hop + DispatchQueue.main.async on iOS is non-free.  The first
+    // chunk (start-of-transfer signal) and the last chunk (done
+    // dispatching signal) always emit, so small files still get
+    // bookend events even if every intermediate is skipped.
+    static constexpr int     kSenderProgressChunkStride = 4;
+
     // ── Lifecycle timing ────────────────────────────────────────────────────
     static constexpr int     kP2PReadyWaitSecs           = 10;
     static constexpr int64_t kOutboundPendingTimeoutSecs = 10LL * 60;

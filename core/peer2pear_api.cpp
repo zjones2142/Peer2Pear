@@ -256,15 +256,15 @@ public:
     // cb mid-execution can dereference the already-destroyed controller
     // (the cb captured references to it).  Idempotent.
     void shutdown() {
-        std::vector<std::thread> pending;
+        std::vector<std::unique_ptr<Slot>> pending;
         {
             std::lock_guard<std::mutex> lk(m_bagMu);
             if (m_shuttingDown) return;
             m_shuttingDown = true;
             pending.swap(m_bag);
         }
-        for (auto& t : pending) {
-            if (t.joinable()) t.join();
+        for (auto& s : pending) {
+            if (s->t.joinable()) s->t.join();
         }
     }
 
@@ -275,43 +275,74 @@ public:
     void singleShot(int delayMs, std::function<void()> cb) override {
         auto* ctrlMu = m_ctrlMu;
         auto* self = this;
-        std::thread t([self, delayMs, ctrlMu, cb = std::move(cb)]() {
+
+        auto slot = std::make_unique<Slot>();
+        Slot* slotRaw = slot.get();
+
+        slot->t = std::thread([self, slotRaw, delayMs, ctrlMu, cb = std::move(cb)]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
-            if (!cb) return;
-            // If the factory is being torn down by now, the p2p_context
-            // is mid-destruction — skip the callback; the shutdown path
-            // will join this thread.
-            {
-                std::lock_guard<std::mutex> lk(self->m_bagMu);
-                if (self->m_shuttingDown) return;
+            if (cb) {
+                // Skip the callback if teardown has started — the shutdown
+                // path will still join this thread via m_bag.
+                bool shuttingDown = false;
+                {
+                    std::lock_guard<std::mutex> lk(self->m_bagMu);
+                    shuttingDown = self->m_shuttingDown;
+                }
+                if (!shuttingDown) {
+                    if (ctrlMu) {
+                        std::lock_guard<std::mutex> cg(*ctrlMu);
+                        cb();
+                    } else {
+                        cb();
+                    }
+                }
             }
-            if (ctrlMu) {
-                std::lock_guard<std::mutex> cg(*ctrlMu);
-                cb();
-            } else {
-                cb();
-            }
+            // Mark ourselves reapable — a later singleShot() call (or
+            // shutdown()) will join + erase us from m_bag.  Must be the
+            // last write; after this point the reaper may join us.
+            slotRaw->done.store(true, std::memory_order_release);
         });
-        // Stash the handle so the dtor can join it.  The bag grows for
-        // the session lifetime (bounded by call count — jitter timers
-        // etc.); process teardown drains it.  A more aggressive GC could
-        // track "done" flags per thread, but the simplest-correct shape
-        // is to just keep handles until shutdown.
+
         std::lock_guard<std::mutex> lk(m_bagMu);
+        // Reap completed siblings before pushing the new slot.  This is
+        // what keeps m_bag bounded over session lifetime instead of
+        // accumulating one handle per timer tick.
+        reapLocked();
         if (m_shuttingDown) {
             // Racing with destruction — detach and let the thread's own
             // m_shuttingDown re-check skip the cb.
-            t.detach();
+            slot->t.detach();
         } else {
-            m_bag.push_back(std::move(t));
+            m_bag.push_back(std::move(slot));
         }
     }
 
 private:
-    std::mutex*              m_ctrlMu = nullptr;
-    std::mutex               m_bagMu;
-    std::vector<std::thread> m_bag;
-    bool                     m_shuttingDown = false;
+    struct Slot {
+        std::thread        t;
+        std::atomic<bool>  done{false};
+    };
+
+    // Caller holds m_bagMu.  Walks m_bag erasing any Slot whose worker
+    // has finished (done==true); joins before erase so the thread is
+    // fully reclaimed.  join() on a done thread returns immediately.
+    void reapLocked() {
+        auto it = m_bag.begin();
+        while (it != m_bag.end()) {
+            if ((*it)->done.load(std::memory_order_acquire)) {
+                if ((*it)->t.joinable()) (*it)->t.join();
+                it = m_bag.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::mutex*                           m_ctrlMu = nullptr;
+    std::mutex                            m_bagMu;
+    std::vector<std::unique_ptr<Slot>>    m_bag;
+    bool                                  m_shuttingDown = false;
 };
 
 // ── p2p_context: the opaque handle ──────────────────────────────────────────

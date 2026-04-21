@@ -14,11 +14,11 @@ struct ConversationView: View {
         client.messages.filter { $0.from == peerId }
     }
 
-    /// Transfers with this peer — inbound or outbound.  Both halves land
-    /// in `client.fileProgress` keyed by transferId; the counterparty is
-    /// `peerId` regardless of direction, so filtering is uniform.
-    private var activeTransfers: [P2PFileProgress] {
-        client.fileProgress.values
+    /// Transfers with this peer — inbound or outbound, in-flight or
+    /// terminal.  The unified `transfers` dict is keyed by transferId;
+    /// counterparty filter is uniform across directions.
+    private var activeTransfers: [P2PTransferRecord] {
+        client.transfers.values
             .filter { $0.peerId == peerId }
             .sorted(by: { $0.timestamp > $1.timestamp })
     }
@@ -65,22 +65,8 @@ struct ConversationView: View {
     // MARK: - Body fragments (split to keep the type-checker happy)
 
     @ViewBuilder private var messagesScroll: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach(peerMessages) { msg in
-                        MessageBubble(message: msg,
-                                      isMine: msg.from == client.myPeerId)
-                            .id(msg.id)
-                    }
-                }
-                .padding()
-            }
-            .onChange(of: peerMessages.count) {
-                if let last = peerMessages.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
-            }
+        ChatMessagesScroll(messages: peerMessages) { msg in
+            MessageBubble(message: msg, isMine: msg.from == client.myPeerId)
         }
     }
 
@@ -88,7 +74,7 @@ struct ConversationView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(activeTransfers) { t in
-                    FileTransferRow(client: client, progress: t)
+                    FileTransferRow(client: client, transfer: t)
                 }
             }
             .padding(.horizontal)
@@ -98,31 +84,13 @@ struct ConversationView: View {
     }
 
     @ViewBuilder private var inputBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                showFilePicker = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-            }
-
-            TextField("Message", text: $messageText)
-                .textFieldStyle(.roundedBorder)
-
-            Button {
-                guard !messageText.isEmpty else { return }
-                client.sendText(to: peerId, text: messageText)
-                messageText = ""
-            } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(.green)
-            }
-            .disabled(messageText.isEmpty)
+        ChatInputBar(text: $messageText) {
+            showFilePicker = true
+        } onSend: {
+            guard !messageText.isEmpty else { return }
+            client.sendText(to: peerId, text: messageText)
+            messageText = ""
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
     }
 
     @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
@@ -209,50 +177,18 @@ struct GroupConversationView: View {
     }
 
     @ViewBuilder private var messagesScroll: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach(groupMessages) { msg in
-                        GroupMessageBubble(message: msg,
-                                           isMine: msg.from == client.myPeerId)
-                            .id(msg.id)
-                    }
-                }
-                .padding()
-            }
-            .onChange(of: groupMessages.count) {
-                if let last = groupMessages.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
-            }
+        ChatMessagesScroll(messages: groupMessages) { msg in
+            GroupMessageBubble(message: msg,
+                               isMine: msg.from == client.myPeerId)
         }
     }
 
     @ViewBuilder private var inputBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                showFilePicker = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-            }
-            .disabled(group == nil)
-
-            TextField("Message", text: $messageText)
-                .textFieldStyle(.roundedBorder)
-
-            Button {
-                send()
-            } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(.green)
-            }
-            .disabled(messageText.isEmpty || group == nil)
+        ChatInputBar(text: $messageText, enabled: group != nil) {
+            showFilePicker = true
+        } onSend: {
+            send()
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
     }
 
     private func handleFilePick(result: Result<[URL], Error>) {
@@ -713,57 +649,138 @@ struct KeyChangeBanner: View {
     }
 }
 
+// MARK: - Shared chat components
+// Generic over message type + bubble view so ConversationView (1:1)
+// and GroupConversationView (group) share the same scroll + auto-
+// scroll behavior without duplicating the ScrollViewReader dance.
+
+struct ChatMessagesScroll<Message: Identifiable, Bubble: View>: View {
+    let messages: [Message]
+    @ViewBuilder let bubble: (Message) -> Bubble
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(messages) { msg in
+                        bubble(msg).id(msg.id)
+                    }
+                }
+                .padding()
+            }
+            .onChange(of: messages.count) {
+                if let last = messages.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+        }
+    }
+}
+
+// Paperclip + text field + send button.  Shared between 1:1 and group
+// views.  `enabled` gates both buttons at once — GroupConversationView
+// passes `enabled: group != nil` so there's no interactive input while
+// the group roster hasn't loaded.
+struct ChatInputBar: View {
+    @Binding var text: String
+    var enabled: Bool = true
+    let onAttach: () -> Void
+    let onSend: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                onAttach()
+            } label: {
+                Image(systemName: "paperclip")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(!enabled)
+
+            TextField("Message", text: $text)
+                .textFieldStyle(.roundedBorder)
+
+            Button {
+                onSend()
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.green)
+            }
+            .disabled(!enabled || text.isEmpty)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+}
+
 // MARK: - File transfer row
-// Shows filename + progress (% when streaming, saved-path when done) for
-// a single in-flight transfer.  Tap to cancel.  Blocked + canceled
-// states come from the corresponding @Published dicts so we don't miss
-// anything after fileProgress stops updating.
+// Shows filename + progress (% when streaming, status text when terminal).
+// Reads everything from a single P2PTransferRecord — no cross-dict
+// lookups.
 
 struct FileTransferRow: View {
     @ObservedObject var client: Peer2PearClient
-    let progress: P2PFileProgress
+    let transfer: P2PTransferRecord
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Image(systemName: iconName)
                     .foregroundStyle(tint)
-                Text(progress.fileName)
+                Text(transfer.fileName)
                     .font(.caption.bold())
                     .lineLimit(1)
                     .frame(maxWidth: 160, alignment: .leading)
-                if progress.savedPath == nil && !isTerminal {
+                if !transfer.isTerminal {
                     Button(role: .destructive) {
-                        client.cancelTransfer(transferId: progress.id)
+                        client.cancelTransfer(transferId: transfer.id)
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.caption)
                     }
                 }
             }
-            if let saved = progress.savedPath {
+            subtitle
+        }
+        .padding(8)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder private var subtitle: some View {
+        switch transfer.status {
+        case .completed:
+            if let saved = transfer.savedPath {
                 Text("Saved → " + (saved as NSString).lastPathComponent)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-            } else if isComplete {
-                // Outbound finished — note delivery confirmation lives in
-                // client.deliveredTransferIds (arrives when the receiver acks).
-                Text(client.deliveredTransferIds.contains(progress.id)
-                     ? "Sent · Delivered"
-                     : "Sent · Awaiting confirmation")
+            }
+        case .delivered:
+            Text("Sent · Delivered")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        case .canceled:
+            Text("Canceled")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        case .blocked(let byReceiver):
+            Text(byReceiver ? "Blocked by recipient (P2P required)"
+                            : "Blocked: P2P unavailable")
+                .font(.caption2)
+                .foregroundStyle(.red)
+        case .inFlight:
+            if transfer.direction == .outbound
+               && transfer.chunksTotal > 0
+               && transfer.chunksDone >= transfer.chunksTotal {
+                // Last chunk dispatched, awaiting receiver's file_ack.
+                Text("Sent · Awaiting confirmation")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-            } else if let blocked = client.blockedTransfers[progress.id] {
-                Text(blocked ? "Blocked by recipient (P2P required)"
-                             : "Blocked: P2P unavailable")
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-            } else if client.canceledTransfers[progress.id] != nil {
-                Text("Canceled")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
             } else {
                 ProgressView(value: fraction)
                     .progressViewStyle(.linear)
@@ -771,38 +788,31 @@ struct FileTransferRow: View {
                     .frame(width: 160)
             }
         }
-        .padding(8)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private var fraction: Double {
-        guard progress.chunksTotal > 0 else { return 0 }
-        return Double(progress.chunksDone) / Double(progress.chunksTotal)
+        guard transfer.chunksTotal > 0 else { return 0 }
+        return Double(transfer.chunksDone) / Double(transfer.chunksTotal)
     }
-    /// Outbound transfers complete when the last chunk dispatches
-    /// (chunksDone == chunksTotal) — sender delivery confirmation arrives
-    /// separately via onFileTransferDelivered / deliveredTransferIds.
-    private var isComplete: Bool {
-        if progress.direction == .inbound { return progress.savedPath != nil }
-        return progress.chunksDone >= progress.chunksTotal && progress.chunksTotal > 0
-    }
-    private var isTerminal: Bool {
-        isComplete
-        || client.blockedTransfers[progress.id] != nil
-        || client.canceledTransfers[progress.id] != nil
-    }
+
     private var iconName: String {
-        if isComplete { return "checkmark.circle.fill" }
-        if client.blockedTransfers[progress.id] != nil { return "nosign" }
-        if client.canceledTransfers[progress.id] != nil { return "xmark.circle" }
-        return progress.direction == .inbound ? "arrow.down.circle" : "arrow.up.circle"
+        switch transfer.status {
+        case .completed, .delivered: return "checkmark.circle.fill"
+        case .blocked:               return "nosign"
+        case .canceled:              return "xmark.circle"
+        case .inFlight:
+            return transfer.direction == .inbound ? "arrow.down.circle"
+                                                  : "arrow.up.circle"
+        }
     }
+
     private var tint: Color {
-        if isComplete { return .green }
-        if client.blockedTransfers[progress.id] != nil { return .red }
-        if client.canceledTransfers[progress.id] != nil { return .secondary }
-        return .blue
+        switch transfer.status {
+        case .completed, .delivered: return .green
+        case .blocked:               return .red
+        case .canceled:              return .secondary
+        case .inFlight:              return .blue
+        }
     }
 }
 

@@ -349,6 +349,11 @@ protected:
 
     // Stamp the stored fingerprint row for `peerId` in `party`'s DB with
     // a known-bad 32-byte blob.  Used by safety-number mismatch tests.
+    //
+    // The raw SQL bypasses saveVerifiedFingerprint's cache invalidation,
+    // so we flush the in-memory cache ourselves.  In production that
+    // invalidation happens naturally on the next app start; these tests
+    // compress the "restart" step into one call.
     static void corruptStoredFingerprint(Party& party,
                                           const std::string& peerId,
                                           uint8_t fill) {
@@ -359,6 +364,7 @@ protected:
         q.bindValue(":fp", Bytes(32, fill));
         q.bindValue(":pid", peerId);
         ASSERT_TRUE(q.exec());
+        party.ctrl->clearPeerKeyCache();
     }
 
     void SetUp() override {
@@ -519,6 +525,46 @@ TEST_F(TwoClientSuite, SafetyNumber_MarkAndUnverifyFlow) {
     alice.ctrl->unverifyPeer(bob.id);
     EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
               ChatController::PeerTrust::Unverified);
+}
+
+// ── 3c. Cache invalidation: markPeerVerified after a Unverified read ─────
+// Order matters.  The peerTrust() call warms the in-memory fingerprint
+// cache with {stored=empty}.  markPeerVerified writes verified_peers on
+// disk; the cache must reflect that on the next read or peerTrust will
+// stay Unverified forever — a UX bug, not a security one.
+
+TEST_F(TwoClientSuite, SafetyNumber_CachePicksUpVerifyAfterUnverifiedRead) {
+    connectBoth();
+
+    // Warm the cache: no row in verified_peers yet.
+    ASSERT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Unverified);
+
+    // Now verify.  Cache must update or invalidate.
+    ASSERT_TRUE(alice.ctrl->markPeerVerified(bob.id));
+    EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Verified);
+}
+
+// ── 3d. Cache invalidation: unverifyPeer after a Verified read ───────────
+// The load-bearing one.  If the cache still reports {stored=fingerprint}
+// after the row is deleted, peerTrust would say Verified — a silent
+// security regression (trusting a peer the user just unverified).
+
+TEST_F(TwoClientSuite, SafetyNumber_CacheDropsStoredOnUnverifyAfterVerifiedRead) {
+    connectBoth();
+
+    ASSERT_TRUE(alice.ctrl->markPeerVerified(bob.id));
+    // Warm the cache with {stored=fingerprint, current=same}.
+    ASSERT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Verified);
+
+    // Unverify — the cached `stored` must be dropped.
+    alice.ctrl->unverifyPeer(bob.id);
+    EXPECT_EQ(alice.ctrl->peerTrust(bob.id),
+              ChatController::PeerTrust::Unverified)
+        << "cache stale after unverifyPeer — peerTrust still reports Verified "
+        << "for a peer the user explicitly unverified (security regression)";
 }
 
 // ── 3e. Safety numbers: corrupt stored fingerprint → Mismatch + callback ─
