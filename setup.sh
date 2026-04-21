@@ -66,6 +66,10 @@ require_cmd cmake "Install CMake >= 3.16 from your package manager or https://cm
 # amalgamation in third_party/sqlcipher/ (sqlite3.c + sqlite3.h, committed).
 # core/ compiles it against the OpenSSL that vcpkg pulls in transitively via
 # liboqs.  Same build on desktop and mobile, no per-platform install step.
+#
+# qrcodegen (Project Nayuki, MIT) is also vendored in third_party/qrcodegen/
+# for the desktop Edit Profile QR preview.  Single static library, no deps.
+# iOS uses CIFilter.qrCodeGenerator natively and doesn't link it.
 
 install_macos_deps() {
     if ! command -v brew >/dev/null 2>&1; then

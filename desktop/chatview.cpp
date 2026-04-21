@@ -1,4 +1,5 @@
 #include "chatview.h"
+#include "QrImage.hpp"
 #include "ui_mainwindow.h"
 
 #include <algorithm>
@@ -1834,7 +1835,25 @@ void ChatView::onEditProfile()
     keyRow->addWidget(copyBtn);
     root->addLayout(keyRow);
 
-    auto *keyHint = new QLabel("Share this key with contacts so they can message you.", &dlg);
+    // ── QR code preview ─────────────────────────────────────────────────────
+    // Displayed alongside the Copy button so two in-person users can add each
+    // other without typing: one pulls up Edit Profile, the other scans with
+    // their phone camera.  The encoded payload is the raw 43-char key — byte
+    // for byte what Copy puts on the clipboard, so either method produces the
+    // same input on the receiving side.
+    QImage qrImg = QrImage::encodeText(myKey, /*pixelsPerModule=*/4);
+    if (!qrImg.isNull()) {
+        auto *qrLabel = new QLabel(&dlg);
+        qrLabel->setPixmap(QPixmap::fromImage(qrImg));
+        qrLabel->setAlignment(Qt::AlignCenter);
+        qrLabel->setStyleSheet(
+            "QLabel{background:#fff;border:1px solid #2a2a2a;border-radius:8px;"
+            "padding:8px;}");
+        root->addWidget(qrLabel, 0, Qt::AlignCenter);
+    }
+
+    auto *keyHint = new QLabel("Share this key with contacts so they can message you. "
+                                 "They can paste it or scan the QR code above.", &dlg);
     keyHint->setStyleSheet("color:#555;font-size:11px;background:transparent;");
     keyHint->setWordWrap(true);
     root->addWidget(keyHint);
@@ -2050,9 +2069,25 @@ void ChatView::onAddContact()
     layout->addWidget(new QLabel("Display Name",&dlg));
     auto *nameEdit = new QLineEdit(&dlg); layout->addWidget(nameEdit);
     layout->addWidget(new QLabel("Public Key",&dlg));
-    auto *keyInput = new QLineEdit(&dlg);
+    auto *keyRow_   = new QHBoxLayout;
+    keyRow_->setSpacing(8);
+    auto *keyInput  = new QLineEdit(&dlg);
     keyInput->setPlaceholderText("Paste their 43-character public key…");
-    layout->addWidget(keyInput);
+    keyRow_->addWidget(keyInput, 1);
+    auto *pasteBtn  = new QPushButton("Paste", &dlg);
+    pasteBtn->setAutoDefault(false);
+    pasteBtn->setStyleSheet(
+        "QPushButton{background:#1a2e1c;color:#5dd868;border:1px solid #2e5e30;"
+        "border-radius:8px;padding:8px 14px;font-size:12px;}"
+        "QPushButton:hover{background:#223a24;}");
+    QObject::connect(pasteBtn, &QPushButton::clicked, [keyInput]() {
+        // Trim whitespace/newlines that often ride along when a key is
+        // copied from a chat message — saves the user a manual edit
+        // before isValidPublicKey rejects it for length.
+        keyInput->setText(QApplication::clipboard()->text().trimmed());
+    });
+    keyRow_->addWidget(pasteBtn);
+    layout->addLayout(keyRow_);
 
     layout->addStretch();
 
