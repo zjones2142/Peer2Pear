@@ -193,7 +193,18 @@ public:
     StdTimer& operator=(const StdTimer&) = delete;
 
     void startSingleShot(int delayMs, std::function<void()> cb) override {
-        cancelAndJoin();
+        // Self-rearm case: the caller IS our callback thread (e.g.
+        // ChatController::scheduleMaintenance re-arms itself from inside
+        // runMaintenance).  Joining ourselves would throw system_error
+        // and call std::terminate → abort.  Detach the outgoing thread
+        // — its body is already returning after this call, so the OS
+        // cleans it up naturally — and spawn a fresh one.
+        if (m_thread.joinable() &&
+            m_thread.get_id() == std::this_thread::get_id()) {
+            m_thread.detach();
+        } else {
+            cancelAndJoin();
+        }
         {
             std::lock_guard<std::mutex> lk(m_mu);
             m_canceled = false;
@@ -220,7 +231,22 @@ public:
         });
     }
 
-    void stop() override { cancelAndJoin(); }
+    void stop() override {
+        // Same self-join guard: `stop()` from within the callback thread
+        // (e.g. a user action fires during runMaintenance) must not join
+        // itself.  Detach instead; the thread body is about to return.
+        if (m_thread.joinable() &&
+            m_thread.get_id() == std::this_thread::get_id()) {
+            {
+                std::lock_guard<std::mutex> lk(m_mu);
+                m_canceled = true;
+            }
+            m_cv.notify_all();
+            m_thread.detach();
+            return;
+        }
+        cancelAndJoin();
+    }
 
     bool isActive() const override {
         std::lock_guard<std::mutex> lk(m_mu);

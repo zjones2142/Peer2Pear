@@ -16,6 +16,7 @@ struct Peer2PearApp: App {
                     ChatListView(client: client)
                 }
             }
+            .preferredColorScheme(preferredScheme(client.colorScheme))
             .onAppear {
                 // Give the AppDelegate a handle to the client so APNs
                 // tokens + silent pushes can flow through to the
@@ -59,6 +60,19 @@ struct Peer2PearApp: App {
             @unknown default:
                 break
             }
+        }
+    }
+
+    /// Map the three-way preference to SwiftUI's ColorScheme?.  nil means
+    /// "follow system", which is what SwiftUI does when the modifier is
+    /// absent — passing nil explicitly keeps the callsite unconditional.
+    private func preferredScheme(
+        _ pref: Peer2PearClient.ColorSchemePreference
+    ) -> ColorScheme? {
+        switch pref {
+        case .dark:   return .dark
+        case .light:  return .light
+        case .system: return nil
         }
     }
 }

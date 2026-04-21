@@ -95,6 +95,9 @@ void SettingsPanel::buildUI()
     // ── Privacy level ───────────────────────────────────────────────────────
     bodyLayout->addWidget(makePrivacySection());
 
+    // ── Appearance (theme) ─────────────────────────────────────────────────
+    bodyLayout->addWidget(makeAppearanceSection());
+
     // ── About section ─────────────────────────────────────────────────────────
     // Version    = app version (matches project(Peer2Pear VERSION ...) in CMakeLists.txt)
     // Protocol   = wire-protocol version (matches the relay's /healthz "version" field
@@ -286,6 +289,16 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
         // Triggers the slot which updates the visual + persists again +
         // emits privacyLevelChanged so MainWindow syncs RelayClient on load.
         onPrivacyLevelChanged(lvl);
+    }
+
+    // Appearance — default Dark matches the hardcoded dark palette.
+    {
+        const QString raw = m_db->loadSetting("themePreference", "dark");
+        if      (raw == "light")  m_themePref = ThemePreference::Light;
+        else if (raw == "system") m_themePref = ThemePreference::System;
+        else                       m_themePref = ThemePreference::Dark;
+        applyThemeButtonStyles();
+        emit themeChanged(m_themePref);
     }
 }
 
@@ -1563,4 +1576,117 @@ void SettingsPanel::onPrivacyLevelChanged(int level)
     // Persist and notify.
     if (m_db) m_db->saveSetting("privacyLevel", QString::number(level));
     emit privacyLevelChanged(level);
+}
+
+QWidget *SettingsPanel::makeAppearanceSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    QLabel *heading = new QLabel("APPEARANCE");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    QWidget *segRow = new QWidget();
+    segRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *segLayout = new QHBoxLayout(segRow);
+    segLayout->setContentsMargins(16, 8, 16, 4);
+    segLayout->setSpacing(8);
+
+    auto makeThemeButton = [](const QString &text) -> QPushButton * {
+        QPushButton *btn = new QPushButton(text);
+        btn->setCheckable(true);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1a1a1a;"
+            "  color: #999999;"
+            "  border: 1px solid #2a2a2a;"
+            "  border-radius: 6px;"
+            "  padding: 8px 14px;"
+            "  font-size: 13px;"
+            "}"
+            "QPushButton:hover { background-color: #1e1e1e; color: #cccccc; }"
+            "QPushButton:checked {"
+            "  background-color: #1f2e1f;"
+            "  color: #4caf50;"
+            "  border: 1px solid #4caf50;"
+            "  font-weight: bold;"
+            "}"
+            );
+        return btn;
+    };
+
+    m_themeBtnDark   = makeThemeButton("Dark");
+    m_themeBtnLight  = makeThemeButton("Light");
+    m_themeBtnSystem = makeThemeButton("System");
+
+    segLayout->addWidget(m_themeBtnDark,   1);
+    segLayout->addWidget(m_themeBtnLight,  1);
+    segLayout->addWidget(m_themeBtnSystem, 1);
+    cardLayout->addWidget(segRow);
+
+    // Caption — honest about current scope.  The dark palette is
+    // hardcoded in per-widget stylesheets throughout the app; Light
+    // currently swaps the app-level Fusion palette so system widgets
+    // (menus, dialogs, scrollbars) respect it but per-widget
+    // stylesheets still paint dark.
+    QLabel *caption = new QLabel(
+        "Light theme is a work in progress — app-level chrome switches, "
+        "but per-widget colors still follow the dark palette.  Full "
+        "coverage is tracked as follow-up work."
+        );
+    caption->setWordWrap(true);
+    caption->setStyleSheet(
+        "color: #777777; font-size: 11px;"
+        "padding: 6px 16px 14px 16px;"
+        "background: transparent; border: none;"
+        );
+    cardLayout->addWidget(caption);
+
+    auto pickTheme = [this](ThemePreference pref) {
+        m_themePref = pref;
+        applyThemeButtonStyles();
+        if (m_db) {
+            const char* raw = pref == ThemePreference::Light  ? "light"
+                             : pref == ThemePreference::System ? "system"
+                                                                : "dark";
+            m_db->saveSetting("themePreference", raw);
+        }
+        emit themeChanged(pref);
+    };
+    connect(m_themeBtnDark,   &QPushButton::clicked, this,
+            [pickTheme]() { pickTheme(ThemePreference::Dark); });
+    connect(m_themeBtnLight,  &QPushButton::clicked, this,
+            [pickTheme]() { pickTheme(ThemePreference::Light); });
+    connect(m_themeBtnSystem, &QPushButton::clicked, this,
+            [pickTheme]() { pickTheme(ThemePreference::System); });
+
+    return card;
+}
+
+void SettingsPanel::applyThemeButtonStyles()
+{
+    if (!m_themeBtnDark || !m_themeBtnLight || !m_themeBtnSystem) return;
+    QSignalBlocker b0(m_themeBtnDark);
+    QSignalBlocker b1(m_themeBtnLight);
+    QSignalBlocker b2(m_themeBtnSystem);
+    m_themeBtnDark  ->setChecked(m_themePref == ThemePreference::Dark);
+    m_themeBtnLight ->setChecked(m_themePref == ThemePreference::Light);
+    m_themeBtnSystem->setChecked(m_themePref == ThemePreference::System);
 }

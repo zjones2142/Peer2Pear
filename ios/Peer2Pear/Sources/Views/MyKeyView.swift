@@ -13,6 +13,10 @@ import UIKit
 //      are interchangeable.
 //
 // Surfaced from ChatListView's toolbar (person.circle icon) as a sheet.
+// Per-device preferences (appearance, biometric unlock, notification
+// privacy, relay URL) live in SettingsView — they used to sit here
+// but were confusing under the "My Key" title since they have
+// nothing to do with identity-sharing.
 struct MyKeyView: View {
     @ObservedObject var client: Peer2PearClient
     @Environment(\.dismiss) private var dismiss
@@ -64,11 +68,6 @@ struct MyKeyView: View {
                     .tint(.green)
                     .padding(.horizontal)
                     .disabled(client.myPeerId.isEmpty)
-
-                    Divider().padding(.vertical, 8)
-
-                    NotificationPrivacySection(client: client)
-                        .padding(.horizontal)
                 }
                 .padding(.vertical)
             }
@@ -79,64 +78,6 @@ struct MyKeyView: View {
                     Button("Done") { dismiss() }
                 }
             }
-        }
-    }
-}
-
-// Notification-content privacy picker.  Sits in MyKeyView because it's
-// a per-user preference that affects what iOS persists in its system
-// notification store.  Default is "hidden" — the OS only sees a
-// generic "New message" banner.  Users who value richer banners over
-// the residual forensic leak can opt up.
-//
-// Background: iOS writes every delivered notification payload into a
-// system-level store (backboardd / NotificationCenter DB).  That
-// store is NOT inside the app's sandbox; it survives app deletion
-// and is readable by forensic tools that have device access.  Even
-// if the app scrubs its own on-disk state, notification text that
-// once hit the banner can be recovered.  Hiding the content at the
-// UNMutableNotificationContent level keeps plaintext out of that
-// store entirely.
-private struct NotificationPrivacySection: View {
-    @ObservedObject var client: Peer2PearClient
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "bell.badge")
-                    .foregroundStyle(.green)
-                Text("Notification content")
-                    .font(.headline)
-            }
-
-            Picker("Content", selection: Binding(
-                get: { client.notificationContentMode },
-                set: { client.notificationContentMode = $0 }
-            )) {
-                Text("Hidden").tag(Peer2PearClient.NotificationContentMode.hidden)
-                Text("Sender").tag(Peer2PearClient.NotificationContentMode.senderOnly)
-                Text("Full").tag(Peer2PearClient.NotificationContentMode.full)
-            }
-            .pickerStyle(.segmented)
-
-            Text(explanation(for: client.notificationContentMode))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(12)
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(10)
-    }
-
-    private func explanation(for mode: Peer2PearClient.NotificationContentMode)
-        -> String {
-        switch mode {
-        case .hidden:
-            return "Banners show only \"New message\".  Message contents stay inside the encrypted app sandbox — the OS notification history sees nothing."
-        case .senderOnly:
-            return "Banners name the sender (or group).  The OS stores that identifier; message text stays private."
-        case .full:
-            return "Banners include the message text.  Convenient, but the OS retains the plaintext in its notification history, which forensic tools can read even after the message is deleted."
         }
     }
 }

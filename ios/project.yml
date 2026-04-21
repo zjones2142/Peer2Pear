@@ -64,6 +64,13 @@ targets:
         NSCameraUsageDescription: >-
           Peer2Pear uses the camera to scan other users' QR codes so you can
           add them as contacts without typing a 43-character key.
+        # LAContext / BiometricUnlock surfaces this string as the
+        # subtitle on the Face ID sheet.  Required the first time we
+        # evaluate .deviceOwnerAuthenticationWithBiometrics or iOS
+        # crashes the app at the call site.
+        NSFaceIDUsageDescription: >-
+          Peer2Pear uses Face ID to unlock your passphrase from the iOS
+          Keychain so you don't have to type it on every launch.
         # Silent APNs pushes wake the app for ~30 s to fetch queued
         # envelopes from the relay and display local notifications.
         # Plaintext is decrypted client-side; the push itself is
@@ -122,3 +129,5 @@ targets:
       - sdk: SwiftUI.framework
       # AVFoundation backs QRScannerView's AVCaptureMetadataOutput.
       - sdk: AVFoundation.framework
+      # LAContext — BiometricUnlock's Face ID / Touch ID prompt.
+      - sdk: LocalAuthentication.framework

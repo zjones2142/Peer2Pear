@@ -5,11 +5,35 @@ struct ChatListView: View {
     @State private var showAddContact = false
     @State private var showNewGroup = false
     @State private var showMyKey = false
+    @State private var showSettings = false
     @State private var newContactId = ""
 
-    /// 1:1 conversations keyed by the other peer's ID.
+    /// 1:1 conversations keyed by the OTHER peer's ID (not always the
+    /// `from` — for outgoing messages `from == myPeerId` and we key off
+    /// `to` instead).  Used to render the last-message preview per chat.
     private var conversations: [String: [P2PMessage]] {
-        Dictionary(grouping: client.messages, by: \.from)
+        Dictionary(grouping: client.messages) { msg in
+            msg.from == client.myPeerId ? (msg.to ?? "") : msg.from
+        }
+    }
+
+    /// Every peer that should show up in the Direct Messages section:
+    /// the union of peers we've messaged with (either direction) and
+    /// peers the user explicitly added via New Chat (before any
+    /// messages flowed).  Sorted to keep the list stable across renders.
+    private var directPeerIds: [String] {
+        var ids: Set<String> = []
+        for msg in client.messages {
+            if msg.from == client.myPeerId {
+                if let to = msg.to, !to.isEmpty { ids.insert(to) }
+            } else {
+                ids.insert(msg.from)
+            }
+        }
+        return ids
+            .union(client.knownPeerContacts)
+            .subtracting([client.myPeerId, ""])
+            .sorted()
     }
 
     /// Groups sorted most-recently-active first.
@@ -18,7 +42,7 @@ struct ChatListView: View {
     }
 
     private var isEmpty: Bool {
-        conversations.isEmpty && groupsSorted.isEmpty
+        directPeerIds.isEmpty && groupsSorted.isEmpty
     }
 
     var body: some View {
@@ -35,9 +59,9 @@ struct ChatListView: View {
                         }
                     }
                 }
-                if !conversations.isEmpty {
+                if !directPeerIds.isEmpty {
                     Section("Direct Messages") {
-                        ForEach(conversations.keys.sorted(), id: \.self) { peerId in
+                        ForEach(directPeerIds, id: \.self) { peerId in
                             NavigationLink {
                                 ConversationView(client: client, peerId: peerId)
                             } label: {
@@ -59,9 +83,26 @@ struct ChatListView: View {
             .navigationTitle("Chats")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Text(client.isConnected ? "Connected" : "Offline")
-                        .font(.caption)
+                    // The toolbar leading slot is narrow on the Dynamic
+                    // Island phones — "Connected" was truncating to
+                    // "Con..." which looked like a weirdly-named avatar.
+                    // A single SF Symbol tells the story without eating
+                    // horizontal space; accessibility label keeps the
+                    // state legible to VoiceOver.
+                    Image(systemName: client.isConnected
+                          ? "wifi" : "wifi.slash")
                         .foregroundStyle(client.isConnected ? .green : .red)
+                        .accessibilityLabel(client.isConnected
+                                            ? "Connected"
+                                            : "Offline")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Settings")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -89,13 +130,16 @@ struct ChatListView: View {
                 }
             }
             .sheet(isPresented: $showAddContact) {
-                AddContactSheet(newContactId: $newContactId)
+                AddContactSheet(client: client, newContactId: $newContactId)
             }
             .sheet(isPresented: $showNewGroup) {
                 NewGroupSheet(client: client)
             }
             .sheet(isPresented: $showMyKey) {
                 MyKeyView(client: client)
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView(client: client)
             }
             .overlay {
                 if isEmpty {
@@ -277,16 +321,20 @@ struct NewGroupSheet: View {
 // can host the QR scanner as a full-screen presentation inside it.
 
 struct AddContactSheet: View {
+    @ObservedObject var client: Peer2PearClient
     @Binding var newContactId: String
     @Environment(\.dismiss) private var dismiss
     @State private var showScanner = false
     @State private var scanError: String?
 
+    private var trimmed: String {
+        newContactId.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private var isValid: Bool {
         // The 43-char base64url check matches the desktop `isValidPublicKey`.
         // A trimmed input is the canonical form the protocol accepts.
-        let s = newContactId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return s.count == 43
+        trimmed.count == 43
     }
 
     var body: some View {
@@ -329,7 +377,16 @@ struct AddContactSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Chat") {
-                        newContactId = newContactId.trimmingCharacters(in: .whitespacesAndNewlines)
+                        // Persist the peer so they appear in the chat
+                        // list immediately, even before the first
+                        // message round-trip.  Without this the user
+                        // saw "nothing happen" — the sheet dismissed
+                        // but the conversation list is derived from
+                        // inbound messages, so an unused new peer ID
+                        // vanished into the trimmed state and never
+                        // surfaced anywhere.
+                        client.addContact(peerId: trimmed)
+                        newContactId = ""
                         dismiss()
                     }
                     .disabled(!isValid)

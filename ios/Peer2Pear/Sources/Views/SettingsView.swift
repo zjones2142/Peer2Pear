@@ -1,0 +1,258 @@
+import SwiftUI
+
+// SettingsView — per-device preferences that don't belong on the My Key
+// screen.  Split out of MyKeyView so users can find settings under a
+// gear icon (expected iOS affordance) rather than buried behind
+// "profile" / "my key" which suggests identity-sharing.
+//
+// Sections (top to bottom):
+//   • Appearance — three-way dark/light/system picker.
+//   • Unlock with Face ID / Touch ID — biometric opt-in.
+//   • Notification content — hidden / sender / full privacy mode.
+//   • Relay server — advanced, self-host / federation switch.
+//
+// Every section persists to either UserDefaults or the Keychain; no
+// save button required.  The full rationale for each choice lives in
+// the section structs below.
+struct SettingsView: View {
+    @ObservedObject var client: Peer2PearClient
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 16) {
+                    AppearanceSection(client: client)
+                    BiometricUnlockSection(client: client)
+                    NotificationPrivacySection(client: client)
+                    RelayURLSection()
+                }
+                .padding(.horizontal)
+                .padding(.vertical)
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// Three-way appearance picker.  Default is Dark to match the
+// desktop app's hardcoded palette — users who prefer the OS
+// default can pick System; Light is a deliberate override.
+private struct AppearanceSection: View {
+    @ObservedObject var client: Peer2PearClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "moon.circle")
+                    .foregroundStyle(.green)
+                Text("Appearance")
+                    .font(.headline)
+            }
+
+            Picker("Appearance", selection: Binding(
+                get: { client.colorScheme },
+                set: { client.colorScheme = $0 }
+            )) {
+                Text("Dark").tag(Peer2PearClient.ColorSchemePreference.dark)
+                Text("Light").tag(Peer2PearClient.ColorSchemePreference.light)
+                Text("System").tag(Peer2PearClient.ColorSchemePreference.system)
+            }
+            .pickerStyle(.segmented)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+}
+
+// Biometric-unlock opt-in.  When enabled, the user's passphrase is
+// stored in the iOS Keychain under a `.biometryCurrentSet` access
+// control — Face ID / Touch ID success releases the passphrase to
+// Swift, which hands it to p2p_set_passphrase_v2 as if the user had
+// typed it.  Re-enrolling biometry invalidates the entry (Apple's own
+// guarantee via .biometryCurrentSet).
+//
+// The toggle is only shown when hardware actually supports it.  On
+// enable, we reuse the passphrase from the current unlock session
+// (`client.lastUnlockPassphrase`) so the user doesn't have to re-type —
+// one less friction step for a setting that's purely additive
+// convenience.  The passphrase is then zeroed from memory.
+private struct BiometricUnlockSection: View {
+    @ObservedObject var client: Peer2PearClient
+    @State private var enabled: Bool = BiometricUnlock.isEnabled
+    @State private var errorMessage: String = ""
+
+    var body: some View {
+        if BiometricUnlock.isAvailable {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: BiometricUnlock.biometryName
+                          .contains("Face") ? "faceid" : "touchid")
+                        .foregroundStyle(.green)
+                    Text("Unlock with \(BiometricUnlock.biometryName)")
+                        .font(.headline)
+                }
+
+                Toggle(isOn: $enabled) {
+                    Text(enabled
+                         ? "Enabled"
+                         : "Use \(BiometricUnlock.biometryName) instead of typing your passphrase on launch.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .tint(.green)
+                .onChange(of: enabled) { _, newValue in
+                    if newValue {
+                        guard !client.lastUnlockPassphrase.isEmpty else {
+                            errorMessage = "Please close and reopen settings, then try again."
+                            enabled = false
+                            return
+                        }
+                        do {
+                            try BiometricUnlock.enable(
+                                passphrase: client.lastUnlockPassphrase)
+                            errorMessage = ""
+                        } catch {
+                            errorMessage = error.localizedDescription
+                            enabled = false
+                        }
+                    } else {
+                        BiometricUnlock.remove()
+                        errorMessage = ""
+                    }
+                }
+
+                if !errorMessage.isEmpty {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Text("Passphrase stays on this device, sealed to your biometry. Re-enrolling \(BiometricUnlock.biometryName) disables this automatically.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(Color(.secondarySystemBackground))
+            .cornerRadius(10)
+        }
+    }
+}
+
+// Notification-content privacy picker.  Default is "hidden" — the OS
+// only sees a generic "New message" banner.  Users who value richer
+// banners over the residual forensic leak can opt up.
+//
+// Background: iOS writes every delivered notification payload into a
+// system-level store (backboardd / NotificationCenter DB).  That
+// store is NOT inside the app's sandbox; it survives app deletion
+// and is readable by forensic tools that have device access.  Even
+// if the app scrubs its own on-disk state, notification text that
+// once hit the banner can be recovered.  Hiding the content at the
+// UNMutableNotificationContent level keeps plaintext out of that
+// store entirely.
+private struct NotificationPrivacySection: View {
+    @ObservedObject var client: Peer2PearClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "bell.badge")
+                    .foregroundStyle(.green)
+                Text("Notification content")
+                    .font(.headline)
+            }
+
+            Picker("Content", selection: Binding(
+                get: { client.notificationContentMode },
+                set: { client.notificationContentMode = $0 }
+            )) {
+                Text("Hidden").tag(Peer2PearClient.NotificationContentMode.hidden)
+                Text("Sender").tag(Peer2PearClient.NotificationContentMode.senderOnly)
+                Text("Full").tag(Peer2PearClient.NotificationContentMode.full)
+            }
+            .pickerStyle(.segmented)
+
+            Text(explanation(for: client.notificationContentMode))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+
+    private func explanation(for mode: Peer2PearClient.NotificationContentMode)
+        -> String {
+        switch mode {
+        case .hidden:
+            return "Banners show only \"New message\".  Message contents stay inside the encrypted app sandbox — the OS notification history sees nothing."
+        case .senderOnly:
+            return "Banners name the sender (or group).  The OS stores that identifier; message text stays private."
+        case .full:
+            return "Banners include the message text.  Convenient, but the OS retains the plaintext in its notification history, which forensic tools can read even after the message is deleted."
+        }
+    }
+}
+
+// Relay URL — advanced setting for users self-hosting a relay or
+// switching federation.  Off the Onboarding screen because the vast
+// majority of users will stay on the default, and asking about it
+// up front is a cognitive-load tax for a decision that doesn't matter
+// to them.  Applies on next app launch; changing the live WebSocket
+// mid-session would need a reconnect orchestration we haven't built.
+private struct RelayURLSection: View {
+    @State private var url: String = Peer2PearClient.storedRelayUrl
+    @State private var saved = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "server.rack")
+                    .foregroundStyle(.green)
+                Text("Relay server")
+                    .font(.headline)
+            }
+
+            TextField("Relay URL", text: $url)
+                .textFieldStyle(.roundedBorder)
+                .autocapitalization(.none)
+                .keyboardType(.URL)
+                .onSubmit { save() }
+
+            HStack {
+                Button(saved ? "Saved" : "Save") { save() }
+                    .buttonStyle(.bordered)
+                    .disabled(url == Peer2PearClient.storedRelayUrl)
+                Spacer()
+                if url != Peer2PearClient.kDefaultRelayUrl {
+                    Button("Reset to default") {
+                        url = Peer2PearClient.kDefaultRelayUrl
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+            }
+
+            Text("Relays forward encrypted envelopes between peers; they never see message content.  Takes effect on next launch.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+
+    private func save() {
+        UserDefaults.standard.set(url, forKey: Peer2PearClient.kDefaultsRelayUrlKey)
+        saved = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { saved = false }
+    }
+}

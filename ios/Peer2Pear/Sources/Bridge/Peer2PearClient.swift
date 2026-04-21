@@ -26,6 +26,12 @@ final class Peer2PearStore {
         var groupAvatars:  [String: String]
         var groupMessages: [P2PGroupMessage]
         var messages:      [P2PMessage]
+        // Peers the user explicitly added via New Chat.  Without this
+        // set, "Direct Messages" is derived purely from inbound
+        // messages — a peer you just added but haven't swapped a
+        // message with wouldn't appear, so tapping "Chat" looked like
+        // a no-op.  Optional because older snapshots predate the field.
+        var knownPeerContacts: [String]?
     }
 
     init(documentDir: String) {
@@ -57,6 +63,11 @@ struct P2PMessage: Identifiable, Codable {
     let from: String     // peer ID (base64url)
     let text: String
     let timestamp: Date
+    // Set only for locally-originated (outgoing) messages so the UI
+    // knows which conversation the echo belongs to.  Nil for inbound
+    // — the sender is the conversation key in that case.  Optional so
+    // older on-disk snapshots that predate this field load cleanly.
+    var to: String?
 }
 
 /// Group message — carries groupId + member list alongside the text.
@@ -170,6 +181,64 @@ struct P2PKeyChange: Identifiable {
 /// High-level Swift wrapper around the peer2pear C API.
 /// Owns the p2p_context and bridges C callbacks → Combine publishers.
 final class Peer2PearClient: ObservableObject {
+    // MARK: - Relay URL (shared by Onboarding + Settings)
+
+    // UserDefaults survives app launches and passcode unlock but is
+    // wiped on uninstall (iOS sandbox).  Cross-reinstall persistence
+    // would need iCloud Keychain, which we deliberately avoid to keep
+    // the relay URL from leaving the device.
+    static let kDefaultsRelayUrlKey = "p2p.lastRelayUrl"
+    static let kDefaultRelayUrl     = "https://peer2pear.com"
+
+    /// Last-entered (or default) relay URL.  Reads UserDefaults each
+    /// time so a Settings-screen change is visible without needing a
+    /// notification to propagate.
+    static var storedRelayUrl: String {
+        UserDefaults.standard.string(forKey: kDefaultsRelayUrlKey)
+            ?? kDefaultRelayUrl
+    }
+
+    /// True when a passphrase-unlockable identity already lives on disk.
+    /// Drives the Onboarding "Unlock" vs. "Create" branching — mirrors
+    /// what `p2p_set_passphrase_v2` in the core checks (the salt file is
+    /// created on first run and persists for the life of the install).
+    static func identityExists(documentDir: String) -> Bool {
+        let salt = URL(fileURLWithPath: documentDir)
+            .appendingPathComponent("keys/db_salt.bin")
+        return FileManager.default.fileExists(atPath: salt.path)
+    }
+
+    static var documentsPath: String {
+        FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0].path
+    }
+
+    // MARK: - Appearance preference
+
+    /// Three-way color scheme preference.  `.system` follows the OS
+    /// dark/light toggle; `.dark` / `.light` pin regardless.  Default
+    /// is `.dark` because the desktop app is dark-only and we want
+    /// per-user identity posture to feel consistent across platforms.
+    enum ColorSchemePreference: String, CaseIterable, Identifiable {
+        case dark   = "dark"
+        case light  = "light"
+        case system = "system"
+        var id: String { rawValue }
+    }
+
+    private static let kColorSchemeKey = "p2p.colorScheme"
+
+    @Published var colorScheme: ColorSchemePreference = {
+        let raw = UserDefaults.standard.string(forKey: kColorSchemeKey)
+               ?? ColorSchemePreference.dark.rawValue
+        return ColorSchemePreference(rawValue: raw) ?? .dark
+    }() {
+        didSet {
+            UserDefaults.standard.set(colorScheme.rawValue,
+                                       forKey: Self.kColorSchemeKey)
+        }
+    }
+
     // MARK: - Published state (drives SwiftUI)
 
     @Published var isConnected = false
@@ -211,6 +280,54 @@ final class Peer2PearClient: ObservableObject {
     /// Views use this to render a warning banner; clear entries after
     /// the user re-verifies via `markPeerVerified`.
     @Published var keyChanges: [String: P2PKeyChange] = [:]
+
+    /// Peers the user added via "New Chat" before any messages flowed.
+    /// ChatListView unions this with the message-derived peer set so a
+    /// freshly-added contact shows up immediately.  Persisted alongside
+    /// groups / messages in `Peer2PearStore` so restarts don't lose
+    /// contacts that haven't yet exchanged a message.
+    @Published var knownPeerContacts: Set<String> = []
+
+    /// Register a peer as a known contact.  Safe to call on an already-
+    /// known peer (idempotent), and skips self (the core filters self
+    /// out everywhere else, keep the invariant here too).
+    func addContact(peerId: String) {
+        let trimmed = peerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != myPeerId else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.knownPeerContacts.insert(trimmed)
+        }
+    }
+
+    /// Remove a peer from the explicit-contacts set.  Does not touch
+    /// message history — if they've sent us anything, they remain
+    /// visible via the message-derived branch.  Used from ContactDetail
+    /// swipe-to-delete if we add one later.
+    func removeContact(peerId: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.knownPeerContacts.remove(peerId)
+        }
+    }
+
+    // Ephemeral copy of the most recent successful unlock passphrase.
+    // ONLY used by Settings → "Enable Face ID": that flow needs the
+    // plaintext passphrase to install into the Keychain, and asking
+    // the user to re-type it right after they just unlocked is
+    // redundant friction.  Cleared on logout / app background (see
+    // `clearUnlockPassphrase`).
+    //
+    // This is the one place we hold onto the passphrase past
+    // `p2p_set_passphrase_v2`.  The core's own copy is zeroed inside
+    // the FFI boundary; this Swift String sits in the heap until
+    // either Face ID opt-in consumes it or we explicitly clear it.
+    @Published var lastUnlockPassphrase: String = ""
+
+    func clearUnlockPassphrase() {
+        // String doesn't expose byte-level overwrite (Swift Strings
+        // are value types with COW), but resetting the @Published
+        // drops the heap buffer's strong reference; ARC releases it.
+        lastUnlockPassphrase = ""
+    }
 
     // MARK: - Internal
 
@@ -308,6 +425,7 @@ final class Peer2PearClient: ObservableObject {
             groupAvatars  = snap.groupAvatars
             groupMessages = snap.groupMessages
             messages      = snap.messages
+            knownPeerContacts = Set(snap.knownPeerContacts ?? [])
             // Replay every known group's roster to the core so inbound
             // group_rename / group_avatar / group_leave / group_member_update
             // from existing members are admitted.  Without this, all
@@ -338,10 +456,11 @@ final class Peer2PearClient: ObservableObject {
     private func persistSnapshot() {
         guard let store else { return }
         store.save(.init(
-            groups:        groups,
-            groupAvatars:  groupAvatars,
-            groupMessages: groupMessages,
-            messages:      messages))
+            groups:            groups,
+            groupAvatars:      groupAvatars,
+            groupMessages:     groupMessages,
+            messages:          messages,
+            knownPeerContacts: Array(knownPeerContacts)))
     }
 
     func stop() {
@@ -491,6 +610,21 @@ final class Peer2PearClient: ObservableObject {
 
     func sendText(to peerId: String, text: String) {
         guard let ctx = rawContext else { return }
+        // Local echo: the core doesn't fire on_message for our own
+        // outbound sends, so the sender's ConversationView would stay
+        // empty even after a successful send.  Append to `messages`
+        // with from == myPeerId so MessageBubble renders it on the
+        // right side.  Mirrors the group send path which already echoes
+        // via `client.groupMessages.append(...)` in ConversationView.
+        let echo = P2PMessage(
+            id: UUID().uuidString,
+            from: myPeerId,
+            text: text,
+            timestamp: Date(),
+            to: peerId)
+        DispatchQueue.main.async { [weak self] in
+            self?.messages.append(echo)
+        }
         p2p_send_text(ctx, peerId, text)
     }
 

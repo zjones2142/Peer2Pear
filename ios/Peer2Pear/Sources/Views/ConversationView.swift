@@ -11,7 +11,14 @@ struct ConversationView: View {
     @State private var activeFileRequest: P2PFileRequest?
 
     private var peerMessages: [P2PMessage] {
-        client.messages.filter { $0.from == peerId }
+        // Both directions: inbound (from == peerId) + outbound echoes
+        // (from == myPeerId && to == peerId).  Without the echo side
+        // the sender's own bubbles would never render — tapping Send
+        // would just clear the text field with no visible feedback.
+        client.messages.filter { msg in
+            msg.from == peerId
+                || (msg.from == client.myPeerId && msg.to == peerId)
+        }
     }
 
     /// Transfers with this peer — inbound or outbound, in-flight or

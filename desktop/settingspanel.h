@@ -30,6 +30,17 @@ public:
         Full       = 2    // "<senderName>: <message text>"
     };
 
+    // Appearance preference.  Default is Dark because the app's per-
+    // widget stylesheets were written assuming a dark palette — Light
+    // remaps the palette via Qt Fusion but per-widget overrides
+    // (SettingsPanel, MainWindow chrome) still dominate until those
+    // stylesheets are centralized.  System follows the OS.
+    enum class ThemePreference {
+        Dark   = 0,
+        Light  = 1,
+        System = 2
+    };
+
     explicit SettingsPanel(QWidget *parent = nullptr);
 
     // Returns whether notifications are currently enabled
@@ -70,6 +81,10 @@ signals:
     // changed are refused at the ChatController layer.  MainWindow forwards
     // to m_controller.setHardBlockOnKeyChange.
     void hardBlockOnKeyChangeToggled(bool on);
+
+    // Dark/Light/System appearance toggle.  MainWindow applies the
+    // Fusion palette + any widget-level refresh when this fires.
+    void themeChanged(SettingsPanel::ThemePreference pref);
 
 private slots:
     void onToggleNotifications();
@@ -143,6 +158,14 @@ private:
     QPushButton *m_hardBlockKeyChangeToggleBtn = nullptr;
     QLabel      *m_hardBlockKeyChangeStatusLbl = nullptr;
     void applyHardBlockKeyChangeState();
+
+    // Appearance — three buttons styled like the privacy level picker.
+    ThemePreference m_themePref        = ThemePreference::Dark;
+    QPushButton    *m_themeBtnDark     = nullptr;
+    QPushButton    *m_themeBtnLight    = nullptr;
+    QPushButton    *m_themeBtnSystem   = nullptr;
+    QWidget *makeAppearanceSection();
+    void applyThemeButtonStyles();
 };
 
 #endif // SETTINGSPANEL_H
