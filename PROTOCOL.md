@@ -608,12 +608,13 @@ dropped (never processed, never ack'd).
 | `file_ack` | receiver→sender | File fully received and integrity-verified |
 | `file_request` | receiver→sender | Resume: re-send these chunks |
 | `file_chunk` | sender→receiver | Encrypted chunk (uses SEALEDFC: prefix) |
-| `group_text` | member→members | Text in a group chat |
+| `group_msg` | member→members | Text in a group chat (sender-chain-encrypted) |
+| `group_skey_announce` | member→member | Distribute a sender-chain seed (via 1:1 ratchet) |
 | `group_invite` | member→members | New-member invite |
 | `group_leave` | member→members | Member-left notification |
-| `group_rename` | member→members | Rename a group |
-| `group_avatar` | member→members | Update group avatar |
-| `group_member_update` | member→members | Member list changed |
+| `group_rename` | member→members | Rename a group (sender-chain-encrypted) |
+| `group_avatar` | member→members | Update group avatar (sender-chain-encrypted) |
+| `group_member_update` | member→members | Member list changed (sender-chain-encrypted) |
 | `ice_offer`, `ice_answer` | peer↔peer | P2P signaling (optional) |
 
 ### 7.2 Text messages
@@ -622,24 +623,142 @@ dropped (never processed, never ack'd).
 { "type": "text", "text": "hello", "from": "...", "ts": 1712956800, "msgId": "..." }
 ```
 
-For group messages:
+#### 7.2.1 Group messaging — sender keys
+
+Group chats use **sender keys**: each member maintains one outbound
+symmetric chain per group that every other member installs a copy of.
+User content (`group_msg` body, `group_rename` new name, `group_avatar`
+image, `group_member_update` roster) is AEAD-encrypted once per send
+under a chain-derived message key, not re-encrypted per recipient.
+
+The outer envelope still rides the 1:1 sealed ratchet between sender
+and each receiver — sealed-sender metadata hiding and per-peer
+forward-secrecy still apply.  Sender-chain encryption adds a second,
+group-level confidentiality layer and cuts the per-send CPU cost from
+O(N) plaintext encrypts to one encrypt + N envelope wraps.
+
+**Chain ratchet** — both sides derive the same sequence of message
+keys from a shared 32-byte `seed`:
+
+```
+chain_key_0 = seed
+msg_key_n   = BLAKE2b-256(key=chain_key_n, input=0x02)
+chain_key_{n+1} = BLAKE2b-256(key=chain_key_n, input=0x01)
+```
+
+**AEAD of inner payload** (same primitive everywhere: XChaCha20-Poly1305):
+
+```
+plaintext  = <JSON object — shape depends on wire type>
+AAD        = msgType || '\n' || from || '\n' || gid
+           || epoch(LE u64) || idx(LE u32)
+ciphertext = AEAD_encrypt(msg_key_idx, plaintext, AAD)
+```
+
+AAD binds the wire `type`, so a ciphertext produced for `group_msg`
+cannot be relabelled as `group_rename` (or any other type) without
+failing AEAD authentication.
+
+#### 7.2.2 `group_msg`
 
 ```json
 {
-  "type": "group_text",
+  "type":       "group_msg",
+  "groupId":    "<UUID>",
+  "groupName":  "...",
+  "members":    ["<id1>", "<id2>", ...],
+  "skey_epoch": <uint64>,
+  "skey_idx":   <uint32>,
+  "ciphertext": "<base64url(AEAD_encrypt(msg_key, {\"text\":\"...\"}))>",
+  "from":       "...",
+  "ts":         ...,
+  "msgId":      "..."
+}
+```
+
+The inner plaintext is a JSON object `{"text": "<string>"}`.
+
+#### 7.2.3 `group_skey_announce`
+
+Distributes the sender's current chain seed to a recipient via the
+1:1 sealed ratchet between them.  Emitted on first group send (lazy
+chain creation), on add of a new member (current seed to the joiner
+only), and on rekey-on-leave (new seed to every remaining member).
+
+```json
+{
+  "type":    "group_skey_announce",
+  "groupId": "<UUID>",
+  "epoch":   <uint64>,
+  "seed":    "<base64url 32 bytes>",
+  "from":    "...",
+  "ts":      ...,
+  "msgId":   "..."
+}
+```
+
+The receiver installs the seed as `SenderChain::fromSeed(seed)`
+under (gid, from, epoch).  If an earlier chain existed at a lower
+epoch, it moves to a prev slot retained for ~5 minutes of grace so
+in-flight messages at the old epoch still decrypt.
+
+#### 7.2.4 `group_rename`, `group_avatar`, `group_member_update`
+
+Same sender-chain envelope shape as `group_msg`, with different
+inner plaintext JSON per type:
+
+| Wire type | Inner plaintext JSON |
+|---|---|
+| `group_rename` | `{"newName": "<string>"}` |
+| `group_avatar` | `{"avatar": "<base64-encoded image>"}` |
+| `group_member_update` | `{"groupName": "<string>", "members": [...]}` |
+
+Outer envelope fields are the same as `group_msg` except `groupName`
+and `members` are NOT duplicated in plaintext on `group_member_update`
+(they live inside the ciphertext).  `group_rename` and `group_avatar`
+have never had those fields and continue to carry only routing
+metadata (`from`, `groupId`, `ts`, `msgId`, `skey_epoch`, `skey_idx`,
+`ciphertext`).
+
+#### 7.2.5 `group_leave`
+
+Plaintext payload — no sender-chain encryption.  The leaver's
+departure is a metadata-level signal with no user content; it rides
+the 1:1 sealed ratchet like any other control message.
+
+```json
+{
+  "type":      "group_leave",
   "groupId":   "<UUID>",
   "groupName": "...",
-  "members":   ["<id1>", "<id2>", ...],
-  "seq":       <monotonic uint64>,
-  "text":      "...",
+  "members":   [...],
   "from":      "...",
   "ts":        ...,
   "msgId":     "..."
 }
 ```
 
-`seq` is a per-(group, sender) monotonic counter detected by each member
-for gap detection.
+#### 7.2.6 Rekey-on-leave
+
+When a member is removed from a group via `group_member_update`:
+
+1. The initiator bumps their chain's `epoch`, generates a fresh
+   `seed`, and writes the rotated chain to disk.
+2. A `group_skey_announce` at the new epoch is fanned out to every
+   **remaining** member (not the removed peer).
+3. The `group_member_update` message then fans out to the same
+   remaining members; inside its ciphertext is the new roster.
+4. Receivers install the new chain, moving the previous-epoch chain
+   to a grace slot with a ~5-minute expiry for in-flight decryption.
+
+The removed peer keeps their copy of the pre-rekey seed in memory,
+but it is useless against any future outbound message from the
+initiator: the new epoch's AAD mismatches, so AEAD authentication
+fails regardless of which seed the removed peer tries.  Other
+remaining members do NOT auto-rotate their own chains — the removed
+peer is cryptographically blinded to their future sends by not being
+a recipient of the outer 1:1 sealed envelope, not by a sender-chain
+rotation.
 
 ### 7.3 File transfer (1:1)
 
@@ -930,12 +1049,42 @@ alignment.
 
 ---
 
-## 11. Future extensions
+## 11. Known limitations and future extensions
 
-The following are under consideration for a future protocol version and
-are deliberately NOT part of v2.0:
+### 11.1 Known limitations
 
-- **Sender Keys / MLS** for groups > 20 members.
+**Group-membership authority is not cryptographically enforced.**
+Sender keys bound the impact of a compromised group member (they
+cannot decrypt messages from others whose sender-chain seeds they
+never received) and the impact of a removed member (rekey-on-leave
+invalidates their old copy of the initiator's chain for new
+messages).  They do NOT prevent a group member from publishing a
+forged roster claim to a peer that lacks an independent view of the
+group.  Specifically:
+
+- An attacker who is a group member can send a `group_member_update`
+  to other members naming whichever roster they want.  Recipients
+  merge the sender into their local view (bootstrap case) but do
+  not blindly accept full roster replacements from peers who are
+  already known members.
+- An attacker who knows a `groupId` but is NOT a member cannot inject
+  a forged roster: the outer sealed envelope is authenticated to a
+  specific sender, and `isAuthorizedSender` drops control messages
+  from non-members.
+- An attacker cannot decrypt sender-chain-encrypted payloads (group
+  messages, renames, avatars, roster updates) without receiving the
+  relevant chain seed via a legitimate `group_skey_announce`.
+
+Full membership authority (creator-signed invite chains with
+verifiable epoch transitions, MLS-style) remains future work.
+
+### 11.2 Future extensions
+
+The following are under consideration for a future protocol version:
+
+- **MLS (Messaging Layer Security)** for larger groups and
+  cryptographic membership authority.  Would replace or augment the
+  current sender-keys group path.
 - **Multi-device identity** with cross-device key sync and per-device
   message fanout.
 - **QR-code and invite-link contact exchange** (UX; no wire change).
@@ -1080,7 +1229,18 @@ function unseal(recipient_curve_priv, recipient_ed_pub,
 
 ## Appendix C: Changelog
 
-- **v2.0.0 (current)** — Recipient AAD binding, envelope-id replay
+- **v2.1.0 (current)** — Sender keys for group messaging: `group_msg`,
+  `group_rename`, `group_avatar`, and `group_member_update` all
+  encrypt their user-content fields inside a sender-chain-derived
+  AEAD ciphertext with AAD binding
+  `type || from || gid || epoch || idx`.  New `group_skey_announce`
+  control message distributes chain seeds via the 1:1 sealed ratchet.
+  Rekey-on-leave: removing a member bumps the initiator's epoch +
+  fans a fresh seed to remaining peers.  Breaking change from v2.0
+  for all group control messages (plaintext `text` / `newName` /
+  `avatar` / `members` fields replaced by `ciphertext` + `skey_epoch`
+  + `skey_idx`).
+- **v2.0.0** — Recipient AAD binding, envelope-id replay
   protection, onion routing, file transfer with resumption, PQ-hybrid
   at every layer.
 - **v1.x (deprecated)** — Initial design. Removed: `/mbox/enqueue`,

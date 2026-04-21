@@ -51,6 +51,17 @@ void SessionStore::createTables() {
         "  created_at     INTEGER NOT NULL"
         ");"
     );
+
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS sender_chains ("
+        "  group_id   TEXT NOT NULL,"
+        "  sender_id  TEXT NOT NULL,"
+        "  epoch      INTEGER NOT NULL,"
+        "  chain_blob BLOB NOT NULL,"
+        "  updated_at INTEGER NOT NULL,"
+        "  PRIMARY KEY (group_id, sender_id)"
+        ");"
+    );
 }
 
 // ---------------------------
@@ -126,6 +137,10 @@ static std::string sessionAad(const std::string& peerId) {
 static std::string handshakeAad(const std::string& peerId, int role) {
     return "pending_handshake|" + peerId + "|" + std::to_string(role);
 }
+static std::string senderChainAad(const std::string& groupId,
+                                     const std::string& senderId) {
+    return "sender_chain|" + groupId + "|" + senderId;
+}
 
 // ---------------------------
 // Ratchet sessions
@@ -170,7 +185,8 @@ void SessionStore::clearAll() {
     SqlCipherQuery q(m_db);
     q.exec("DELETE FROM ratchet_sessions;");
     q.exec("DELETE FROM pending_handshakes;");
-    P2P_LOG("[SessionStore] Cleared all sessions, skipped keys, and pending handshakes");
+    q.exec("DELETE FROM sender_chains;");
+    P2P_LOG("[SessionStore] Cleared all sessions, pending handshakes, and sender chains");
 }
 
 // ---------------------------
@@ -239,4 +255,81 @@ std::vector<std::string> SessionStore::pruneStaleHandshakes(int maxAgeSecs) {
         P2P_LOG("[SessionStore] Pruned " << int(pruned.size()) << " stale pending handshakes");
     }
     return pruned;
+}
+
+// ---------------------------
+// Group sender-chain persistence
+// ---------------------------
+
+void SessionStore::saveSenderChain(const std::string& groupId,
+                                     const std::string& senderId,
+                                     uint64_t epoch,
+                                     const Bytes& chainBlob)
+{
+    if (groupId.empty() || senderId.empty() || chainBlob.empty()) return;
+    const int64_t now = nowSecs();
+
+    SqlCipherQuery q(m_db);
+    q.prepare(
+        "INSERT INTO sender_chains (group_id, sender_id, epoch, chain_blob, updated_at)"
+        " VALUES (:gid, :sid, :epoch, :blob, :now)"
+        " ON CONFLICT(group_id, sender_id) DO UPDATE SET"
+        "   epoch=excluded.epoch,"
+        "   chain_blob=excluded.chain_blob,"
+        "   updated_at=excluded.updated_at;"
+    );
+    q.bindValue(":gid",   groupId);
+    q.bindValue(":sid",   senderId);
+    // SQLite's INTEGER is 64-bit signed — the unsigned epoch fits
+    // comfortably given we bump by one per membership change and
+    // nothing in the protocol ever approaches 2^63.
+    q.bindValue(":epoch", static_cast<int64_t>(epoch));
+    q.bindValue(":blob",  encryptBlob(chainBlob, senderChainAad(groupId, senderId)));
+    q.bindValue(":now",   now);
+    if (!q.exec())
+        P2P_WARN("SessionStore::saveSenderChain: " << q.lastError());
+}
+
+std::vector<SessionStore::SenderChainRecord>
+SessionStore::loadAllSenderChains() const
+{
+    std::vector<SenderChainRecord> out;
+    SqlCipherQuery q(m_db.handle());
+    q.prepare("SELECT group_id, sender_id, epoch, chain_blob FROM sender_chains;");
+    if (!q.exec()) return out;
+
+    while (q.next()) {
+        SenderChainRecord r;
+        r.groupId   = q.valueText(0);
+        r.senderId  = q.valueText(1);
+        r.epoch     = static_cast<uint64_t>(q.valueInt64(2));
+        const Bytes ct = q.valueBlob(3);
+        r.chainBlob = decryptBlob(ct, senderChainAad(r.groupId, r.senderId));
+        // Silently drop rows that fail decryption — a storeKey change
+        // (e.g., passphrase rotation) makes old rows unreadable, which
+        // should surface as "chains absent on restart" not as a crash.
+        if (r.chainBlob.empty()) continue;
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+void SessionStore::deleteSenderChain(const std::string& groupId,
+                                       const std::string& senderId)
+{
+    if (groupId.empty() || senderId.empty()) return;
+    SqlCipherQuery q(m_db);
+    q.prepare("DELETE FROM sender_chains WHERE group_id=:gid AND sender_id=:sid;");
+    q.bindValue(":gid", groupId);
+    q.bindValue(":sid", senderId);
+    q.exec();
+}
+
+void SessionStore::deleteSenderChainsForGroup(const std::string& groupId)
+{
+    if (groupId.empty()) return;
+    SqlCipherQuery q(m_db);
+    q.prepare("DELETE FROM sender_chains WHERE group_id=:gid;");
+    q.bindValue(":gid", groupId);
+    q.exec();
 }

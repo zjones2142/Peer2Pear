@@ -22,6 +22,7 @@ set(CORE_SOURCES
     SessionStore.cpp        SessionStore.hpp
     SqlCipherDb.cpp         SqlCipherDb.hpp
     SessionSealer.cpp       SessionSealer.hpp
+    SenderChain.cpp         SenderChain.hpp
     GroupProtocol.cpp       GroupProtocol.hpp
     FileProtocol.cpp        FileProtocol.hpp
     ChatController.cpp      ChatController.hpp

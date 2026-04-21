@@ -323,6 +323,13 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
     m_sessionMgr = std::make_unique<SessionManager>(m_crypto, *m_sessionStore);
 
+    // Hand the store to GroupProtocol so sender chains get persisted
+    // on every advance and restored after restart.  Restore happens
+    // here (before any group traffic flows) so inbound group_msgs that
+    // arrive early find their chains already in memory.
+    m_groupProto.setSessionStore(m_sessionStore.get());
+    m_groupProto.restorePersistedChains();
+
     // Wire up file-transfer persistence and restore any in-flight state.
     m_fileMgr.setDatabase(&db);
     m_fileMgr.loadPersistedTransfers();
@@ -967,34 +974,44 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             if (!msgId.empty() && !markSeen(msgId)) return;
             if (onMessageReceived) onMessageReceived(senderId,
                                  o.value("text", std::string()), tsSecs, msgId);
+        } else if (type == "group_skey_announce") {
+            // Sender-chain control message: a peer is distributing
+            // the seed for their outbound SenderChain to us.  The
+            // outer sealed envelope already authenticated the sender
+            // (via their 1:1 ratchet), so we trust the payload to
+            // identify them; we just need to install the chain so
+            // future group_msg from this peer decrypts.
+            if (!msgId.empty() && !markSeen(msgId)) return;
+
+            const std::string gid    = o.value("groupId", std::string());
+            const uint64_t    epoch  = o.value("epoch", uint64_t(0));
+            const std::string seedB64 = o.value("seed", std::string());
+            if (gid.empty() || seedB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_skey_announce from "
+                         << senderId.substr(0, 8) << "...");
+                return;
+            }
+            const Bytes seed = CryptoEngine::fromBase64Url(seedB64);
+            m_groupProto.installRemoteChain(gid, senderId, epoch, seed);
+            P2P_LOG("[GROUP] installed sender chain from "
+                    << senderId.substr(0, 8) << "... for "
+                    << gid.substr(0, 8) << "... epoch " << epoch);
         } else if (type == "group_msg") {
             if (!msgId.empty() && !markSeen(msgId)) return;
 
-            // Sequence gap detection + reject regressions.  Any
-            // non-monotonic seq from a given (group, sender) is dropped
-            // loudly — otherwise a relay that captured an old group_msg
-            // could replay it after the msgId LRU evicted the original,
-            // and the receiver would fire onGroupMessageReceived again.
-            const std::string gid = o.value("groupId", std::string());
-            if (o.contains("seq")) {
-                const int64_t seq = o.value("seq", int64_t(0));
-                // non-monotonic seq from a given (group, sender) is a
-                // replay — drop loudly.  Gaps are logged but not fatal
-                // (legitimate traffic can skip seq values when a member
-                // goes offline mid-fanout).
-                const int64_t lastSeen = m_groupProto.recordInboundSeq(gid, senderId, seq);
-                if (lastSeen >= 0 && seq <= lastSeen) {
-                    P2P_WARN("[GROUP] dropping non-monotonic seq from "
-                             << senderId.substr(0, 8) << "... in "
-                             << gid.substr(0, 8) << "... (got " << seq
-                             << ", last " << lastSeen << ")");
-                    return;
-                }
-                if (lastSeen >= 0 && seq > lastSeen + 1) {
-                    P2P_WARN("[GROUP] seq gap from " << senderId.substr(0, 8) << "..."
-                               << " in " << gid.substr(0, 8) << "..."
-                               << " expected " << (lastSeen + 1) << " got " << seq);
-                }
+            // Wire format: ciphertext + skey_epoch + skey_idx.
+            // Replay protection lives in the AAD binding
+            // (from || gid || epoch || idx) — tampering any field
+            // makes AEAD auth fail.
+            const std::string gid      = o.value("groupId", std::string());
+            const uint64_t    skeyEpoch = o.value("skey_epoch", uint64_t(0));
+            const uint32_t    skeyIdx   = o.value("skey_idx", uint32_t(0));
+            const std::string ctB64     = o.value("ciphertext", std::string());
+
+            if (gid.empty() || ctB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_msg from "
+                         << senderId.substr(0, 8) << "...");
+                return;
             }
 
             std::vector<std::string> memberKeys;
@@ -1002,17 +1019,45 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 for (const auto& v : o["members"])
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
 
-            // A valid sealed group_msg from X about group G adds X (and
-            // the declared members) to our roster.  Known limitation:
-            // first-mover race on an unknown group (see GroupProtocol
-            // for details); UIs should call setKnownGroupMembers at
+            // Decrypt the ciphertext BEFORE touching roster state.
+            // If the chain isn't installed yet (skey_announce still in
+            // flight) or decryption fails for any reason, reject the
+            // message entirely rather than bootstrap a roster from a
+            // payload we couldn't read.
+            const Bytes ct = CryptoEngine::fromBase64Url(ctB64);
+            const Bytes pt = m_groupProto.decryptGroupMessage(
+                "group_msg", gid, senderId, skeyEpoch, skeyIdx, ct);
+            if (pt.empty()) {
+                P2P_WARN("[GROUP] decrypt failed for group_msg from "
+                         << senderId.substr(0, 8) << "... in "
+                         << gid.substr(0, 8) << "... epoch=" << skeyEpoch
+                         << " idx=" << skeyIdx
+                         << " (chain missing or AEAD auth failed)");
+                return;
+            }
+
+            // A valid sealed group_msg from X about group G adds X
+            // (and the declared members) to our roster.  Known
+            // limitation: first-mover race on an unknown group (see
+            // GroupProtocol); UIs should call setKnownGroupMembers at
             // startup from persisted state to beat the bootstrap path.
             m_groupProto.upsertMembersFromTrustedMessage(gid, senderId, memberKeys);
 
+            // Parse the decrypted inner JSON for user content.  The
+            // text field is the only user-facing payload today.
+            std::string text;
+            try {
+                auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+                text = inner.value("text", std::string());
+            } catch (...) {
+                P2P_WARN("[GROUP] malformed inner plaintext in group_msg from "
+                         << senderId.substr(0, 8) << "...");
+                return;
+            }
             if (onGroupMessageReceived) onGroupMessageReceived(senderId, gid,
                                        o.value("groupName", std::string()),
                                        memberKeys,
-                                       o.value("text", std::string()), tsSecs, msgId);
+                                       text, tsSecs, msgId);
         } else if (type == "group_leave") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
             const std::string gid = o.value("groupId", std::string());
@@ -1028,9 +1073,13 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             if (o.contains("members") && o["members"].is_array())
                 for (const auto& v : o["members"])
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
-            // The sender left — strike them from our roster so they can't push
-            // further member-update / rename / avatar messages afterwards.
+            // The sender left — strike them from our roster so they
+            // can't push further member-update / rename / avatar
+            // messages afterwards.  Also drop their sender-key chain:
+            // they won't be sending new group_msg into this group and
+            // keeping their chain material around is pointless.
             m_groupProto.removeMember(gid, senderId);
+            m_groupProto.forgetRemoteChain(gid, senderId);
             if (onGroupMemberLeft) onGroupMemberLeft(senderId, gid,
                                   o.value("groupName", std::string()),
                                   memberKeys, tsSecs, msgId);
@@ -1046,7 +1095,32 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                            << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
             }
-            if (onGroupRenamed) onGroupRenamed(gid, o.value("newName", std::string()));
+            const uint64_t    skeyEpoch = o.value("skey_epoch", uint64_t(0));
+            const uint32_t    skeyIdx   = o.value("skey_idx", uint32_t(0));
+            const std::string ctB64     = o.value("ciphertext", std::string());
+            if (gid.empty() || ctB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_rename from "
+                         << senderId.substr(0, 8) << "...");
+                return;
+            }
+            const Bytes ct = CryptoEngine::fromBase64Url(ctB64);
+            const Bytes pt = m_groupProto.decryptGroupMessage(
+                "group_rename", gid, senderId, skeyEpoch, skeyIdx, ct);
+            if (pt.empty()) {
+                P2P_WARN("[GROUP] decrypt failed for group_rename from "
+                         << senderId.substr(0, 8) << "... in "
+                         << gid.substr(0, 8) << "...");
+                return;
+            }
+            std::string newName;
+            try {
+                auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+                newName = inner.value("newName", std::string());
+            } catch (...) {
+                P2P_WARN("[GROUP] malformed inner plaintext in group_rename");
+                return;
+            }
+            if (onGroupRenamed) onGroupRenamed(gid, newName);
         } else if (type == "group_avatar") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
             const std::string gid = o.value("groupId", std::string());
@@ -1055,15 +1129,68 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                            << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
             }
-            if (onGroupAvatarReceived) onGroupAvatarReceived(gid, o.value("avatar", std::string()));
+            const uint64_t    skeyEpoch = o.value("skey_epoch", uint64_t(0));
+            const uint32_t    skeyIdx   = o.value("skey_idx", uint32_t(0));
+            const std::string ctB64     = o.value("ciphertext", std::string());
+            if (gid.empty() || ctB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_avatar from "
+                         << senderId.substr(0, 8) << "...");
+                return;
+            }
+            const Bytes ct = CryptoEngine::fromBase64Url(ctB64);
+            const Bytes pt = m_groupProto.decryptGroupMessage(
+                "group_avatar", gid, senderId, skeyEpoch, skeyIdx, ct);
+            if (pt.empty()) {
+                P2P_WARN("[GROUP] decrypt failed for group_avatar from "
+                         << senderId.substr(0, 8) << "... in "
+                         << gid.substr(0, 8) << "...");
+                return;
+            }
+            std::string avatarB64;
+            try {
+                auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+                avatarB64 = inner.value("avatar", std::string());
+            } catch (...) {
+                P2P_WARN("[GROUP] malformed inner plaintext in group_avatar");
+                return;
+            }
+            if (onGroupAvatarReceived) onGroupAvatarReceived(gid, avatarB64);
         } else if (type == "group_member_update") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
-            const std::string gid   = o.value("groupId", std::string());
-            const std::string gname = o.value("groupName", std::string());
+            const std::string gid       = o.value("groupId", std::string());
+            const uint64_t    skeyEpoch = o.value("skey_epoch", uint64_t(0));
+            const uint32_t    skeyIdx   = o.value("skey_idx", uint32_t(0));
+            const std::string ctB64     = o.value("ciphertext", std::string());
+
+            // Decrypt the inner payload first — the groupName + members
+            // fields are carried inside the sender-chain ciphertext,
+            // bound to AAD including the "group_member_update" type.
+            std::string gname;
             std::vector<std::string> memberKeys;
-            if (o.contains("members") && o["members"].is_array())
-                for (const auto& v : o["members"])
-                    if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+            if (gid.empty() || ctB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_member_update from "
+                         << senderId.substr(0, 8) << "...");
+                return;
+            }
+            const Bytes ct = CryptoEngine::fromBase64Url(ctB64);
+            const Bytes pt = m_groupProto.decryptGroupMessage(
+                "group_member_update", gid, senderId, skeyEpoch, skeyIdx, ct);
+            if (pt.empty()) {
+                P2P_WARN("[GROUP] decrypt failed for group_member_update from "
+                         << senderId.substr(0, 8) << "... in "
+                         << gid.substr(0, 8) << "...");
+                return;
+            }
+            try {
+                auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+                gname = inner.value("groupName", std::string());
+                if (inner.contains("members") && inner["members"].is_array())
+                    for (const auto& v : inner["members"])
+                        if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+            } catch (...) {
+                P2P_WARN("[GROUP] malformed inner plaintext in group_member_update");
+                return;
+            }
 
             if (!gid.empty()) {
                 // Bootstrap path: unknown group accepts the proposed
