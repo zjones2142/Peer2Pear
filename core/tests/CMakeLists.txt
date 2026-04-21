@@ -54,6 +54,7 @@ peer2pear_add_test(test_e2e_two_clients)
 peer2pear_add_test(test_c_api)
 peer2pear_add_test(test_c_api_e2e)
 peer2pear_add_test(test_relay_cover_traffic)
+peer2pear_add_test(test_std_timer)
 
 # test_c_api + test_c_api_e2e + test_e2e_two_clients all instantiate
 # ChatController, which — when built with PEER2PEAR_P2P=ON — has

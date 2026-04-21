@@ -67,8 +67,40 @@ enum BiometricUnlock {
     }
 
     /// Has the user opted in, and is a passphrase actually stored?
+    /// Checks both halves: UserDefaults flag AND Keychain item presence.
+    /// Drift cases where they disagree:
+    ///   • iOS restores UserDefaults from iCloud backup but the
+    ///     Keychain item (.biometryCurrentSet, ThisDeviceOnly) does
+    ///     NOT restore — flag would say true, item missing.
+    ///   • User re-enrolls Face ID — Keychain entry invalidates,
+    ///     flag stays true.
+    /// We treat "either half missing" as not enabled and fix up the
+    /// flag, so the Onboarding "Unlock with Face ID" button stops
+    /// offering itself when it would just fail.
     static var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: kEnabledKey)
+        let flag = UserDefaults.standard.bool(forKey: kEnabledKey)
+        if !flag { return false }
+        if hasKeychainItem { return true }
+        // Flag-said-yes but item is gone — reconcile.
+        UserDefaults.standard.set(false, forKey: kEnabledKey)
+        return false
+    }
+
+    /// Probe for the stored passphrase entry without prompting biometry.
+    /// `errSecInteractionNotAllowed` means "exists but auth required",
+    /// which is the normal happy state for our biometry-protected item;
+    /// `errSecSuccess` would only happen if access control had no
+    /// interaction requirement.  Anything else (notably errSecItemNotFound)
+    /// signals the item is gone.
+    private static var hasKeychainItem: Bool {
+        let query: [String: Any] = [
+            kSecClass as String:                kSecClassGenericPassword,
+            kSecAttrService as String:          service,
+            kSecAttrAccount as String:          account,
+            kSecUseAuthenticationUI as String:  kSecUseAuthenticationUIFail,
+        ]
+        let status = SecItemCopyMatching(query as CFDictionary, nil)
+        return status == errSecSuccess || status == errSecInteractionNotAllowed
     }
 
     /// Enable biometric unlock by storing the passphrase.  Called from

@@ -79,6 +79,7 @@ struct MyKeyView: View {
                 }
             }
         }
+        .p2pColorScheme(client.colorScheme)
     }
 }
 

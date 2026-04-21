@@ -14,9 +14,6 @@
 #include <QStackedWidget>
 #include <QTimer>
 #include <QApplication>
-#include <QPalette>
-#include <QColor>
-#include <QStyle>
 #include <QDateTime>
 #include <QTimeZone>
 #include <QInputDialog>
@@ -400,13 +397,6 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_settingsPanel, &SettingsPanel::notificationModeChanged,
             m_notifier,      &ChatNotifier::setContentMode);
 
-    // Appearance — swaps the application-level palette (Fusion style +
-    // dark/light QPalette).  Widgets with no explicit stylesheet pick
-    // up the new palette automatically; widgets with hardcoded
-    // stylesheets (SettingsPanel, chat chrome) still paint dark — the
-    // caption in SettingsPanel flags this to the user.
-    connect(m_settingsPanel, &SettingsPanel::themeChanged,
-            this, &MainWindow::applyTheme);
     connect(m_settingsPanel, &SettingsPanel::exportContactsClicked,
             this, &MainWindow::onExportContacts);
     connect(m_settingsPanel, &SettingsPanel::importContactsClicked,
@@ -634,52 +624,4 @@ void MainWindow::onImportContacts()
 
     QMessageBox::information(this, "Import Complete",
                              QString("Imported %1 contact(s).").arg(imported));
-}
-
-void MainWindow::applyTheme(SettingsPanel::ThemePreference pref)
-{
-    // We use Qt's Fusion style so palette changes propagate
-    // predictably across platforms (native styles on macOS/Windows
-    // largely ignore QPalette).  Per-widget stylesheets scattered
-    // through SettingsPanel / chat chrome still paint dark colors
-    // because they hardcode them — the SettingsPanel caption warns
-    // the user about that.  Centralizing those stylesheets into a
-    // theme registry is tracked as follow-up.
-    qApp->setStyle("Fusion");
-
-    QPalette pal;
-    switch (pref) {
-    case SettingsPanel::ThemePreference::Dark: {
-        pal.setColor(QPalette::Window,          QColor("#0d0d0d"));
-        pal.setColor(QPalette::WindowText,      QColor("#e0e0e0"));
-        pal.setColor(QPalette::Base,            QColor("#111111"));
-        pal.setColor(QPalette::AlternateBase,   QColor("#1a1a1a"));
-        pal.setColor(QPalette::ToolTipBase,     QColor("#1a1a1a"));
-        pal.setColor(QPalette::ToolTipText,     QColor("#e0e0e0"));
-        pal.setColor(QPalette::Text,            QColor("#e0e0e0"));
-        pal.setColor(QPalette::Button,          QColor("#1a1a1a"));
-        pal.setColor(QPalette::ButtonText,      QColor("#e0e0e0"));
-        pal.setColor(QPalette::BrightText,      Qt::red);
-        pal.setColor(QPalette::Link,            QColor("#4caf50"));
-        pal.setColor(QPalette::Highlight,       QColor("#4caf50"));
-        pal.setColor(QPalette::HighlightedText, QColor("#0d0d0d"));
-        break;
-    }
-    case SettingsPanel::ThemePreference::Light: {
-        pal = QApplication::style()->standardPalette();
-        // Nudge the accent so the green highlight stays consistent
-        // with the dark palette's link / highlight color.
-        pal.setColor(QPalette::Link,            QColor("#2e7d32"));
-        pal.setColor(QPalette::Highlight,       QColor("#4caf50"));
-        pal.setColor(QPalette::HighlightedText, QColor("#ffffff"));
-        break;
-    }
-    case SettingsPanel::ThemePreference::System: {
-        // Follow the OS — Qt's Fusion style + default palette picks
-        // up the platform's dark/light mode on macOS and Windows 10+.
-        pal = QApplication::style()->standardPalette();
-        break;
-    }
-    }
-    qApp->setPalette(pal);
 }

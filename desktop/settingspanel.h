@@ -30,17 +30,6 @@ public:
         Full       = 2    // "<senderName>: <message text>"
     };
 
-    // Appearance preference.  Default is Dark because the app's per-
-    // widget stylesheets were written assuming a dark palette — Light
-    // remaps the palette via Qt Fusion but per-widget overrides
-    // (SettingsPanel, MainWindow chrome) still dominate until those
-    // stylesheets are centralized.  System follows the OS.
-    enum class ThemePreference {
-        Dark   = 0,
-        Light  = 1,
-        System = 2
-    };
-
     explicit SettingsPanel(QWidget *parent = nullptr);
 
     // Returns whether notifications are currently enabled
@@ -81,10 +70,6 @@ signals:
     // changed are refused at the ChatController layer.  MainWindow forwards
     // to m_controller.setHardBlockOnKeyChange.
     void hardBlockOnKeyChangeToggled(bool on);
-
-    // Dark/Light/System appearance toggle.  MainWindow applies the
-    // Fusion palette + any widget-level refresh when this fires.
-    void themeChanged(SettingsPanel::ThemePreference pref);
 
 private slots:
     void onToggleNotifications();
@@ -160,12 +145,21 @@ private:
     void applyHardBlockKeyChangeState();
 
     // Appearance — three buttons styled like the privacy level picker.
-    ThemePreference m_themePref        = ThemePreference::Dark;
+    // The selected preference itself lives on ThemeManager (single
+    // source of truth); this class only owns the button pointers.
     QPushButton    *m_themeBtnDark     = nullptr;
     QPushButton    *m_themeBtnLight    = nullptr;
     QPushButton    *m_themeBtnSystem   = nullptr;
     QWidget *makeAppearanceSection();
     void applyThemeButtonStyles();
+
+    // Walks every child widget tagged with one of our p2p* objectNames
+    // (p2pCard / p2pSectionHeading / p2pKeyLabel / p2pValueLabel /
+    // p2pDivider) and overwrites its stylesheet with one built from the
+    // currently-active Theme.  Called at end of buildUI() and again
+    // every time ThemeManager::themeChanged fires.  Cheap (single
+    // findChildren walk per tag); no widget-tree rebuild required.
+    void applyThemeStyles();
 };
 
 #endif // SETTINGSPANEL_H

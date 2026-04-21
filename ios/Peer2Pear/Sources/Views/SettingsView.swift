@@ -38,6 +38,10 @@ struct SettingsView: View {
                 }
             }
         }
+        // Sheet hosts don't inherit the root WindowGroup's preferred
+        // color scheme; re-apply here so flipping the Appearance picker
+        // below repaints this very sheet without waiting for a relaunch.
+        .p2pColorScheme(client.colorScheme)
     }
 }
 
@@ -110,14 +114,13 @@ private struct BiometricUnlockSection: View {
                 .tint(.green)
                 .onChange(of: enabled) { _, newValue in
                     if newValue {
-                        guard !client.lastUnlockPassphrase.isEmpty else {
-                            errorMessage = "Please close and reopen settings, then try again."
+                        guard let pass = client.consumeUnlockPassphrase() else {
+                            errorMessage = "Please re-launch the app and unlock, then enable Face ID right after."
                             enabled = false
                             return
                         }
                         do {
-                            try BiometricUnlock.enable(
-                                passphrase: client.lastUnlockPassphrase)
+                            try BiometricUnlock.enable(passphrase: pass)
                             errorMessage = ""
                         } catch {
                             errorMessage = error.localizedDescription

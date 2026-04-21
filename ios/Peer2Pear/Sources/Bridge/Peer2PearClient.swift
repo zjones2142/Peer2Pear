@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 import UserNotifications
 
 // MARK: - Persistent UI-state snapshot
@@ -309,24 +310,43 @@ final class Peer2PearClient: ObservableObject {
         }
     }
 
-    // Ephemeral copy of the most recent successful unlock passphrase.
-    // ONLY used by Settings → "Enable Face ID": that flow needs the
-    // plaintext passphrase to install into the Keychain, and asking
-    // the user to re-type it right after they just unlocked is
-    // redundant friction.  Cleared on logout / app background (see
-    // `clearUnlockPassphrase`).
-    //
-    // This is the one place we hold onto the passphrase past
-    // `p2p_set_passphrase_v2`.  The core's own copy is zeroed inside
-    // the FFI boundary; this Swift String sits in the heap until
-    // either Face ID opt-in consumes it or we explicitly clear it.
-    @Published var lastUnlockPassphrase: String = ""
+    /// Every peer the user has any relationship with: anyone who sent
+    /// us a message, anyone we've sent a message to, plus anyone they
+    /// explicitly added via New Chat.  Self filtered out.  Single
+    /// source of truth for both ChatListView's Direct Messages section
+    /// and NewGroupSheet's member picker — without this, a freshly-
+    /// added contact who shows up in Chats was invisible to the
+    /// "create group" picker.
+    var knownPeerIds: Set<String> {
+        var ids = Set<String>()
+        for m in messages {
+            ids.insert(m.from)
+            if let to = m.to { ids.insert(to) }
+        }
+        ids.formUnion(knownPeerContacts)
+        ids.remove(myPeerId)
+        return ids
+    }
 
-    func clearUnlockPassphrase() {
-        // String doesn't expose byte-level overwrite (Swift Strings
-        // are value types with COW), but resetting the @Published
-        // drops the heap buffer's strong reference; ARC releases it.
+    // Plaintext passphrase from the most recent unlock, held only so
+    // the Settings → "Enable Face ID" toggle can install it into the
+    // Keychain without re-prompting.  Wiped on app background and on
+    // first read via `consumeUnlockPassphrase()` — whichever comes
+    // first.  Not @Published: we don't want the value flowing through
+    // SwiftUI re-renders or driving persistSnapshot.
+    private var lastUnlockPassphrase: String = ""
+
+    func setLastUnlockPassphrase(_ pass: String) {
+        lastUnlockPassphrase = pass
+    }
+
+    /// One-time read.  Returns the cached passphrase and clears it.
+    /// Returns nil if nothing's cached (e.g. user came back to Settings
+    /// after backgrounding the app, or already enabled Face ID once).
+    func consumeUnlockPassphrase() -> String? {
+        let pass = lastUnlockPassphrase
         lastUnlockPassphrase = ""
+        return pass.isEmpty ? nil : pass
     }
 
     // MARK: - Internal
@@ -347,7 +367,26 @@ final class Peer2PearClient: ObservableObject {
     init() {
         ws = WebSocketAdapter(client: self)
         http = HttpAdapter(client: self)
+        // Wipe any cached unlock passphrase as soon as the app
+        // backgrounds — UIKit posts this synchronously before the
+        // process can be jetsam'd or memory-imaged.  Kept token here
+        // so the observer doesn't outlive `self`.
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            _ = self?.consumeUnlockPassphrase()
+        }
     }
+
+    deinit {
+        if let backgroundObserver {
+            NotificationCenter.default.removeObserver(backgroundObserver)
+        }
+        stop()
+    }
+
+    private var backgroundObserver: NSObjectProtocol?
 
     /// Initialize the protocol engine with a data directory and passphrase.
     func start(dataDir: String, passphrase: String, relayUrl: String) {
@@ -437,11 +476,22 @@ final class Peer2PearClient: ObservableObject {
             }
         }
 
-        // Auto-save on any persisted-state change, debounced so a burst
-        // of message arrivals coalesces into one write.
-        saveCancellable = objectWillChange
-            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in self?.persistSnapshot() }
+        // Save on changes to ANY of the persisted fields, debounced so
+        // a burst of message arrivals coalesces into one write.  Don't
+        // observe `objectWillChange` directly: it fires on every
+        // @Published mutation (colorScheme, isConnected, statusMessage,
+        // peerPresence, transfers, ...) and would rewrite the full
+        // snapshot for noise that doesn't belong in it.
+        saveCancellable = Publishers.MergeMany(
+            $messages         .map { _ in () }.eraseToAnyPublisher(),
+            $groups           .map { _ in () }.eraseToAnyPublisher(),
+            $groupAvatars     .map { _ in () }.eraseToAnyPublisher(),
+            $groupMessages    .map { _ in () }.eraseToAnyPublisher(),
+            $knownPeerContacts.map { _ in () }.eraseToAnyPublisher()
+        )
+        .dropFirst()  // Skip the initial values published on subscribe.
+        .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
+        .sink { [weak self] _ in self?.persistSnapshot() }
 
         p2p_set_relay_url(rawContext, relayUrl)
         p2p_connect(rawContext)
@@ -470,8 +520,6 @@ final class Peer2PearClient: ObservableObject {
         }
         isConnected = false
     }
-
-    deinit { stop() }
 
     // MARK: - Push notifications
 

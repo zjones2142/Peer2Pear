@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IWebSocket.hpp"
+#include "qt_thread_hop.hpp"
 #include <QWebSocket>
 #include <QUrl>
 #include <QString>
@@ -11,6 +12,9 @@
  * Thin wrapper that forwards QWebSocket signals to the std-typed
  * IWebSocket callback interface. Converts Qt ↔ std at the adapter
  * boundary.
+ *
+ * QWebSocket is owner-thread-pinned (same as QNetworkAccessManager);
+ * mutating entry points hop via runOnOwnerThread before touching m_ws.
  */
 class QtWebSocket : public QObject, public IWebSocket {
     Q_OBJECT
@@ -38,10 +42,16 @@ public:
     }
 
     void open(const std::string& url) override {
-        m_ws.open(QUrl(QString::fromStdString(url)));
+        p2p::runOnOwnerThread(this, [this, url]() {
+            m_ws.open(QUrl(QString::fromStdString(url)));
+        });
     }
-    void close() override { m_ws.close(); }
 
+    void close() override {
+        p2p::runOnOwnerThread(this, [this]() { m_ws.close(); });
+    }
+
+    // QWebSocket::state() is safe from any thread — atomic snapshot.
     bool isConnected() const override {
         return m_ws.state() == QAbstractSocket::ConnectedState;
     }
@@ -51,7 +61,9 @@ public:
     }
 
     void sendTextMessage(const std::string& message) override {
-        m_ws.sendTextMessage(QString::fromStdString(message));
+        p2p::runOnOwnerThread(this, [this, message]() {
+            m_ws.sendTextMessage(QString::fromStdString(message));
+        });
     }
 
 private:

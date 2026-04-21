@@ -10,6 +10,7 @@ set(DESKTOP_SOURCES
     chattypes.h
     filetransfer.h
     settingspanel.cpp    settingspanel.h
+    theme.cpp            theme.h
     onboardingdialog.cpp onboardingdialog.h
     ChatNotifier.h
     QtWebSocket.hpp

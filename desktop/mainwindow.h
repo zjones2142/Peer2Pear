@@ -32,7 +32,6 @@ private slots:
     void onSettingsBackClicked();
     void onExportContacts();
     void onImportContacts();
-    void applyTheme(SettingsPanel::ThemePreference pref);
 
 private:
     Ui::MainWindow  *ui;

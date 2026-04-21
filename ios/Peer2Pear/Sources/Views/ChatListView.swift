@@ -17,23 +17,8 @@ struct ChatListView: View {
         }
     }
 
-    /// Every peer that should show up in the Direct Messages section:
-    /// the union of peers we've messaged with (either direction) and
-    /// peers the user explicitly added via New Chat (before any
-    /// messages flowed).  Sorted to keep the list stable across renders.
     private var directPeerIds: [String] {
-        var ids: Set<String> = []
-        for msg in client.messages {
-            if msg.from == client.myPeerId {
-                if let to = msg.to, !to.isEmpty { ids.insert(to) }
-            } else {
-                ids.insert(msg.from)
-            }
-        }
-        return ids
-            .union(client.knownPeerContacts)
-            .subtracting([client.myPeerId, ""])
-            .sorted()
+        client.knownPeerIds.subtracting([""]).sorted()
     }
 
     /// Groups sorted most-recently-active first.
@@ -83,12 +68,8 @@ struct ChatListView: View {
             .navigationTitle("Chats")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    // The toolbar leading slot is narrow on the Dynamic
-                    // Island phones — "Connected" was truncating to
-                    // "Con..." which looked like a weirdly-named avatar.
-                    // A single SF Symbol tells the story without eating
-                    // horizontal space; accessibility label keeps the
-                    // state legible to VoiceOver.
+                    // SF Symbol used because text truncates in the
+                    // narrow toolbar leading slot on Dynamic Island phones.
                     Image(systemName: client.isConnected
                           ? "wifi" : "wifi.slash")
                         .foregroundStyle(client.isConnected ? .green : .red)
@@ -247,11 +228,13 @@ struct NewGroupSheet: View {
     @State private var groupName = ""
     @State private var selectedPeers: Set<String> = []
 
-    /// Peer IDs we've seen in 1:1 messages — potential group members.
+    /// Same source as ChatListView's Direct Messages section so any
+    /// peer visible in Chats can be picked here.  Pre-fix this only
+    /// looked at inbound `from` addresses, so freshly-added contacts
+    /// (in knownPeerContacts) and outbound-only conversations were
+    /// silently excluded from the group picker.
     private var knownPeers: [String] {
-        let ids = Set(client.messages.map(\.from))
-            .union(Set(client.peerPresence.keys))
-        return ids.filter { $0 != client.myPeerId }.sorted()
+        client.knownPeerIds.subtracting([""]).sorted()
     }
 
     var body: some View {
@@ -312,6 +295,7 @@ struct NewGroupSheet: View {
                 }
             }
         }
+        .p2pColorScheme(client.colorScheme)
     }
 }
 
@@ -377,14 +361,9 @@ struct AddContactSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Chat") {
-                        // Persist the peer so they appear in the chat
-                        // list immediately, even before the first
-                        // message round-trip.  Without this the user
-                        // saw "nothing happen" — the sheet dismissed
-                        // but the conversation list is derived from
-                        // inbound messages, so an unused new peer ID
-                        // vanished into the trimmed state and never
-                        // surfaced anywhere.
+                        // addContact lands the peer in knownPeerContacts
+                        // so they surface in the chat list before any
+                        // message round-trip happens.
                         client.addContact(peerId: trimmed)
                         newContactId = ""
                         dismiss()
@@ -408,6 +387,7 @@ struct AddContactSheet: View {
                 )
             }
         }
+        .p2pColorScheme(client.colorScheme)
     }
 }
 

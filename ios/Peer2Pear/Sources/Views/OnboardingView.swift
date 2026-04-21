@@ -10,9 +10,8 @@ struct OnboardingView: View {
     @ObservedObject var client: Peer2PearClient
     @State private var passphrase = ""
     @State private var starting = false
-    // Tracks whether we've already offered biometric unlock on appear.
-    // Without this, a user who cancels Face ID would get re-prompted
-    // every time a @State change re-evaluates the view body.
+    // Suppresses re-prompting biometry on every view re-evaluation
+    // after the user dismisses the first auto-prompt.
     @State private var biometricAutoAttempted = false
 
     // Computed once at view construction.  If the user creates an
@@ -112,7 +111,7 @@ struct OnboardingView: View {
                 // when the user previously opted in (Settings).
                 if biometricAvailable {
                     Button {
-                        tryBiometric(auto: false)
+                        tryBiometric()
                     } label: {
                         Label("Unlock with \(BiometricUnlock.biometryName)",
                               systemImage: BiometricUnlock.biometryName
@@ -129,69 +128,48 @@ struct OnboardingView: View {
             }
             .padding()
             .onAppear {
-                // One-shot biometric prompt on first appearance.  If
-                // the user dismisses Face ID, we don't re-nag — they
-                // can tap the explicit button or type their
-                // passphrase.  Without the guard, every re-render
-                // (e.g., keyboard showing) would pop the sheet again.
+                // One-shot biometric prompt on first appearance.  Guard
+                // against re-nagging on every body re-render.
                 if biometricAvailable && !biometricAutoAttempted {
                     biometricAutoAttempted = true
-                    tryBiometric(auto: true)
+                    tryBiometric()
                 }
             }
         }
     }
 
     private func submit() {
+        unlock(with: passphrase)
+    }
+
+    private func tryBiometric() {
+        BiometricUnlock.retrieve(reason: "Unlock Peer2Pear") { pass in
+            guard let pass, !pass.isEmpty else { return }
+            unlock(with: pass)
+        }
+    }
+
+    // Argon2id runs for ~1.3 s on typical hardware; kick it off on a
+    // background queue so the button's spinner actually renders.  The
+    // @Published myPeerId mutation inside start() marshals back to
+    // main before Peer2PearApp's conditional switches to ChatListView.
+    private func unlock(with pass: String) {
         starting = true
-        // Stash a copy of what the user typed for potential use by
-        // the Settings biometric-enable flow.  Only kept if the
-        // unlock succeeds; zeroed otherwise (see below).
-        let typed = passphrase
-        // Argon2id runs for ~1.3 s on typical hardware; kick it off
-        // on a background queue so the button's spinner actually
-        // renders.  The @Published myPeerId mutation inside start()
-        // marshals back to main before Peer2PearApp's conditional
-        // switches to ChatListView.
         DispatchQueue.global(qos: .userInitiated).async {
             client.start(dataDir: Peer2PearClient.documentsPath,
-                          passphrase: typed,
+                          passphrase: pass,
                           relayUrl: Peer2PearClient.storedRelayUrl)
             DispatchQueue.main.async {
-                // Expose the just-used passphrase to Settings so
-                // "Enable Face ID" doesn't need to re-prompt.  Only
-                // stored on successful unlock; if start() failed,
-                // myPeerId is still empty and we don't cache it.
+                // Cache the passphrase only on a successful unlock so
+                // the Settings → "Enable Face ID" toggle can install it
+                // without re-prompting.  consumeUnlockPassphrase()
+                // wipes it after first read.
                 if !client.myPeerId.isEmpty {
-                    client.lastUnlockPassphrase = typed
+                    client.setLastUnlockPassphrase(pass)
                 }
                 starting = false
             }
         }
-    }
-
-    private func tryBiometric(auto: Bool) {
-        let reason = "Unlock Peer2Pear"
-        BiometricUnlock.retrieve(reason: reason) { pass in
-            guard let pass, !pass.isEmpty else { return }
-            starting = true
-            DispatchQueue.global(qos: .userInitiated).async {
-                client.start(dataDir: Peer2PearClient.documentsPath,
-                              passphrase: pass,
-                              relayUrl: Peer2PearClient.storedRelayUrl)
-                DispatchQueue.main.async {
-                    if !client.myPeerId.isEmpty {
-                        client.lastUnlockPassphrase = pass
-                    }
-                    starting = false
-                }
-            }
-        }
-        // Suppress unused-parameter warning without changing the
-        // signature; `auto` is there for future telemetry (distinguishing
-        // on-appear from explicit button-tap unlocks if we ever want
-        // to count cancel rates).
-        _ = auto
     }
 
     private var passphraseAccepted: Bool {

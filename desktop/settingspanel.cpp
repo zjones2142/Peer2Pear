@@ -1,5 +1,6 @@
 #include "settingspanel.h"
 #include "databasemanager.h"
+#include "theme.h"
 
 #include <QLabel>
 #include <QVBoxLayout>
@@ -17,6 +18,13 @@ SettingsPanel::SettingsPanel(QWidget *parent)
     : QWidget(parent)
 {
     buildUI();
+    // Re-style on theme change.  Cheap (single findChildren walk) and
+    // also refreshes the appearance-picker button highlights.
+    connect(&ThemeManager::instance(), &ThemeManager::themeChanged,
+            this, [this](const Theme&) {
+                applyThemeStyles();
+                applyThemeButtonStyles();
+            });
 }
 
 void SettingsPanel::buildUI()
@@ -30,7 +38,10 @@ void SettingsPanel::buildUI()
 
     // ── Top bar ───────────────────────────────────────────────────────────────
     QWidget *settingsHeader = new QWidget();
+    // settingsHeader objectName drives the inline #settingsHeader sheet
+    // below; p2pRole is what applyThemeStyles keys on for re-styling.
     settingsHeader->setObjectName("settingsHeader");
+    settingsHeader->setProperty("p2pRole", "headerBar");
     settingsHeader->setFixedHeight(72);
     settingsHeader->setStyleSheet(
         "QWidget#settingsHeader { background-color: #0d0d0d; border-bottom: 1px solid #1e1e1e; }"
@@ -56,6 +67,7 @@ void SettingsPanel::buildUI()
         );
 
     QLabel *titleLabel = new QLabel("Settings");
+    titleLabel->setProperty("p2pRole", "headerTitle");
     titleLabel->setStyleSheet("color: #ffffff; font-size: 16px; font-weight: bold;");
 
     headerLayout->addWidget(backBtn);
@@ -66,12 +78,14 @@ void SettingsPanel::buildUI()
 
     // ── Scrollable body ───────────────────────────────────────────────────────
     QScrollArea *scroll = new QScrollArea();
+    scroll->setProperty("p2pRole", "scroll");
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setWidgetResizable(true);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scroll->setStyleSheet("background-color: #0d0d0d; border: none;");
 
     QWidget *body = new QWidget();
+    body->setProperty("p2pRole", "body");
     body->setStyleSheet("background-color: #0d0d0d;");
     QVBoxLayout *bodyLayout = new QVBoxLayout(body);
     bodyLayout->setContentsMargins(32, 24, 32, 24);
@@ -115,6 +129,12 @@ void SettingsPanel::buildUI()
 
     outerLayout->addWidget(settingsHeader);
     outerLayout->addWidget(scroll);
+
+    // Final pass: every widget tagged with a p2pRole property gets its
+    // stylesheet rewritten from the active Theme.  Inline stylesheets
+    // set above are still emitted but get overwritten by this call,
+    // which becomes important the first time the user flips Light mode.
+    applyThemeStyles();
 }
 
 // Builds the Profile section card with display name and public key + copy button
@@ -292,13 +312,15 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
     }
 
     // Appearance — default Dark matches the hardcoded dark palette.
+    // setPreference cascades through reapply() → themeChanged signal →
+    // applyThemeStyles + applyThemeButtonStyles via the connection in
+    // our constructor.
     {
         const QString raw = m_db->loadSetting("themePreference", "dark");
-        if      (raw == "light")  m_themePref = ThemePreference::Light;
-        else if (raw == "system") m_themePref = ThemePreference::System;
-        else                       m_themePref = ThemePreference::Dark;
-        applyThemeButtonStyles();
-        emit themeChanged(m_themePref);
+        const auto pref = raw == "light"  ? ThemeManager::Preference::Light
+                        : raw == "system" ? ThemeManager::Preference::System
+                        :                    ThemeManager::Preference::Dark;
+        ThemeManager::instance().setPreference(pref);
     }
 }
 
@@ -1659,23 +1681,24 @@ QWidget *SettingsPanel::makeAppearanceSection()
         );
     cardLayout->addWidget(caption);
 
-    auto pickTheme = [this](ThemePreference pref) {
-        m_themePref = pref;
-        applyThemeButtonStyles();
+    auto pickTheme = [this](ThemeManager::Preference pref) {
         if (m_db) {
-            const char* raw = pref == ThemePreference::Light  ? "light"
-                             : pref == ThemePreference::System ? "system"
-                                                                : "dark";
+            const char* raw = pref == ThemeManager::Preference::Light  ? "light"
+                             : pref == ThemeManager::Preference::System ? "system"
+                                                                          : "dark";
             m_db->saveSetting("themePreference", raw);
         }
-        emit themeChanged(pref);
+        // Single source of truth — ThemeManager fires themeChanged
+        // which our constructor's connection routes to applyThemeStyles
+        // + applyThemeButtonStyles, so the buttons re-highlight too.
+        ThemeManager::instance().setPreference(pref);
     };
     connect(m_themeBtnDark,   &QPushButton::clicked, this,
-            [pickTheme]() { pickTheme(ThemePreference::Dark); });
+            [pickTheme]() { pickTheme(ThemeManager::Preference::Dark); });
     connect(m_themeBtnLight,  &QPushButton::clicked, this,
-            [pickTheme]() { pickTheme(ThemePreference::Light); });
+            [pickTheme]() { pickTheme(ThemeManager::Preference::Light); });
     connect(m_themeBtnSystem, &QPushButton::clicked, this,
-            [pickTheme]() { pickTheme(ThemePreference::System); });
+            [pickTheme]() { pickTheme(ThemeManager::Preference::System); });
 
     return card;
 }
@@ -1683,10 +1706,168 @@ QWidget *SettingsPanel::makeAppearanceSection()
 void SettingsPanel::applyThemeButtonStyles()
 {
     if (!m_themeBtnDark || !m_themeBtnLight || !m_themeBtnSystem) return;
+    const auto pref = ThemeManager::instance().preference();
     QSignalBlocker b0(m_themeBtnDark);
     QSignalBlocker b1(m_themeBtnLight);
     QSignalBlocker b2(m_themeBtnSystem);
-    m_themeBtnDark  ->setChecked(m_themePref == ThemePreference::Dark);
-    m_themeBtnLight ->setChecked(m_themePref == ThemePreference::Light);
-    m_themeBtnSystem->setChecked(m_themePref == ThemePreference::System);
+    m_themeBtnDark  ->setChecked(pref == ThemeManager::Preference::Dark);
+    m_themeBtnLight ->setChecked(pref == ThemeManager::Preference::Light);
+    m_themeBtnSystem->setChecked(pref == ThemeManager::Preference::System);
+}
+
+// ── Theme application ───────────────────────────────────────────────────────
+//
+// Strategy: every section maker above has already emitted hardcoded dark
+// stylesheets via setStyleSheet().  applyThemeStyles auto-classifies each
+// child widget by inspecting that stylesheet (e.g. "background-color:
+// #111111" + "border-radius: 10px" → card) and overwrites with a theme-
+// driven sheet.  Auto-classification keeps the section makers simple
+// (no per-widget tagging boilerplate) and the override-then-overwrite
+// flow is harmless: in dark mode the rewritten sheet matches the
+// original byte-for-byte; in light mode it actually flips colors.
+//
+// Roles handled:
+//   • card        — section background + border + 10px radius
+//   • heading     — green ALL-CAPS section label
+//   • key         — left-side row label (e.g. "Display Name")
+//   • value       — right-side dim row value (e.g. truncated key)
+//   • divider     — 1px horizontal rule between rows
+//   • outerChrome — settingsPanel / settingsHeader / scroll / body
+//
+// Buttons + segmented pickers are intentionally NOT covered yet —
+// they have state-dependent stylesheets (enabled/disabled, checked/
+// hover) that the existing apply*State() methods recompute on every
+// toggle.  Migrating those is a follow-up.
+
+namespace {
+
+QString cardCss(const Theme& t) {
+    return QStringLiteral(
+        "background-color: %1;"
+        "border: 1px solid %2;"
+        "border-radius: 10px;"
+    ).arg(t.card.name(), t.border.name());
+}
+
+QString headingCss(const Theme& t) {
+    return QStringLiteral(
+        "color: %1;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+    ).arg(t.accent.name());
+}
+
+QString keyCss(const Theme& t, int fontSize = 13) {
+    return QStringLiteral(
+        "color: %1; font-size: %2px;"
+        "background: transparent; border: none;"
+    ).arg(t.textPrimary.name()).arg(fontSize);
+}
+
+QString valueCss(const Theme& t, int fontSize = 13, bool monospace = false) {
+    return QStringLiteral(
+        "color: %1; font-size: %2px;%3"
+        "background: transparent; border: none;"
+    ).arg(t.textMuted.name())
+     .arg(fontSize)
+     .arg(monospace ? " font-family: monospace;" : "");
+}
+
+QString dividerCss(const Theme& t) {
+    return QStringLiteral(
+        "color: %1; background-color: %1;"
+        "border: none; max-height: 1px;"
+    ).arg(t.divider.name());
+}
+
+}  // namespace
+
+void SettingsPanel::applyThemeStyles()
+{
+    const Theme& t = ThemeManager::instance().current();
+
+    // ── Outer chrome ────────────────────────────────────────────────────
+    setStyleSheet(QStringLiteral(
+        "QWidget#settingsPanel { background-color: %1; }"
+    ).arg(t.bg.name()));
+
+    if (auto* header = findChild<QWidget*>("settingsHeader")) {
+        header->setStyleSheet(QStringLiteral(
+            "QWidget#settingsHeader {"
+            "  background-color: %1;"
+            "  border-bottom: 1px solid %2;"
+            "}"
+        ).arg(t.bg.name(), t.border.name()));
+    }
+
+    // Scroll area + body widget: tagged via p2pRole so we can find them
+    // even though they have no objectName.
+    for (auto* w : findChildren<QWidget*>()) {
+        const QString role = w->property("p2pRole").toString();
+        if (role == "scroll" || role == "body") {
+            w->setStyleSheet(QStringLiteral(
+                "background-color: %1; border: none;"
+            ).arg(t.bg.name()));
+        }
+    }
+
+    // ── Auto-classified content widgets ─────────────────────────────────
+    // Single pass over every child — for each one, look at its existing
+    // stylesheet (which the section maker emitted hardcoded-dark) and
+    // overwrite with the theme-driven equivalent.  Cheap: a hundred or
+    // so widgets, single QString::contains per check.
+    for (auto* w : findChildren<QWidget*>()) {
+        const QString css = w->styleSheet();
+        if (css.isEmpty()) continue;
+
+        // Card surface — bg #111 + 10px radius.  Match on radius
+        // because a couple of non-card widgets also use #111.
+        if (css.contains(QLatin1String("border-radius: 10px"))
+            && css.contains(QLatin1String("background-color: #111111"))) {
+            w->setStyleSheet(cardCss(t));
+            continue;
+        }
+
+        // Section heading — green text + bold + 11px.  Distinct enough
+        // to avoid colliding with any value/heading-like label.
+        if (auto* lbl = qobject_cast<QLabel*>(w)) {
+            if (css.contains(QLatin1String("color: #4caf50"))
+                && css.contains(QLatin1String("font-size: 11px"))
+                && css.contains(QLatin1String("font-weight: bold"))) {
+                lbl->setStyleSheet(headingCss(t));
+                continue;
+            }
+            // Key label — primary text color + 13px on transparent bg.
+            // Pattern is identical across every section's row labels.
+            if (css.contains(QLatin1String("color: #cccccc; font-size: 13px"))
+                && css.contains(QLatin1String("background: transparent"))) {
+                lbl->setStyleSheet(keyCss(t));
+                continue;
+            }
+            // Value label — muted text + 13px.  Some are monospace
+            // (truncated keys); preserve that.
+            if (css.contains(QLatin1String("color: #555555; font-size: 13px"))
+                && css.contains(QLatin1String("background: transparent"))) {
+                const bool mono = css.contains(QLatin1String("font-family: monospace"));
+                lbl->setStyleSheet(valueCss(t, /*fontSize=*/13, mono));
+                continue;
+            }
+            if (css.contains(QLatin1String("color: #555555; font-size: 12px"))
+                && css.contains(QLatin1String("background: transparent"))) {
+                const bool mono = css.contains(QLatin1String("font-family: monospace"));
+                lbl->setStyleSheet(valueCss(t, /*fontSize=*/12, mono));
+                continue;
+            }
+        }
+
+        // Horizontal-rule frame — distinctive 1px height.
+        if (qobject_cast<QFrame*>(w)
+            && css.contains(QLatin1String("max-height: 1px"))) {
+            w->setStyleSheet(dividerCss(t));
+            continue;
+        }
+    }
 }
