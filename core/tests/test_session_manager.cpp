@@ -72,12 +72,12 @@ protected:
 
         s_aliceCrypto = std::make_unique<CryptoEngine>();
         s_aliceCrypto->setDataDir(s_aliceDir);
-        s_aliceCrypto->setPassphrase("alice-test-only");
+        s_aliceCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_aliceCrypto->ensureIdentity());
 
         s_bobCrypto = std::make_unique<CryptoEngine>();
         s_bobCrypto->setDataDir(s_bobDir);
-        s_bobCrypto->setPassphrase("bob-test-only");
+        s_bobCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_bobCrypto->ensureIdentity());
     }
 

@@ -62,17 +62,17 @@ protected:
 
         s_meCrypto = std::make_unique<CryptoEngine>();
         s_meCrypto->setDataDir(s_meDir);
-        s_meCrypto->setPassphrase("gp-test-me");
+        s_meCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_meCrypto->ensureIdentity());
 
         s_aliceCrypto = std::make_unique<CryptoEngine>();
         s_aliceCrypto->setDataDir(s_aliceDir);
-        s_aliceCrypto->setPassphrase("gp-test-alice");
+        s_aliceCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_aliceCrypto->ensureIdentity());
 
         s_bobCrypto = std::make_unique<CryptoEngine>();
         s_bobCrypto->setDataDir(s_bobDir);
-        s_bobCrypto->setPassphrase("gp-test-bob");
+        s_bobCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_bobCrypto->ensureIdentity());
 
         s_meId    = CryptoEngine::toBase64Url(s_meCrypto->identityPub());
