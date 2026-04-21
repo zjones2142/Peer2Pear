@@ -15,6 +15,9 @@ class QuicConnection;  // forward declaration — full include in .cpp
 #include "RelayClient.hpp"
 #include "SessionManager.hpp"
 #include "SealedEnvelope.hpp"
+#include "SessionSealer.hpp"
+#include "GroupProtocol.hpp"
+#include "FileProtocol.hpp"
 #include "FileTransferManager.hpp"
 #include "ITimer.hpp"
 
@@ -25,7 +28,6 @@ class QuicConnection;  // forward declaration — full include in .cpp
 #include <map>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 
@@ -121,42 +123,55 @@ public:
     //                (fresh install) and every verification is stale.
     //                Fires onPeerKeyChanged.  If hard-block toggle is on,
     //                sends + receives for that peer are refused.
-    enum class PeerTrust { Unverified, Verified, Mismatch };
+    // Re-exported from SessionSealer so existing callers (C API, tests,
+    // desktop/chatview.cpp) can keep using ChatController::PeerTrust.
+    using PeerTrust = SessionSealer::PeerTrust;
 
     /// Returns the 60-digit safety-number display string for the
     /// (self, peer) pair.  Empty on invalid peerId.
-    std::string safetyNumber(const std::string& peerIdB64u) const;
+    std::string safetyNumber(const std::string& peerIdB64u) const {
+        return m_sealer.safetyNumber(peerIdB64u);
+    }
 
     /// Current verification state for peer.  Computed fresh each call.
-    PeerTrust peerTrust(const std::string& peerIdB64u) const;
+    PeerTrust peerTrust(const std::string& peerIdB64u) const {
+        return m_sealer.peerTrust(peerIdB64u);
+    }
 
-    // Wipe the in-memory fingerprint cache.  Production callers shouldn't
-    // need this — the cache invalidates itself whenever `verified_peers`
-    // is written through saveVerifiedFingerprint / deleteVerifiedPeer.
-    // Exposed for (a) test fixtures that mutate the DB directly to
-    // simulate tampering / restart, and (b) future migration / admin
-    // tooling that might write verified_peers out of band.
-    void clearPeerKeyCache() { m_peerKeyCache.clear(); }
+    // Wipe the in-memory fingerprint cache.  See SessionSealer for
+    // when / why to call this (test fixtures + migration tooling).
+    void clearPeerKeyCache() { m_sealer.clearPeerKeyCache(); }
 
     /// Persist "user has compared safety numbers and confirmed".  The
     /// current (self, peer) fingerprint is stored; mismatches surface if
     /// either side changes.  Returns false on invalid peerId.
-    bool markPeerVerified(const std::string& peerIdB64u);
+    bool markPeerVerified(const std::string& peerIdB64u) {
+        return m_sealer.markPeerVerified(peerIdB64u);
+    }
 
     /// Forget the verification for a peer — they become Unverified.
-    void unverifyPeer(const std::string& peerIdB64u);
+    void unverifyPeer(const std::string& peerIdB64u) {
+        m_sealer.unverifyPeer(peerIdB64u);
+    }
 
     /// Policy toggle: when true, messages to/from a Mismatch peer are
     /// blocked at the ChatController level.  Default false (soft warn
     /// via onPeerKeyChanged; UI decides how to surface).
-    void setHardBlockOnKeyChange(bool on) { m_hardBlockOnKeyChange = on; }
-    bool hardBlockOnKeyChange() const     { return m_hardBlockOnKeyChange; }
+    void setHardBlockOnKeyChange(bool on) { m_sealer.setHardBlockOnKeyChange(on); }
+    bool hardBlockOnKeyChange() const     { return m_sealer.hardBlockOnKeyChange(); }
 
-    // Restore/persist group sequence counters across restarts.
+    // Restore/persist group sequence counters across restarts.  Delegates
+    // to GroupProtocol — the counters themselves live there.
     void setGroupSeqCounters(const std::map<std::string, int64_t>& seqOut,
-                             const std::map<std::string, int64_t>& seqIn);
-    const std::map<std::string, int64_t>& groupSeqOut() const { return m_groupSeqOut; }
-    const std::map<std::string, int64_t>& groupSeqIn()  const { return m_groupSeqIn;  }
+                             const std::map<std::string, int64_t>& seqIn) {
+        m_groupProto.setSeqCounters(seqOut, seqIn);
+    }
+    const std::map<std::string, int64_t>& groupSeqOut() const {
+        return m_groupProto.seqOut();
+    }
+    const std::map<std::string, int64_t>& groupSeqIn() const {
+        return m_groupProto.seqIn();
+    }
 
     /// Populate known-group-members state on startup from the UI's
     /// persisted group rosters.  ChatController rejects group_rename,
@@ -175,29 +190,35 @@ public:
     /// to the sender.  requireP2P tells the sender "I refuse relay fallback
     /// for this transfer" (for now just forwarded in the file_accept
     /// message).
-    void acceptFileTransfer(const std::string& transferId, bool requireP2P = false);
+    void acceptFileTransfer(const std::string& transferId, bool requireP2P = false) {
+        m_fileProto.acceptIncoming(transferId, requireP2P);
+    }
 
     /// Decline a pending incoming file transfer. Discards the stashed key and
     /// sends file_decline (no reason field — anti-probing).
-    void declineFileTransfer(const std::string& transferId);
+    void declineFileTransfer(const std::string& transferId) {
+        m_fileProto.declineIncoming(transferId);
+    }
 
     /// Cancel an in-flight transfer — works for both outbound and inbound.
     /// Sender: aborts streaming, drops state. Receiver: closes + deletes partial.
     /// Sends file_cancel to the peer.
-    void cancelFileTransfer(const std::string& transferId);
+    void cancelFileTransfer(const std::string& transferId) {
+        m_fileProto.cancel(transferId);
+    }
 
     /// Global consent settings (persisted by the caller via DatabaseManager).
-    void setFileAutoAcceptMaxMB(int mb) { m_fileAutoAcceptMaxMB = mb; }
-    void setFileHardMaxMB(int mb)       { m_fileHardMaxMB       = mb; }
+    void setFileAutoAcceptMaxMB(int mb) { m_fileProto.setAutoAcceptMaxMB(mb); }
+    void setFileHardMaxMB(int mb)       { m_fileProto.setHardMaxMB(mb); }
     void setFileRequireP2P(bool on)     {
-        m_fileRequireP2P = on;
+        m_fileProto.setRequireP2P(on);
         // Propagate live so in-flight streams upgrade to P2P-only on the
         // next chunk rather than finishing under the prior policy.
         m_fileMgr.setSenderRequiresP2P(on);
     }
-    int  fileAutoAcceptMaxMB() const    { return m_fileAutoAcceptMaxMB; }
-    int  fileHardMaxMB() const          { return m_fileHardMaxMB; }
-    bool fileRequireP2P() const         { return m_fileRequireP2P; }
+    int  fileAutoAcceptMaxMB() const    { return m_fileProto.autoAcceptMaxMB(); }
+    int  fileHardMaxMB() const          { return m_fileProto.hardMaxMB(); }
+    bool fileRequireP2P() const         { return m_fileProto.requireP2P(); }
 
     // ── Event callbacks — plain class, no signals ──────────────────────────
     //
@@ -279,19 +300,36 @@ public:
 
 private:
     void onEnvelope(const Bytes& body);
+    // Splits onEnvelope: the outer method owns unseal / session-decrypt /
+    // rate-limit / safety-number check, then hands the decrypted JSON
+    // payload here for type-dispatch.  Separating the two keeps each
+    // function under control (both were ~640 lines in one pre-split).
+    // `via` is "RELAY" or "P2P" and is only used for log tagging + the
+    // "P2P presence heartbeat" behaviour.
+    // `msgKey` is the 32-byte ratchet message key from the just-completed
+    // session decrypt.  The file_key handler installs it as the file's
+    // AEAD key; other handlers ignore it.  Passed by value so the handler
+    // can zero it on exit.
+    void dispatchSealedPayload(const nlohmann::json& o,
+                                const std::string& senderId,
+                                int64_t tsSecs,
+                                const std::string& msgId,
+                                const std::string& via,
+                                Bytes msgKey);
 #ifdef PEER2PEAR_P2P
     void onP2PDataReceived(const std::string& peerIdB64u, const Bytes& data);
 #endif
     void handleRelayConnected();
 
 private:
-    Bytes sealForPeer(const std::string& peerIdB64u, const Bytes& plaintext);
+    // Seal + send.  Thin wrapper — the sealing itself lives on
+    // SessionSealer (the choke point for safety-number enforcement);
+    // this just adds the "hand the sealed envelope to the relay" step.
     void sendSealedPayload(const std::string& peerIdB64u, const nlohmann::json& payload);
 
-    // Is `peerId` currently a known member of group `gid`?  Returns true
-    // (permissively) only for groups we've never seen before; otherwise
-    // false unless peerId is in our roster.
-    bool isAuthorizedGroupSender(const std::string& gid, const std::string& peerId) const;
+    // Roster authorization for inbound group control messages lives on
+    // GroupProtocol.  onEnvelope calls m_groupProto.isAuthorizedSender
+    // directly — no local indirection needed.
 #ifdef PEER2PEAR_P2P
     QuicConnection* setupP2PConnection(const std::string& peerIdB64u, bool controlling);
     void initiateP2PConnection(const std::string& peerIdB64u);
@@ -321,10 +359,29 @@ private:
     RelayClient          m_relay;
     FileTransferManager  m_fileMgr;
 
+    // Choke point for outbound sealing + safety-number enforcement + KEM
+    // pub bookkeeping.  See SessionSealer.hpp for details.  Must be
+    // declared AFTER m_crypto (holds a reference) and BEFORE any member
+    // that wires a callback to it (so the callback is established before
+    // anything that could fire it).
+    SessionSealer m_sealer{m_crypto};
+
+    // Group outbound actions + roster + seq counters.  See
+    // GroupProtocol.hpp.  Inbound group_* handlers still live in
+    // onEnvelope and query this for authorization + counter state;
+    // they move in the future EnvelopeDispatcher refactor.
+    GroupProtocol m_groupProto{m_crypto};
+
+    // File-transfer outbound + per-transfer state + consent flow.  See
+    // FileProtocol.hpp.  Inbound file_* handlers in onEnvelope mutate
+    // the state via public accessors (fileKeys() / pendingIncoming())
+    // — they move into EnvelopeDispatcher in the next refactor step.
+    FileProtocol m_fileProto{m_crypto, m_sealer, m_fileMgr};
+
     // Session-based crypto (Noise IK + Double Ratchet + Sealed Sender)
     std::unique_ptr<SessionStore>   m_sessionStore;
     std::unique_ptr<SessionManager> m_sessionMgr;
-    SqlCipherDb* m_dbPtr = nullptr;  // stored for KEM pub lookups
+    SqlCipherDb* m_dbPtr = nullptr;  // kept for group / file / seen-envelopes tables
 
     std::vector<std::string> m_selfKeys;
 
@@ -342,122 +399,26 @@ private:
     static constexpr int64_t kP2PCleanupGraceSecs = 120;
 #endif
 
-    // Per-group outbound sequence counter (monotonic, not persisted).
-    std::map<std::string, int64_t> m_groupSeqOut;
-    // Per-(group,sender) last-seen sequence — detects gaps.
-    std::map<std::string, int64_t> m_groupSeqIn;  // key: "groupId:senderId"
-
-    // Known members per group, bootstrapped by setKnownGroupMembers from
-    // persisted UI state and updated as trusted group messages arrive.
-    // Used to authorize group_member_update / group_leave / group_rename /
-    // group_avatar — messages from peers not in this set are dropped.
-    std::map<std::string, std::set<std::string>> m_groupMembers;
+    // Group sequence counters + roster now live on m_groupProto.
 
     // Count consecutive handshake timeouts per peer — 2+ suggests an older client.
     std::map<std::string, int> m_handshakeFailCount;
 
-    // Peer ML-KEM-768 public keys: peerIdB64u -> 1184-byte KEM pub
-    // Populated by kem_pub_announce messages, used by sealForPeer() for hybrid envelopes
-    std::map<std::string, Bytes> m_peerKemPubs;
-    std::set<std::string> m_kemPubAnnounced;  // peers we've already announced to this session
-    Bytes lookupPeerKemPub(const std::string& peerIdB64u);
+    // Peer ML-KEM-768 pub storage + announce-once tracking live on
+    // SessionSealer.  announceKemPub stays here because it builds a
+    // sealed payload and hands it to m_relay.
     void announceKemPub(const std::string& peerIdB64u);
 
-    // Group file transfers create a distinct per-member transferId internally
-    // so the sender honors each recipient's consent gate independently.
-    // This map bundles those per-member transferIds under a single group-
-    // level id returned to the caller, so cancelFileTransfer() can fan out
-    // across all members.
-    std::map<std::string, std::vector<std::string>> m_groupFileMembers;
+    // Safety-numbers state + fingerprint cache + verified_peers DB helpers
+    // all live on SessionSealer.  ChatController's public trust API
+    // (peerTrust / markPeerVerified / unverifyPeer / etc.) delegates
+    // through m_sealer.  Inbound dispatch calls m_sealer.detectKeyChange
+    // directly at the top of onEnvelope.
 
-    // Safety-numbers state.
-    bool m_hardBlockOnKeyChange = false;
-    // In-memory set of peerIds we've already fired onPeerKeyChanged for
-    // this session — prevents spamming the UI on every message from a
-    // mismatched peer.  Cleared when a peer is re-verified or explicitly
-    // unverified.
-    std::set<std::string> m_keyChangeWarned;
-
-    // Per-peer fingerprint cache.  Eliminates the SQLCipher SELECT +
-    // BLAKE2b recompute that `peerTrust` and `detectKeyChange` used to
-    // do on every send + receive.  For a group fan-out to N members
-    // that was N round-trips per message; now it's O(1) after warmup.
-    //
-    // Source of truth is still the `verified_peers` DB table — the
-    // cache only shortcuts reads.  Writes (via saveVerifiedFingerprint /
-    // deleteVerifiedPeer) invalidate the matching entry, so the next
-    // read repopulates from disk.
-    //
-    // Invariant: `current` depends on `m_crypto.identityPub()`, which is
-    // set once by setPassphrase during ChatController startup and does
-    // not change for the lifetime of the controller.  If identity
-    // rotation is ever added, the entire cache must be cleared.
-    struct PeerKeyCacheEntry {
-        Bytes stored;   // verified_peers row (32 B); empty = not verified
-        Bytes current;  // BLAKE2b(me, peer) (32 B); empty if peerId was invalid
-    };
-    mutable std::unordered_map<std::string, PeerKeyCacheEntry> m_peerKeyCache;
-
-    // Populates + returns the cache entry for a peer.  All trust checks
-    // go through this; never read the DB directly.
-    const PeerKeyCacheEntry& fingerprintsFor(const std::string& peerIdB64u) const;
-    // Drop a cached entry after writing through to DB.  Const because
-    // the cache itself is mutable — the observable state of the class
-    // (the DB contents) isn't changed by invalidation.
-    void invalidatePeerKeyCache(const std::string& peerIdB64u) const;
-
-    // DB-backed helpers (defined in ChatController.cpp).
-    void ensureVerifiedPeersTable();
-    // Returns stored 32-byte fingerprint, or empty if no row.  Kept as
-    // the one SQL-touching helper so cache misses fan back in here.
-    Bytes loadVerifiedFingerprint(const std::string& peerIdB64u) const;
-    void  saveVerifiedFingerprint(const std::string& peerIdB64u,
-                                   const Bytes& fingerprint);
-    void  deleteVerifiedPeer(const std::string& peerIdB64u);
-    // Returns true if a Mismatch was detected (and fires onPeerKeyChanged
-    // at most once per session per peer).  Caller decides whether to
-    // continue based on m_hardBlockOnKeyChange.
-    bool detectKeyChange(const std::string& peerIdB64u);
-
-    // File transfer ratchet keys: senderId:transferId -> 32-byte symmetric key.
-    // Populated by file_key announcements (after consent), consumed by
-    // handleFileEnvelope().  Lifetime bounded by FileTransferManager's 7-day
-    // partial-file purge — no separate in-memory TTL (a short TTL would expire
-    // keys while the DB still held the transfer, causing livelock resumptions).
-    std::map<std::string, Bytes> m_fileKeys;
-
-    // ── Incoming file transfers awaiting user consent ───────────────────────
-    // When a file_key arrives but policy says "prompt", we stash the key here
-    // (instead of m_fileKeys) so chunks arriving before the user responds will
-    // drop silently.  On accept → move into m_fileKeys.  On decline → zero +
-    // drop.
-    struct PendingIncoming {
-        std::string peerId;
-        std::string fileName;
-        int64_t     fileSize    = 0;
-        Bytes       fileKey;            // 32 bytes, zeroed on drop
-        Bytes       fileHash;           // 32 bytes — locked at file_key time
-        int         totalChunks  = 0;   // locked at file_key time
-        int64_t     announcedTs  = 0;   // sender's ts from file_key
-        std::string groupId;
-        std::string groupName;
-        int64_t     announcedSecs = 0;
-    };
-    std::map<std::string, PendingIncoming> m_pendingIncomingFiles;
-    // Cap the pending-prompt queue so a hostile peer flooding file_key
-    // announcements in the prompt-size band can't exhaust memory.  Matches
-    // the FileTransferManager::kMaxConcurrent bound so both queues share
-    // the same worst-case footprint.
-    static constexpr size_t kMaxPendingIncomingFiles = 50;
-
-    // Consent settings (persisted by the application via DatabaseManager).
-    // Defaults: everything below hard-max auto-accepts.
-    int  m_fileAutoAcceptMaxMB = 100;  // everything ≤ this auto-accepts
-    int  m_fileHardMaxMB       = 100;  // anything > this auto-declines
-    bool m_fileRequireP2P      = false;
-
-    // Internal: construct and route control messages via ratchet.
-    void sendFileControlMessage(const std::string& peerIdB64u, const nlohmann::json& msg);
+    // File-transfer state (m_fileKeys / m_pendingIncomingFiles /
+    // m_groupFileMembers) + consent settings now live on m_fileProto.
+    // Inbound file_* handlers in onEnvelope mutate them via the public
+    // accessors on FileProtocol.
 
     // Per-sender envelope rate limiting.
     // Tracks (senderId -> count) within current poll cycle; reset each poll.

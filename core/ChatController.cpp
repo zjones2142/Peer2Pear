@@ -60,6 +60,53 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     , m_timerFactory(&timers)
     , m_maintenanceTimer(timers.create())
 {
+    // Forward the sealer's key-change event through ChatController's own
+    // public callback surface — keeps the onPeerKeyChanged(peerId,
+    // oldFp, newFp) signature stable for the C API + desktop.
+    m_sealer.onPeerKeyChanged =
+        [this](const std::string& peerId,
+               const Bytes& oldFp, const Bytes& newFp) {
+            if (onPeerKeyChanged) onPeerKeyChanged(peerId, oldFp, newFp);
+        };
+
+    // GroupProtocol fans out through sendSealedPayload, which itself
+    // routes through m_sealer + m_relay.  Keep the choke-point
+    // invariant: every outbound group byte still passes through
+    // SessionSealer.sealForPeer.
+    m_groupProto.setSendSealedFn(
+        [this](const std::string& peerId, const nlohmann::json& payload) {
+            sendSealedPayload(peerId, payload);
+        });
+
+    // FileProtocol needs a raw relay-send callback because sendFile
+    // builds the file_key envelope + reads the ratchet's
+    // lastMessageKey in one atomic step, and can't re-seal through
+    // sendSealedPayload.  The sealing itself still goes through
+    // m_sealer (which FileProtocol holds a reference to).
+    m_fileProto.setSendEnvelopeFn(
+        [this](const Bytes& env) { m_relay.sendEnvelope(env); });
+
+    // Forward FileProtocol's transfer lifecycle callbacks to
+    // ChatController's public surface.
+    m_fileProto.onAcceptRequested =
+        [this](const std::string& from, const std::string& tid,
+               const std::string& fileName, int64_t fileSize) {
+            if (onFileAcceptRequested)
+                onFileAcceptRequested(from, tid, fileName, fileSize);
+        };
+    m_fileProto.onCanceled =
+        [this](const std::string& tid, bool byReceiver) {
+            if (onFileTransferCanceled) onFileTransferCanceled(tid, byReceiver);
+        };
+    m_fileProto.onDelivered =
+        [this](const std::string& tid) {
+            if (onFileTransferDelivered) onFileTransferDelivered(tid);
+        };
+    m_fileProto.onBlocked =
+        [this](const std::string& tid, bool byReceiver) {
+            if (onFileTransferBlocked) onFileTransferBlocked(tid, byReceiver);
+        };
+
     // RelayClient — plain class now; assign callbacks directly.
     m_relay.onStatus = [this](const std::string& s) {
         if (onStatus) onStatus(s);
@@ -119,7 +166,7 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
             json ack = json::object();
             ack["type"]       = "file_ack";
             ack["transferId"] = transferId;
-            sendFileControlMessage(fromPeerId, ack);
+            m_fileProto.sendControlMessage(fromPeerId, ack);
         }
     };
 
@@ -132,14 +179,14 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     // Remove ratchet-derived file key when transfer completes.
     m_fileMgr.onTransferCompleted = [this](const std::string& transferId) {
         const std::string suffix = ":" + transferId;
-        auto it = m_fileKeys.begin();
-        while (it != m_fileKeys.end()) {
+        auto it = m_fileProto.fileKeys().begin();
+        while (it != m_fileProto.fileKeys().end()) {
             const auto& k = it->first;
             const bool ends = k.size() >= suffix.size() &&
                               k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
             if (ends || k == transferId) {
                 sodium_memzero(it->second.data(), it->second.size());
-                it = m_fileKeys.erase(it);
+                it = m_fileProto.fileKeys().erase(it);
             } else {
                 ++it;
             }
@@ -166,7 +213,7 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
                const FileTransferManager::Bytes& fileKey) {
         if (fileKey.size() != 32) return;
         const std::string compound = fromPeerId + ":" + transferId;
-        m_fileKeys[compound] = fileKey;
+        m_fileProto.fileKeys()[compound] = fileKey;
         P2P_LOG("[FILE] restored file key for " << transferId.substr(0, 8)
                  << " from " << fromPeerId.substr(0, 8) << "...");
     };
@@ -283,8 +330,14 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
     // Envelope-ID dedup survives restart when a DB is present.
     ensureSeenEnvelopesTable();
-    // Safety-numbers store for out-of-band verification.
-    ensureVerifiedPeersTable();
+
+    // Wire SessionSealer to the same DB + session manager.  Internally
+    // this creates the verified_peers table on first open and registers
+    // the onPeerKeyChanged forwarder.  All trust + sealing paths route
+    // through m_sealer from here on.
+    m_sealer.setDatabase(&db);
+    m_sealer.setSessionManager(m_sessionMgr.get());
+    m_fileProto.setSessionManager(m_sessionMgr.get());
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
     m_sessionMgr->setSendResponseFn([this](const std::string& peerId, const Bytes& blob) {
@@ -294,7 +347,7 @@ void ChatController::setDatabase(SqlCipherDb& db)
         if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0) return;
 
         Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
-        Bytes peerKemPub = lookupPeerKemPub(peerId);
+        Bytes peerKemPub = m_sealer.lookupPeerKemPub(peerId);
         Bytes sealed = SealedEnvelope::seal(
             recipientCurvePub, peerEdPub,
             m_crypto.identityPub(), m_crypto.identityPriv(),
@@ -328,7 +381,7 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
         Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
         sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
-        Bytes peerKemPub = lookupPeerKemPub(peerId);
+        Bytes peerKemPub = m_sealer.lookupPeerKemPub(peerId);
         Bytes sealed = SealedEnvelope::seal(
             recipientCurvePub, peerEdPub,
             m_crypto.identityPub(), m_crypto.identityPriv(),
@@ -388,7 +441,7 @@ void ChatController::sendText(const std::string& peerIdB64u, const std::string& 
     const Bytes pt(ptStr.begin(), ptStr.end());
 
     // ── Sealed path (always required for text) ──────────────────────────────
-    Bytes sealedEnv = sealForPeer(peerIdB64u, pt);
+    Bytes sealedEnv = m_sealer.sealForPeer(peerIdB64u, pt);
     if (sealedEnv.empty()) {
         P2P_WARN("[SEND] BLOCKED — cannot seal text to " << peerIdB64u.substr(0, 8) << "...");
         if (onStatus) onStatus("Message not sent — encrypted session unavailable. Try again shortly.");
@@ -424,75 +477,18 @@ void ChatController::sendAvatar(const std::string& peerIdB64u,
 }
 
 // ── File transfer delegation ─────────────────────────────────────────────────
+// All outbound paths + consent responses live on m_fileProto.  ChatController
+// keeps wrappers so the public API + onStatus reporting stay stable.
 
 std::string ChatController::sendFile(const std::string& peerIdB64u,
                                      const std::string& fileName,
                                      const std::string& filePath)
 {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    if (!fs::is_regular_file(filePath, ec)) {
-        if (onStatus) onStatus("File not found: " + filePath);
-        return {};
+    std::string tid = m_fileProto.sendFile(peerIdB64u, fileName, filePath);
+    if (tid.empty() && onStatus) {
+        onStatus("File not sent — check size, path, or session state.");
     }
-    const int64_t fileSize = int64_t(fs::file_size(filePath, ec));
-    if (ec || fileSize > FileTransferManager::kMaxFileBytes) {
-        if (onStatus) onStatus("File too large (max "
-                               + std::to_string(FileTransferManager::kMaxFileBytes / (1024 * 1024))
-                               + " MB).");
-        return {};
-    }
-
-    // Streaming hash — one pass over the file, bounded RAM.
-    const Bytes fileHash = FileTransferManager::blake2b256File(filePath);
-    if (fileHash.size() != 32) {
-        if (onStatus) onStatus("Could not hash file: " + fileName);
-        return {};
-    }
-    const int chunkCount = int((fileSize + FileTransferManager::kChunkBytes - 1)
-                                / FileTransferManager::kChunkBytes);
-
-    const std::string transferId = p2p::makeUuid();
-
-    // Send file_key announcement through the ratchet to derive a forward-secret key.
-    // The announcement now includes fileHash + chunkCount so the receiver can allocate
-    // its partial-file bitmap and verify the final hash without waiting for every chunk's metadata.
-    json announce = json::object();
-    announce["from"]        = myIdB64u();
-    announce["type"]        = "file_key";
-    announce["transferId"]  = transferId;
-    announce["fileName"]    = fileName;
-    announce["fileSize"]    = fileSize;
-    announce["fileHash"]    = CryptoEngine::toBase64Url(fileHash);
-    announce["chunkCount"]  = chunkCount;
-    announce["ts"]          = nowSecs();
-
-    const std::string ptStr = announce.dump();
-    const Bytes pt(ptStr.begin(), ptStr.end());
-    Bytes sealedEnv = sealForPeer(peerIdB64u, pt);
-    if (sealedEnv.empty()) {
-        P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerIdB64u.substr(0, 8) << "...");
-        if (onStatus) onStatus("File not sent — encrypted session unavailable.");
-        return {};
-    }
-
-    // Queue the outbound state BEFORE we put the file_key announce on the
-    // wire.  Otherwise Bob's file_accept can race back faster than the
-    // queue call completes and FTM sees "startOutboundStream: unknown
-    // transferId" — a race latent in production (masked by network
-    // RTT) and reliably exposed by in-process test mocks.  The read of
-    // lastMessageKey() is safe here because sealForPeer has already
-    // populated it via encryptForPeer above.
-    Bytes fileKey = m_sessionMgr->lastMessageKey();
-    m_fileMgr.queueOutboundFile(myIdB64u(), peerIdB64u,
-                                 fileKey, transferId, fileName, filePath,
-                                 fileSize, fileHash);
-    sodium_memzero(fileKey.data(), fileKey.size());
-
-    m_relay.sendEnvelope(sealedEnv);
-    P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
-             << " to " << peerIdB64u.substr(0, 8) << "... size=" << fileSize);
-    return transferId;
+    return tid;
 }
 
 std::string ChatController::sendGroupFile(const std::string& groupId,
@@ -501,92 +497,16 @@ std::string ChatController::sendGroupFile(const std::string& groupId,
                                           const std::string& fileName,
                                           const std::string& filePath)
 {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    if (!fs::is_regular_file(filePath, ec)) {
-        if (onStatus) onStatus("File not found: " + filePath);
-        return {};
+    std::string tid = m_fileProto.sendGroupFile(groupId, groupName, memberPeerIds,
+                                                 fileName, filePath);
+    if (tid.empty() && onStatus) {
+        onStatus("File not sent — check size, path, or session state.");
     }
-    const int64_t fileSize = int64_t(fs::file_size(filePath, ec));
-    if (ec || fileSize > FileTransferManager::kMaxFileBytes) {
-        if (onStatus) onStatus("File too large (max "
-                               + std::to_string(FileTransferManager::kMaxFileBytes / (1024 * 1024))
-                               + " MB).");
-        return {};
+    if (!tid.empty() && onStatus) {
+        onStatus("'" + fileName + "' queued for group " + groupName
+                 + " (awaiting per-member consent)");
     }
-
-    // Hash the file once up-front (streaming) and reuse for all members.
-    const Bytes fileHash = FileTransferManager::blake2b256File(filePath);
-    if (fileHash.size() != 32) {
-        if (onStatus) onStatus("Could not hash file: " + fileName);
-        return {};
-    }
-    const int chunkCount = int((fileSize + FileTransferManager::kChunkBytes - 1)
-                                / FileTransferManager::kChunkBytes);
-
-    const std::string myId = myIdB64u();
-
-    // Each member gets a unique transferId so the sender can honor
-    // file-transfer consent (queue-then-wait-for-file_accept) independently
-    // per recipient, matching 1:1 behavior.  The caller sees a single
-    // group-level transferId that fans out to all members for cancellation;
-    // per-member callbacks (file_accept, file_ack, file_cancel etc.) fire
-    // with the per-member transferId as they do for 1:1.
-    const std::string groupTransferId = p2p::makeUuid();
-    std::vector<std::string> memberTids;
-    memberTids.reserve(memberPeerIds.size());
-
-    for (const std::string& peerIdRaw : memberPeerIds) {
-        // Trim leading/trailing whitespace (was QString::trimmed()).
-        auto lb = peerIdRaw.find_first_not_of(" \t\r\n");
-        if (lb == std::string::npos) continue;
-        auto rb = peerIdRaw.find_last_not_of(" \t\r\n");
-        const std::string peerId = peerIdRaw.substr(lb, rb - lb + 1);
-        if (peerId.empty() || peerId == myId) continue;
-
-        const std::string memberTid = p2p::makeUuid();
-
-        json announce = json::object();
-        announce["from"]        = myId;
-        announce["type"]        = "file_key";
-        announce["transferId"]  = memberTid;
-        announce["fileName"]    = fileName;
-        announce["fileSize"]    = fileSize;
-        announce["fileHash"]    = CryptoEngine::toBase64Url(fileHash);
-        announce["chunkCount"]  = chunkCount;
-        announce["ts"]          = nowSecs();
-        announce["groupId"]     = groupId;
-        announce["groupName"]   = groupName;
-
-        const std::string ptStr = announce.dump();
-        const Bytes pt(ptStr.begin(), ptStr.end());
-        Bytes sealedEnv = sealForPeer(peerId, pt);
-        if (sealedEnv.empty()) {
-            P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerId.substr(0, 8) << "...");
-            continue;
-        }
-
-        // Queue BEFORE send so a fast-ack file_accept can find us ready.
-        // See sendFile() for the full rationale on the ordering.
-        Bytes fileKey = m_sessionMgr->lastMessageKey();
-        m_fileMgr.queueOutboundFile(myId, peerId, fileKey, memberTid, fileName,
-                                     filePath, fileSize, fileHash,
-                                     groupId, groupName);
-        sodium_memzero(fileKey.data(), fileKey.size());
-
-        m_relay.sendEnvelope(sealedEnv);
-        P2P_LOG("[FILE] file_key announced for " << memberTid.substr(0, 8) << "..."
-                 << " to " << peerId.substr(0, 8) << "... (group)");
-
-        memberTids.push_back(memberTid);
-    }
-
-    if (!memberTids.empty())
-        m_groupFileMembers[groupTransferId] = std::move(memberTids);
-
-    if (onStatus) onStatus("'" + fileName + "' queued for group " + groupName
-                           + " (awaiting per-member consent)");
-    return groupTransferId;
+    return tid;
 }
 
 void ChatController::connectToRelay()
@@ -616,7 +536,7 @@ void ChatController::handleRelayConnected()
         msg["type"]       = "file_request";
         msg["transferId"] = pr.transferId;
         msg["chunks"]     = std::move(chunks);
-        sendFileControlMessage(pr.peerId, msg);
+        m_fileProto.sendControlMessage(pr.peerId, msg);
         P2P_LOG("[FILE] requested resumption of "
                  << pr.transferId.substr(0, 8)
                  << " from " << pr.peerId.substr(0, 8) << "..."
@@ -651,238 +571,26 @@ void ChatController::checkPresence(const std::vector<std::string>& peerIds)
     m_relay.queryPresence(peerIds);
 }
 
-// ── File-transfer consent / cancel ───────────────────────────────────────────
-
-void ChatController::sendFileControlMessage(const std::string& peerIdB64u,
-                                             const nlohmann::json& msg)
-{
-    // Include a fresh msgId so the receiver can dedup any duplicated delivery.
-    json payload = msg;
-    payload["from"]  = myIdB64u();
-    payload["ts"]    = nowSecs();
-    payload["msgId"] = p2p::makeUuid();
-
-    const std::string ptStr = payload.dump();
-    const Bytes pt(ptStr.begin(), ptStr.end());
-    Bytes sealed = sealForPeer(peerIdB64u, pt);
-    if (sealed.empty()) {
-        P2P_WARN("[FILE] BLOCKED — cannot seal " << msg.value("type", std::string())
-                   << " for " << peerIdB64u.substr(0, 8) << "...");
-        return;
-    }
-    m_relay.sendEnvelope(sealed);
-}
-
-void ChatController::acceptFileTransfer(const std::string& transferId, bool requireP2P)
-{
-    auto it = m_pendingIncomingFiles.find(transferId);
-    if (it == m_pendingIncomingFiles.end()) {
-        P2P_WARN("[FILE] acceptFileTransfer: no pending transfer " << transferId.substr(0, 8));
-        return;
-    }
-
-    const std::string peerId   = it->second.peerId;
-    const std::string compound = peerId + ":" + transferId;
-
-    // Announce with the metadata locked from file_key time — NOT from
-    // whatever the sender might put in later chunks.
-    if (!m_fileMgr.announceIncoming(peerId,
-                                      transferId,
-                                      it->second.fileName,
-                                      it->second.fileSize, it->second.totalChunks,
-                                      it->second.fileHash,
-                                      it->second.fileKey,
-                                      it->second.announcedTs,
-                                      it->second.groupId,
-                                      it->second.groupName)) {
-        P2P_WARN("[FILE] acceptFileTransfer: announceIncoming failed for "
-                   << transferId.substr(0, 8));
-        sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
-        m_pendingIncomingFiles.erase(it);
-        return;
-    }
-
-    // Move the stashed key into the active file-keys map so chunks decrypt.
-    m_fileKeys[compound] = it->second.fileKey;           // copy
-
-    sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
-    m_pendingIncomingFiles.erase(it);
-
-    json msg = json::object();
-    msg["type"]       = "file_accept";
-    msg["transferId"] = transferId;
-    // Respect the receiver's global "no relay" preference, or the per-call override.
-    if (requireP2P || m_fileRequireP2P) msg["requireP2P"] = true;
-    sendFileControlMessage(peerId, msg);
-}
-
-void ChatController::declineFileTransfer(const std::string& transferId)
-{
-    auto it = m_pendingIncomingFiles.find(transferId);
-    if (it == m_pendingIncomingFiles.end()) return;
-
-    const std::string peerId = it->second.peerId;
-    sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
-    m_pendingIncomingFiles.erase(it);
-
-    json msg = json::object();
-    msg["type"]       = "file_decline";
-    msg["transferId"] = transferId;
-    // NO reason field — see privacy mitigations §4 in the plan.
-    sendFileControlMessage(peerId, msg);
-
-    if (onFileTransferCanceled) onFileTransferCanceled(transferId, true);  // receiver declined
-}
-
-void ChatController::cancelFileTransfer(const std::string& transferId)
-{
-    // Figure out which role we hold for this transferId and clean up + notify.
-
-    // If this is the group-level id we returned from sendGroupFile,
-    // fan out the cancel to every per-member transferId underneath it.
-    auto grpIt = m_groupFileMembers.find(transferId);
-    if (grpIt != m_groupFileMembers.end()) {
-        for (const std::string& memberTid : grpIt->second) {
-            const std::string peer = m_fileMgr.outboundPeerFor(memberTid);
-            if (peer.empty()) continue;  // already accepted/declined/streamed away
-            m_fileMgr.abandonOutboundTransfer(memberTid);
-            json msg = json::object();
-            msg["type"]       = "file_cancel";
-            msg["transferId"] = memberTid;
-            sendFileControlMessage(peer, msg);
-        }
-        m_groupFileMembers.erase(grpIt);
-        if (onFileTransferCanceled) onFileTransferCanceled(transferId, false);
-        return;
-    }
-
-    // Outbound pending (sender canceling a queued-but-unaccepted send)?
-    const std::string outboundPeer = m_fileMgr.outboundPeerFor(transferId);
-    if (!outboundPeer.empty()) {
-        m_fileMgr.abandonOutboundTransfer(transferId);
-        json msg = json::object();
-        msg["type"]       = "file_cancel";
-        msg["transferId"] = transferId;
-        sendFileControlMessage(outboundPeer, msg);
-        if (onFileTransferCanceled) onFileTransferCanceled(transferId, false);  // sender-initiated
-        return;
-    }
-
-    // Inbound, pre-accept (user changed mind before answering prompt)?
-    auto itPending = m_pendingIncomingFiles.find(transferId);
-    if (itPending != m_pendingIncomingFiles.end()) {
-        const std::string peerId = itPending->second.peerId;
-        sodium_memzero(itPending->second.fileKey.data(), itPending->second.fileKey.size());
-        m_pendingIncomingFiles.erase(itPending);
-        json msg = json::object();
-        msg["type"]       = "file_cancel";
-        msg["transferId"] = transferId;
-        sendFileControlMessage(peerId, msg);
-        if (onFileTransferCanceled) onFileTransferCanceled(transferId, true);   // receiver-initiated
-        return;
-    }
-
-    // Inbound, in-progress (user canceled mid-stream)?
-    const std::string inboundPeer = m_fileMgr.inboundPeerFor(transferId);
-    if (!inboundPeer.empty()) {
-        m_fileMgr.cancelInboundTransfer(transferId);
-        json msg = json::object();
-        msg["type"]       = "file_cancel";
-        msg["transferId"] = transferId;
-        sendFileControlMessage(inboundPeer, msg);
-        if (onFileTransferCanceled) onFileTransferCanceled(transferId, true);
-    }
-}
-
-// Local helper: trim ASCII whitespace from both ends (replaces QString::trimmed).
-static std::string trimmed(const std::string& s) {
-    auto lb = s.find_first_not_of(" \t\r\n");
-    if (lb == std::string::npos) return {};
-    auto rb = s.find_last_not_of(" \t\r\n");
-    return s.substr(lb, rb - lb + 1);
-}
+// ── File-transfer consent / cancel — see FileProtocol.cpp ───────────────────
+// sendFileControlMessage, acceptFileTransfer, declineFileTransfer, and
+// cancelFileTransfer all live on m_fileProto.  The public API surface above
+// (acceptFileTransfer / declineFileTransfer / cancelFileTransfer) delegates
+// inline.  The inbound file_* branches in onEnvelope read + mutate state
+// via m_fileProto.fileKeys() / pendingIncoming() / sendControlMessage.
 
 void ChatController::sendGroupMessageViaMailbox(const std::string& groupId,
                                                 const std::string& groupName,
                                                 const std::vector<std::string>& memberPeerIds,
                                                 const std::string& text)
 {
-    const std::string myId  = myIdB64u();
-    const int64_t     ts    = nowSecs();
-    const std::string msgId = p2p::makeUuid();
-
-    json membersArray = json::array();
-    for (const std::string& key : memberPeerIds) {
-        if (trimmed(key) == myId) continue;
-        membersArray.push_back(key);
-    }
-
-    // Monotonic per-group sequence counter.
-    const int64_t seq = ++m_groupSeqOut[groupId];
-
-    for (const std::string& peerIdRaw : memberPeerIds) {
-        const std::string peerId = trimmed(peerIdRaw);
-        if (peerId.empty() || peerId == myId) continue;
-
-        json payload = json::object();
-        payload["from"]      = myId;
-        payload["type"]      = "group_msg";
-        payload["groupId"]   = groupId;
-        payload["groupName"] = groupName;
-        payload["members"]   = membersArray;
-        payload["text"]      = text;
-        payload["ts"]        = ts;
-        payload["msgId"]     = msgId;
-        payload["seq"]       = seq;
-
-        const std::string ptStr = payload.dump();
-        const Bytes pt(ptStr.begin(), ptStr.end());
-        Bytes env = sealForPeer(peerId, pt);
-        if (!env.empty()) {
-            P2P_LOG("[SEND MAILBOX] sealed group_msg to " << peerId.substr(0, 8) << "...");
-            m_relay.sendEnvelope(env);
-        } else {
-            P2P_WARN("[SEND] BLOCKED — cannot seal group_msg to " << peerId.substr(0, 8) << "...");
-        }
-    }
+    m_groupProto.sendText(groupId, groupName, memberPeerIds, text);
 }
 
 void ChatController::sendGroupLeaveNotification(const std::string& groupId,
                                                 const std::string& groupName,
                                                 const std::vector<std::string>& memberPeerIds)
 {
-    const std::string myId  = myIdB64u();
-    const int64_t     ts    = nowSecs();
-    const std::string msgId = p2p::makeUuid();
-
-    // Include member list so receivers can update their local group member list
-    json membersArray = json::array();
-    for (const std::string& key : memberPeerIds)
-        membersArray.push_back(key);
-
-    for (const std::string& peerIdRaw : memberPeerIds) {
-        const std::string peerId = trimmed(peerIdRaw);
-        if (peerId.empty() || peerId == myId) continue;
-
-        json payload = json::object();
-        payload["from"]      = myId;
-        payload["type"]      = "group_leave";
-        payload["groupId"]   = groupId;
-        payload["groupName"] = groupName;
-        payload["members"]   = membersArray;
-        payload["ts"]        = ts;
-        payload["msgId"]     = msgId;  // include msgId for dedup
-
-        const std::string ptStr = payload.dump();
-        const Bytes pt(ptStr.begin(), ptStr.end());
-        Bytes env = sealForPeer(peerId, pt);
-        if (!env.empty()) {
-            P2P_LOG("[SEND MAILBOX] sealed group_leave to " << peerId.substr(0, 8) << "...");
-            m_relay.sendEnvelope(env);
-        } else {
-            P2P_WARN("[SEND] BLOCKED — cannot seal group_leave to " << peerId.substr(0, 8) << "...");
-        }
-    }
+    m_groupProto.sendLeave(groupId, groupName, memberPeerIds);
 }
 
 // ── Private ───────────────────────────────────────────────────────────────────
@@ -977,64 +685,6 @@ void ChatController::pruneSeenEnvelopes()
 // Returns the sealed envelope bytes (SEALED:<version>\n<ciphertext>), or empty
 // on failure.  Every outbound path should call this instead of inlining the
 // encrypt→convert→seal→prefix logic.
-Bytes ChatController::sealForPeer(const std::string& peerIdB64u,
-                                  const Bytes& plaintext)
-{
-    if (!m_sessionMgr) return {};
-
-    // Safety-numbers enforcement — applies to every user-initiated
-    // outbound send because sealForPeer is the single choke point for
-    // sendText / sendAvatar / sendGroupMessageViaMailbox / sendFile /
-    // sendGroupFile / group control messages.  (The Noise handshake
-    // response path bypasses sealForPeer and builds its envelope
-    // directly via SessionManager's sendResponseFn callback, so
-    // infrastructure traffic is never gated.)
-    //
-    // detectKeyChange fires onPeerKeyChanged once per session per peer.
-    // When the hard-block toggle is on, a Mismatch returns empty here
-    // and the caller sees "seal failed" → surfaces as a status message.
-    if (detectKeyChange(peerIdB64u) && m_hardBlockOnKeyChange) {
-        P2P_WARN("[SEND] BLOCKED — peer's safety number changed for "
-                 << peerIdB64u.substr(0, 8) << "... (hard-block on)");
-        return {};
-    }
-
-    // Pass peer's KEM pub so SessionManager can do hybrid Noise handshake if available
-    Bytes peerKemPub = lookupPeerKemPub(peerIdB64u);
-    Bytes sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext, peerKemPub);
-    if (sessionBlob.empty()) return {};
-
-    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    unsigned char peerCurvePub[32];
-    if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0)
-        return {};
-
-    Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
-    sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
-
-    // Use hybrid seal if we know the peer's ML-KEM-768 public key (already looked up above)
-    // Include ML-DSA-65 signature if we have DSA keys.
-    Bytes sealed = SealedEnvelope::seal(
-        recipientCurvePub, peerEdPub,
-        m_crypto.identityPub(), m_crypto.identityPriv(),
-        sessionBlob, peerKemPub,
-        m_crypto.dsaPub(), m_crypto.dsaPriv());
-    if (sealed.empty()) return {};
-
-    // Inner wire: kSealedPrefix + "\n" + sealed
-    Bytes inner;
-    const size_t prefixLen = std::strlen(kSealedPrefix);
-    inner.reserve(prefixLen + 1 + sealed.size());
-    inner.insert(inner.end(),
-                 reinterpret_cast<const uint8_t*>(kSealedPrefix),
-                 reinterpret_cast<const uint8_t*>(kSealedPrefix) + prefixLen);
-    inner.push_back('\n');
-    inner.insert(inner.end(), sealed.begin(), sealed.end());
-
-    // Wrap with relay routing header so /v1/send can route anonymously
-    return SealedEnvelope::wrapForRelay(peerEdPub, inner);
-}
-
 // ── Sealed payload via mailbox, fail-closed ───────────────────────────────
 void ChatController::sendSealedPayload(const std::string& peerIdB64u,
                                        const nlohmann::json& payload)
@@ -1043,7 +693,7 @@ void ChatController::sendSealedPayload(const std::string& peerIdB64u,
     const Bytes pt(ptStr.begin(), ptStr.end());
     const std::string type = payload.value("type", std::string());
 
-    Bytes env = sealForPeer(peerIdB64u, pt);
+    Bytes env = m_sealer.sealForPeer(peerIdB64u, pt);
     if (!env.empty()) {
         P2P_LOG("[SEND MAILBOX] " << type << " to " << peerIdB64u.substr(0, 8) << "...");
         m_relay.sendEnvelope(env);
@@ -1097,7 +747,7 @@ QuicConnection* ChatController::setupP2PConnection(const std::string& peerIdB64u
     conn->onFileDataReceived = [this, peerIdB64u](const Bytes& d) {
         m_fileMgr.handleFileEnvelope(peerIdB64u, d,
             [this](const std::string& id) { return markSeen(id); },
-            m_fileKeys);
+            m_fileProto.fileKeys());
     };
     conn->initIce(controlling);
     return conn;
@@ -1213,7 +863,7 @@ void ChatController::onEnvelope(const Bytes& body)
             // craft valid sealed envelopes from causing unnecessary crypto work.
             bool hasKeyFromSender = false;
             const std::string senderPrefix = senderId + ":";
-            for (const auto& kv : m_fileKeys) {
+            for (const auto& kv : m_fileProto.fileKeys()) {
                 if (kv.first.size() >= senderPrefix.size() &&
                     kv.first.compare(0, senderPrefix.size(), senderPrefix) == 0) {
                     hasKeyFromSender = true;
@@ -1229,7 +879,7 @@ void ChatController::onEnvelope(const Bytes& body)
             P2P_LOG("[RECV " << via << "] sealed file chunk from " << senderId.substr(0, 8) << "...");
             m_fileMgr.handleFileEnvelope(senderId, unsealedInnerPayload,
                 [this](const std::string& id) { return markSeen(id); },
-                m_fileKeys);
+                m_fileProto.fileKeys());
             return;
         }
 
@@ -1263,12 +913,15 @@ void ChatController::onEnvelope(const Bytes& body)
             return;
         }
 
-        // Dispatch based on the decrypted JSON payload.
+        // Parse the decrypted JSON payload + hand off to the type
+        // dispatcher.  Everything above this point is envelope plumbing
+        // (unseal, dedup, decrypt, rate limit); everything below is
+        // per-type routing.
         const json o = json::parse(pt.begin(), pt.end(),
                                    /*cb=*/nullptr, /*allow_exceptions=*/false);
         if (!o.is_object()) return;
-        const std::string type = o.value("type", std::string());
 
+        const std::string type = o.value("type", std::string());
         const int64_t tsSecs = o.value("ts", int64_t(0));
         const std::string msgId = o.value("msgId", std::string());
 
@@ -1278,11 +931,37 @@ void ChatController::onEnvelope(const Bytes& body)
         // most once per session; the hard-block toggle then refuses to
         // deliver to the app callbacks.  Only applies to already-verified
         // peers — first-contact / unverified messages flow through.
-        if (detectKeyChange(senderId) && m_hardBlockOnKeyChange) {
+        if (m_sealer.detectKeyChange(senderId) && m_sealer.hardBlockOnKeyChange()) {
             P2P_WARN("[RECV] dropping message from " << senderId.substr(0, 8)
                      << "... — hard-block on key change");
             return;
         }
+
+        dispatchSealedPayload(o, senderId, tsSecs, msgId, via, std::move(msgKey));
+        return;
+    }
+
+    // Any frame that isn't a SEALED: / SEALEDFC: envelope is dropped.
+    // The sealed handler above covers every message type the app emits;
+    // static-ECDH fallbacks would lack forward secrecy and unsealed file
+    // chunks would leak the sender's pubkey to the relay in plaintext.
+    P2P_WARN("[RECV " << via << "] dropping non-sealed envelope ("
+             << header.size() << " header bytes) — sealed envelopes required");
+}
+
+// ── dispatchSealedPayload ───────────────────────────────────────────────────
+// The inbound type-switch, split from onEnvelope so neither function is a
+// 600-line god-method.  Called for every sealed envelope whose session
+// decrypt succeeds (i.e., every inbound user message + every protocol
+// control message).  Safety-number hard-block check has already run.
+void ChatController::dispatchSealedPayload(const nlohmann::json& o,
+                                            const std::string& senderId,
+                                            int64_t tsSecs,
+                                            const std::string& msgId,
+                                            const std::string& via,
+                                            Bytes msgKey)
+{
+        const std::string type = o.value("type", std::string());
 
         if (type == "text") {
             if (!msgId.empty() && !markSeen(msgId)) return;
@@ -1299,25 +978,23 @@ void ChatController::onEnvelope(const Bytes& body)
             const std::string gid = o.value("groupId", std::string());
             if (o.contains("seq")) {
                 const int64_t seq = o.value("seq", int64_t(0));
-                const std::string seqKey = gid + ":" + senderId;
-                auto sit = m_groupSeqIn.find(seqKey);
-                if (sit != m_groupSeqIn.end()) {
-                    const int64_t lastSeen = sit->second;
-                    if (seq <= lastSeen) {
-                        P2P_WARN("[GROUP] dropping non-monotonic seq from "
-                                 << senderId.substr(0, 8) << "... in "
-                                 << gid.substr(0, 8) << "... (got " << seq
-                                 << ", last " << lastSeen << ") — L3 replay guard");
-                        return;
-                    }
-                    const int64_t expected = lastSeen + 1;
-                    if (seq > expected) {
-                        P2P_WARN("[GROUP] seq gap from " << senderId.substr(0, 8) << "..."
-                                   << " in " << gid.substr(0, 8) << "..."
-                                   << " expected " << expected << " got " << seq);
-                    }
+                // non-monotonic seq from a given (group, sender) is a
+                // replay — drop loudly.  Gaps are logged but not fatal
+                // (legitimate traffic can skip seq values when a member
+                // goes offline mid-fanout).
+                const int64_t lastSeen = m_groupProto.recordInboundSeq(gid, senderId, seq);
+                if (lastSeen >= 0 && seq <= lastSeen) {
+                    P2P_WARN("[GROUP] dropping non-monotonic seq from "
+                             << senderId.substr(0, 8) << "... in "
+                             << gid.substr(0, 8) << "... (got " << seq
+                             << ", last " << lastSeen << ")");
+                    return;
                 }
-                m_groupSeqIn[seqKey] = seq;
+                if (lastSeen >= 0 && seq > lastSeen + 1) {
+                    P2P_WARN("[GROUP] seq gap from " << senderId.substr(0, 8) << "..."
+                               << " in " << gid.substr(0, 8) << "..."
+                               << " expected " << (lastSeen + 1) << " got " << seq);
+                }
             }
 
             std::vector<std::string> memberKeys;
@@ -1326,35 +1003,11 @@ void ChatController::onEnvelope(const Bytes& body)
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
 
             // A valid sealed group_msg from X about group G adds X (and
-            // the declared members) to our roster — this is ground truth
-            // because the message is already authenticated.  We still
-            // require sender ∈ members to avoid rogue "I'm messaging this
-            // group but I'm not in it" bootstraps.
-            //
-            // KNOWN LIMITATION: first-mover attack.  An attacker who learns
-            // a groupId (e.g. by observing a shared invite link) can race
-            // a legit sender by sending a group_msg with themselves in the
-            // roster *before* the legitimate creator's first message
-            // lands.  We accept the first plausible roster and subsequent
-            // messages layer on top.  The proper fix is a creator-signed
-            // genesis message + signed invite chain (Sender Keys / MLS
-            // style — listed under §11 Future extensions in PROTOCOL.md).
-            // Mitigation in the meantime: the UI should call
-            // setKnownGroupMembers() on startup from its own persisted
-            // roster, which beats the bootstrap path
-            // (isAuthorizedGroupSender checks that set).
-            if (!gid.empty() && !senderId.empty()) {
-                auto gmit = m_groupMembers.find(gid);
-                if (gmit == m_groupMembers.end()) {
-                    // Bootstrap: accept only if sender includes themselves.
-                    const bool senderInList = std::find(memberKeys.begin(), memberKeys.end(), senderId) != memberKeys.end();
-                    if (senderInList) {
-                        m_groupMembers[gid] = std::set<std::string>(memberKeys.begin(), memberKeys.end());
-                    }
-                } else {
-                    gmit->second.insert(senderId);
-                }
-            }
+            // the declared members) to our roster.  Known limitation:
+            // first-mover race on an unknown group (see GroupProtocol
+            // for details); UIs should call setKnownGroupMembers at
+            // startup from persisted state to beat the bootstrap path.
+            m_groupProto.upsertMembersFromTrustedMessage(gid, senderId, memberKeys);
 
             if (onGroupMessageReceived) onGroupMessageReceived(senderId, gid,
                                        o.value("groupName", std::string()),
@@ -1364,9 +1017,9 @@ void ChatController::onEnvelope(const Bytes& body)
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
             const std::string gid = o.value("groupId", std::string());
             // A leave message may ONLY be self-leave — senders can't
-            // announce that OTHER members left.  And the sender must have
-            // been a known member of the group.
-            if (!gid.empty() && !isAuthorizedGroupSender(gid, senderId)) {
+            // announce that OTHER members left.  And the sender must
+            // have been a known member of the group.
+            if (!gid.empty() && !m_groupProto.isAuthorizedSender(gid, senderId)) {
                 P2P_WARN("[GROUP] dropping group_leave from non-member "
                            << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
@@ -1377,9 +1030,7 @@ void ChatController::onEnvelope(const Bytes& body)
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
             // The sender left — strike them from our roster so they can't push
             // further member-update / rename / avatar messages afterwards.
-            auto gmIt = m_groupMembers.find(gid);
-            if (gmIt != m_groupMembers.end())
-                gmIt->second.erase(senderId);
+            m_groupProto.removeMember(gid, senderId);
             if (onGroupMemberLeft) onGroupMemberLeft(senderId, gid,
                                   o.value("groupName", std::string()),
                                   memberKeys, tsSecs, msgId);
@@ -1390,7 +1041,7 @@ void ChatController::onEnvelope(const Bytes& body)
         } else if (type == "group_rename") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
             const std::string gid = o.value("groupId", std::string());
-            if (!gid.empty() && !isAuthorizedGroupSender(gid, senderId)) {
+            if (!gid.empty() && !m_groupProto.isAuthorizedSender(gid, senderId)) {
                 P2P_WARN("[GROUP] dropping group_rename from non-member "
                            << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
@@ -1399,7 +1050,7 @@ void ChatController::onEnvelope(const Bytes& body)
         } else if (type == "group_avatar") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
             const std::string gid = o.value("groupId", std::string());
-            if (!gid.empty() && !isAuthorizedGroupSender(gid, senderId)) {
+            if (!gid.empty() && !m_groupProto.isAuthorizedSender(gid, senderId)) {
                 P2P_WARN("[GROUP] dropping group_avatar from non-member "
                            << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
@@ -1409,43 +1060,42 @@ void ChatController::onEnvelope(const Bytes& body)
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
             const std::string gid   = o.value("groupId", std::string());
             const std::string gname = o.value("groupName", std::string());
-            // Reject member-list updates from peers that aren't currently
-            // in our roster.  First-sight of a new group bootstraps from
-            // the sender's proposed list only if the sender names
-            // themselves as a member.
             std::vector<std::string> memberKeys;
             if (o.contains("members") && o["members"].is_array())
                 for (const auto& v : o["members"])
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
 
             if (!gid.empty()) {
-                const bool bootstrap = !m_groupMembers.count(gid);
-                if (bootstrap) {
-                    // Sender must include themselves in the proposed list.
-                    const bool senderInList = std::find(memberKeys.begin(), memberKeys.end(), senderId) != memberKeys.end();
+                // Bootstrap path: unknown group accepts the proposed
+                // roster only if the sender names themselves.  Otherwise
+                // the sender must already be in our roster.  Both paths
+                // land on GroupProtocol helpers so the authorization
+                // rule lives in one place.
+                if (!m_groupProto.isAuthorizedSender(gid, senderId)) {
+                    // Unknown group — try bootstrap: sender must include self.
+                    const bool senderInList =
+                        std::find(memberKeys.begin(), memberKeys.end(), senderId)
+                        != memberKeys.end();
                     if (!senderInList) {
                         P2P_WARN("[GROUP] rejecting bootstrap group_member_update"
                                    << " from " << senderId.substr(0, 8) << "..."
-                                   << " \u2014 sender not in proposed member list");
+                                   << " — sender not in proposed member list");
                         return;
                     }
-                    m_groupMembers[gid] = std::set<std::string>(memberKeys.begin(), memberKeys.end());
-                } else if (!m_groupMembers[gid].count(senderId)) {
-                    P2P_WARN("[GROUP] dropping group_member_update from non-member "
-                               << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
-                    return;
+                    m_groupProto.replaceMembers(gid, memberKeys);
                 } else {
-                    // Authorized update: merge in new members (conservative —
-                    // we don't accept REMOVALS via this message type, only adds).
-                    for (const std::string& m : memberKeys)
-                        m_groupMembers[gid].insert(m);
+                    // Authorized update: add-only merge.  We deliberately
+                    // don't accept REMOVALS via this message type — only
+                    // group_leave from the leaving peer themselves drops
+                    // someone from the roster.
+                    m_groupProto.upsertMembersFromTrustedMessage(gid, senderId, memberKeys);
                 }
             }
 
             // Re-use the existing groupMessageReceived signal — the
             // ChatView::onIncomingGroupMessage handler already merges new
-            // member keys into the group's key list.
-            // Empty text means no chat bubble appears, but the key merge still happens.
+            // member keys into the group's key list.  Empty text means
+            // no chat bubble, but the roster merge still happens.
             if (onGroupMessageReceived) onGroupMessageReceived(senderId, gid, gname, memberKeys,
                                       std::string(), tsSecs,
                                       msgId.empty() ? p2p::makeUuid() : msgId);
@@ -1508,9 +1158,9 @@ void ChatController::onEnvelope(const Bytes& body)
             const int64_t fileSizeMB = fileSize / (1024 * 1024);
             bool autoAccept = false;
             bool autoDecline = false;
-            if (fileSize > int64_t(m_fileHardMaxMB) * 1024 * 1024) {
+            if (fileSize > int64_t(m_fileProto.hardMaxMB()) * 1024 * 1024) {
                 autoDecline = true;
-            } else if (fileSize <= int64_t(m_fileAutoAcceptMaxMB) * 1024 * 1024) {
+            } else if (fileSize <= int64_t(m_fileProto.autoAcceptMaxMB()) * 1024 * 1024) {
                 autoAccept = true;
             }
 
@@ -1520,7 +1170,7 @@ void ChatController::onEnvelope(const Bytes& body)
                 json declineMsg = json::object();
                 declineMsg["type"]       = "file_decline";
                 declineMsg["transferId"] = transferId;
-                sendFileControlMessage(senderId, declineMsg);
+                m_fileProto.sendControlMessage(senderId, declineMsg);
                 sodium_memzero(msgKey.data(), msgKey.size());
             } else if (autoAccept) {
                 // Announce the transfer to FileTransferManager FIRST so
@@ -1546,14 +1196,14 @@ void ChatController::onEnvelope(const Bytes& body)
                 }
 
                 // Install key so chunks can decrypt.
-                m_fileKeys[compoundKey] = msgKey;
+                m_fileProto.fileKeys()[compoundKey] = msgKey;
                 sodium_memzero(msgKey.data(), msgKey.size());
 
                 json acceptMsg = json::object();
                 acceptMsg["type"]       = "file_accept";
                 acceptMsg["transferId"] = transferId;
-                if (m_fileRequireP2P) acceptMsg["requireP2P"] = true;
-                sendFileControlMessage(senderId, acceptMsg);
+                if (m_fileProto.requireP2P()) acceptMsg["requireP2P"] = true;
+                m_fileProto.sendControlMessage(senderId, acceptMsg);
 
                 P2P_LOG("[FILE] auto-accept " << fileName << " (" << fileSizeMB << "MB)"
                          << " from " << senderId.substr(0, 8) << "...");
@@ -1577,10 +1227,10 @@ void ChatController::onEnvelope(const Bytes& body)
                 // Drops the oldest entry (and zeroes its stashed file key)
                 // when the cap is hit; in practice the user's UI surface
                 // is already overloaded long before this bound.
-                if (m_pendingIncomingFiles.size() >= kMaxPendingIncomingFiles) {
-                    auto oldest = m_pendingIncomingFiles.begin();
-                    for (auto it = m_pendingIncomingFiles.begin();
-                         it != m_pendingIncomingFiles.end(); ++it) {
+                if (m_fileProto.pendingIncoming().size() >= FileProtocol::kMaxPendingIncomingFiles) {
+                    auto oldest = m_fileProto.pendingIncoming().begin();
+                    for (auto it = m_fileProto.pendingIncoming().begin();
+                         it != m_fileProto.pendingIncoming().end(); ++it) {
                         if (it->second.announcedSecs < oldest->second.announcedSecs)
                             oldest = it;
                     }
@@ -1588,10 +1238,10 @@ void ChatController::onEnvelope(const Bytes& body)
                                    oldest->second.fileKey.size());
                     P2P_WARN("[FILE] pending-incoming cap hit — evicting "
                              << oldest->first.substr(0, 8) << "... to make room");
-                    m_pendingIncomingFiles.erase(oldest);
+                    m_fileProto.pendingIncoming().erase(oldest);
                 }
 
-                PendingIncoming p;
+                FileProtocol::PendingIncoming p;
                 p.peerId         = senderId;
                 p.fileName       = fileName;
                 p.fileSize       = fileSize;
@@ -1602,7 +1252,7 @@ void ChatController::onEnvelope(const Bytes& body)
                 p.groupId        = gId;
                 p.groupName      = gName;
                 p.announcedSecs  = nowSecs();
-                m_pendingIncomingFiles[transferId] = std::move(p);
+                m_fileProto.pendingIncoming()[transferId] = std::move(p);
                 sodium_memzero(msgKey.data(), msgKey.size());
 
                 P2P_LOG("[FILE] prompt needed for " << fileName << " (" << fileSizeMB << "MB)"
@@ -1618,7 +1268,7 @@ void ChatController::onEnvelope(const Bytes& body)
                 // Sender's side of the "no relay" preference (global toggle).
                 // Desktop surfaces this via the "Require direct connection"
                 // setting too — not privacy-level yet; that can come later.
-                const bool senderRequiresP2P = m_fileRequireP2P;
+                const bool senderRequiresP2P = m_fileProto.requireP2P();
 
                 // Is P2P ready for this peer right now?
                 bool p2pReady = false;
@@ -1724,10 +1374,10 @@ void ChatController::onEnvelope(const Bytes& body)
             m_fileMgr.forgetSentTransfer(transferId);
 
             // Inbound pending (we were about to prompt)?
-            auto itPending = m_pendingIncomingFiles.find(transferId);
-            if (itPending != m_pendingIncomingFiles.end()) {
+            auto itPending = m_fileProto.pendingIncoming().find(transferId);
+            if (itPending != m_fileProto.pendingIncoming().end()) {
                 sodium_memzero(itPending->second.fileKey.data(), itPending->second.fileKey.size());
-                m_pendingIncomingFiles.erase(itPending);
+                m_fileProto.pendingIncoming().erase(itPending);
                 if (onFileTransferCanceled) onFileTransferCanceled(transferId, false); // sender canceled
                 return;
             }
@@ -1741,19 +1391,11 @@ void ChatController::onEnvelope(const Bytes& body)
             // Post-quantum KEM public key exchange — store the peer's ML-KEM-768 pub
             Bytes kemPub = CryptoEngine::fromBase64Url(o.value("kem_pub_b64u", std::string()));
             if (kemPub.size() == 1184) {  // ML-KEM-768 pub key size
-                m_peerKemPubs[senderId] = kemPub;
-                // Persist to DB
-                if (m_dbPtr && m_dbPtr->isOpen()) {
-                    SqlCipherQuery q(*m_dbPtr);
-                    q.prepare("UPDATE contacts SET kem_pub=:kp WHERE peer_id=:pid;");
-                    q.bindValue(":kp",  kemPub);
-                    q.bindValue(":pid", senderId);
-                    q.exec();
-                }
+                m_sealer.saveKemPub(senderId, kemPub);
                 P2P_LOG("[PQ] Stored ML-KEM-768 pub from " << senderId.substr(0, 8) << "..."
                          << " | hybrid sealing now active for this peer");
                 // Reciprocate: send our KEM pub back if we haven't already
-                if (m_crypto.hasPQKeys() && !lookupPeerKemPub(senderId).empty()) {
+                if (m_crypto.hasPQKeys() && !m_sealer.lookupPeerKemPub(senderId).empty()) {
                     // They sent theirs, we have theirs — send ours if they might not have it
                     announceKemPub(senderId);
                 }
@@ -1767,80 +1409,27 @@ void ChatController::onEnvelope(const Bytes& body)
             P2P_WARN("[RECV " << via << "] unexpected file_chunk in session payload from "
                        << senderId.substr(0, 8) << "...");
         }
-        return;
-    }
-
-    // Any frame that isn't a SEALED: / SEALEDFC: envelope is dropped.
-    // The sealed handler above covers every message type the app emits;
-    // static-ECDH fallbacks would lack forward secrecy and unsealed file
-    // chunks would leak the sender's pubkey to the relay in plaintext.
-    P2P_WARN("[RECV " << via << "] dropping non-sealed envelope ("
-             << header.size() << " header bytes) \u2014 sealed envelopes required (H1 fix)");
 }
 
 void ChatController::sendGroupRename(const std::string& groupId,
                                      const std::string& newName,
                                      const std::vector<std::string>& memberKeys)
 {
-    const std::string msgId = p2p::makeUuid();
-    json payload = json::object();
-    payload["from"]    = myIdB64u();
-    payload["type"]    = "group_rename";
-    payload["groupId"] = groupId;
-    payload["newName"] = newName;
-    payload["msgId"]   = msgId;
-    payload["ts"]      = nowSecs();
-    for (const std::string& key : memberKeys)
-        sendSealedPayload(key, payload);
+    m_groupProto.sendRename(groupId, newName, memberKeys);
 }
 
 void ChatController::sendGroupAvatar(const std::string& groupId,
                                      const std::string& avatarB64,
                                      const std::vector<std::string>& memberKeys)
 {
-    const std::string msgId = p2p::makeUuid();
-    json payload = json::object();
-    payload["from"]    = myIdB64u();
-    payload["type"]    = "group_avatar";
-    payload["groupId"] = groupId;
-    payload["avatar"]  = avatarB64;
-    payload["msgId"]   = msgId;
-    payload["ts"]      = nowSecs();
-    for (const std::string& key : memberKeys)
-        sendSealedPayload(key, payload);
+    m_groupProto.sendAvatar(groupId, avatarB64, memberKeys);
 }
 
 void ChatController::sendGroupMemberUpdate(const std::string& groupId,
                                            const std::string& groupName,
                                            const std::vector<std::string>& memberKeys)
 {
-    const std::string myId = myIdB64u();
-    const std::string msgId = p2p::makeUuid();
-
-    // Build the member array (excluding self, matching group_msg format)
-    json membersArray = json::array();
-    for (const std::string& key : memberKeys) {
-        if (trimmed(key) == myId) continue;
-        membersArray.push_back(key);
-    }
-
-    // Send to ALL members (including newly added ones) so everyone gets
-    // the updated member list and new members discover the group.
-    for (const std::string& peerIdRaw : memberKeys) {
-        const std::string peerId = trimmed(peerIdRaw);
-        if (peerId.empty() || peerId == myId) continue;
-
-        json payload = json::object();
-        payload["from"]      = myId;
-        payload["type"]      = "group_member_update";
-        payload["groupId"]   = groupId;
-        payload["groupName"] = groupName;
-        payload["members"]   = membersArray;
-        payload["msgId"]     = msgId;
-        payload["ts"]        = nowSecs();
-
-        sendSealedPayload(peerId, payload);
-    }
+    m_groupProto.sendMemberUpdate(groupId, groupName, memberKeys);
 }
 
 // ── Reset encrypted session ──────────────────────────────────────────────────
@@ -1853,221 +1442,37 @@ void ChatController::resetSession(const std::string& peerIdB64u)
     }
 }
 
-// ── Safety numbers / out-of-band key verification ───────────────────────────
+// ── Safety numbers: see SessionSealer.cpp ───────────────────────────────────
+// The public trust API (peerTrust / markPeerVerified / unverifyPeer /
+// safetyNumber / setHardBlockOnKeyChange / clearPeerKeyCache) is forwarded
+// to m_sealer inline in ChatController.hpp.  The fingerprint cache +
+// verified_peers DB helpers + detectKeyChange + onPeerKeyChanged callback
+// all live on SessionSealer so sealForPeer has a single choke point.
 
-void ChatController::ensureVerifiedPeersTable()
-{
-    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
-    SqlCipherQuery q(*m_dbPtr);
-    q.exec(
-        "CREATE TABLE IF NOT EXISTS verified_peers ("
-        "  peer_id              TEXT PRIMARY KEY,"
-        "  verified_at          INTEGER NOT NULL,"
-        "  verified_fingerprint BLOB NOT NULL"
-        ");"
-    );
-}
-
-Bytes ChatController::loadVerifiedFingerprint(const std::string& peerIdB64u) const
-{
-    if (!m_dbPtr || !m_dbPtr->isOpen()) return {};
-    SqlCipherQuery q(m_dbPtr->handle());
-    if (!q.prepare("SELECT verified_fingerprint FROM verified_peers WHERE peer_id=:pid;"))
-        return {};
-    q.bindValue(":pid", peerIdB64u);
-    if (q.exec() && q.next()) return q.valueBlob(0);
-    return {};
-}
-
-void ChatController::saveVerifiedFingerprint(const std::string& peerIdB64u,
-                                              const Bytes& fingerprint)
-{
-    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
-    SqlCipherQuery q(*m_dbPtr);
-    if (!q.prepare(
-            "INSERT INTO verified_peers (peer_id, verified_at, verified_fingerprint)"
-            " VALUES (:pid, :at, :fp)"
-            " ON CONFLICT(peer_id) DO UPDATE SET"
-            "   verified_at=excluded.verified_at,"
-            "   verified_fingerprint=excluded.verified_fingerprint;"))
-        return;
-    q.bindValue(":pid", peerIdB64u);
-    q.bindValue(":at",  nowSecs());
-    q.bindValue(":fp",  fingerprint);
-    q.exec();
-
-    // Drop the cached entry so the next trust check picks up the new
-    // stored fingerprint from disk.  Doing this inside the low-level DB
-    // helper (rather than only at the markPeerVerified call site) means
-    // any future caller that writes through here is automatically safe.
-    invalidatePeerKeyCache(peerIdB64u);
-}
-
-void ChatController::deleteVerifiedPeer(const std::string& peerIdB64u)
-{
-    if (!m_dbPtr || !m_dbPtr->isOpen()) return;
-    SqlCipherQuery q(*m_dbPtr);
-    if (!q.prepare("DELETE FROM verified_peers WHERE peer_id=:pid;"))
-        return;
-    q.bindValue(":pid", peerIdB64u);
-    q.exec();
-
-    // Same reasoning as saveVerifiedFingerprint: belt-and-braces
-    // invalidation at the DB-write layer so no caller can forget.
-    // A stale "stored" entry here would silently report a now-unverified
-    // peer as Verified — the one direction that IS a security regression.
-    invalidatePeerKeyCache(peerIdB64u);
-}
-
-std::string ChatController::safetyNumber(const std::string& peerIdB64u) const
-{
-    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
-    if (peerEd.size() != 32) return {};
-    return CryptoEngine::safetyNumber(m_crypto.identityPub(), peerEd);
-}
-
-const ChatController::PeerKeyCacheEntry&
-ChatController::fingerprintsFor(const std::string& peerIdB64u) const
-{
-    auto it = m_peerKeyCache.find(peerIdB64u);
-    if (it != m_peerKeyCache.end()) return it->second;
-
-    PeerKeyCacheEntry e;
-    const Bytes peerEd = CryptoEngine::fromBase64Url(peerIdB64u);
-    if (peerEd.size() == 32) {
-        // `current` is stable for the lifetime of this ChatController:
-        // it depends only on identityPub() (set once in setPassphrase)
-        // and the peerIdB64u key we're indexed on.
-        e.current = CryptoEngine::safetyFingerprint(m_crypto.identityPub(), peerEd);
-    }
-    e.stored = loadVerifiedFingerprint(peerIdB64u);
-    auto [ins, _] = m_peerKeyCache.emplace(peerIdB64u, std::move(e));
-    return ins->second;
-}
-
-void ChatController::invalidatePeerKeyCache(const std::string& peerIdB64u) const
-{
-    m_peerKeyCache.erase(peerIdB64u);
-}
-
-ChatController::PeerTrust ChatController::peerTrust(const std::string& peerIdB64u) const
-{
-    const auto& c = fingerprintsFor(peerIdB64u);
-    if (c.stored.size() != 32)  return PeerTrust::Unverified;
-    if (c.current.size() != 32) return PeerTrust::Unverified;  // invalid peerId
-    return (c.current == c.stored) ? PeerTrust::Verified : PeerTrust::Mismatch;
-}
-
-bool ChatController::markPeerVerified(const std::string& peerIdB64u)
-{
-    const auto& c = fingerprintsFor(peerIdB64u);
-    if (c.current.size() != 32) return false;
-    // saveVerifiedFingerprint invalidates the cache on write, so the
-    // next read repopulates with stored == current.
-    saveVerifiedFingerprint(peerIdB64u, c.current);
-    // A fresh mark clears the once-per-session warning so if the user
-    // re-verifies and we later detect ANOTHER change they'll see it.
-    m_keyChangeWarned.erase(peerIdB64u);
-    return true;
-}
-
-void ChatController::unverifyPeer(const std::string& peerIdB64u)
-{
-    deleteVerifiedPeer(peerIdB64u);
-    m_keyChangeWarned.erase(peerIdB64u);
-}
-
-bool ChatController::detectKeyChange(const std::string& peerIdB64u)
-{
-    const auto& c = fingerprintsFor(peerIdB64u);
-    if (c.stored.size() != 32)  return false;  // Unverified — not a mismatch
-    if (c.current.size() != 32) return false;  // peerId didn't decode
-    if (c.current == c.stored)  return false;
-
-    // Mismatch.  Fire the callback at most once per session per peer.
-    if (m_keyChangeWarned.insert(peerIdB64u).second) {
-        if (onPeerKeyChanged) onPeerKeyChanged(peerIdB64u, c.stored, c.current);
-        P2P_WARN("[SAFETY] key-change detected for " << peerIdB64u.substr(0, 8)
-                 << "... (hardBlock=" << (m_hardBlockOnKeyChange ? "on" : "off") << ")");
-    }
-    return true;
-}
-
-// ── Group sequence counter persistence ───────────────────────────────────────
-
-void ChatController::setGroupSeqCounters(const std::map<std::string, int64_t>& seqOut,
-                                          const std::map<std::string, int64_t>& seqIn)
-{
-    m_groupSeqOut = seqOut;
-    m_groupSeqIn  = seqIn;
-}
-
-// ── Group-membership authorization ───────────────────────────────────────────
+// ── Group state: see GroupProtocol.cpp ──────────────────────────────────────
+// Sequence counters + roster authorization + all send* methods live on
+// GroupProtocol.  ChatController forwards through m_groupProto; onEnvelope
+// queries m_groupProto.isAuthorizedSender / recordInboundSeq /
+// upsertMembersFromTrustedMessage directly.
 
 void ChatController::setKnownGroupMembers(const std::string& groupId,
                                            const std::vector<std::string>& members)
 {
-    if (groupId.empty()) return;
-    m_groupMembers[groupId] = std::set<std::string>(members.begin(), members.end());
+    m_groupProto.setKnownMembers(groupId, members);
 }
 
-bool ChatController::isAuthorizedGroupSender(const std::string& gid,
-                                              const std::string& peerId) const
-{
-    if (gid.empty() || peerId.empty()) return false;
-    auto it = m_groupMembers.find(gid);
-    if (it == m_groupMembers.end()) {
-        // Deny-by-default for unknown groups.  Without this gate, any
-        // authenticated peer could send group_rename / group_avatar /
-        // group_leave for a group ID our roster hadn't yet loaded — an
-        // attacker who guessed or observed a gid (e.g. via a shared link)
-        // could rename the group or inject a fake avatar before the
-        // legitimate roster arrived.
-        //
-        // Bootstrap is still possible: the group_msg handler does its own
-        // sender-in-declared-members check and populates m_groupMembers
-        // from that, so the first real group_msg admits everyone that
-        // follows.  Control messages (rename/avatar/leave) that arrive
-        // before any group_msg are dropped — if a legitimate sender
-        // races a rename ahead of their own group_msg, they'll just need
-        // to retry after the roster establishes.
-        return false;
-    }
-    return it->second.count(peerId) != 0;
-}
-
-// ---------------------------
-// Post-Quantum KEM pub exchange
-// ---------------------------
-
-Bytes ChatController::lookupPeerKemPub(const std::string& peerIdB64u)
-{
-    // Check in-memory cache first
-    auto it = m_peerKemPubs.find(peerIdB64u);
-    if (it != m_peerKemPubs.end()) return it->second;
-
-    // Load from DB
-    if (!m_dbPtr || !m_dbPtr->isOpen()) return {};
-    SqlCipherQuery q(m_dbPtr->handle());
-    q.prepare("SELECT kem_pub FROM contacts WHERE peer_id=:pid;");
-    q.bindValue(":pid", peerIdB64u);
-    if (q.exec() && q.next()) {
-        Bytes pub = q.valueBlob(0);
-        if (!pub.empty()) {
-            m_peerKemPubs[peerIdB64u] = pub;
-            return pub;
-        }
-    }
-    return {};
-}
+// ── Post-Quantum KEM pub exchange ───────────────────────────────────────────
+// lookupPeerKemPub + the KEM pub cache live on SessionSealer.  announceKemPub
+// stays here because it builds a sealed payload and hands it to the relay;
+// m_sealer tracks whether we've already announced to a given peer.
 
 void ChatController::announceKemPub(const std::string& peerIdB64u)
 {
     if (!m_crypto.hasPQKeys()) return;
     if (!m_sessionMgr) return;
-    if (m_kemPubAnnounced.count(peerIdB64u)) return;  // already sent this session
+    if (m_sealer.hasAnnouncedKemPubTo(peerIdB64u)) return;
 
-    m_kemPubAnnounced.insert(peerIdB64u);
+    m_sealer.markKemPubAnnouncedTo(peerIdB64u);
 
     json payload = json::object();
     payload["from"] = myIdB64u();
