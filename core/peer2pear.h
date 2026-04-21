@@ -204,6 +204,33 @@ void p2p_add_send_relay(p2p_context* ctx, const char* url);
  */
 void p2p_set_privacy_level(p2p_context* ctx, int level);
 
+/**
+ * Register a push-notification token with the relay.  Called by
+ * mobile clients after they receive a device token from APNs (iOS)
+ * or FCM (Android).  The relay stores (peer_id, platform, token) so
+ * it can fire a silent wake-up push when a new envelope arrives for
+ * an offline recipient.
+ *
+ * `platform` is a short identifier like "ios" or "android".  Pass an
+ * empty token to unregister (e.g., on sign-out).
+ *
+ * Safe to call any time after p2p_connect — the call is forwarded
+ * to the relay over the authenticated WebSocket.
+ */
+void p2p_set_push_token(p2p_context* ctx,
+                         const char* token,
+                         const char* platform);
+
+/**
+ * Wake-up hook for background push arrivals.  Mobile silent-push
+ * handlers invoke this from their background-task entry point;
+ * internally it nudges the relay connection to drain any queued
+ * envelopes that were waiting on this device.  Returns immediately;
+ * completion signalling is via the usual on_message / on_group_message
+ * callbacks.
+ */
+void p2p_wake_for_push(p2p_context* ctx);
+
 /* ── Messaging ─────────────────────────────────────────────────────────── */
 
 /**

@@ -195,6 +195,11 @@ void RelayClient::onWsDisconnected()
     m_coverTimer->stop();
     m_onlinePeers.clear();
 
+    // Queue a push-token replay if we had one registered — the relay
+    // may have lost per-connection state, and the next reconnect
+    // should re-establish us as reachable via push.
+    if (!m_pushPlatform.empty()) m_pushPending = true;
+
     P2P_LOG("[Relay] WebSocket disconnected");
 
     if (onDisconnected) onDisconnected();
@@ -237,6 +242,21 @@ void RelayClient::onWsTextMessage(const std::string& message)
         P2P_LOG("[Relay] Authenticated as " << peerPrefix(obj.value("peer_id", std::string())));
         if (m_coverIntervalSec > 0) scheduleCoverTimer();
         refreshRelayInfo();
+
+        // Replay any pending push-token registration on this fresh
+        // authenticated WS.  The cached (platform, token) pair is
+        // whatever the app last told us — includes the "unregister"
+        // case (empty token) so the relay drops stale rows if the
+        // user signed out offline.
+        if (m_pushPending && !m_pushPlatform.empty()) {
+            json msg;
+            msg["type"]     = "push_register";
+            msg["platform"] = m_pushPlatform;
+            msg["token"]    = m_pushToken;
+            m_ws.sendTextMessage(msg.dump());
+            m_pushPending = false;
+        }
+
         if (onConnected) onConnected();
         return;
     }
@@ -342,6 +362,27 @@ void RelayClient::queryPresence(const std::vector<std::string>& peerIds)
     msg["type"]     = "presence_query";
     msg["peer_ids"] = std::move(ids);
     m_ws.sendTextMessage(msg.dump());
+}
+
+void RelayClient::registerPushToken(const std::string& platform,
+                                       const std::string& token)
+{
+    // Cache so we can replay on reconnect.  The WS auth already
+    // identifies which peer_id this is for, so the relay stores
+    // under (connected_peer_id, platform).  Token may be empty to
+    // signal "unregister" — the relay treats that as a delete.
+    m_pushPlatform = platform;
+    m_pushToken    = token;
+    m_pushPending  = true;
+
+    if (!isConnected()) return;
+
+    json msg;
+    msg["type"]     = "push_register";
+    msg["platform"] = platform;
+    msg["token"]    = token;
+    m_ws.sendTextMessage(msg.dump());
+    m_pushPending = false;
 }
 
 // ── Retry queue ──────────────────────────────────────────────────────────────

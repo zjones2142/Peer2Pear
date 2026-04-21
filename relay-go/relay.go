@@ -167,6 +167,13 @@ type Hub struct {
 	relayX25519Pub  *[32]byte
 	relayX25519Priv *[32]byte
 
+	// Mobile push-notification integration.  Tokens are stored per
+	// (peer_id, platform) and consulted when an envelope lands for
+	// an offline recipient — the sender stub logs today; swapping in
+	// a real APNs client is a one-file change.
+	push       *PushStore
+	pushSender *PushSender
+
 	upgrader websocket.Upgrader
 }
 
@@ -183,6 +190,17 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 			WriteBufferSize: maxEnvelopeBytes,
 			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
+		pushSender: NewPushSender(false), // stub until APNs key configured
+	}
+	// Push-token store sits on the same SQLite file as the mailbox so
+	// the tokens persist across relay restarts.  Stub-only sends are
+	// log noise; real sends will go out when pushSender.live is true.
+	if mbox != nil && mbox.db != nil {
+		if store, err := NewPushStore(mbox.db); err == nil {
+			h.push = store
+		} else {
+			log.Printf("push: failed to init store: %v (push disabled)", err)
+		}
 	}
 	// Periodically purge expired auth nonces from the persistent table.
 	// RegisterAuthNonce() also cleans up opportunistically; this just
@@ -273,8 +291,19 @@ func (h *Hub) deliverOrStore(recipientID string, envelope []byte) (delivered boo
 		}
 	}
 
-	// Offline or buffer full — store in mailbox
-	return false, h.mbox.Store(recipientID, envelope)
+	// Offline or buffer full — store in mailbox + wake the peer's
+	// device via push.  Push is best-effort and cooldown-gated
+	// inside PushSender so a burst of queued envelopes fires only
+	// one wake-up, not one per envelope.
+	if err := h.mbox.Store(recipientID, envelope); err != nil {
+		return false, err
+	}
+	if h.push != nil && h.pushSender != nil {
+		if records, perr := h.push.GetForPeer(recipientID); perr == nil {
+			h.pushSender.NotifyOffline(recipientID, records)
+		}
+	}
+	return false, nil
 }
 
 // notifyPresence pushes online/offline events to subscribers.
@@ -623,6 +652,25 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 		case "ping":
 			resp, _ := json.Marshal(map[string]string{"type": "pong"})
 			peer.Send <- resp
+
+		case "push_register":
+			// Mobile client tells us "wake me via this APNs/FCM token
+			// when envelopes land while I'm offline."  Authenticated
+			// WS already identifies peer.ID, so we just upsert
+			// (peer.ID, platform, token).  An empty token acts as
+			// unregister.
+			if h.push == nil {
+				continue
+			}
+			platform, _ := msg["platform"].(string)
+			token, _ := msg["token"].(string)
+			if platform == "" {
+				continue
+			}
+			if err := h.push.Upsert(peer.ID, platform, token); err != nil {
+				log.Printf("push: upsert failed for %s…: %v",
+					truncID(peer.ID), err)
+			}
 		}
 	}
 }

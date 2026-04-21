@@ -376,13 +376,19 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onSettingsBackClicked);
     connect(m_settingsPanel, &SettingsPanel::notificationsToggled,
             m_notifier,      &ChatNotifier::setEnabled);
+    connect(m_settingsPanel, &SettingsPanel::notificationModeChanged,
+            m_notifier,      &ChatNotifier::setContentMode);
     connect(m_settingsPanel, &SettingsPanel::exportContactsClicked,
             this, &MainWindow::onExportContacts);
     connect(m_settingsPanel, &SettingsPanel::importContactsClicked,
             this, &MainWindow::onImportContacts);
 
-    // Apply persisted notification state to the notifier
+    // Apply persisted notification state to the notifier.  Both the
+    // global on/off and the content-privacy mode are mirrored from
+    // whatever the DB restored — avoids a window between construction
+    // and the first user toggle where banners could leak plaintext.
     m_notifier->setEnabled(m_settingsPanel->notificationsEnabled());
+    m_notifier->setContentMode(m_settingsPanel->notificationMode());
 
     // Phase 2: file transfer consent settings → ChatController
     // ChatController isn't a QObject anymore, so route the SettingsPanel

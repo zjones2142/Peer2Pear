@@ -1016,6 +1016,30 @@ void p2p_set_privacy_level(p2p_context* ctx, int level)
     ctx->controller.relay().setPrivacyLevel(level);
 }
 
+void p2p_set_push_token(p2p_context* ctx,
+                         const char* token,
+                         const char* platform)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    const std::string tok = token    ? std::string(token)    : std::string();
+    const std::string plt = platform ? std::string(platform) : std::string();
+    ctx->controller.relay().registerPushToken(plt, tok);
+}
+
+void p2p_wake_for_push(p2p_context* ctx)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    // Most relays deliver queued envelopes automatically on
+    // (re)authentication, so the simple + robust response is to
+    // ensure the relay WS is up.  If already connected, this is a
+    // no-op; if disconnected, nudge a (re)connect which drains the
+    // mailbox as part of normal auth flow.
+    if (!ctx->controller.relay().isConnected())
+        ctx->controller.relay().connectToRelay();
+}
+
 // ── Platform → Core events ──────────────────────────────────────────────────
 
 void p2p_ws_on_connected(p2p_context* ctx)

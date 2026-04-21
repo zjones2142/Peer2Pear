@@ -57,6 +57,15 @@ public:
     // One-shot presence query.
     void queryPresence(const std::vector<std::string>& peerIds);
 
+    // Tell the relay which push token / platform to wake us on when
+    // an envelope arrives while we're disconnected.  Pass an empty
+    // token to unregister (e.g., sign-out).  Safe to call repeatedly;
+    // the relay upserts by (peer_id, platform).  If the WS is down
+    // at call time, the latest (platform, token) pair is replayed
+    // after the next successful reconnect.
+    void registerPushToken(const std::string& platform,
+                             const std::string& token);
+
     // ── DAITA: client-side traffic analysis defense ─────────────────────────
     void setJitterRange(int minMs, int maxMs);
     void setCoverTrafficInterval(int seconds);
@@ -153,4 +162,12 @@ private:
     bool                     m_multiHop     = false;
 
     std::map<std::string, Bytes> m_relayX25519Pubs;
+
+    // Push-token registration state.  Stored after the first
+    // registerPushToken call so we can replay on reconnect.  Empty
+    // token means "unregister on next reconnect" — relays handle
+    // absent/empty tokens by removing any existing row.
+    std::string m_pushPlatform;
+    std::string m_pushToken;
+    bool        m_pushPending = false;   // have we replayed to this WS yet?
 };

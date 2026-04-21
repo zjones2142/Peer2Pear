@@ -996,7 +996,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         emit unreadChanged(totalUnread());
         promoteChatToTop(idx);
         rebuildChatList();
-        if (m_notifier) m_notifier->notify(chatName, text);
+        if (m_notifier) m_notifier->notifyGroup(senderName, chatName, text);
     }
 }
 

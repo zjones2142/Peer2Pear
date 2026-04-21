@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UserNotifications
 
 // MARK: - Persistent UI-state snapshot
 // Groups, group avatars, and message history live here across app
@@ -326,6 +327,12 @@ final class Peer2PearClient: ObservableObject {
 
         p2p_set_relay_url(rawContext, relayUrl)
         p2p_connect(rawContext)
+
+        // If APNs registered before start() completed, the AppDelegate
+        // will have stashed the token in `pendingPushToken`.  Forward
+        // it now so the relay sees us as reachable via push from the
+        // very first connection.
+        forwardPushTokenIfConnected()
     }
 
     private func persistSnapshot() {
@@ -346,6 +353,139 @@ final class Peer2PearClient: ObservableObject {
     }
 
     deinit { stop() }
+
+    // MARK: - Push notifications
+
+    /// Hand the APNs device token to the core, which forwards it to
+    /// the relay over the authenticated WebSocket.  Safe to call
+    /// before `start()` — the token is stashed and replayed once the
+    /// core is live.  `token` is the hex-encoded bytes; empty
+    /// unregisters the device.
+    func setPushToken(_ token: String, platform: String) {
+        pendingPushToken = (token, platform)
+        forwardPushTokenIfConnected()
+    }
+
+    /// Invoked by the AppDelegate when a silent push arrives while the
+    /// app is backgrounded.  iOS gives us ~30 s to fetch queued
+    /// envelopes before freezing the app again.  Completion is called
+    /// with `true` if we observed any new data during the wake.
+    func handleBackgroundPush(completion: @escaping (Bool) -> Void) {
+        guard let ctx = rawContext else {
+            completion(false)
+            return
+        }
+        let baseline = messages.count + groupMessages.count
+        p2p_wake_for_push(ctx)
+
+        // Poll for ~5 s: if a new message has landed by then, we
+        // report newData.  Longer-running delivery after completion
+        // still fires normal callbacks + local notifications — the
+        // completion here just tells iOS whether the wake was useful
+        // for background-refresh scheduling heuristics.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self else { completion(false); return }
+            let now = self.messages.count + self.groupMessages.count
+            completion(now > baseline)
+        }
+    }
+
+    private var pendingPushToken: (token: String, platform: String)?
+
+    private func forwardPushTokenIfConnected() {
+        guard let ctx = rawContext, let p = pendingPushToken else { return }
+        p2p_set_push_token(ctx, p.token, p.platform)
+        // Leave `pendingPushToken` set — RelayClient replays it on
+        // every reconnect already, and re-sending on a warm WS is
+        // idempotent at the relay level (upsert).
+    }
+
+    /// How much content to reveal in the OS notification banner.
+    /// Default is `.hidden` because iOS persists notification
+    /// payloads in a system-level store (`backboardd` / NotificationCenter
+    /// DB) that forensic tools can extract even after the app "forgets"
+    /// a message.  Once plaintext enters that store, our SQLCipher-
+    /// at-rest posture is defeated.  Users who value UX over this
+    /// residual leak can opt up to `.senderOnly` or `.full`.
+    enum NotificationContentMode: String {
+        case hidden     = "hidden"      // "New message"
+        case senderOnly = "sender"      // "New message from <fingerprint>"
+        case full       = "full"        // "Alice: hello"
+    }
+
+    private static let kNotificationModeKey = "p2p.notificationContentMode"
+
+    @Published var notificationContentMode: NotificationContentMode = {
+        let raw = UserDefaults.standard.string(forKey: kNotificationModeKey)
+               ?? NotificationContentMode.hidden.rawValue
+        return NotificationContentMode(rawValue: raw) ?? .hidden
+    }() {
+        didSet {
+            UserDefaults.standard.set(notificationContentMode.rawValue,
+                                       forKey: Self.kNotificationModeKey)
+        }
+    }
+
+    /// Fire a local UNUserNotificationCenter banner for an inbound
+    /// message, applying the user's content-privacy mode.  The OS
+    /// decides whether to actually surface it — foreground banners
+    /// go through Peer2PearAppDelegate's willPresent delegate method;
+    /// backgrounded banners surface directly.
+    ///
+    /// The sender ID / message text passed here are always the
+    /// decrypted, plaintext values; this function decides what
+    /// fraction (if any) to hand to the OS notification store.
+    /// Own-message check prevents double-notify when the sender
+    /// receives their own fan-out on group sends.
+    fileprivate func fireLocalNotification(
+        fromPeerId: String,
+        senderDisplay: String,   // e.g., first-8-chars fingerprint, or "Alice"
+        groupName: String?,      // non-nil for group messages
+        messageText: String,
+        threadId: String
+    ) {
+        if fromPeerId == myPeerId { return }
+
+        let content = UNMutableNotificationContent()
+        content.sound = .default
+        content.threadIdentifier = threadId
+
+        switch notificationContentMode {
+        case .hidden:
+            // Generic wake-up only — the OS notification DB learns
+            // nothing about who or what.  User opens the app to see
+            // the actual message, which lives only in our encrypted
+            // sandbox (Peer2PearStore with completeFileProtection +
+            // SQLCipher).
+            content.title = "Peer2Pear"
+            content.body  = "New message"
+
+        case .senderOnly:
+            content.title = "Peer2Pear"
+            if let group = groupName, !group.isEmpty {
+                content.body = "New message in \(group)"
+            } else {
+                content.body = "New message from \(senderDisplay)"
+            }
+
+        case .full:
+            if let group = groupName, !group.isEmpty {
+                content.title = group
+                content.subtitle = senderDisplay
+            } else {
+                content.title = senderDisplay
+            }
+            content.body = messageText.count > 140
+                ? String(messageText.prefix(137)) + "…"
+                : messageText
+        }
+
+        let req = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil)
+        UNUserNotificationCenter.current().add(req) { _ in }
+    }
 
     // MARK: - Messaging actions
 
@@ -716,7 +856,18 @@ final class Peer2PearClient: ObservableObject {
                 text: String(cString: text),
                 timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
             )
-            DispatchQueue.main.async { client.messages.append(msg) }
+            DispatchQueue.main.async {
+                client.messages.append(msg)
+                // threadId = sender so iOS groups banners per-conversation.
+                // The content-privacy mode decides how much actually
+                // enters the OS notification store.
+                client.fireLocalNotification(
+                    fromPeerId: msg.from,
+                    senderDisplay: String(msg.from.prefix(8)) + "…",
+                    groupName: nil,
+                    messageText: msg.text,
+                    threadId: "dm:" + msg.from)
+            }
         }, selfPtr)
 
         // ── Incoming group text ────────────────────────────────────────
@@ -762,6 +913,13 @@ final class Peer2PearClient: ObservableObject {
                 // from this group's members are admitted.
                 client.setKnownGroupMembers(groupId: gm.groupId,
                                              memberPeerIds: roster)
+
+                client.fireLocalNotification(
+                    fromPeerId: gm.from,
+                    senderDisplay: String(gm.from.prefix(8)) + "…",
+                    groupName: gm.groupName.isEmpty ? "Group" : gm.groupName,
+                    messageText: gm.text,
+                    threadId: "group:" + gm.groupId)
             }
         }, selfPtr)
 

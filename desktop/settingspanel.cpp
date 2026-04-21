@@ -227,6 +227,21 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
     m_notificationsEnabled = (saved == "true");
     applyNotificationState();
 
+    // Load notification content-privacy mode.  Default is Hidden —
+    // generic "New message" banners keep plaintext out of the OS-
+    // level notification store.  Users can opt up in the UI.
+    {
+        const QString raw = m_db->loadSetting("notificationMode", "hidden");
+        if (raw == "full")         m_notifMode = NotificationMode::Full;
+        else if (raw == "sender")  m_notifMode = NotificationMode::SenderOnly;
+        else                        m_notifMode = NotificationMode::Hidden;
+        if (m_notifModeCombo) {
+            QSignalBlocker blocker(m_notifModeCombo);
+            m_notifModeCombo->setCurrentIndex(static_cast<int>(m_notifMode));
+        }
+        emit notificationModeChanged(m_notifMode);
+    }
+
     // Load file-transfer consent settings.  Defaults: everything ≤100 MB
     // accepts, no relay requirement.
     const int softMB = m_db->loadSetting("fileAutoAcceptMaxMB", "100").toInt();
@@ -486,6 +501,97 @@ QWidget *SettingsPanel::makeNotificationsSection()
     al->addStretch();
     al->addWidget(m_messageAlertsLabel);
     cardLayout->addWidget(alertsRow);
+
+    // ── Notification content (privacy) row ────────────────────────────────────
+    //
+    // Content-level control of what the OS notification store sees.
+    // Default is "Hidden" because the macOS/Windows/Linux notification
+    // history is outside the app's sandbox — once plaintext enters it,
+    // our SQLCipher-at-rest posture is defeated.  Mirrors the iOS
+    // setting so a user who opts up on one platform sees the same
+    // label on the other.
+    addDivider();
+
+    QWidget *contentRow = new QWidget();
+    contentRow->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *contentCol = new QVBoxLayout(contentRow);
+    contentCol->setContentsMargins(16, 10, 16, 10);
+    contentCol->setSpacing(4);
+
+    QHBoxLayout *contentTop = new QHBoxLayout();
+    contentTop->setSpacing(8);
+    QLabel *contentKey = new QLabel("Show in banner");
+    contentKey->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+    m_notifModeCombo = new QComboBox();
+    m_notifModeCombo->addItems({"Hidden", "Sender only", "Full content"});
+    m_notifModeCombo->setCurrentIndex(0);
+    m_notifModeCombo->setFixedWidth(160);
+    m_notifModeCombo->setStyleSheet(
+        "QComboBox {"
+        "  background-color: #1a1a1a;"
+        "  color: #cccccc;"
+        "  border: 1px solid #2e2e2e;"
+        "  border-radius: 6px;"
+        "  padding: 4px 8px;"
+        "  font-size: 12px;"
+        "}"
+        "QComboBox:hover { border-color: #3a3a3a; }"
+        );
+    contentTop->addWidget(contentKey);
+    contentTop->addStretch();
+    contentTop->addWidget(m_notifModeCombo);
+    contentCol->addLayout(contentTop);
+
+    m_notifModeHelp = new QLabel(
+        "Banners show only \"New message\".  Contents stay inside the "
+        "app's encrypted store — the OS notification history sees nothing."
+        );
+    m_notifModeHelp->setWordWrap(true);
+    m_notifModeHelp->setStyleSheet(
+        "color: #777777; font-size: 11px; background: transparent; border: none;"
+        );
+    contentCol->addWidget(m_notifModeHelp);
+
+    cardLayout->addWidget(contentRow);
+
+    connect(m_notifModeCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int idx) {
+                m_notifMode = static_cast<NotificationMode>(
+                    std::clamp(idx, 0, 2));
+                if (m_db) {
+                    const char* raw =
+                        m_notifMode == NotificationMode::Full       ? "full"
+                      : m_notifMode == NotificationMode::SenderOnly ? "sender"
+                      :                                                "hidden";
+                    m_db->saveSetting("notificationMode", raw);
+                }
+                if (m_notifModeHelp) {
+                    switch (m_notifMode) {
+                    case NotificationMode::Hidden:
+                        m_notifModeHelp->setText(
+                            "Banners show only \"New message\".  Contents "
+                            "stay inside the app's encrypted store — the "
+                            "OS notification history sees nothing.");
+                        break;
+                    case NotificationMode::SenderOnly:
+                        m_notifModeHelp->setText(
+                            "Banners name the sender.  The OS stores that "
+                            "identifier; message text stays private.");
+                        break;
+                    case NotificationMode::Full:
+                        m_notifModeHelp->setText(
+                            "Banners include the message text.  Convenient, "
+                            "but the OS retains the plaintext in its "
+                            "notification history — readable by forensic "
+                            "tools even after the message is deleted.");
+                        break;
+                    }
+                }
+                emit notificationModeChanged(m_notifMode);
+            });
 
     // ── Sound row ─────────────────────────────────────────────────────────────
     addDivider();

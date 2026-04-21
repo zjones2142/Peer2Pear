@@ -64,6 +64,12 @@ targets:
         NSCameraUsageDescription: >-
           Peer2Pear uses the camera to scan other users' QR codes so you can
           add them as contacts without typing a 43-character key.
+        # Silent APNs pushes wake the app for ~30 s to fetch queued
+        # envelopes from the relay and display local notifications.
+        # Plaintext is decrypted client-side; the push itself is
+        # content-free.
+        UIBackgroundModes:
+          - remote-notification
 
     # Code signing config lives in an xcconfig so per-developer Team IDs
     # never enter the committed pbxproj.  See ios/README.md for the

@@ -9,6 +9,7 @@
 #include <QHBoxLayout>
 #include <QFrame>
 #include <QSpinBox>
+#include <QComboBox>
 
 class DatabaseManager;
 
@@ -17,10 +18,26 @@ class SettingsPanel : public QWidget
     Q_OBJECT
 
 public:
+    // Notification-content privacy mode.  Controls how much plaintext
+    // reaches the OS-level notification store (macOS NotificationCenter
+    // DB, Windows Action Center, Linux notification daemons) where
+    // forensic tools can read it even after the app wipes its own
+    // state.  Default is Hidden — generic banner only.  See the
+    // matching enum on iOS (Peer2PearClient.NotificationContentMode).
+    enum class NotificationMode {
+        Hidden     = 0,   // "Peer2Pear — new message"
+        SenderOnly = 1,   // "<senderName> sent a new message"
+        Full       = 2    // "<senderName>: <message text>"
+    };
+
     explicit SettingsPanel(QWidget *parent = nullptr);
 
     // Returns whether notifications are currently enabled
     bool notificationsEnabled() const { return m_notificationsEnabled; }
+
+    // Currently-selected notification content mode.  Defaults to
+    // Hidden (most private) until the user explicitly opts up.
+    NotificationMode notificationMode() const { return m_notifMode; }
 
     // Call after construction to populate profile fields
     void setProfileInfo(const QString &displayName, const QString &publicKey);
@@ -31,6 +48,7 @@ public:
 signals:
     void backClicked();
     void notificationsToggled(bool enabled);
+    void notificationModeChanged(SettingsPanel::NotificationMode mode);
     void exportContactsClicked();
     void importContactsClicked();
 
@@ -87,7 +105,10 @@ private:
     DatabaseManager *m_db               = nullptr;
 
     // Notifications
-    bool         m_notificationsEnabled = true;
+    bool             m_notificationsEnabled = true;
+    NotificationMode m_notifMode            = NotificationMode::Hidden;
+    QComboBox       *m_notifModeCombo       = nullptr;
+    QLabel          *m_notifModeHelp        = nullptr;
     QPushButton *m_notifToggleBtn       = nullptr;
     QLabel      *m_notifStatusLabel     = nullptr;
     QLabel      *m_messageAlertsLabel   = nullptr;

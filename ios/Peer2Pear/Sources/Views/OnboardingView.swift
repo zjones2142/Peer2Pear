@@ -1,10 +1,21 @@
 import SwiftUI
 
+// Key used to persist the last-entered relay URL across launches.
+// UserDefaults survives app launches and passcode unlock but is wiped
+// on uninstall (iOS sandbox).  Cross-reinstall persistence would need
+// iCloud Keychain or NSUbiquitousKeyValueStore, which adds an iCloud
+// entitlement and user-dependent sync behaviour — not worth it for a
+// URL the user typed once.
+private let kDefaultsRelayUrlKey = "p2p.lastRelayUrl"
+private let kDefaultRelayUrl = "https://relay.peer2pear.org:8443"
+
 struct OnboardingView: View {
     @ObservedObject var client: Peer2PearClient
     @State private var displayName = ""
     @State private var passphrase = ""
-    @State private var relayUrl = "https://relay.peer2pear.org:8443"
+    @State private var relayUrl =
+        UserDefaults.standard.string(forKey: kDefaultsRelayUrlKey)
+        ?? kDefaultRelayUrl
 
     var body: some View {
         NavigationStack {
@@ -40,6 +51,10 @@ struct OnboardingView: View {
                 Button("Get Started") {
                     let dataDir = FileManager.default
                         .urls(for: .documentDirectory, in: .userDomainMask)[0].path
+                    // Remember what the user typed so subsequent
+                    // first-runs (after logout / identity reset) do not
+                    // have to re-enter the relay URL.
+                    UserDefaults.standard.set(relayUrl, forKey: kDefaultsRelayUrlKey)
                     client.start(dataDir: dataDir, passphrase: passphrase, relayUrl: relayUrl)
                 }
                 .buttonStyle(.borderedProminent)
