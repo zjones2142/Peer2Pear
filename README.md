@@ -4,9 +4,11 @@ A peer-to-peer encrypted messaging and file-sharing **protocol**. Open source, r
 
 This repository contains:
 
-- **`core/`** — portable C++ protocol core (crypto, handshake, ratchet, sealed sender, relay client)
-- **`desktop/`** — Qt 5/6 desktop client for Linux, macOS, and Windows
-- **`relay-go/`** — reference Go relay server (single static binary, SQLite mailbox, onion-capable)
+- **`core/`** — portable C++ protocol core (crypto, handshake, ratchet, sealed sender, relay client). Builds Qt-free for mobile via `-DBUILD_DESKTOP=OFF`.
+- **`desktop/`** — Qt 5/6 desktop client for Linux, macOS, and Windows.
+- **`ios/`** — SwiftUI iOS client built on the C FFI (`core/peer2pear.h`), targeting iOS 26+ arm64. Relay-only transport for now (P2P deferred); full feature parity with desktop for messaging, groups, files, safety numbers, and QR exchange.
+- **`relay-go/`** — reference Go relay server (single static binary, SQLite mailbox, onion-capable).
+- **`core/tests/`** — GoogleTest suite (176 cases across 13 binaries) covering crypto primitives, sealed envelopes, ratchet, session manager, sealer / group / file protocols, full E2E two-client round-trips, the C API surface, and relay cover traffic.
 
 ---
 
@@ -25,8 +27,10 @@ This repository contains:
 - **Relay-first networking** — all clients connect to one or more relays via WebSocket. Anonymous HTTP `POST /v1/send` for outbound. Optional direct QUIC-over-ICE P2P upgrade when both peers are online.
 - **Opt-in traffic analysis defenses** — fixed-size padding buckets, send jitter, bursty cover traffic to real contacts, multi-relay send rotation, onion-routed multi-hop forwarding.
 - **Encrypted at rest** — SQLCipher (AES-256) full-DB encryption plus per-field XChaCha20-Poly1305 AEAD. No plaintext SQLite on any device.
-- **Group chats** — encrypted broadcasts with per-group sequence numbering and size-gated consent for file transfers.
-- **Cross-platform client** — Linux, macOS, Windows via Qt 5/6. A C FFI (`core/peer2pear.h`) enables native mobile frontends without Qt.
+- **Group chats** — encrypted broadcasts with per-group sequence numbering, deny-by-default roster authorization for control messages (rename / avatar / member-update / leave), and size-gated consent for file transfers.
+- **Safety numbers** — sort-invariant 60-digit BLAKE2b fingerprint for out-of-band verification. Verify-once persistence; key-change detection with once-per-session warning callback; optional hard-block on mismatch.
+- **QR peer exchange** — scan or display the 43-char base64url Peer ID on iOS (CoreImage + AVFoundation) or desktop (vendored Nayuki encoder). Complementary to copy/paste — same wire format on both sides.
+- **Cross-platform clients** — Linux / macOS / Windows via Qt 5/6 (`desktop/`); iOS 26+ via SwiftUI (`ios/`). A C FFI (`core/peer2pear.h`) backs the iOS bridge and is the integration point for any future native frontend (Android, etc.).
 
 ## How it works
 
@@ -98,20 +102,31 @@ At Privacy Level 2, the client fetches each relay's X25519 public key from `GET 
 ## Architecture
 
 ```
-desktop/Peer2Pear.app         ← Qt 5/6 GUI (optional frontend)
-  └── links
-core/libpeer2pear-core.a      ← portable protocol core
+desktop/Peer2Pear.app         ios/Peer2Pear.app
+  Qt 5/6 GUI                  SwiftUI (iOS 26+)
+  Qt::WebSocket impl          URLSessionWebSocket adapter
+  Qt::HttpClient impl         URLSession adapter
+       │                            │
+       └────── both link ───────────┘
+                  │
+                  ▼
+core/libpeer2pear-core.a      ← portable protocol core (Qt optional)
   ├── CryptoEngine            (Ed25519, X25519, ML-KEM-768, ML-DSA-65, AEAD, HKDF, Argon2id)
   ├── SessionManager          (Noise IK + Double Ratchet lifecycle)
   │   ├── NoiseState          (hybrid Noise IK handshake)
   │   ├── RatchetSession      (hybrid Double Ratchet with KEM augmentation)
   │   └── SessionStore        (SQLCipher-encrypted persistence)
   ├── SealedEnvelope          (v2: recipient-bound AAD, envelope-id replay protection)
-  ├── ChatController          (orchestration, control-message routing)
+  ├── ChatController          (orchestration, dispatchSealedPayload, control routing)
+  │   ├── SessionSealer       (single choke point for sealForPeer + safety numbers)
+  │   ├── GroupProtocol       (fan-out + roster authorization + per-group seq)
+  │   └── FileProtocol        (sendFile / consent flow / per-transfer key state)
   ├── FileTransferManager     (streamed chunk encryption, disk-backed partials, resumption)
   ├── RelayClient             (WebSocket, anonymous POST send, padding, jitter, cover)
   ├── OnionWrap               (NaCl Box multi-hop layering)
   ├── SqlCipherDb             (AES-256 encrypted SQLite wrapper)
+  ├── IWebSocket / IHttpClient (transport interfaces — Qt impl on desktop,
+  │                            URLSession impl on iOS)
   └── peer2pear.h             (C FFI for mobile / third-party clients)
 
 relay-go/                     ← reference Go relay (single binary)
@@ -178,8 +193,13 @@ while keeping node hosting as a single static binary.
 | [liboqs](https://openquantumsafe.org/) | Post-quantum primitives (ML-KEM-768, ML-DSA-65) |
 | [msquic](https://github.com/microsoft/msquic) | Optional: QUIC transport for direct P2P (`-DPEER2PEAR_P2P=ON`) |
 | [libnice](https://libnice.freedesktop.org/) | Optional: ICE/STUN/TURN for direct P2P |
+| [qrcodegen](https://www.nayuki.io/page/qr-code-generator-library) | Vendored: QR rendering for Edit Profile (desktop only) |
 
-Client dependencies are managed via [vcpkg](https://vcpkg.io/). SQLCipher is vendored in `third_party/sqlcipher/` (amalgamation) so no system install is required — the repo compiles it from source against the OpenSSL that vcpkg pulls in.
+Client dependencies are managed via [vcpkg](https://vcpkg.io/). SQLCipher (`third_party/sqlcipher/`) and qrcodegen (`third_party/qrcodegen/`) are vendored — no system install required. The repo compiles SQLCipher from source against the OpenSSL that vcpkg pulls in transitively via liboqs.
+
+### iOS
+
+In addition to the core library, the iOS app links **AVFoundation** (camera capture for QR scanning) and uses Apple's built-in **CoreImage** for QR rendering. Both are SDK frameworks — no third-party deps beyond what `core/` already needs.
 
 ### Go relay
 
@@ -210,6 +230,31 @@ cmake --build build
 ```
 
 Direct P2P (QUIC over ICE) is optional and off by default. Enable with `-DPEER2PEAR_P2P=ON`.
+
+### iOS
+
+Cross-compiles `libpeer2pear-core.a` for arm64 simulator + arm64 device, then xcodegen generates `ios/Peer2Pear.xcodeproj` from the committed `ios/project.yml`. Full setup steps (including Apple Developer Team ID config for on-device builds) are in [`ios/README.md`](ios/README.md). Quick start:
+
+```bash
+./setup.sh                # bootstraps vcpkg (one-time)
+./build-ios.sh --both     # builds the static core for sim + device
+cd ios && ./generate.sh   # regenerates the .xcodeproj from project.yml
+open Peer2Pear.xcodeproj
+```
+
+iOS is relay-only (`PEER2PEAR_P2P=OFF`); the core is built Qt-free (`WITH_QT_CORE=OFF`) so no Qt is needed in the iOS dependency chain.
+
+## Testing
+
+The core library ships a GoogleTest suite of 176 cases across 13 binaries — crypto primitives, Noise/ratchet/sealed-envelope round trips, persistence (SQLCipher), the per-module security gates (SessionSealer / GroupProtocol / FileProtocol), end-to-end two-client scenarios over a mock relay, the C FFI surface, and relay cover-traffic timing. Tests build by default on desktop (`BUILD_TESTS=ON`) and are skipped on iOS / Android cross-compiles.
+
+```bash
+cmake --build build              # builds the test binaries alongside the app
+ctest --test-dir build           # runs all 176 cases (~90 s on M-series Mac)
+ctest --test-dir build -R Group  # filter by name regex
+```
+
+The Go relay has its own `go test` suite (40+ cases under `relay-go/`) covering the L1 native-TLS path, onion forwarding, presence, and the connection-replacement race. Run with `cd relay-go && go test ./...`.
 
 ## Security properties
 
