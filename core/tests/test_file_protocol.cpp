@@ -74,12 +74,12 @@ protected:
 
         s_meCrypto = std::make_unique<CryptoEngine>();
         s_meCrypto->setDataDir(s_meDir);
-        s_meCrypto->setPassphrase("fp-test-me");
+        s_meCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_meCrypto->ensureIdentity());
 
         s_peerCrypto = std::make_unique<CryptoEngine>();
         s_peerCrypto->setDataDir(s_peerDir);
-        s_peerCrypto->setPassphrase("fp-test-peer");
+        s_peerCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_peerCrypto->ensureIdentity());
 
         s_peerId = CryptoEngine::toBase64Url(s_peerCrypto->identityPub());

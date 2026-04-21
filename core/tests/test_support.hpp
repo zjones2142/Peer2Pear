@@ -39,4 +39,21 @@ inline std::string makeTempDir(const char* tag) {
     return path;
 }
 
+// Shared GoogleTest fixture passphrase.
+//
+// Used to seed CryptoEngine identities for the test suites.  Passphrases
+// unlock the local identity.json (Argon2id → master key → SQLCipher key
+// + identity-unlock subkey via HKDF); they never enter the wire protocol.
+// Each test fixture writes to its own temp directory under
+// `std::filesystem::temp_directory_path()`, torn down at suite end, so a
+// shared passphrase across parties is safe — the resulting on-disk keys
+// are independent because the per-identity Argon2 salt differs.
+//
+// ggshield-ignore — the literal name + the fact that this is the ONLY
+// passphrase any test fixture ever uses makes it self-evidently a test
+// constant, not a real secret.  GitGuardian's "Generic Password" heuristic
+// flags string args to setPassphrase; centralizing here lets us annotate
+// once instead of 1×per call site.
+inline constexpr const char* kTestPassphrase = "p2p-tests-only-not-a-real-secret";  // ggshield-ignore
+
 }  // namespace p2p_test

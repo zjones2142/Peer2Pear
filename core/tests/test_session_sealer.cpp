@@ -76,12 +76,12 @@ protected:
 
         s_meCrypto = std::make_unique<CryptoEngine>();
         s_meCrypto->setDataDir(s_meDir);
-        s_meCrypto->setPassphrase("sealer-test-me");
+        s_meCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_meCrypto->ensureIdentity());
 
         s_peerCrypto = std::make_unique<CryptoEngine>();
         s_peerCrypto->setDataDir(s_peerDir);
-        s_peerCrypto->setPassphrase("sealer-test-peer");
+        s_peerCrypto->setPassphrase(p2p_test::kTestPassphrase);
         ASSERT_NO_THROW(s_peerCrypto->ensureIdentity());
 
         s_peerIdB64u = CryptoEngine::toBase64Url(s_peerCrypto->identityPub());
