@@ -1,0 +1,16 @@
+//
+// Signing.local.xcconfig.template
+//
+// Copy this file to Signing.local.xcconfig (drop the `.template` suffix)
+// and fill in your 10-character Apple Developer Team ID below.
+//
+// Where to find your Team ID:
+//   1. Sign in at https://developer.apple.com/account
+//   2. Membership tab → look for "Team ID" (e.g. ABCD12345E)
+//   - or - in Xcode: Settings → Accounts → select your team → "Manage
+//     Certificates" sheet shows the Team ID at the top.
+//
+// The real Signing.local.xcconfig is gitignored so your Team ID stays
+// local.  Both Debug and Release configs read this file.
+
+DEVELOPMENT_TEAM = REPLACE_WITH_YOUR_10_CHAR_TEAM_ID

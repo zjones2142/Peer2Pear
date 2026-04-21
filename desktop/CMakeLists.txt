@@ -14,6 +14,7 @@ set(DESKTOP_SOURCES
     ChatNotifier.h
     QtWebSocket.hpp
     QtHttpClient.hpp
+    QrImage.cpp          QrImage.hpp
     databasemanager.cpp  databasemanager.h
     resources.qrc
 )
@@ -64,6 +65,7 @@ endif()
 
 target_link_libraries(Peer2Pear PRIVATE
     peer2pear-core
+    qrcodegen
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
     Qt${QT_VERSION_MAJOR}::WebSockets

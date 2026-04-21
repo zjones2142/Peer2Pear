@@ -100,6 +100,10 @@ message(STATUS "SQLCipher: vendored amalgamation "
 # ── Subdirectories ────────────────────────────────────────────────────────────
 add_subdirectory(core)      # libpeer2pear-core (static library)
 if(BUILD_DESKTOP)
+    # qrcodegen — Nayuki's MIT-licensed C++ QR encoder, used only by the
+    # desktop Edit Profile dialog.  iOS uses CIFilter.qrCodeGenerator, so
+    # we don't pay the static-lib cost on mobile builds.
+    add_subdirectory(third_party/qrcodegen)
     add_subdirectory(desktop)   # Peer2Pear desktop executable
 endif()
 

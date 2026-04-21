@@ -58,6 +58,20 @@ targets:
         NSLocalNetworkUsageDescription: >-
           Peer2Pear may use your local network to establish direct peer-to-peer
           connections for faster, more private messaging.
+        # QRScannerView opens AVCaptureSession to read peer-ID QR codes from
+        # MyKeyView on a counterpart device.  iOS hard-aborts capture-session
+        # start without this string.
+        NSCameraUsageDescription: >-
+          Peer2Pear uses the camera to scan other users' QR codes so you can
+          add them as contacts without typing a 43-character key.
+
+    # Code signing config lives in an xcconfig so per-developer Team IDs
+    # never enter the committed pbxproj.  See ios/README.md for the
+    # "copy template → fill in Team ID" first-time setup; before that,
+    # builds fail at link/sign time with a "no team selected" error.
+    configFiles:
+      Debug:   Peer2Pear/Configs/Signing.xcconfig
+      Release: Peer2Pear/Configs/Signing.xcconfig
 
     settings:
       base:
@@ -100,3 +114,5 @@ targets:
       - sdk: Foundation.framework
       - sdk: Security.framework
       - sdk: SwiftUI.framework
+      # AVFoundation backs QRScannerView's AVCaptureMetadataOutput.
+      - sdk: AVFoundation.framework

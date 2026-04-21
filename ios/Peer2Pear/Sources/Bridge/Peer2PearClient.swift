@@ -1,10 +1,57 @@
 import Foundation
 import Combine
 
+// MARK: - Persistent UI-state snapshot
+// Groups, group avatars, and message history live here across app
+// launches.  The core's own SQLCipher DB covers identity + ratchet
+// sessions separately; this snapshot is just the iOS-side @Published
+// surface so the user doesn't see an empty chat list on every restart.
+//
+// Storage: JSON file at <docs>/peer2pear-ui-state.json.  Written with
+// .completeFileProtection so iOS encrypts it at rest while the device
+// is locked (matches the at-rest posture of identity.json + the
+// SQLCipher DB).
+//
+// Not persisted (intentional): peerPresence (transient), keyChanges
+// (session-scoped warnings), pendingFileRequests (re-arrive on
+// reconnect), transfers (FileTransferManager owns ground truth and
+// re-emits progress on resume), statusMessage / isConnected /
+// myPeerId (derived).
+final class Peer2PearStore {
+    private let url: URL
+
+    struct Snapshot: Codable {
+        var groups:        [String: P2PGroup]
+        var groupAvatars:  [String: String]
+        var groupMessages: [P2PGroupMessage]
+        var messages:      [P2PMessage]
+    }
+
+    init(documentDir: String) {
+        url = URL(fileURLWithPath: documentDir)
+            .appendingPathComponent("peer2pear-ui-state.json")
+    }
+
+    func load() -> Snapshot? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        return try? dec.decode(Snapshot.self, from: data)
+    }
+
+    func save(_ snap: Snapshot) {
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        guard let data = try? enc.encode(snap) else { return }
+        // Atomic write so a crash mid-save doesn't truncate the file.
+        try? data.write(to: url, options: [.atomic, .completeFileProtection])
+    }
+}
+
 // MARK: - Event data models
 
 /// Message received from a peer.
-struct P2PMessage: Identifiable {
+struct P2PMessage: Identifiable, Codable {
     let id: String       // msgId
     let from: String     // peer ID (base64url)
     let text: String
@@ -12,7 +59,7 @@ struct P2PMessage: Identifiable {
 }
 
 /// Group message — carries groupId + member list alongside the text.
-struct P2PGroupMessage: Identifiable {
+struct P2PGroupMessage: Identifiable, Codable {
     let id: String       // msgId
     let from: String
     let groupId: String
@@ -27,7 +74,7 @@ struct P2PGroupMessage: Identifiable {
 /// derived from inbound messages + locally-created groups.  `memberIds`
 /// includes the peers you send to; your own peerId is NOT in the list
 /// (self-filtering is handled in the core when fanning out).
-struct P2PGroup: Identifiable {
+struct P2PGroup: Identifiable, Codable {
     let id: String         // groupId — a UUID chosen by the creator
     var name: String
     var memberIds: [String]
@@ -172,6 +219,11 @@ final class Peer2PearClient: ObservableObject {
     private var ws: WebSocketAdapter!
     private var http: HttpAdapter!
 
+    // Persistent UI-state — bound after `start()` once we know the
+    // data dir.  See Peer2PearStore for what gets persisted vs. not.
+    private var store: Peer2PearStore?
+    private var saveCancellable: AnyCancellable?
+
     // MARK: - Lifecycle
 
     init() {
@@ -245,8 +297,44 @@ final class Peer2PearClient: ObservableObject {
             return
         }
         myPeerId = String(cString: p2p_my_id(rawContext))
+
+        // Restore persisted UI state.  Do this BEFORE connectToRelay so
+        // setKnownGroupMembers replays the H2 roster gate before any
+        // inbound control messages arrive on the new socket.
+        store = Peer2PearStore(documentDir: dataDir)
+        if let snap = store?.load() {
+            groups        = snap.groups
+            groupAvatars  = snap.groupAvatars
+            groupMessages = snap.groupMessages
+            messages      = snap.messages
+            // Replay every known group's roster to the core so inbound
+            // group_rename / group_avatar / group_leave / group_member_update
+            // from existing members are admitted.  Without this, all
+            // control messages drop after restart until a fresh group_msg
+            // bootstraps the roster.
+            for group in snap.groups.values {
+                setKnownGroupMembers(groupId: group.id,
+                                      memberPeerIds: group.memberIds)
+            }
+        }
+
+        // Auto-save on any persisted-state change, debounced so a burst
+        // of message arrivals coalesces into one write.
+        saveCancellable = objectWillChange
+            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in self?.persistSnapshot() }
+
         p2p_set_relay_url(rawContext, relayUrl)
         p2p_connect(rawContext)
+    }
+
+    private func persistSnapshot() {
+        guard let store else { return }
+        store.save(.init(
+            groups:        groups,
+            groupAvatars:  groupAvatars,
+            groupMessages: groupMessages,
+            messages:      messages))
     }
 
     func stop() {

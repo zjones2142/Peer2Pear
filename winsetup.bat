@@ -14,6 +14,10 @@ REM SQLCipher is NOT installed via winget/vcpkg -- the repo vendors the
 REM amalgamation in third_party/sqlcipher/ and core/ builds it from source
 REM against the OpenSSL that vcpkg pulls in.
 REM
+REM qrcodegen (Project Nayuki, MIT) is also vendored in third_party/qrcodegen/
+REM for the desktop Edit Profile QR preview.  Single static library, no deps.
+REM iOS uses CIFilter.qrCodeGenerator natively and doesn't link it.
+REM
 REM Idempotent -- re-running after a successful setup is a no-op.
 REM
 REM First-time download is ~10 GB.  Budget an hour with a good connection.

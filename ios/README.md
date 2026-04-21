@@ -54,6 +54,56 @@ xcodebuild -project Peer2Pear.xcodeproj -scheme Peer2Pear \
            -sdk iphonesimulator -arch arm64 -configuration Debug
 ```
 
+## Code signing (for device builds)
+
+Simulator builds work out of the box — they don't need any code signing.
+Running on a physical device or shipping to TestFlight requires an Apple
+Developer Program membership ($99/year individual, $299/year organization).
+
+**One-time setup:**
+
+1. **Sign up for Apple Developer Program** at
+   <https://developer.apple.com/programs/enroll/>.  The Personal Team
+   tier (free) is enough for 7-day on-device testing if you're not ready
+   to pay yet — for TestFlight or App Store distribution you need the
+   paid tier.
+
+2. **Sign in to Xcode** with your Apple ID:
+   `Xcode → Settings → Accounts → +` → enter Apple ID → wait for the
+   team list to populate.
+
+3. **Find your Team ID** (10 characters, looks like `ABCD12345E`):
+   - Apple Developer portal: <https://developer.apple.com/account> →
+     Membership tab → "Team ID" field, OR
+   - Xcode → Settings → Accounts → select your team → "Manage Certificates"
+     sheet header.
+
+4. **Wire the Team ID into the build:**
+   ```bash
+   cd ios/Peer2Pear/Configs
+   cp Signing.local.xcconfig.template Signing.local.xcconfig
+   # edit Signing.local.xcconfig, replace REPLACE_WITH_YOUR_10_CHAR_TEAM_ID
+   # with your actual ID — file is gitignored, won't end up in the repo.
+   ```
+
+5. **Build for device:**
+   - Open `ios/Peer2Pear.xcodeproj` in Xcode
+   - Plug in your iPhone, unlock it, accept the "Trust" prompt
+   - Select your device in the run-target dropdown
+   - Hit ⌘R
+
+   Xcode will auto-create a development provisioning profile for the
+   `com.peer2pear.Peer2Pear` bundle ID under your team the first time
+   you build for device.  No manual portal trips needed — that's the
+   whole point of `CODE_SIGN_STYLE = Automatic` (set in
+   `Configs/Signing.xcconfig`).
+
+**Why xcconfig instead of editing project.yml directly?**
+Different developers / CI runners use different Team IDs.  An xcconfig
+keeps everyone's local Team ID out of the committed YAML, lets you
+flip it without re-running `generate.sh`, and survives fresh repo
+clones because the include is optional (`#include?`).
+
 ## Files
 
 ```
@@ -62,12 +112,19 @@ ios/
   generate.sh                                  # creates .xcodeproj
   README.md                                    # this file
   Peer2Pear/
+    Configs/
+      Signing.xcconfig                         # committed shell, optionally
+                                               # includes Signing.local.xcconfig
+      Signing.local.xcconfig.template          # copy to Signing.local.xcconfig
+                                               # and add your Team ID
     Sources/
       App/Peer2PearApp.swift                   # @main entry point
       Views/
         OnboardingView.swift                   # first-run: passphrase + relay
         ChatListView.swift                     # contact list + conversations
         ConversationView.swift                 # message bubbles + send bar
+        MyKeyView.swift                        # show own peer ID + QR + Copy
+        QRScannerView.swift                    # AVFoundation-backed QR scanner
       Bridge/
         Peer2PearClient.swift                  # Swift wrapper around C API
         Peer2Pear-Bridging-Header.h            # exposes peer2pear.h to Swift
@@ -100,22 +157,14 @@ What works today:
 - App boots, bridges Swift ↔ C, WebSocket adapter uses URLSessionWebSocketTask.
 
 What's scaffolded but incomplete:
-- `Peer2PearClient.setupCallbacks()` only wires 4 of the 12 C callbacks.
-  Missing: group messages, avatars, group rename/avatar/member-update,
-  file progress, file accept request, file canceled/delivered/blocked.
-  Add them by mirroring the pattern used for `p2p_set_on_message`.
 - Onboarding view does identity setup but doesn't persist the last
   relay URL yet.
-- No contact QR code scanning / sharing — user manually pastes the 43-char
-  peer ID.
 
 What's deferred:
 - **P2P transport on iOS.** `PEER2PEAR_P2P=OFF` because libnice / msquic /
   GLib haven't been ported to iOS in the repo.  iOS is relay-only for now;
   QuicConnection is Qt-free (Phase 7d) and could run on iOS in principle
   once the dependency chain is ported.
-- **Code signing for device.** Simulator runs under "Sign to Run Locally";
-  physical devices need an Apple Developer team to be added.
 
 ## Troubleshooting
 

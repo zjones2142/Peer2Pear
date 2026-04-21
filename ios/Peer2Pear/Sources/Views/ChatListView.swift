@@ -4,6 +4,7 @@ struct ChatListView: View {
     @ObservedObject var client: Peer2PearClient
     @State private var showAddContact = false
     @State private var showNewGroup = false
+    @State private var showMyKey = false
     @State private var newContactId = ""
 
     /// 1:1 conversations keyed by the other peer's ID.
@@ -63,6 +64,14 @@ struct ChatListView: View {
                         .foregroundStyle(client.isConnected ? .green : .red)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showMyKey = true
+                    } label: {
+                        Image(systemName: "person.crop.circle")
+                    }
+                    .accessibilityLabel("My key")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button {
                             showAddContact = true
@@ -79,21 +88,14 @@ struct ChatListView: View {
                     }
                 }
             }
-            .alert("New Chat", isPresented: $showAddContact) {
-                TextField("Peer ID", text: $newContactId)
-                    .autocapitalization(.none)
-                Button("Cancel", role: .cancel) { newContactId = "" }
-                Button("Chat") {
-                    if !newContactId.isEmpty {
-                        // Navigate to conversation with this peer
-                        newContactId = ""
-                    }
-                }
-            } message: {
-                Text("Enter the peer's public key or scan their QR code")
+            .sheet(isPresented: $showAddContact) {
+                AddContactSheet(newContactId: $newContactId)
             }
             .sheet(isPresented: $showNewGroup) {
                 NewGroupSheet(client: client)
+            }
+            .sheet(isPresented: $showMyKey) {
+                MyKeyView(client: client)
             }
             .overlay {
                 if isEmpty {
@@ -264,6 +266,89 @@ struct NewGroupSheet: View {
                     .disabled(groupName.trimmingCharacters(in: .whitespaces).isEmpty
                               || selectedPeers.isEmpty)
                 }
+            }
+        }
+    }
+}
+
+// MARK: - Add-contact sheet
+// Paste OR scan paths land in the same `newContactId` binding so the
+// caller doesn't care which one the user took.  Sheet (vs alert) so we
+// can host the QR scanner as a full-screen presentation inside it.
+
+struct AddContactSheet: View {
+    @Binding var newContactId: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var showScanner = false
+    @State private var scanError: String?
+
+    private var isValid: Bool {
+        // The 43-char base64url check matches the desktop `isValidPublicKey`.
+        // A trimmed input is the canonical form the protocol accepts.
+        let s = newContactId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.count == 43
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Paste peer's 43-char key", text: $newContactId, axis: .vertical)
+                        .font(.system(.footnote, design: .monospaced))
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        .lineLimit(2...4)
+                } header: {
+                    Text("Peer ID")
+                } footer: {
+                    Text("Either paste the base64url key here or scan their QR code.")
+                }
+
+                Section {
+                    Button {
+                        scanError = nil
+                        showScanner = true
+                    } label: {
+                        Label("Scan QR Code", systemImage: "qrcode.viewfinder")
+                    }
+                    if let scanError {
+                        Text(scanError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle("New Chat")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        newContactId = ""
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Chat") {
+                        newContactId = newContactId.trimmingCharacters(in: .whitespacesAndNewlines)
+                        dismiss()
+                    }
+                    .disabled(!isValid)
+                }
+            }
+            .fullScreenCover(isPresented: $showScanner) {
+                QRScannerView(
+                    onScan: { raw in
+                        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if trimmed.count == 43 {
+                            newContactId = trimmed
+                            showScanner = false
+                        } else {
+                            scanError = "That QR code isn't a Peer2Pear key (\(trimmed.count) chars, need 43)."
+                            showScanner = false
+                        }
+                    },
+                    onCancel: { showScanner = false }
+                )
             }
         }
     }

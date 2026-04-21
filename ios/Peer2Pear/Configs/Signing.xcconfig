@@ -1,0 +1,29 @@
+//
+// Signing.xcconfig — committed shell that pulls in your local team config.
+//
+// The committed half of the signing setup. Copy
+// Signing.local.xcconfig.template → Signing.local.xcconfig and fill in
+// your DEVELOPMENT_TEAM there. That local file is gitignored so your
+// 10-character Team ID never ends up in the repo.
+//
+// The `?` after #include makes the include OPTIONAL — if the local file
+// doesn't exist (e.g. first-time clone before the developer ran the setup),
+// the build still configures successfully; it'll just fail at the actual
+// signing step with Xcode's standard "no team selected" error, which is
+// the right place to surface that.
+//
+// Why xcconfig instead of editing project.yml directly:
+//   1. Different developers / CI runners use different Team IDs.
+//   2. We never want a real Team ID in the committed pbxproj/yaml.
+//   3. xcconfig changes take effect WITHOUT regenerating the pbxproj —
+//      flip a Team ID without re-running ios/generate.sh.
+
+#include? "Signing.local.xcconfig"
+
+// Defaults that survive even when the local file is empty.
+// "Apple Development" replaces the older "iPhone Developer" identity name
+// (Xcode 11+).  CODE_SIGN_STYLE = Automatic lets Xcode manage the
+// provisioning profiles via the team you signed into in
+// Xcode → Settings → Accounts.
+CODE_SIGN_STYLE = Automatic
+CODE_SIGN_IDENTITY = Apple Development
