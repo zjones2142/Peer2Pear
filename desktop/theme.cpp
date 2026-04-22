@@ -75,9 +75,17 @@ QString ThemeManager::buildGlobalStyleSheet(const Theme& t) const {
     // Selectors target widget types, not object names — the idea is
     // to establish a sensible default for any unstyled widget in the
     // app.  Per-widget stylesheets still override these where they
-    // exist (e.g., ChatView bubbles, which remain dark for now).
+    // exist.
+    //
+    // NOTE: do NOT set `QWidget { background-color: ... }` universally
+    // — it leaks into custom item widgets (chat list row containers,
+    // list item widgets inside dialogs) and paints them at the
+    // main-window bg while their parent paints at card/surface color,
+    // producing visible rectangles around every row.  Only set the
+    // foreground (color) on the universal rule; bg is set by the
+    // specific widget-type rules below + each widget's own sheet.
     return QString(
-        "QWidget { background-color: %1; color: %2; }"
+        "QWidget { color: %2; }"
         "QMainWindow { background-color: %1; }"
         "QScrollArea { background-color: %1; border: none; }"
         "QLabel { background: transparent; color: %2; }"

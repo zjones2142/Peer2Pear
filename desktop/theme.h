@@ -29,6 +29,10 @@ struct Theme {
     QColor bg;             // window / top-level background
     QColor bgAlt;          // secondary background (scroll areas, list rows)
     QColor card;           // card surface sitting on bg
+    QColor surface;        // raised surface ABOVE card — other-party bubbles,
+                            // file thumbnails.  Distinct from card so bubbles
+                            // visibly separate from the scroll bg instead of
+                            // fading into it.
     QColor border;         // thin separators / card outlines
     QColor divider;        // horizontal rules inside cards
     QColor textPrimary;    // body text, titles
@@ -38,6 +42,9 @@ struct Theme {
     QColor accentSoft;     // checked-state background tint for the accent
     QColor dangerText;     // warnings / destructive button text
     QColor dangerBg;       // warnings / destructive button background
+    QColor warningText;    // attention-needed but non-destructive (e.g.
+                            // safety-number mismatch banner).  Orange-ish;
+                            // distinct from dangerText (red).
 };
 
 namespace Themes {
@@ -52,6 +59,7 @@ inline Theme dark() {
     t.bg             = QColor("#0d0d0d");
     t.bgAlt          = QColor("#111111");
     t.card           = QColor("#111111");
+    t.surface        = QColor("#222222");
     t.border         = QColor("#1e1e1e");
     t.divider        = QColor("#1e1e1e");
     t.textPrimary    = QColor("#cccccc");
@@ -61,6 +69,7 @@ inline Theme dark() {
     t.accentSoft     = QColor("#1f2e1f");
     t.dangerText     = QColor("#cc5555");
     t.dangerBg       = QColor("#2e1a1a");
+    t.warningText    = QColor("#e6a33a");
     return t;
 }
 
@@ -73,6 +82,7 @@ inline Theme light() {
     t.bg             = QColor("#f4f4f5");
     t.bgAlt          = QColor("#ffffff");
     t.card           = QColor("#ffffff");
+    t.surface        = QColor("#ececec");
     t.border         = QColor("#dcdcdc");
     t.divider        = QColor("#e5e5e5");
     t.textPrimary    = QColor("#222222");
@@ -82,6 +92,7 @@ inline Theme light() {
     t.accentSoft     = QColor("#e8f5e9");
     t.dangerText     = QColor("#b00020");
     t.dangerBg       = QColor("#fde3e3");
+    t.warningText    = QColor("#b25900");
     return t;
 }
 

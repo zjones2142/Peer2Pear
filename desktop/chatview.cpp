@@ -1,5 +1,7 @@
 #include "chatview.h"
 #include "QrImage.hpp"
+#include "theme.h"
+#include "theme_styles.h"
 #include "ui_mainwindow.h"
 
 #include <algorithm>
@@ -167,27 +169,15 @@ static QString processText(const QString &text, const QFontMetrics &fm, int maxW
     return out.join(' ');
 }
 
-// ── Shared dialog stylesheet ──────────────────────────────────────────────────
-static const char *kDlgStyle =
-    "QDialog { background-color: #111111; color: #f0f0f0; }"
-    "QLabel { color: #aaaaaa; font-size: 12px; }"
-    "QLabel#dlgTitle { color: #ffffff; font-size: 15px; font-weight: bold; }"
-    "QLineEdit { background-color: #1a1a1a; color: #f0f0f0; border: 1px solid #2a2a2a;"
-    "  border-radius: 8px; padding: 8px 12px; font-size: 13px; }"
-    "QLineEdit:focus { border: 1px solid #3a9e48; }"
-    "QListWidget { background-color: #1a1a1a; color: #dddddd; border: 1px solid #2a2a2a;"
-    "  border-radius: 8px; font-size: 13px; }"
-    "QListWidget::item { padding: 6px 10px; border-bottom: 1px solid #222222; }"
-    "QListWidget::item:selected { background-color: #162818; color: #ffffff; }"
-    "QPushButton { background-color: #1a2e1c; color: #5dd868; border: 1px solid #2e5e30;"
-    "  border-radius: 8px; font-size: 13px; padding: 8px 16px; }"
-    "QPushButton:hover { background-color: #223a24; border-color: #3a9e48; }"
-    "QPushButton#saveBtn   { background-color: #2e8b3a; color: #ffffff; border: none; }"
-    "QPushButton#saveBtn:hover { background-color: #38a844; }"
-    "QPushButton#cancelBtn { background-color: #1e1e1e; color: #888888; border: 1px solid #2a2a2a; }"
-    "QPushButton#cancelBtn:hover { background-color: #252525; color: #cccccc; }"
-    "QPushButton#removeKeyBtn { background-color: #2e1a1a; color: #cc5555; border: 1px solid #5e2e2e; }"
-    "QPushButton#removeKeyBtn:hover { background-color: #3a2020; }";
+// Applies the theme-aware dialog stylesheet + tags the dialog so the
+// classifier picks it up on a live theme flip while the dialog is
+// open.  Replaces the previous `static const char* kDlgStyle` which
+// was hardcoded dark.
+static inline void applyDialogStyle(QWidget* dlg) {
+    dlg->setProperty("p2pRole", QLatin1String("dialog"));
+    dlg->setStyleSheet(themeStyles::dialogCss(
+        ThemeManager::instance().current()));
+}
 
 // Opens a modal dialog to edit a contact name + list of public keys.
 // nameInOut and keysInOut are updated on Save; returns false on Cancel.
@@ -206,7 +196,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
-    dlg.setStyleSheet(kDlgStyle);
+    applyDialogStyle(&dlg);
     dlg.setMinimumWidth(420);
     dlg.setModal(true);
 
@@ -257,10 +247,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
         auto *changePhotoBtn = new QPushButton("Change Photo", &dlg);
         changePhotoBtn->setAutoDefault(false);
-        changePhotoBtn->setStyleSheet(
-            "QPushButton{background:#111;border:1px solid #333;color:#f0f0f0;"
-            "border-radius:8px;padding:8px 14px;font-size:13px;}"
-            "QPushButton:hover{background:#1a1a1a;border:1px solid #555;}");
+        themeStyles::applyRole(changePhotoBtn, "dialogNeutralBtn",
+            themeStyles::dialogNeutralBtnCss(ThemeManager::instance().current()));
 
         // Inline photo options — toggled by changePhotoBtn
         auto *photoOptionsGroup = new QWidget(&dlg);
@@ -271,10 +259,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
         auto *pUpload = new QPushButton("Upload Photo", photoOptionsGroup);
         pUpload->setAutoDefault(false);
-        pUpload->setStyleSheet(
-            "QPushButton{background:#111;border:1px solid #1e1e1e;color:#f0f0f0;"
-            "border-radius:8px;padding:8px;font-size:13px;}"
-            "QPushButton:hover{background:#1a1a1a;border:1px solid #333;}");
+        themeStyles::applyRole(pUpload, "dialogNeutralBtn",
+            themeStyles::dialogNeutralBtnCss(ThemeManager::instance().current()));
         QObject::connect(pUpload, &QPushButton::clicked, [&]() {
             const QString path = QFileDialog::getOpenFileName(
                 &dlg, "Choose Photo", QString(),
@@ -389,7 +375,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         QObject::connect(addMemberBtn, &QPushButton::clicked, [&]() {
             QDialog picker(&dlg);
             picker.setWindowTitle("Add Member");
-            picker.setStyleSheet(kDlgStyle);
+            applyDialogStyle(&picker);
             picker.setMinimumWidth(340);
             auto *pLayout = new QVBoxLayout(&picker);
             pLayout->setSpacing(12);
@@ -484,11 +470,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                 controller->safetyNumber(peerIdStd));
             auto *numLbl = new QLabel(number, &dlg);
             numLbl->setTextInteractionFlags(Qt::TextSelectableByMouse);
-            numLbl->setStyleSheet(
-                "QLabel{color:#f0f0f0;background:#111;border:1px solid #2a2a2a;"
-                "border-radius:8px;padding:10px 14px;"
-                "font-family:'Menlo','Monaco',monospace;font-size:13px;"
-                "letter-spacing:0.5px;}");
+            themeStyles::applyRole(numLbl, "safetyNumber",
+                themeStyles::safetyNumberCss(ThemeManager::instance().current()));
             numLbl->setWordWrap(true);
             root->addWidget(numLbl);
 
@@ -498,24 +481,25 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             verifyBtn->setAutoDefault(false);
 
             auto refresh = [controller, peerIdStd, statusLbl, verifyBtn]() {
+                const Theme& th = ThemeManager::instance().current();
                 const auto t = controller->peerTrust(peerIdStd);
                 if (t == ChatController::PeerTrust::Verified) {
                     statusLbl->setText("✓ Verified — compared out of band");
-                    statusLbl->setStyleSheet(
-                        "QLabel{color:#5dd868;font-size:12px;background:transparent;}");
+                    themeStyles::applyRole(statusLbl, "statusVerified",
+                        themeStyles::statusVerifiedCss(th));
                     verifyBtn->setText("Unverify");
                 } else if (t == ChatController::PeerTrust::Mismatch) {
                     statusLbl->setText(
                         "! Safety number changed — either you or they reinstalled. "
                         "Compare again before continuing.");
-                    statusLbl->setStyleSheet(
-                        "QLabel{color:#e6a33a;font-size:12px;background:transparent;}");
+                    themeStyles::applyRole(statusLbl, "statusWarning",
+                        themeStyles::statusWarningCss(th));
                     verifyBtn->setText("Re-verify");
                 } else {
                     statusLbl->setText("Not yet verified — compare this number "
                                        "with your contact out of band.");
-                    statusLbl->setStyleSheet(
-                        "QLabel{color:#888;font-size:12px;background:transparent;}");
+                    themeStyles::applyRole(statusLbl, "statusUnverified",
+                        themeStyles::statusUnverifiedCss(th));
                     verifyBtn->setText("Mark as Verified");
                 }
             };
@@ -523,10 +507,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             statusLbl->setWordWrap(true);
             root->addWidget(statusLbl);
 
-            verifyBtn->setStyleSheet(
-                "QPushButton{background:#111;border:1px solid #333;color:#f0f0f0;"
-                "border-radius:8px;padding:8px 14px;font-size:13px;}"
-                "QPushButton:hover{background:#1a1a1a;border:1px solid #555;}");
+            themeStyles::applyRole(verifyBtn, "dialogNeutralBtn",
+                themeStyles::dialogNeutralBtnCss(ThemeManager::instance().current()));
             QObject::connect(verifyBtn, &QPushButton::clicked,
                 [controller, peerIdStd, refresh]() {
                     if (controller->peerTrust(peerIdStd)
@@ -556,15 +538,17 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         root->addWidget(actionSep);
 
         auto *actionRow = new QHBoxLayout;
+        // Built from the active theme so destructive buttons in
+        // light mode render as light-red pills with dark-red text
+        // (Theme.dangerBg / Theme.dangerText) instead of the dark
+        // brown-red the previous hardcoded sheet baked in.
         const QString destructiveStyle =
-            "QPushButton { background-color: #2e1a1a; color: #cc5555;"
-            "  border: 1px solid #5e2e2e; border-radius: 8px; padding: 8px 16px; }"
-            "QPushButton:hover { background-color: #3a2020; }";
+            themeStyles::destructiveBtnCss(ThemeManager::instance().current());
 
         // Block — contacts only
         if (!isGroup) {
             auto *blockBtn = new QPushButton(isBlocked ? "Unblock Contact" : "Block Contact", &dlg);
-            blockBtn->setStyleSheet(destructiveStyle);
+            themeStyles::applyRole(blockBtn, "destructiveBtn", destructiveStyle);
             actionRow->addWidget(blockBtn);
             QObject::connect(blockBtn, &QPushButton::clicked, [&]() {
                 const QString msg = isBlocked
@@ -579,7 +563,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
             // Reset Session — wipe ratchet state to force fresh handshake.
             auto *resetBtn = new QPushButton("Reset Session", &dlg);
-            resetBtn->setStyleSheet(destructiveStyle);
+            themeStyles::applyRole(resetBtn, "destructiveBtn", destructiveStyle);
             actionRow->addWidget(resetBtn);
             QObject::connect(resetBtn, &QPushButton::clicked, [&]() {
                 if (QMessageBox::question(&dlg, "Reset Session",
@@ -596,7 +580,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
         // Leave — groups only
         if (isGroup) {
             auto *leaveBtn = new QPushButton("Leave Group", &dlg);
-            leaveBtn->setStyleSheet(destructiveStyle);
+            themeStyles::applyRole(leaveBtn, "destructiveBtn", destructiveStyle);
             actionRow->addWidget(leaveBtn);
             QObject::connect(leaveBtn, &QPushButton::clicked, [&]() {
                 if (QMessageBox::question(&dlg, "Leave Group",
@@ -610,7 +594,7 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
         // Remove/Delete — always shown
         auto *removeBtn = new QPushButton(isGroup ? "Delete Group" : "Remove Contact", &dlg);
-        removeBtn->setStyleSheet(destructiveStyle);
+        themeStyles::applyRole(removeBtn, "destructiveBtn", destructiveStyle);
         actionRow->addWidget(removeBtn);
         actionRow->addStretch();
         root->addLayout(actionRow);
@@ -712,6 +696,23 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
 
     // Start presence polling (check every 30 seconds)
     startPresencePolling(30000);
+
+    // Re-style chat surfaces (bubbles, sender labels, ...) on theme
+    // flips.  ThemeManager handles the qApp-wide palette + stylesheet;
+    // this call covers widgets ChatView created at runtime with their
+    // own setStyleSheet.
+    QObject::connect(&ThemeManager::instance(), &ThemeManager::themeChanged,
+                     this, [this](const Theme& t) {
+        if (m_ui && m_ui->centralwidget) {
+            themeStyles::reapplyForChildren(m_ui->centralwidget, t);
+        }
+    });
+    // Initial pass: handles whatever bubbles already landed during
+    // initChats() before the ThemeManager preference is loaded from DB.
+    if (m_ui && m_ui->centralwidget) {
+        themeStyles::reapplyForChildren(m_ui->centralwidget,
+                                         ThemeManager::instance().current());
+    }
 }
 
 bool ChatView::eventFilter(QObject *obj, QEvent *event)
@@ -796,10 +797,11 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
                     ? m_chats[i].subtitle
                     : QString("%1 of %2 members online").arg(onlineCount).arg(totalMembers);
                 m_ui->chatSubLabel->setText(statusText);
-                m_ui->chatSubLabel->setStyleSheet(
+                themeStyles::applyRole(m_ui->chatSubLabel,
+                    onlineCount > 0 ? "onlineStatus" : "offlineStatus",
                     onlineCount > 0
-                        ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
-                        : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+                        ? themeStyles::onlineStatusCss(ThemeManager::instance().current())
+                        : themeStyles::offlineStatusCss(ThemeManager::instance().current()));
             }
             continue;  // don't return — this peer may be in multiple groups
         }
@@ -831,9 +833,10 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
                                                ? "Online"
                                                : formatLastSeen(m_chats[i].lastActive);
                 m_ui->chatSubLabel->setText("● " + statusText);
-                m_ui->chatSubLabel->setStyleSheet(
-                    online ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
-                           : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
+                themeStyles::applyRole(m_ui->chatSubLabel,
+                    online ? "onlineStatus" : "offlineStatus",
+                    online ? themeStyles::onlineStatusCss(ThemeManager::instance().current())
+                           : themeStyles::offlineStatusCss(ThemeManager::instance().current()));
             }
         }
     }
@@ -1662,7 +1665,7 @@ void ChatView::onEditProfile()
     // ── Main profile dialog ───────────────────────────────────────────────────
     QDialog dlg(m_ui->centralwidget);
     dlg.setWindowTitle("Edit Profile");
-    dlg.setStyleSheet(kDlgStyle);
+    applyDialogStyle(&dlg);
     dlg.setMinimumWidth(420);
     dlg.setModal(true);
 
@@ -1702,10 +1705,8 @@ void ChatView::onEditProfile()
 
     auto *changePhotoBtn = new QPushButton("Change Photo", &dlg);
     changePhotoBtn->setAutoDefault(false);
-    changePhotoBtn->setStyleSheet(
-        "QPushButton{background:#111;border:1px solid #333;color:#f0f0f0;"
-        "border-radius:8px;padding:8px 14px;font-size:13px;}"
-        "QPushButton:hover{background:#1a1a1a;border:1px solid #555;}");
+    themeStyles::applyRole(changePhotoBtn, "dialogNeutralBtn",
+        themeStyles::dialogNeutralBtnCss(ThemeManager::instance().current()));
 
     avatarRowLayout->addWidget(avatarThumb);
     avatarRowLayout->addWidget(changePhotoBtn);
@@ -1755,10 +1756,8 @@ void ChatView::onEditProfile()
     auto *pCustom = new QPushButton("+", photoOptionsWidget);
     pCustom->setFixedSize(28, 28);
     pCustom->setAutoDefault(false);
-    pCustom->setStyleSheet(
-        "QPushButton{background:#1e1e1e;border:1px solid #555;border-radius:14px;"
-        "color:#f0f0f0;font-size:16px;font-weight:bold;}"
-        "QPushButton:hover{background:#2a2a2a;}");
+    themeStyles::applyRole(pCustom, "dialogNeutralBtn",
+        themeStyles::dialogNeutralBtnCss(ThemeManager::instance().current()));
     QObject::connect(pCustom, &QPushButton::clicked, [&]() {
         QColor c = QColorDialog::getColor(avatarColor, nullptr, "Choose Color");
         if (!c.isValid()) return;
@@ -1774,10 +1773,8 @@ void ChatView::onEditProfile()
 
     auto *pUpload = new QPushButton("Upload Photo", photoOptionsWidget);
     pUpload->setAutoDefault(false);
-    pUpload->setStyleSheet(
-        "QPushButton{background:#111;border:1px solid #1e1e1e;color:#f0f0f0;"
-        "border-radius:8px;padding:8px;font-size:13px;}"
-        "QPushButton:hover{background:#1a1a1a;border:1px solid #333;}");
+    themeStyles::applyRole(pUpload, "dialogNeutralBtn",
+        themeStyles::dialogNeutralBtnCss(ThemeManager::instance().current()));
     QObject::connect(pUpload, &QPushButton::clicked, [&]() {
         const QString path = QFileDialog::getOpenFileName(
             &dlg, "Choose Photo", QString(),
@@ -1810,17 +1807,14 @@ void ChatView::onEditProfile()
 
     auto *keyDisplay = new QLineEdit(myKey, &dlg);
     keyDisplay->setReadOnly(true);
-    keyDisplay->setStyleSheet(
-        "QLineEdit{background:#111;color:#999;border:1px solid #2a2a2a;"
-        "border-radius:8px;padding:8px 12px;font-size:12px;font-family:monospace;}");
+    themeStyles::applyRole(keyDisplay, "keyDisplay",
+        themeStyles::keyDisplayCss(ThemeManager::instance().current()));
     keyRow->addWidget(keyDisplay, 1);
 
     auto *copyBtn = new QPushButton("Copy", &dlg);
     copyBtn->setAutoDefault(false);
-    copyBtn->setStyleSheet(
-        "QPushButton{background:#1a2e1c;color:#5dd868;border:1px solid #2e5e30;"
-        "border-radius:8px;padding:8px 14px;font-size:12px;}"
-        "QPushButton:hover{background:#223a24;}");
+    themeStyles::applyRole(copyBtn, "dialogAccentBtn",
+        themeStyles::dialogAccentBtnCss(ThemeManager::instance().current()));
     QObject::connect(copyBtn, &QPushButton::clicked, [myKey, copyBtn]() {
         QApplication::clipboard()->setText(myKey);
         copyBtn->setText("Copied!");
@@ -1854,7 +1848,8 @@ void ChatView::onEditProfile()
 
     auto *keyHint = new QLabel("Share this key with contacts so they can message you. "
                                  "They can paste it or scan the QR code above.", &dlg);
-    keyHint->setStyleSheet("color:#555;font-size:11px;background:transparent;");
+    themeStyles::applyRole(keyHint, "caption11",
+        themeStyles::captionCss(ThemeManager::instance().current(), 11));
     keyHint->setWordWrap(true);
     root->addWidget(keyHint);
 
@@ -2057,7 +2052,7 @@ void ChatView::onAddContact()
     QString name; QStringList keys;
 
     QDialog dlg(m_ui->centralwidget);
-    dlg.setWindowTitle("Add Contact"); dlg.setStyleSheet(kDlgStyle);
+    dlg.setWindowTitle("Add Contact"); applyDialogStyle(&dlg);
     dlg.setMinimumWidth(420); dlg.setModal(true);
 
     auto *layout = new QVBoxLayout(&dlg);
@@ -2076,10 +2071,8 @@ void ChatView::onAddContact()
     keyRow_->addWidget(keyInput, 1);
     auto *pasteBtn  = new QPushButton("Paste", &dlg);
     pasteBtn->setAutoDefault(false);
-    pasteBtn->setStyleSheet(
-        "QPushButton{background:#1a2e1c;color:#5dd868;border:1px solid #2e5e30;"
-        "border-radius:8px;padding:8px 14px;font-size:12px;}"
-        "QPushButton:hover{background:#223a24;}");
+    themeStyles::applyRole(pasteBtn, "dialogAccentBtn",
+        themeStyles::dialogAccentBtnCss(ThemeManager::instance().current()));
     QObject::connect(pasteBtn, &QPushButton::clicked, [keyInput]() {
         // Trim whitespace/newlines that often ride along when a key is
         // copied from a chat message — saves the user a manual edit
@@ -2095,9 +2088,8 @@ void ChatView::onAddContact()
     auto *grpBtn = new QPushButton("Create Group Chat",&dlg);
     auto *can    = new QPushButton("Cancel",&dlg); can->setObjectName("cancelBtn");
     auto *sav    = new QPushButton("Save",  &dlg); sav->setObjectName("saveBtn");
-    grpBtn->setStyleSheet(
-        "QPushButton{background-color:#1a2e1c;color:#5dd868;border:1px solid #2e5e30;"
-        "border-radius:8px;padding:8px 16px;}QPushButton:hover{background-color:#223a24;}");
+    themeStyles::applyRole(grpBtn, "dialogAccentBtn",
+        themeStyles::dialogAccentBtnCss(ThemeManager::instance().current()));
     br->setSpacing(10); br->addWidget(grpBtn); br->addStretch();
     br->addWidget(can); br->addWidget(sav);
     layout->addLayout(br);
@@ -2115,7 +2107,7 @@ void ChatView::onAddContact()
                                      "Add some contacts first before creating a group."); return; }
 
         QDialog gd(m_ui->centralwidget);
-        gd.setWindowTitle("New Group Chat"); gd.setStyleSheet(kDlgStyle);
+        gd.setWindowTitle("New Group Chat"); applyDialogStyle(&gd);
         gd.setMinimumWidth(380);
         auto *gl = new QVBoxLayout(&gd); gl->setSpacing(12); gl->setContentsMargins(24,24,24,24);
         auto *gt = new QLabel("New Group Chat",&gd); gt->setObjectName("dlgTitle");
@@ -2370,10 +2362,8 @@ void ChatView::rebuildChatList()
 
         auto *editBtn = new QToolButton(row);
         editBtn->setText("✎"); editBtn->setFixedSize(28,28);
-        editBtn->setStyleSheet(
-            "QToolButton{background:transparent;border:none;color:#444444;"
-            "font-size:15px;border-radius:6px;}"
-            "QToolButton:hover{color:#5dd868;background:#1a2e1c;}");
+        themeStyles::applyRole(editBtn, "toolIconBtn",
+            themeStyles::toolIconBtnCss(ThemeManager::instance().current()));
         hl->addWidget(editBtn);
         m_ui->chatList->setItemWidget(item, row);
         connect(editBtn, &QToolButton::clicked, this, [this,i](){ onEditContact(i); });
@@ -2579,6 +2569,7 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
         auto *nameRow = new QHBoxLayout;
         nameRow->setContentsMargins(0, 0, 0, 0);
         auto *nameLbl = new QLabel(senderName, row);
+        nameLbl->setProperty("p2pRole", "senderName");
         nameLbl->setStyleSheet(
             "color: #5dd868; font-size: 11px; background: transparent; padding-left: 4px;"
             );
@@ -2598,6 +2589,12 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
     bubble->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
     bubble->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
+    // Tag BEFORE setting the stylesheet so the theme classifier can
+    // find this bubble again on every flip — classifier prefers the
+    // p2pRole property over stylesheet-content matching, which only
+    // works the first pass (once we rewrite the sheet, the original
+    // #222222 / #2e8b3a literal is gone and substring match fails).
+    bubble->setProperty("p2pRole", sent ? "bubbleSelf" : "bubbleOther");
     if (sent) {
         bubble->setStyleSheet("background-color:#2e8b3a;color:#ffffff;"
                               "border-radius:14px;padding:10px 14px;font-size:13px;");
@@ -2607,6 +2604,9 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
                               "border-radius:14px;padding:10px 14px;font-size:13px;");
         rl->addWidget(bubble); rl->addStretch();
     }
+    // Re-classify just the new row so a bubble added in light mode
+    // doesn't briefly flash dark before the next themeChanged.
+    themeStyles::reapplyForChildren(row, ThemeManager::instance().current());
     outerLayout->addLayout(rl);
 
     auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());

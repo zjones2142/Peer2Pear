@@ -85,6 +85,7 @@ private slots:
 private:
     void buildUI();
     void applyNotificationState();   // sync UI labels to m_notificationsEnabled
+    void applyDndState();            // sync UI labels to m_dndEnabled
     void applyRequireP2PState();
     QWidget *makeProfileSection();
     QWidget *makeSection(const QString &sectionTitle,

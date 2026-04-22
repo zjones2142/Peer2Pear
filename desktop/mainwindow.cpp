@@ -4,6 +4,8 @@
 #include "qt_interop.hpp"  // Qt↔std boundary helpers for CryptoEngine calls
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
 #include "peer2pear.h"     // P2P_MIN_PASSPHRASE_BYTES — single source of truth
+#include "theme.h"         // ThemeManager — dark/light palette + global stylesheet
+#include "theme_styles.h"  // tagChromeWidgets + reapplyForChildren
                             // with the C API; desktop uses ChatController
                             // directly, not the C API, but the constant is
                             // shared policy so we mirror it from here.
@@ -33,6 +35,20 @@ MainWindow::MainWindow(QWidget *parent)
     , m_controller(m_webSocket, m_httpClient, m_timerFactory)
 {
     ui->setupUi(this);
+
+    // Tag the .ui-defined chrome widgets with p2pRole properties so
+    // subsequent theme flips can live-update them through the
+    // theme_styles classifier.  applyTheme (wired via SettingsPanel's
+    // themeChanged signal further below) then reapplies the palette +
+    // walks centralwidget's children on every flip.
+    themeStyles::tagChromeWidgets(this, ThemeManager::instance().current());
+    connect(&ThemeManager::instance(), &ThemeManager::themeChanged,
+            this, [this](const Theme& t) {
+        themeStyles::tagChromeWidgets(this, t);
+        if (centralWidget()) {
+            themeStyles::reapplyForChildren(centralWidget(), t);
+        }
+    });
 
     // ── Identity unlock ───────────────────────────────────────────────────────
     // Passphrase must be obtained BEFORE opening the DB so we can derive the
