@@ -11,7 +11,9 @@
 #include "settingspanel.h"
 #include "chatview.h"
 #include "ChatNotifier.h"
-#include "databasemanager.h"
+#include "AppDataStoreQt.hpp"
+#include "AppDataStore.hpp"
+#include "SqlCipherDb.hpp"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -35,7 +37,13 @@ private slots:
 
 private:
     Ui::MainWindow  *ui;
-    DatabaseManager  m_db;
+    // App-data layer.  m_db is the raw SQLCipher handle (page-level
+    // encryption); m_store is the table-level CRUD that lives on top
+    // and adds per-field XChaCha20-Poly1305.  Both replace the old
+    // legacy Qt facade — chatview/settingspanel hit m_store via the
+    // free-function helpers in AppDataStoreQt.hpp.
+    SqlCipherDb      m_db;
+    AppDataStore     m_store;
     QtWebSocket      m_webSocket;
     QtHttpClient     m_httpClient;
     QtTimerFactory   m_timerFactory;

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ChatListView: View {
     @ObservedObject var client: Peer2PearClient
@@ -6,6 +7,8 @@ struct ChatListView: View {
     @State private var showNewGroup = false
     @State private var showMyKey = false
     @State private var showSettings = false
+    @State private var showContacts = false
+    @State private var showConnectivityInfo = false
     @State private var newContactId = ""
 
     /// 1:1 conversations keyed by the OTHER peer's ID (not always the
@@ -18,7 +21,7 @@ struct ChatListView: View {
     }
 
     private var directPeerIds: [String] {
-        client.knownPeerIds.subtracting([""]).sorted()
+        client.chatPeerIds.subtracting([""]).sorted()
     }
 
     /// Groups sorted most-recently-active first.
@@ -61,21 +64,55 @@ struct ChatListView: View {
                                 }
                                 .tint(.blue)
                             }
+                            // Trailing swipe: wipe the chat transcript.
+                            // Leaves `knownPeerContacts` alone — useful for
+                            // dismissing a stranger's chat without adding
+                            // them as a contact just to remove them.
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button(role: .destructive) {
+                                    client.deleteChat(peerId: peerId)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                         }
                     }
                 }
             }
             .navigationTitle("Chats")
             .toolbar {
+                // Leading slot: full contacts list (separate from the
+                // chats-with-history section below).  Lets the user
+                // edit / remove peers even before any messages flow.
                 ToolbarItem(placement: .topBarLeading) {
-                    // SF Symbol used because text truncates in the
-                    // narrow toolbar leading slot on Dynamic Island phones.
-                    Image(systemName: client.isConnected
-                          ? "wifi" : "wifi.slash")
-                        .foregroundStyle(client.isConnected ? .green : .red)
-                        .accessibilityLabel(client.isConnected
-                                            ? "Connected"
-                                            : "Offline")
+                    Button {
+                        showContacts = true
+                    } label: {
+                        Image(systemName: "person.2")
+                    }
+                    .accessibilityLabel("Contacts")
+                }
+                // Trailing cluster, left-to-right:
+                //   wifi (status, was top-leading)
+                //   gear (settings)
+                //   person (my key)
+                //   + (add menu)
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showConnectivityInfo = true
+                    } label: {
+                        Image(systemName: client.isConnected
+                              ? "wifi" : "wifi.slash")
+                            .foregroundStyle(client.isConnected ? .green : .red)
+                    }
+                    .accessibilityLabel(client.isConnected
+                                        ? "Connected"
+                                        : "Offline")
+                    .popover(isPresented: $showConnectivityInfo,
+                             arrowEdge: .top) {
+                        ConnectivityPopover(client: client)
+                            .presentationCompactAdaptation(.popover)
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -121,6 +158,9 @@ struct ChatListView: View {
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(client: client)
+            }
+            .sheet(isPresented: $showContacts) {
+                ContactsListView(client: client)
             }
             .overlay {
                 if isEmpty {
@@ -195,9 +235,14 @@ struct ChatRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(peerId.prefix(8) + "...")
+                    Text(client.displayName(for: peerId))
                         .font(.headline)
                     TrustBadge(trust: client.peerTrust(for: peerId))
+                    if client.isBlocked(peerId: peerId) {
+                        Image(systemName: "nosign")
+                            .foregroundStyle(.red)
+                            .accessibilityLabel("Blocked")
+                    }
                 }
                 if let preview, !preview.isEmpty {
                     Text(preview)
@@ -228,13 +273,15 @@ struct NewGroupSheet: View {
     @State private var groupName = ""
     @State private var selectedPeers: Set<String> = []
 
-    /// Same source as ChatListView's Direct Messages section so any
-    /// peer visible in Chats can be picked here.  Pre-fix this only
-    /// looked at inbound `from` addresses, so freshly-added contacts
-    /// (in knownPeerContacts) and outbound-only conversations were
-    /// silently excluded from the group picker.
+    /// Anyone you might want in a group — explicit contacts plus
+    /// active chat partners.  Wider than ChatListView's Direct
+    /// Messages section because picking-into-a-group is a contact-
+    /// list operation, not a chat-list operation.
     private var knownPeers: [String] {
-        client.knownPeerIds.subtracting([""]).sorted()
+        client.chatPeerIds
+            .union(client.contactPeerIds)
+            .subtracting([""])
+            .sorted()
     }
 
     var body: some View {
@@ -263,7 +310,7 @@ struct NewGroupSheet: View {
                                            ? "checkmark.circle.fill" : "circle")
                                         .foregroundStyle(selectedPeers.contains(peerId)
                                                          ? .green : .secondary)
-                                    Text(peerId.prefix(12) + "...")
+                                    Text(client.displayName(for: peerId))
                                         .font(.body)
                                     Spacer()
                                     TrustBadge(trust: client.peerTrust(for: peerId))
@@ -424,9 +471,14 @@ struct ContactDetailView: View {
     let peerId: String
     @Environment(\.dismiss) private var dismiss
     @State private var confirmUnverify = false
+    @State private var confirmRemove = false
+    @State private var confirmBlock = false
+    @State private var confirmReset = false
+    @State private var nicknameDraft = ""
 
     private var trust: P2PPeerTrust { client.peerTrust(for: peerId) }
     private var keyChanged: Bool   { client.keyChanges[peerId] != nil }
+    private var isBlocked: Bool    { client.isBlocked(peerId: peerId) }
 
     var body: some View {
         Form {
@@ -442,8 +494,12 @@ struct ContactDetailView: View {
                                 .foregroundStyle(.white)
                         }
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(peerId.prefix(16) + "...")
+                        Text(client.displayName(for: peerId))
                             .font(.headline)
+                        Text(peerId.prefix(16) + "…")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                         HStack(spacing: 4) {
                             TrustBadge(trust: trust)
                             Text(trustLabel)
@@ -459,6 +515,34 @@ struct ContactDetailView: View {
                     Spacer()
                 }
                 .padding(.vertical, 4)
+            }
+
+            // ── Send Message — entry point from the contact card.
+            // Chats are now message-history-only (no longer auto-include
+            // address-book contacts), so without this link an explicit
+            // contact with no prior chat would be unreachable from the
+            // contacts list.
+            Section {
+                NavigationLink {
+                    ConversationView(client: client, peerId: peerId)
+                } label: {
+                    Label("Send Message", systemImage: "bubble.left")
+                }
+            }
+
+            // ── Nickname (user-editable) ───────────────────────────────
+            Section {
+                TextField("Add a nickname", text: $nicknameDraft)
+                    .textInputAutocapitalization(.words)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .onSubmit {
+                        client.setNickname(peerId: peerId, nickname: nicknameDraft)
+                    }
+            } header: {
+                Text("Nickname")
+            } footer: {
+                Text("Only visible on this device. The peer can't see what you've named them.")
             }
 
             // ── Key-change warning, if any ─────────────────────────────
@@ -502,9 +586,45 @@ struct ContactDetailView: View {
                     .tint(.green)
                 }
             }
+
+            // ── Session + block management ─────────────────────────────
+            // Reset Session wipes the ratchet so the next outbound
+            // handshake is fresh (recovery path for desync / device
+            // swap).  Block is a client-side filter — inbound DMs and
+            // file requests from blocked peers are dropped silently.
+            Section {
+                Button("Reset Session") {
+                    confirmReset = true
+                }
+                .tint(.orange)
+                Button(isBlocked ? "Unblock Contact" : "Block Contact",
+                       role: isBlocked ? .none : .destructive) {
+                    confirmBlock = true
+                }
+            } footer: {
+                if isBlocked {
+                    Text("Blocked — messages and files from this peer are discarded.")
+                        .foregroundStyle(.red)
+                }
+            }
+
+            // ── Destructive: Remove Contact ────────────────────────────
+            // Narrow removal: drops the address-book entry and clears
+            // the nickname but leaves message history alone so the
+            // chat thread can keep flowing under the peer's key.  Use
+            // the trailing-swipe Delete on ChatListView to wipe the
+            // transcript separately.
+            Section {
+                Button("Remove Contact", role: .destructive) {
+                    confirmRemove = true
+                }
+            }
         }
         .navigationTitle("Contact Info")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            nicknameDraft = client.contactNicknames[peerId] ?? ""
+        }
         .confirmationDialog("Unverify this contact?",
                             isPresented: $confirmUnverify,
                             titleVisibility: .visible) {
@@ -514,6 +634,40 @@ struct ContactDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Messages will still flow, but the verification check will be cleared.")
+        }
+        .confirmationDialog("Remove this contact?",
+                            isPresented: $confirmRemove,
+                            titleVisibility: .visible) {
+            Button("Remove", role: .destructive) {
+                client.removeContact(peerId: peerId)
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("They'll leave your contacts list. Message history stays — if they write again, the chat continues under the same key.")
+        }
+        .confirmationDialog(isBlocked ? "Unblock this contact?" : "Block this contact?",
+                            isPresented: $confirmBlock,
+                            titleVisibility: .visible) {
+            Button(isBlocked ? "Unblock" : "Block",
+                   role: isBlocked ? .none : .destructive) {
+                client.setBlocked(peerId: peerId, blocked: !isBlocked)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(isBlocked
+                 ? "They'll be able to send you messages and files again."
+                 : "Their messages and file requests will be silently dropped on arrival. You can unblock later from this screen.")
+        }
+        .confirmationDialog("Reset the encrypted session?",
+                            isPresented: $confirmReset,
+                            titleVisibility: .visible) {
+            Button("Reset Session", role: .destructive) {
+                client.resetSession(peerId: peerId)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The next message either of you sends will start a fresh handshake. Use this if the peer reports undecryptable messages or after a device swap.")
         }
     }
 
@@ -553,5 +707,192 @@ struct ContactDetailView: View {
             groups[$0..<min($0+3, groups.count)].joined(separator: " ")
         }
         return rows.joined(separator: "\n")
+    }
+}
+
+// MARK: - Contacts list (address book)
+//
+// Surfaced from ChatListView's leading toolbar button.  Backed by
+// `client.contactPeerIds` — only peers the user EXPLICITLY added
+// (via New Chat / QR scan / Import).  Strangers who messaged us
+// without being added show up in Chats but NOT here, keeping the
+// address book as a curated roster.
+//
+// Tap a row → ContactDetailView (safety number + verify/unverify +
+// destructive Remove).  Swipe-to-delete = full removal (wipes the
+// address-book entry AND 1:1 message history).
+
+struct ContactsListView: View {
+    @ObservedObject var client: Peer2PearClient
+    @Environment(\.dismiss) private var dismiss
+    @State private var showExport = false
+    @State private var showImport = false
+    @State private var importAlert: ImportAlert?
+
+    // Contacts = address book, distinct from Chats (which unions
+    // contacts with any peer who's messaged us).  See `chatPeerIds`
+    // vs `contactPeerIds` in Peer2PearClient.
+    private var peerIds: [String] {
+        client.contactPeerIds.subtracting([""]).sorted()
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if peerIds.isEmpty {
+                    ContentUnavailableView(
+                        "No contacts yet",
+                        systemImage: "person.2",
+                        description: Text("Use the + button on the chats screen to add a contact.")
+                    )
+                } else {
+                    List {
+                        ForEach(peerIds, id: \.self) { peerId in
+                            NavigationLink {
+                                ContactDetailView(client: client, peerId: peerId)
+                            } label: {
+                                ChatRow(client: client, peerId: peerId,
+                                        preview: client.peerTrust(for: peerId) == .verified
+                                            ? "Verified"
+                                            : nil)
+                            }
+                        }
+                        // Swipe-to-delete is a shortcut for the
+                        // ContactDetail Remove button — no
+                        // confirmation dialog here since iOS already
+                        // surfaces a tap-to-confirm "Delete" pill.
+                        .onDelete { offsets in
+                            for idx in offsets {
+                                client.removeContact(peerId: peerIds[idx])
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Contacts")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Button {
+                            showExport = true
+                        } label: {
+                            Label("Export…", systemImage: "square.and.arrow.up")
+                        }
+                        .disabled(peerIds.isEmpty)
+                        Button {
+                            showImport = true
+                        } label: {
+                            Label("Import…", systemImage: "square.and.arrow.down")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .accessibilityLabel("Contact actions")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .fileExporter(
+                isPresented: $showExport,
+                document: ContactsExportDoc(data: client.exportContactsJSON()),
+                contentType: .json,
+                defaultFilename: "peer2pear_contacts"
+            ) { _ in }
+            .fileImporter(
+                isPresented: $showImport,
+                allowedContentTypes: [.json]
+            ) { result in
+                switch result {
+                case .success(let url):
+                    // iOS file picker hands us a security-scoped URL;
+                    // must start accessing before reading the file or
+                    // the read fails with EACCES.
+                    let started = url.startAccessingSecurityScopedResource()
+                    defer { if started { url.stopAccessingSecurityScopedResource() } }
+                    guard let data = try? Data(contentsOf: url) else {
+                        importAlert = .failure("Couldn't read the selected file.")
+                        return
+                    }
+                    let count = client.importContacts(from: data)
+                    importAlert = count > 0
+                        ? .success("Imported \(count) contact\(count == 1 ? "" : "s").")
+                        : .failure("No valid contacts found in that file.")
+                case .failure(let err):
+                    importAlert = .failure(err.localizedDescription)
+                }
+            }
+            .alert(item: $importAlert) { alert in
+                Alert(title: Text(alert.title),
+                      message: Text(alert.message),
+                      dismissButton: .default(Text("OK")))
+            }
+        }
+        .p2pColorScheme(client.colorScheme)
+    }
+}
+
+// Sheet-shaped alert payload for the import flow.  Two cases (ok /
+// error) let us drive a single .alert binding with the right copy.
+private struct ImportAlert: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+
+    static func success(_ msg: String) -> ImportAlert {
+        .init(title: "Import Complete", message: msg)
+    }
+    static func failure(_ msg: String) -> ImportAlert {
+        .init(title: "Import Failed", message: msg)
+    }
+}
+
+// FileDocument wrapper for the .json export.  Doesn't bother with
+// read support — imports go through .fileImporter instead, which
+// takes a URL rather than deserializing into a FileDocument.
+struct ContactsExportDoc: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+    static var writableContentTypes: [UTType] { [.json] }
+
+    let data: Data
+
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws {
+        self.data = configuration.file.regularFileContents ?? Data()
+    }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
+
+// MARK: - Connectivity popover
+// Tap target for the wifi icon in the top toolbar.  Shows the live
+// connection state + which relay the client is pointed at, so the
+// user can tell at a glance whether they are on the default relay
+// or a self-hosted one without drilling into Settings → Relay server.
+
+struct ConnectivityPopover: View {
+    @ObservedObject var client: Peer2PearClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: client.isConnected
+                      ? "wifi" : "wifi.slash")
+                    .foregroundStyle(client.isConnected ? .green : .red)
+                Text(client.isConnected ? "Connected" : "Offline")
+                    .font(.headline)
+            }
+            Divider()
+            Text("Relay")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(Peer2PearClient.storedRelayUrl)
+                .font(.system(.footnote, design: .monospaced))
+                .textSelection(.enabled)
+        }
+        .padding(14)
+        .frame(minWidth: 240, maxWidth: 300, alignment: .leading)
     }
 }

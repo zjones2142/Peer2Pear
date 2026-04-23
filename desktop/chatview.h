@@ -14,7 +14,7 @@
 
 #include "ChatNotifier.h"
 #include "chattypes.h"
-#include "databasemanager.h"
+#include "AppDataStoreQt.hpp"
 #include "filetransfer.h"
 
 namespace Ui { class MainWindow; }
@@ -26,7 +26,7 @@ class ChatView : public QObject
 public:
     explicit ChatView(Ui::MainWindow *ui,
                       ChatController *controller,
-                      DatabaseManager *db,
+                      AppDataStore *store,
                       QObject *parent = nullptr);
 
     void reloadCurrentChat();
@@ -127,6 +127,11 @@ public:
     /// Safety-numbers: called when ChatController::onPeerKeyChanged
     /// fires, so the contact list re-renders its verification badges.
     void refreshAfterKeyChange() { rebuildChatList(); }
+    /// "Only accept files from verified contacts" UI policy.  Set
+    /// from MainWindow when SettingsPanel emits the toggle.  Pure
+    /// presentation-layer filter — onFileAcceptRequested checks this
+    /// + peerTrust before raising the consent QMessageBox.
+    void setRequireVerifiedFiles(bool on) { m_requireVerifiedFiles = on; }
 
 private:
     void rebuildChatList();
@@ -155,11 +160,12 @@ private:
     Ui::MainWindow  *m_ui         = nullptr;
     ChatController  *m_controller = nullptr;
     ChatNotifier    *m_notifier   = nullptr;
-    DatabaseManager *m_db         = nullptr;
+    AppDataStore    *m_store      = nullptr;
 
     std::function<bool()> m_shouldToastFn;
 
     QVector<ChatData> m_chats;
+    bool              m_requireVerifiedFiles = false;
     int               m_currentChat = -1;
 
     QVector<int> m_unread;

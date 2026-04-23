@@ -42,6 +42,7 @@ endfunction()
 
 peer2pear_add_test(test_crypto_engine)
 peer2pear_add_test(test_sqlcipher_db)
+peer2pear_add_test(test_app_data_store)
 peer2pear_add_test(test_sealed_envelope)
 peer2pear_add_test(test_ratchet_session)
 peer2pear_add_test(test_session_manager)

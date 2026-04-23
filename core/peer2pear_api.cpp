@@ -17,6 +17,7 @@
 #include "CryptoEngine.hpp"
 #include "SqlCipherDb.hpp"
 #include "SessionStore.hpp"
+#include "AppDataStore.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -198,6 +199,12 @@ struct p2p_context {
     // reference into db — destruct first (C++ destroys members in
     // reverse declaration order).
     SqlCipherDb       db;
+
+    // App-data layer (contacts / messages / settings / file_transfers /
+    // group_seq_counters) on the same SQLCipher handle.  Bound right
+    // after `db.open()` succeeds in p2p_set_passphrase_v2.  Must
+    // outlive `controller` for the same destruction-order reason as db.
+    AppDataStore      appData;
 
     ChatController    controller;
 
@@ -558,6 +565,14 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
         const std::string dbPath = ctx->dataDir + "/peer2pear.db";
         if (ctx->db.open(dbPath, dbKey)) {
             ctx->controller.setDatabase(ctx->db);
+            // Bind the app-data layer to the same SQLCipher handle and
+            // give it the same key for per-field XChaCha20-Poly1305.
+            // Page-level (SQLCipher) + field-level (libsodium) gives
+            // defense-in-depth: a memory dump that captures the page
+            // key still doesn't yield message bodies until the field
+            // key is also recovered.
+            ctx->appData.bind(ctx->db);
+            ctx->appData.setEncryptionKey(dbKey);
         } else {
             rc = -1;
         }
@@ -615,6 +630,13 @@ void p2p_set_hard_block_on_key_change(p2p_context* ctx, int enabled)
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
     ctx->controller.setHardBlockOnKeyChange(enabled != 0);
+}
+
+void p2p_reset_session(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller.resetSession(peer_id);
 }
 
 void p2p_set_relay_url(p2p_context* ctx, const char* url)
@@ -1068,4 +1090,227 @@ void p2p_set_on_peer_key_changed(p2p_context* ctx,
     P2P_CTX_GUARD(ctx);
     ctx->cb.on_peer_key_changed = cb;
     ctx->cb.peer_key_changed_ud = ud;
+}
+
+// ── App-data store (contacts / messages / settings / file_transfers) ──────
+//
+// All entry points guard ctx + p2p_context::ctrlMu so a callback that
+// races with shutdown sees a coherent appData (mirrors the rest of
+// the API).  load_* callbacks invoke `cb` while holding the mutex —
+// the consumer's callback must NOT call back into p2p_app_* synchronously
+// (it would deadlock).  The Swift wrappers buffer rows into an array
+// before returning to user code, which sidesteps this entirely.
+
+namespace {
+// Convert std::vector<std::string> ↔ NULL-terminated C-string array.
+// Used to bridge contacts.keys across the FFI without copying the
+// underlying string data twice.
+std::vector<const char*> toCArray(const std::vector<std::string>& v,
+                                   std::vector<const char*>& storage)
+{
+    storage.clear();
+    storage.reserve(v.size() + 1);
+    for (const auto& s : v) storage.push_back(s.c_str());
+    storage.push_back(nullptr);
+    return storage;
+}
+
+std::vector<std::string> fromCArray(const char* const* arr)
+{
+    std::vector<std::string> out;
+    if (!arr) return out;
+    for (const char* const* p = arr; *p; ++p) out.emplace_back(*p);
+    return out;
+}
+} // namespace
+
+int p2p_app_save_contact(p2p_context* ctx,
+                          const char* peer_id,
+                          const char* name,
+                          const char* subtitle,
+                          const char* const* keys,
+                          int is_blocked,
+                          int is_group,
+                          const char* group_id,
+                          const char* avatar_b64,
+                          int64_t last_active_secs,
+                          int in_address_book)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    AppDataStore::Contact c;
+    c.peerIdB64u     = peer_id;
+    c.name           = name      ? name     : "";
+    c.subtitle       = subtitle  ? subtitle : "";
+    c.keys           = fromCArray(keys);
+    c.isBlocked      = is_blocked != 0;
+    c.isGroup        = is_group   != 0;
+    c.groupId        = group_id   ? group_id   : "";
+    c.avatarB64      = avatar_b64 ? avatar_b64 : "";
+    c.lastActiveSecs = last_active_secs;
+    c.inAddressBook  = in_address_book != 0;
+    return ctx->appData.saveContact(c) ? 0 : -1;
+}
+
+int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData.deleteContact(peer_id) ? 0 : -1;
+}
+
+void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
+{
+    if (!ctx || !cb) return;
+    P2P_CTX_GUARD(ctx);
+    std::vector<const char*> keysStorage;
+    ctx->appData.loadAllContacts([&](const AppDataStore::Contact& c) {
+        toCArray(c.keys, keysStorage);
+        cb(c.peerIdB64u.c_str(),
+           c.name.c_str(),
+           c.subtitle.c_str(),
+           keysStorage.data(),
+           c.isBlocked ? 1 : 0,
+           c.isGroup   ? 1 : 0,
+           c.groupId.c_str(),
+           c.avatarB64.c_str(),
+           c.lastActiveSecs,
+           c.inAddressBook ? 1 : 0,
+           ud);
+    });
+}
+
+int p2p_app_save_contact_avatar(p2p_context* ctx,
+                                 const char* peer_id,
+                                 const char* avatar_b64)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData.saveContactAvatar(peer_id,
+                                           avatar_b64 ? avatar_b64 : "")
+        ? 0 : -1;
+}
+
+int p2p_app_save_message(p2p_context* ctx,
+                          const char* peer_id,
+                          int sent,
+                          const char* text,
+                          int64_t timestamp_secs,
+                          const char* msg_id,
+                          const char* sender_name)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    AppDataStore::Message m;
+    m.sent          = sent != 0;
+    m.text          = text        ? text        : "";
+    m.timestampSecs = timestamp_secs;
+    m.msgId         = msg_id      ? msg_id      : "";
+    m.senderName    = sender_name ? sender_name : "";
+    return ctx->appData.saveMessage(peer_id, m) ? 0 : -1;
+}
+
+void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
+                            p2p_message_cb cb, void* ud)
+{
+    if (!ctx || !peer_id || !cb) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->appData.loadMessages(peer_id, [&](const AppDataStore::Message& m) {
+        cb(m.sent ? 1 : 0,
+           m.text.c_str(),
+           m.timestampSecs,
+           m.msgId.c_str(),
+           m.senderName.c_str(),
+           ud);
+    });
+}
+
+int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData.deleteMessages(peer_id) ? 0 : -1;
+}
+
+int p2p_app_save_setting(p2p_context* ctx, const char* key, const char* value)
+{
+    if (!ctx || !key) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData.saveSetting(key, value ? value : "") ? 0 : -1;
+}
+
+const char* p2p_app_load_setting(p2p_context* ctx, const char* key,
+                                  const char* default_value)
+{
+    if (!ctx || !key) return default_value ? default_value : "";
+    P2P_CTX_GUARD(ctx);
+    ctx->scratch = ctx->appData.loadSetting(key, default_value ? default_value : "");
+    return ctx->scratch.c_str();
+}
+
+int p2p_app_save_file_record(p2p_context* ctx,
+                              const char* transfer_id,
+                              const char* chat_key,
+                              const char* file_name,
+                              int64_t file_size,
+                              const char* peer_id,
+                              const char* peer_name,
+                              int64_t timestamp_secs,
+                              int sent,
+                              int status,
+                              int chunks_total,
+                              int chunks_complete,
+                              const char* saved_path)
+{
+    if (!ctx || !transfer_id || !chat_key) return -1;
+    P2P_CTX_GUARD(ctx);
+    AppDataStore::FileRecord r;
+    r.transferId      = transfer_id;
+    r.chatKey         = chat_key;
+    r.fileName        = file_name  ? file_name  : "";
+    r.fileSize        = file_size;
+    r.peerIdB64u      = peer_id    ? peer_id    : "";
+    r.peerName        = peer_name  ? peer_name  : "";
+    r.timestampSecs   = timestamp_secs;
+    r.sent            = sent != 0;
+    r.status          = status;
+    r.chunksTotal     = chunks_total;
+    r.chunksComplete  = chunks_complete;
+    r.savedPath       = saved_path ? saved_path : "";
+    return ctx->appData.saveFileRecord(chat_key, r) ? 0 : -1;
+}
+
+int p2p_app_delete_file_record(p2p_context* ctx, const char* transfer_id)
+{
+    if (!ctx || !transfer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData.deleteFileRecord(transfer_id) ? 0 : -1;
+}
+
+int p2p_app_delete_file_records_for_chat(p2p_context* ctx, const char* chat_key)
+{
+    if (!ctx || !chat_key) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData.deleteFileRecordsForChat(chat_key) ? 0 : -1;
+}
+
+void p2p_app_load_file_records(p2p_context* ctx, const char* chat_key,
+                                p2p_file_record_cb cb, void* ud)
+{
+    if (!ctx || !chat_key || !cb) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->appData.loadFileRecords(chat_key, [&](const AppDataStore::FileRecord& r) {
+        cb(r.transferId.c_str(),
+           r.fileName.c_str(),
+           r.fileSize,
+           r.peerIdB64u.c_str(),
+           r.peerName.c_str(),
+           r.timestampSecs,
+           r.sent ? 1 : 0,
+           r.status,
+           r.chunksTotal,
+           r.chunksComplete,
+           r.savedPath.c_str(),
+           ud);
+    });
 }

@@ -18,7 +18,10 @@
 #include <QApplication>
 #include <QDateTime>
 #include <QTimeZone>
+#include <QDir>
+#include <QFile>
 #include <QInputDialog>
+#include <QIODevice>
 #include <QMessageBox>
 #include <QLineEdit>
 #include <QToolButton>
@@ -28,6 +31,166 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QStandardPaths>
+
+#include <sodium.h>
+#include <sqlite3.h>
+
+namespace {
+
+// Best-effort secure delete: overwrite + unlink.  Used by the legacy
+// plaintext-DB migration to scrub the WAL/SHM and original .db before
+// the encrypted copy takes its place.  On copy-on-write filesystems
+// (APFS, btrfs) the overwrite isn't guaranteed to land on the same
+// physical blocks, but the attempt is still worth more than nothing.
+void secureRemoveFile(const QString &filePath)
+{
+    QFile f(filePath);
+    if (!f.exists()) return;
+    const qint64 sz = f.size();
+    if (sz > 0 && f.open(QIODevice::WriteOnly)) {
+        QByteArray noise(static_cast<int>(qMin(sz, qint64(1 << 20))), 0);
+        qint64 remaining = sz;
+        while (remaining > 0) {
+            int chunk = static_cast<int>(qMin(remaining, qint64(noise.size())));
+            randombytes_buf(reinterpret_cast<unsigned char*>(noise.data()),
+                            static_cast<size_t>(chunk));
+            f.write(noise.constData(), chunk);
+            remaining -= chunk;
+        }
+        f.flush();
+        f.close();
+    }
+    QFile::remove(filePath);
+}
+
+// One-shot legacy-plaintext → SQLCipher migration.  Returns true if the
+// upgrade ran (or was unnecessary because the DB was already empty);
+// false on failure or "DB is already encrypted" — both of which the
+// caller treats as "fine, just open it normally."  Marker-file gated
+// upstream so we don't probe the DB on every launch.
+bool migratePlaintextDbToSqlCipher(const QString &dbPath, const QByteArray &dbKey)
+{
+    const QString encPath    = dbPath + ".encrypted";
+    const QString backupPath = dbPath + ".backup";
+
+    QFile::remove(encPath);
+    QFile::remove(encPath + "-wal");
+    QFile::remove(encPath + "-shm");
+    if (QFile::exists(backupPath) && !QFile::exists(dbPath)) {
+        qWarning() << "Migration: found orphaned .backup — restoring original DB";
+        QFile::rename(backupPath, dbPath);
+    }
+    QFile::remove(backupPath);
+
+    sqlite3* plainDb = nullptr;
+    int rc = sqlite3_open_v2(dbPath.toUtf8().constData(), &plainDb,
+                             SQLITE_OPEN_READWRITE, nullptr);
+    if (rc != SQLITE_OK) {
+        if (plainDb) sqlite3_close_v2(plainDb);
+        return false;
+    }
+    sqlite3_exec(plainDb, "PRAGMA locking_mode=EXCLUSIVE;", nullptr, nullptr, nullptr);
+
+    rc = sqlite3_exec(plainDb, "SELECT count(*) FROM sqlite_master;",
+                      nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        sqlite3_close_v2(plainDb);
+        return false;  // Already encrypted (or corrupt) — nothing to migrate.
+    }
+
+    int tableCount = 0;
+    sqlite3_stmt* countStmt = nullptr;
+    if (sqlite3_prepare_v2(plainDb,
+                           "SELECT count(*) FROM sqlite_master WHERE type='table';",
+                           -1, &countStmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(countStmt) == SQLITE_ROW)
+            tableCount = sqlite3_column_int(countStmt, 0);
+        sqlite3_finalize(countStmt);
+    }
+    sqlite3_exec(plainDb, "PRAGMA wal_checkpoint(TRUNCATE);", nullptr, nullptr, nullptr);
+    sqlite3_close_v2(plainDb);
+
+    if (tableCount == 0) {
+        QFile::remove(dbPath);
+        QFile::remove(dbPath + "-wal");
+        QFile::remove(dbPath + "-shm");
+        return true;
+    }
+
+    SqlCipherDb encDb;
+    if (!encDb.open(encPath.toStdString(), appData::qByteArrayToBytes(dbKey))) {
+        qWarning() << "Migration: failed to create encrypted DB";
+        QFile::remove(encPath);
+        return false;
+    }
+
+    QString escapedPlain = dbPath;
+    escapedPlain.replace(QLatin1Char('\''), QLatin1String("''"));
+    const QString attachSql = QStringLiteral(
+        "ATTACH DATABASE '%1' AS plaintext KEY '';").arg(escapedPlain);
+
+    char* err = nullptr;
+    rc = sqlite3_exec(encDb.handle(), attachSql.toUtf8().constData(),
+                      nullptr, nullptr, &err);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(err);
+        encDb.close();
+        QFile::remove(encPath);
+        return false;
+    }
+
+    err = nullptr;
+    rc = sqlite3_exec(encDb.handle(),
+                      "SELECT sqlcipher_export('main', 'plaintext');",
+                      nullptr, nullptr, &err);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(err);
+        sqlite3_exec(encDb.handle(), "DETACH DATABASE plaintext;",
+                     nullptr, nullptr, nullptr);
+        encDb.close();
+        QFile::remove(encPath);
+        return false;
+    }
+    sqlite3_exec(encDb.handle(), "DETACH DATABASE plaintext;",
+                 nullptr, nullptr, nullptr);
+    encDb.close();
+
+    if (!QFile::rename(dbPath, backupPath)) {
+        QFile::remove(encPath);
+        return false;
+    }
+    if (!QFile::rename(encPath, dbPath)) {
+        QFile::rename(backupPath, dbPath);
+        return false;
+    }
+    secureRemoveFile(dbPath + "-wal");
+    secureRemoveFile(dbPath + "-shm");
+    secureRemoveFile(backupPath);
+    return true;
+}
+
+// Centralises the desktop's per-user app-data DB path + the legacy-
+// plaintext migration check.  Caller (MainWindow::ctor) opens the
+// SqlCipherDb after this returns, then binds an AppDataStore to it.
+bool openAppDataDb(SqlCipherDb &db, const QByteArray &dbKey)
+{
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(base);
+    const QString dbPath = base + "/peer2PearUser.db";
+    const QString migratedMarker = base + "/.sqlcipher_migrated";
+
+    if (!dbKey.isEmpty() && QFile::exists(dbPath) && !QFile::exists(migratedMarker)) {
+        migratePlaintextDbToSqlCipher(dbPath, dbKey);
+        // Always write the marker after probing — success or "already
+        // encrypted" both mean "don't probe again on next launch."
+        QFile marker(migratedMarker);
+        if (marker.open(QIODevice::WriteOnly)) marker.close();
+    }
+
+    return db.open(dbPath.toStdString(), appData::qByteArrayToBytes(dbKey));
+}
+
+}  // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -159,7 +322,7 @@ MainWindow::MainWindow(QWidget *parent)
             p2p::bridge::secureZeroQ(identityKey);
 
             // ── Open DB with SQLCipher encryption ────────────────────────────
-            if (!m_db.open(dbKey)) {
+            if (!openAppDataDb(m_db, dbKey)) {
                 QMessageBox::critical(this, "Database Error",
                                       "Could not open the local chat database.\n"
                                       "The passphrase may be incorrect.");
@@ -169,6 +332,11 @@ MainWindow::MainWindow(QWidget *parent)
                 continue;
             }
             p2p::bridge::secureZeroQ(dbKey);
+
+            // Bind the app-data table layer to the handle.  Creates
+            // contacts/messages/settings/file_transfers/group_seq_counters
+            // tables on first run, idempotent on upgrade.
+            m_store.bind(m_db);
 
             // Set per-field encryption key (backward compat with ENC: fields).
             // Legacy keys cover previous key derivation generations:
@@ -185,23 +353,18 @@ MainWindow::MainWindow(QWidget *parent)
                 bytesConcat(m_controller.myIdB64u(), "peer2pear-dbkey")));
             QByteArray legacyGen2 = p2p::bridge::toQByteArray(ChatController::blake2b256(
                 bytesConcat(pass.toStdString(), "peer2pear-dbkey")));
-            m_db.setEncryptionKey(fieldKey, {legacyGen2, legacyGen1});
+            appData::setEncryptionKey(&m_store, fieldKey, {legacyGen2, legacyGen1});
             p2p::bridge::secureZeroQ(fieldKey);
             p2p::bridge::secureZeroQ(legacyGen1);
             p2p::bridge::secureZeroQ(legacyGen2);
 
             // Wire DB to ChatController for Noise/Ratchet session persistence
-            m_controller.setDatabase(m_db.database());
+            m_controller.setDatabase(m_db);
 
-            // Restore persisted group sequence counters.
-            auto qMapToStd = [](const QMap<QString, qint64>& qm) {
-                std::map<std::string, int64_t> out;
-                for (auto it = qm.cbegin(); it != qm.cend(); ++it)
-                    out.emplace(it.key().toStdString(), int64_t(it.value()));
-                return out;
-            };
-            m_controller.setGroupSeqCounters(qMapToStd(m_db.loadGroupSeqOut()),
-                                              qMapToStd(m_db.loadGroupSeqIn()));
+            // Restore persisted group sequence counters — AppDataStore
+            // returns std::map directly so no Qt-bridge conversion needed.
+            m_controller.setGroupSeqCounters(m_store.loadGroupSeqOut(),
+                                              m_store.loadGroupSeqIn());
 
             p2p::bridge::secureZeroQ(pass);
             break;
@@ -211,16 +374,17 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // ── First-time onboarding ─────────────────────────────────────────────────
-    if (m_db.loadSetting("displayName").isEmpty()) {
+    if (appData::loadSetting(&m_store, "displayName").isEmpty()) {
         OnboardingDialog dlg(this);
         if (dlg.exec() != QDialog::Accepted) {
             QTimer::singleShot(0, qApp, &QCoreApplication::quit);
             return;
         }
-        m_db.saveSetting("displayName", dlg.displayName());
+        appData::saveSetting(&m_store, "displayName", dlg.displayName());
         if (!dlg.avatarData().isEmpty()) {
-            m_db.saveSetting("avatarData", dlg.avatarData());
-            m_db.saveSetting("avatarIsPhoto", dlg.isPhotoAvatar() ? "true" : "false");
+            appData::saveSetting(&m_store, "avatarData", dlg.avatarData());
+            appData::saveSetting(&m_store, "avatarIsPhoto",
+                                  dlg.isPhotoAvatar() ? "true" : "false");
         }
 
         // ── Welcome guide (shown once after first onboarding) ────────────────
@@ -253,30 +417,31 @@ MainWindow::MainWindow(QWidget *parent)
     // obsolete endpoints so they land on the current production relay without
     // having to wipe their local DB.
     {
-        const QString old = m_db.loadSetting("relayUrl",
-                                m_db.loadSetting("serverUrl")); // fallback to old key
+        const QString old = appData::loadSetting(&m_store, "relayUrl",
+                                appData::loadSetting(&m_store, "serverUrl")); // fallback to old key
         const bool staleIp      = (old == "http://3.141.14.234" ||
                                    old == "http://3.141.14.234/");
         const bool staleLocal   = (old == "http://localhost:8443" ||
                                    old == "http://localhost:8443/");
         if (staleIp || staleLocal) {
-            m_db.saveSetting("relayUrl", "https://peer2pear.com");
+            appData::saveSetting(&m_store, "relayUrl", "https://peer2pear.com");
         }
     }
     // Default for a fresh install: the production relay on peer2pear.com.
     // Users who self-host can override this via the settings table (no UI
     // yet — edit `SELECT value FROM settings WHERE key='relayUrl';` via
     // SQLCipher, or plumb in a Settings field).
-    const QString relayUrl = m_db.loadSetting("relayUrl", "https://peer2pear.com");
+    const QString relayUrl = appData::loadSetting(&m_store, "relayUrl",
+                                                    "https://peer2pear.com");
     m_controller.setRelayUrl(relayUrl.toStdString());
 
 #ifdef PEER2PEAR_P2P
     // TURN relay for symmetric NAT fallback — only meaningful when P2P is
     // compiled in.  setTurnServer() itself is declared behind the same flag.
-    const QString turnHost = m_db.loadSetting("turnHost", "peer2pear.com");
-    const int     turnPort = m_db.loadSetting("turnPort", "3478").toInt();
-    const QString turnUser = m_db.loadSetting("turnUser", "peer2pear");
-    const QString turnPass = m_db.loadSetting("turnPass", "peer2pear");
+    const QString turnHost = appData::loadSetting(&m_store, "turnHost", "peer2pear.com");
+    const int     turnPort = appData::loadSetting(&m_store, "turnPort", "3478").toInt();
+    const QString turnUser = appData::loadSetting(&m_store, "turnUser", "peer2pear");
+    const QString turnPass = appData::loadSetting(&m_store, "turnPass", "peer2pear");
     if (!turnHost.isEmpty())
         m_controller.setTurnServer(turnHost.toStdString(), turnPort,
                                     turnUser.toStdString(), turnPass.toStdString());
@@ -307,15 +472,15 @@ MainWindow::MainWindow(QWidget *parent)
     m_mainStack->addWidget(ui->contentWidget);  // index 0 – chat
 
     m_settingsPanel = new SettingsPanel(ui->rootWidget);
-    m_settingsPanel->setProfileInfo(m_db.loadSetting("displayName"),
+    m_settingsPanel->setProfileInfo(appData::loadSetting(&m_store, "displayName"),
                                     QString::fromStdString(m_controller.myIdB64u()));
-    m_settingsPanel->setDatabase(&m_db);
+    m_settingsPanel->setAppDataStore(&m_store);
     m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
 
     rootLayout->addWidget(m_mainStack);
 
     // ── ChatView ──────────────────────────────────────────────────────────────
-    m_chatView = new ChatView(ui, &m_controller, &m_db, this);
+    m_chatView = new ChatView(ui, &m_controller, &m_store, this);
 
     m_chatView->setShouldToastFn([this]() -> bool {
         return isMinimized() || !isVisible() || !isActiveWindow();
@@ -434,6 +599,8 @@ MainWindow::MainWindow(QWidget *parent)
             this, [this](int mb) { m_controller.setFileHardMaxMB(mb); });
     connect(m_settingsPanel, &SettingsPanel::fileRequireP2PToggled,
             this, [this](bool on) { m_controller.setFileRequireP2P(on); });
+    connect(m_settingsPanel, &SettingsPanel::fileRequireVerifiedToggled,
+            this, [this](bool on) { m_chatView->setRequireVerifiedFiles(on); });
 
     // Relay URL — settings UI can live-switch which relay we're connected
     // to.  Drop the existing WS, point the RelayClient at the new URL, and
@@ -502,15 +669,10 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow() {
     m_controller.disconnectFromRelay();
 
-    // Persist group sequence counters before shutdown.
-    auto stdToQ = [](const std::map<std::string, int64_t>& m) {
-        QMap<QString, qint64> out;
-        for (const auto& kv : m)
-            out.insert(QString::fromStdString(kv.first), qint64(kv.second));
-        return out;
-    };
-    m_db.saveGroupSeqOut(stdToQ(m_controller.groupSeqOut()));
-    m_db.saveGroupSeqIn(stdToQ(m_controller.groupSeqIn()));
+    // Persist group sequence counters before shutdown.  AppDataStore
+    // takes std::map natively so no Qt-bridge round-trip required.
+    m_store.saveGroupSeqOut(m_controller.groupSeqOut());
+    m_store.saveGroupSeqIn(m_controller.groupSeqIn());
 
     delete ui;
 }
@@ -531,7 +693,7 @@ void MainWindow::onExportContacts()
         "JSON Files (*.json)");
     if (path.isEmpty()) return;
 
-    const QVector<ChatData> contacts = m_db.loadAllContacts();
+    const QVector<ChatData> contacts = appData::loadAllContacts(&m_store);
 
     QJsonArray arr;
     for (const auto &c : contacts) {
@@ -592,7 +754,7 @@ void MainWindow::onImportContacts()
 
     // Build a set of existing contact identifiers so we never overwrite them.
     // Contacts with a real peer ID use that; name-only contacts use "name:<name>".
-    const QVector<ChatData> existing = m_db.loadAllContacts();
+    const QVector<ChatData> existing = appData::loadAllContacts(&m_store);
     QSet<QString> existingIds;
     for (const auto &e : existing) {
         if (!e.peerIdB64u.isEmpty())
@@ -620,7 +782,9 @@ void MainWindow::onImportContacts()
         if (chat.name.isEmpty() && chat.keys.isEmpty())
             continue;
 
-        // Determine the effective storage key (mirrors DatabaseManager::contactKey)
+        // Determine the effective storage key — for unnamed groups
+        // we fall back to "name:Foo" so the row has SOMETHING to key
+        // off; named contacts always use peerIdB64u.
         const QString effectiveKey = chat.peerIdB64u.isEmpty()
             ? QLatin1String("name:") + chat.name
             : chat.peerIdB64u;
@@ -630,7 +794,7 @@ void MainWindow::onImportContacts()
             continue;
 
         chat.subtitle = "Secure chat";
-        m_db.saveContact(chat);
+        appData::saveContact(&m_store, chat);
         existingIds.insert(effectiveKey); // prevent duplicates within the file
         ++imported;
     }

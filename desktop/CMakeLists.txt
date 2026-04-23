@@ -16,7 +16,7 @@ set(DESKTOP_SOURCES
     QtWebSocket.hpp
     QtHttpClient.hpp
     QrImage.cpp          QrImage.hpp
-    databasemanager.cpp  databasemanager.h
+    AppDataStoreQt.hpp
     resources.qrc
 )
 

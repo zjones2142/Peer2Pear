@@ -673,8 +673,8 @@ QString ChatView::chatKey(const ChatData &c)
 }
 
 ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
-                   DatabaseManager *db, QObject *parent)
-    : QObject(parent), m_ui(ui), m_controller(controller), m_db(db)
+                   AppDataStore *store, QObject *parent)
+    : QObject(parent), m_ui(ui), m_controller(controller), m_store(store)
 {
     initChats();
     ensureUnreadSize();
@@ -818,10 +818,10 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
             m_chats[i].isOnline = online;
 
             // Send our avatar on first contact only if it's a real photo
-            if (online && m_chats[i].avatarData.isEmpty() && m_db
-                    && m_db->loadSetting("avatarIsPhoto") == "true") {
-                const QString myName   = m_db->loadSetting("displayName");
-                const QString myAvatar = m_db->loadSetting("avatarData");
+            if (online && m_chats[i].avatarData.isEmpty() && m_store
+                    && appData::loadSetting(m_store,"avatarIsPhoto") == "true") {
+                const QString myName   = appData::loadSetting(m_store,"displayName");
+                const QString myAvatar = appData::loadSetting(m_store,"avatarData");
                 if (!myName.isEmpty())
                     m_controller->sendAvatar(peerIdB64u.toStdString(),
                                               myName.toStdString(), myAvatar.toStdString());
@@ -884,7 +884,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
         Message msg{false, text, timestamp, msgId};
         m_chats[i].messages.append(msg);
         m_chats[i].lastActive = QDateTime::currentDateTimeUtc();
-        if (m_db) { m_db->saveContact(m_chats[i]); m_db->saveMessage(m_chats[i].peerIdB64u, msg); }
+        if (m_store) { appData::saveContact(m_store,m_chats[i]); appData::saveMessage(m_store,m_chats[i].peerIdB64u, msg); }
 
         if (i == m_currentChat) {
             if (needsSep) addDateSeparator(timestamp);
@@ -906,7 +906,7 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
     ChatData nc; nc.name = "Unknown contact"; nc.subtitle = "Secure chat";
     nc.peerIdB64u = from; nc.keys.append(from); nc.messages.append(msg);
     m_chats.prepend(nc);
-    if (m_db) { m_db->saveContact(nc); m_db->saveMessage(from, msg); }
+    if (m_store) { appData::saveContact(m_store,nc); appData::saveMessage(m_store,from, msg); }
     ensureUnreadSize();
     m_unread.prepend(0);
     if (m_currentChat >= 0) m_currentChat += 1;
@@ -936,7 +936,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         ng.name = groupName.isEmpty() ? "Group Chat" : groupName;
         ng.subtitle = "Group chat"; ng.keys.append(fromPeerIdB64u);
         m_chats.append(ng);
-        if (m_db) m_db->saveContact(ng);
+        if (m_store) appData::saveContact(m_store,ng);
         idx = m_chats.size() - 1;
         ensureUnreadSize();
         rebuildChatList();
@@ -957,8 +957,8 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
             keysUpdated = true;
         }
     }
-    if (keysUpdated && m_db)
-        m_db->saveContact(chat); // persist the updated key list
+    if (keysUpdated && m_store)
+        appData::saveContact(m_store,chat); // persist the updated key list
 
     // If text is empty this was a member-update-only message (no chat bubble needed).
     // Key merge above already ran, so just bail out.
@@ -985,7 +985,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     msg.senderName = senderName;
     chat.messages.append(msg);
     chat.lastActive = QDateTime::currentDateTimeUtc();
-    if (m_db) m_db->saveMessage(chat.groupId.isEmpty() ? "name:"+chat.name : chat.groupId, msg);
+    if (m_store) appData::saveMessage(m_store,chat.groupId.isEmpty() ? "name:"+chat.name : chat.groupId, msg);
 
     if (idx == m_currentChat) {
         if (needsSep) addDateSeparator(ts);
@@ -1024,7 +1024,7 @@ void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
 
     // Remove the leaver's key from our local group member list
     chat.keys.removeAll(fromPeerIdB64u);
-    if (m_db) m_db->saveContact(chat);
+    if (m_store) appData::saveContact(m_store,chat);
 
     // Find a display name for the leaver
     QString leaverName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
@@ -1039,7 +1039,7 @@ void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
     const QString systemText = leaverName + " left the group";
     Message systemMsg{ false, systemText, ts };
     chat.messages.append(systemMsg);
-    if (m_db) m_db->saveMessage(
+    if (m_store) appData::saveMessage(m_store,
             chat.groupId.isEmpty() ? "name:" + chat.name : chat.groupId, systemMsg);
 
     if (targetIndex == m_currentChat) {
@@ -1079,7 +1079,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
             ng.name = groupName.isEmpty() ? "Group Chat" : groupName;
             ng.subtitle = "Group chat"; ng.keys.append(from);
             m_chats.append(ng);
-            if (m_db) m_db->saveContact(ng);
+            if (m_store) appData::saveContact(m_store,ng);
             chatIndex = m_chats.size() - 1;
             ensureUnreadSize();
             rebuildChatList();
@@ -1133,7 +1133,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
             qWarning() << "File transfer failed:" << fileName << "(no savedPath)";
         }
 
-        if (m_db) m_db->saveFileRecord(key, *rec);
+        if (m_store) appData::saveFileRecord(m_store,key, *rec);
 
         // In-app toast + system tray notification
         {
@@ -1205,7 +1205,7 @@ void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
     rec->chunksTotal    = chunksTotal;
     if (chunksSent >= chunksTotal && chunksTotal > 0) {
         rec->status = FileTransferStatus::Complete;
-        if (m_db) m_db->saveFileRecord(key, *rec);
+        if (m_store) appData::saveFileRecord(m_store,key, *rec);
     }
 
     if (chatIndex == m_currentChat)
@@ -1229,7 +1229,7 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         // arrived before any avatar), upgrade the name now that we know it.
         if (!displayName.isEmpty() && m_chats[i].name == "Unknown contact") {
             m_chats[i].name = displayName;
-            if (m_db) m_db->saveContact(m_chats[i]);
+            if (m_store) appData::saveContact(m_store,m_chats[i]);
         }
 
         // Empty avatarB64 means the sender reset to default — clear so the UI
@@ -1237,14 +1237,14 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         m_chats[i].avatarData = avatarB64;
 
         // Persist to DB
-        if (m_db) m_db->saveContactAvatar(peerIdB64u, avatarB64);
+        if (m_store) appData::saveContactAvatar(m_store,peerIdB64u, avatarB64);
 
         // Send our avatar back only on first receive to avoid infinite exchange loop
-        if (firstTime && m_db) {
-            const QString myName   = m_db->loadSetting("displayName");
-            const QString myAvatar = m_db->loadSetting("avatarData");
+        if (firstTime && m_store) {
+            const QString myName   = appData::loadSetting(m_store,"displayName");
+            const QString myAvatar = appData::loadSetting(m_store,"avatarData");
             if (!myName.isEmpty()) {
-                const QString myAvatarIsPhoto = m_db->loadSetting("avatarIsPhoto");
+                const QString myAvatarIsPhoto = appData::loadSetting(m_store,"avatarIsPhoto");
                 const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
                 m_controller->sendAvatar(peerIdB64u.toStdString(),
                                           myName.toStdString(), broadcastAvatar.toStdString());
@@ -1292,9 +1292,9 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
     nc.lastActive  = QDateTime::currentDateTimeUtc();
 
     m_chats.prepend(nc);
-    if (m_db) {
-        m_db->saveContact(nc);
-        if (!avatarB64.isEmpty()) m_db->saveContactAvatar(peerIdB64u, avatarB64);
+    if (m_store) {
+        appData::saveContact(m_store,nc);
+        if (!avatarB64.isEmpty()) appData::saveContactAvatar(m_store,peerIdB64u, avatarB64);
     }
 
     ensureUnreadSize();
@@ -1305,11 +1305,11 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
 
     // Reciprocate with our own avatar so the peer also gets our display
     // name / picture.  Only done on first-contact creation to avoid loops.
-    if (m_db) {
-        const QString myName   = m_db->loadSetting("displayName");
+    if (m_store) {
+        const QString myName   = appData::loadSetting(m_store,"displayName");
         if (!myName.isEmpty()) {
-            const QString myAvatar        = m_db->loadSetting("avatarData");
-            const QString myAvatarIsPhoto = m_db->loadSetting("avatarIsPhoto");
+            const QString myAvatar        = appData::loadSetting(m_store,"avatarData");
+            const QString myAvatarIsPhoto = appData::loadSetting(m_store,"avatarIsPhoto");
             const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
             m_controller->sendAvatar(peerIdB64u.toStdString(),
                                       myName.toStdString(), broadcastAvatar.toStdString());
@@ -1324,7 +1324,7 @@ void ChatView::onGroupRenamed(const QString &groupId, const QString &newName)
     for (int i = 0; i < m_chats.size(); ++i) {
         if (!m_chats[i].isGroup || m_chats[i].groupId != groupId) continue;
         m_chats[i].name = newName;
-        if (m_db) m_db->saveContact(m_chats[i]);
+        if (m_store) appData::saveContact(m_store,m_chats[i]);
         rebuildChatList();
         if (m_currentChat == i)
             m_ui->chatTitleLabel->setText(newName);
@@ -1341,7 +1341,7 @@ void ChatView::onGroupAvatarReceived(const QString &groupId, const QString &avat
         if (m_chats[i].avatarData == avatarB64) return;
 
         m_chats[i].avatarData = avatarB64;
-        if (m_db) m_db->saveContactAvatar(m_chats[i].peerIdB64u, avatarB64);
+        if (m_store) appData::saveContactAvatar(m_store,m_chats[i].peerIdB64u, avatarB64);
 
         // Relay to all group members so stragglers receive it too
         if (m_controller && !m_chats[i].keys.isEmpty())
@@ -1436,7 +1436,7 @@ void ChatView::onAttachFile()
     rec.chunksComplete = 0;
     rec.savedPath      = path;
     m_filesByKey[key].append(rec);
-    if (m_db) m_db->saveFileRecord(key, rec);
+    if (m_store) appData::saveFileRecord(m_store,key, rec);
 
     rebuildFilesTab();
 
@@ -1491,7 +1491,7 @@ void ChatView::onSendMessage()
     Message msg{true, text, now, msgId};
     m_chats[m_currentChat].messages.append(msg);
 
-    if (m_db) {
+    if (m_store) {
         const QString dbKey = m_chats[m_currentChat].isGroup
                                   ? (m_chats[m_currentChat].groupId.isEmpty()
                                          ? "name:" + m_chats[m_currentChat].name
@@ -1499,7 +1499,7 @@ void ChatView::onSendMessage()
                                   : (m_chats[m_currentChat].keys.isEmpty()
                                          ? "name:" + m_chats[m_currentChat].name
                                          : m_chats[m_currentChat].keys.first());
-        m_db->saveMessage(dbKey, msg);
+        appData::saveMessage(m_store,dbKey, msg);
     }
 
     addMessageBubble(text, true);
@@ -1654,7 +1654,7 @@ void ChatView::onEditProfile()
     QPixmap uploadedPhoto;
     QColor avatarColor(0x2e, 0x8b, 0x3a);
 
-    const QString currentAvatarB64 = m_db ? m_db->loadSetting("avatarData") : QString();
+    const QString currentAvatarB64 = m_store ? appData::loadSetting(m_store,"avatarData") : QString();
     if (!currentAvatarB64.isEmpty()) {
         QPixmap px;
         px.loadFromData(QByteArray::fromBase64(currentAvatarB64.toUtf8()));
@@ -1903,10 +1903,10 @@ void ChatView::onEditProfile()
     m_ui->profileAvatarLabel->setPixmap(makeCircularPixmap(finalPx, 40));
     m_ui->profileAvatarLabel->setText("");
 
-    if (m_db) {
-        m_db->saveSetting("displayName",  displayName);
-        m_db->saveSetting("avatarData",   newAvatarB64);
-        m_db->saveSetting("avatarIsPhoto", usingPhoto ? "true" : "false");
+    if (m_store) {
+        appData::saveSetting(m_store,"displayName",  displayName);
+        appData::saveSetting(m_store,"avatarData",   newAvatarB64);
+        appData::saveSetting(m_store,"avatarIsPhoto", usingPhoto ? "true" : "false");
     }
 
     // Broadcast to all contacts. Send empty avatar when using default so the
@@ -1941,7 +1941,7 @@ void ChatView::onEditContact(int index)
                           &m_chats,
                           [this](const ChatData &newContact) {
                               m_chats.append(newContact);
-                              if (m_db) m_db->saveContact(newContact);
+                              if (m_store) appData::saveContact(m_store,newContact);
                               rebuildChatList();
                           },
                           wasGroup ? &avatar : nullptr,
@@ -1981,9 +1981,9 @@ void ChatView::onEditContact(int index)
         if (wasGroup) m_chats[index].avatarData = avatar;
         if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
             m_chats[index].peerIdB64u = keys.first();
-        if (m_db) m_db->saveContact(m_chats[index]);
+        if (m_store) appData::saveContact(m_store,m_chats[index]);
         if (wasGroup && !avatar.isEmpty())
-            m_db->saveContactAvatar(m_chats[index].peerIdB64u, avatar);
+            appData::saveContactAvatar(m_store,m_chats[index].peerIdB64u, avatar);
         rebuildChatList();
         if (m_currentChat == index)
             m_ui->chatTitleLabel->setText(name);
@@ -2006,7 +2006,7 @@ void ChatView::onEditContact(int index)
         const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
                                   ? "name:" + m_chats[index].name
                                   : m_chats[index].peerIdB64u;
-        if (m_db) m_db->deleteContact(dbKey);
+        if (m_store) appData::deleteContact(m_store,dbKey);
         m_chats.remove(index);
         m_unread.remove(index);
         m_currentChat = -1;
@@ -2014,7 +2014,7 @@ void ChatView::onEditContact(int index)
         if (!m_chats.isEmpty()) m_ui->chatList->setCurrentRow(0);
     } else if (result == ContactEditorResult::Blocked) {
         m_chats[index].isBlocked = !m_chats[index].isBlocked;
-        if (m_db) m_db->saveContact(m_chats[index]);
+        if (m_store) appData::saveContact(m_store,m_chats[index]);
         rebuildChatList();
 
     } else if (result == ContactEditorResult::SessionReset) {
@@ -2022,7 +2022,7 @@ void ChatView::onEditContact(int index)
         const QString peerId = m_chats[index].peerIdB64u;
         if (!peerId.isEmpty())
             m_controller->resetSession(peerId.toStdString());
-        if (m_db) m_db->saveContact(m_chats[index]);
+        if (m_store) appData::saveContact(m_store,m_chats[index]);
         rebuildChatList();
     } else if (result == ContactEditorResult::Left) {
         // Notify all members you're leaving
@@ -2036,7 +2036,7 @@ void ChatView::onEditContact(int index)
         const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
                                   ? "name:" + m_chats[index].name
                                   : m_chats[index].peerIdB64u;
-        if (m_db) m_db->deleteContact(dbKey);
+        if (m_store) appData::deleteContact(m_store,dbKey);
         m_chats.remove(index);
         m_unread.remove(index);
         m_currentChat = -1;
@@ -2147,7 +2147,7 @@ void ChatView::onAddContact()
         ng.groupId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         ng.peerIdB64u = ng.groupId;
         m_chats.append(ng);
-        if(m_db) m_db->saveContact(ng);
+        if(m_store) appData::saveContact(m_store,ng);
         rebuildChatList();
         m_ui->chatList->setCurrentRow(m_chats.size()-1);
         return;
@@ -2175,12 +2175,12 @@ void ChatView::onAddContact()
     ChatData nc; nc.name=name; nc.subtitle="Secure chat"; nc.keys=keys;
     if(!keys.isEmpty()) nc.peerIdB64u=keys.first();
     m_chats.append(nc);
-    if(m_db) m_db->saveContact(nc);
+    if(m_store) appData::saveContact(m_store,nc);
 
     // Send our avatar to the new contact
     if (!nc.peerIdB64u.isEmpty()) {
-        const QString myName   = m_db ? m_db->loadSetting("displayName") : QString();
-        const QString myAvatar = m_db ? m_db->loadSetting("avatarData")  : QString();
+        const QString myName   = m_store ? appData::loadSetting(m_store,"displayName") : QString();
+        const QString myAvatar = m_store ? appData::loadSetting(m_store,"avatarData")  : QString();
         if (!myName.isEmpty())
             m_controller->sendAvatar(nc.peerIdB64u.toStdString(),
                                       myName.toStdString(), myAvatar.toStdString());
@@ -2212,7 +2212,7 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
     ChatData nc; nc.name = "Unknown contact"; nc.subtitle = "Secure chat";
     nc.peerIdB64u = peerIdB64u; nc.keys.append(peerIdB64u);
     m_chats.prepend(nc);
-    if (m_db) m_db->saveContact(nc);
+    if (m_store) appData::saveContact(m_store,nc);
     ensureUnreadSize();
     m_unread.prepend(0);
     if (m_currentChat >= 0) m_currentChat += 1;
@@ -2222,14 +2222,14 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
 
 void ChatView::initChats()
 {
-    if (m_db) {
-        const QString savedName = m_db->loadSetting("displayName");
+    if (m_store) {
+        const QString savedName = appData::loadSetting(m_store,"displayName");
         if (!savedName.isEmpty()) {
             m_ui->profileNameLabel->setText(savedName);
             m_ui->profileAvatarLabel->setText(QString(savedName[0]).toUpper());
         }
 
-        const QString avatarB64 = m_db->loadSetting("avatarData");
+        const QString avatarB64 = appData::loadSetting(m_store,"avatarData");
         if (!avatarB64.isEmpty()) {
             QPixmap px;
             px.loadFromData(QByteArray::fromBase64(avatarB64.toUtf8()));
@@ -2240,11 +2240,11 @@ void ChatView::initChats()
         }
     }
 
-    if (m_db) {
-        m_chats = m_db->loadAllContacts();
+    if (m_store) {
+        m_chats = appData::loadAllContacts(m_store);
         for (const auto &c : std::as_const(m_chats)) {
             const QString ck = chatKey(c);
-            const auto records = m_db->loadFileRecords(ck);
+            const auto records = appData::loadFileRecords(m_store,ck);
             if (!records.isEmpty())
                 m_filesByKey[ck] = records;
         }
@@ -2849,7 +2849,7 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         if (reply != QMessageBox::Yes) return;
 
         // 1. Delete from database
-        m_db->deleteFileRecord(delTransferId);
+        appData::deleteFileRecord(m_store,delTransferId);
 
         // 3. Remove from in-memory map
         if (m_currentChat >= 0 && m_currentChat < m_chats.size()) {
@@ -3137,6 +3137,19 @@ void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
                                       const QString &fileName,
                                       qint64 fileSize)
 {
+    // Verified-contacts gate: when SettingsPanel's "Only accept from
+    // verified contacts" toggle is on AND the sender's safety number
+    // hasn't been confirmed, silently decline.  Same semantic as the
+    // iOS-side filter — the core has already accepted the envelope;
+    // we just refuse without bothering the user.
+    if (m_requireVerifiedFiles && m_controller) {
+        const auto trust = m_controller->peerTrust(fromPeerIdB64u.toStdString());
+        if (trust != ChatController::PeerTrust::Verified) {
+            m_controller->declineFileTransfer(transferId.toStdString());
+            return;
+        }
+    }
+
     // Figure out which contact/chat this is so we can show a friendly name.
     QString senderName = fromPeerIdB64u.left(8) + "...";
     for (const ChatData &c : m_chats) {
@@ -3178,7 +3191,7 @@ void ChatView::onFileTransferCanceled(const QString &transferId, bool byReceiver
             if (rec.transferId != transferId) continue;
             if (rec.status == FileTransferStatus::Complete) return; // too late
             rec.status = FileTransferStatus::Failed;
-            if (m_db) m_db->saveFileRecord(it.key(), rec);
+            if (m_store) appData::saveFileRecord(m_store,it.key(), rec);
             rebuildFilesTab();
             break;
         }
@@ -3201,7 +3214,7 @@ void ChatView::onFileTransferDelivered(const QString &transferId)
             // Transfer landed + hash verified. Keep status Complete but reflect delivery.
             rec.chunksComplete = rec.chunksTotal;
             rec.status         = FileTransferStatus::Complete;
-            if (m_db) m_db->saveFileRecord(it.key(), rec);
+            if (m_store) appData::saveFileRecord(m_store,it.key(), rec);
             rebuildFilesTab();
             showToast(QString("Delivered: %1").arg(rec.fileName));
             return;
@@ -3217,7 +3230,7 @@ void ChatView::onFileTransferBlocked(const QString &transferId, bool byReceiver)
         for (auto &rec : records) {
             if (rec.transferId != transferId) continue;
             rec.status = FileTransferStatus::Failed;
-            if (m_db) m_db->saveFileRecord(it.key(), rec);
+            if (m_store) appData::saveFileRecord(m_store,it.key(), rec);
             rebuildFilesTab();
             break;
         }

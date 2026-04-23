@@ -25,7 +25,11 @@ struct SettingsView: View {
                     AppearanceSection(client: client)
                     BiometricUnlockSection(client: client)
                     NotificationPrivacySection(client: client)
+                    PrivacyLevelSection(client: client)
+                    TrustSection(client: client)
+                    FileTransferSection(client: client)
                     RelayURLSection()
+                    LockSection(client: client, dismiss: dismiss)
                 }
                 .padding(.horizontal)
                 .padding(.vertical)
@@ -257,5 +261,365 @@ private struct RelayURLSection: View {
         UserDefaults.standard.set(url, forKey: Peer2PearClient.kDefaultsRelayUrlKey)
         saved = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { saved = false }
+    }
+}
+
+// Privacy posture against the relay/network — mirrors desktop's
+// three-tier picker (Standard / Enhanced / Maximum).  Each level
+// strictly subsumes the one below; the descriptive text below the
+// picker swaps to match the chosen tier so the user can see exactly
+// what they're opting into without leaving Settings.
+private struct PrivacyLevelSection: View {
+    @ObservedObject var client: Peer2PearClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "eye.slash.fill")
+                    .foregroundStyle(.green)
+                Text("Privacy")
+                    .font(.headline)
+            }
+
+            Picker("Privacy", selection: Binding(
+                get: { client.privacyLevel },
+                set: { client.privacyLevel = $0 }
+            )) {
+                Text("Standard").tag(Peer2PearClient.PrivacyLevel.standard)
+                Text("Enhanced").tag(Peer2PearClient.PrivacyLevel.enhanced)
+                Text("Maximum").tag(Peer2PearClient.PrivacyLevel.maximum)
+            }
+            .pickerStyle(.segmented)
+
+            // Per-level explainer.  Cumulative wording mirrors the
+            // protocol's actual stacking: each tier adds defenses on
+            // top of every lower tier, never replaces them.
+            switch client.privacyLevel {
+            case .standard:
+                privacyDescription(
+                    title: "Standard — baseline privacy.",
+                    bullets: [
+                        "Envelope size padding (hides message size from the relay)",
+                        "Sealed sender (hides your identity from the relay)",
+                        "End-to-end encryption (no operator can read content)",
+                    ],
+                    footer: "Recommended for most users.")
+            case .enhanced:
+                privacyDescription(
+                    title: "Enhanced — adds traffic shaping.",
+                    bullets: [
+                        "Everything in Standard",
+                        "Send jitter (randomized delays so timing patterns don't leak)",
+                        "Cover traffic (decoy envelopes blend real activity into noise)",
+                        "Multi-relay rotation (no single relay sees the full picture)",
+                    ],
+                    footer: "Higher latency, slightly more battery.")
+            case .maximum:
+                privacyDescription(
+                    title: "Maximum — full anonymity posture.",
+                    bullets: [
+                        "Everything in Enhanced",
+                        "Multi-hop forwarding (envelopes route through several relays)",
+                        "High-frequency cover traffic (continuous decoys)",
+                    ],
+                    footer: "Slowest delivery + highest battery cost.  For high-risk users.")
+            }
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+
+    @ViewBuilder
+    private func privacyDescription(title: String,
+                                     bullets: [String],
+                                     footer: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption.bold())
+            ForEach(bullets, id: \.self) { b in
+                Text("• " + b)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Text(footer)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+        }
+    }
+}
+
+// Trust & Verification — mirrors desktop's "Block contacts whose
+// safety number changed" toggle.  The mismatch warning (orange triangle
+// in ChatRow) still fires either way; this control just decides whether
+// the core hard-blocks send/receive on top of the visual warning.
+private struct TrustSection: View {
+    @ObservedObject var client: Peer2PearClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "checkmark.shield.fill")
+                    .foregroundStyle(.green)
+                Text("Trust")
+                    .font(.headline)
+            }
+
+            Toggle(isOn: Binding(
+                get: { client.hardBlockOnKeyChange },
+                set: { client.hardBlockOnKeyChange = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Block contacts whose safety number changed")
+                        .font(.subheadline)
+                    Text("Refuses to send to (or accept from) a previously-verified contact whose safety number no longer matches.  Default off — a mismatch shows a banner and you decide whether to continue.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.green)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+}
+
+// Mirrors desktop's File Transfers section: two MB thresholds + the
+// require-direct-connection toggle, plus two iOS-specific additions:
+//   * Verified contacts only — silently declines files from peers whose
+//     safety number hasn't been confirmed.
+//   * Auto-accept on Wi-Fi only — overrides the auto-accept threshold
+//     to 0 whenever the device is on cellular, so users never get
+//     surprise data charges from a forgotten 100 MB threshold.
+//
+// All settings persist via UserDefaults and are re-applied on every
+// unlock from Peer2PearClient.start(); didSet hooks push live changes
+// to the core without a reconnect.
+private struct FileTransferSection: View {
+    @ObservedObject var client: Peer2PearClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "externaldrive.badge.checkmark")
+                    .foregroundStyle(.green)
+                Text("File Transfers")
+                    .font(.headline)
+            }
+
+            // ── Auto-accept threshold ───────────────────────────────
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Auto-accept files up to")
+                        .font(.subheadline)
+                    Spacer()
+                    Stepper("\(client.fileAutoAcceptMB) MB",
+                            value: Binding(
+                                get: { client.fileAutoAcceptMB },
+                                set: { client.fileAutoAcceptMB = max(0, $0) }),
+                            in: 0...4096, step: 5)
+                        .labelsHidden()
+                    Text("\(client.fileAutoAcceptMB) MB")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 60, alignment: .trailing)
+                }
+                Text("Files at or below this size download without asking.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            // ── Hard cap ────────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Never accept files larger than")
+                        .font(.subheadline)
+                    Spacer()
+                    Stepper("\(client.fileHardMaxMB) MB",
+                            value: Binding(
+                                get: { client.fileHardMaxMB },
+                                set: { client.fileHardMaxMB = max(1, $0) }),
+                            in: 1...8192, step: 25)
+                        .labelsHidden()
+                    Text("\(client.fileHardMaxMB) MB")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 60, alignment: .trailing)
+                }
+                Text("Files above this size are declined automatically, no notification.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            // ── Wi-Fi-only auto-accept ──────────────────────────────
+            Toggle(isOn: Binding(
+                get: { client.fileAutoAcceptWifiOnly },
+                set: { client.fileAutoAcceptWifiOnly = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Auto-accept on Wi-Fi only")
+                        .font(.subheadline)
+                    Text("Pauses auto-accept on cellular so large files don't surprise your data plan — you'll still see a prompt for each file.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.green)
+            if client.fileAutoAcceptWifiOnly && !client.onWifi {
+                Label("On cellular — auto-accept paused.", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+
+            Divider()
+
+            // ── Direct-connection requirement ───────────────────────
+            Toggle(isOn: Binding(
+                get: { client.fileRequireP2P },
+                set: { client.fileRequireP2P = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Require direct connection")
+                        .font(.subheadline)
+                    Text("Only accept files when a direct P2P connection is available.  Relayed files are refused.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.green)
+
+            Divider()
+
+            // ── Verified-contacts gate ──────────────────────────────
+            Toggle(isOn: Binding(
+                get: { client.fileRequireVerifiedContact },
+                set: { client.fileRequireVerifiedContact = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Only from verified contacts")
+                        .font(.subheadline)
+                    Text("Files from peers whose safety number you haven't confirmed are silently declined.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.green)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+}
+
+// App Lock — bundle of session-security controls.
+//
+//   * Auto-Lock picker: minutes of background time before the app
+//     auto-locks on next foreground.  0 = lock immediately on every
+//     backgrounding (banking-app posture); -1 = never (rely on the
+//     manual button only).
+//   * Erase After 12 Failed Attempts: panic-wipe toggle.  Mirrors the
+//     iOS native passcode "Erase Data" — after 12 consecutive failed
+//     unlocks the entire app sandbox is removed.  Off by default.
+//   * Lock Now: immediate manual lock, no confirmation (footer copy
+//     already explains the consequence, and the action is non-
+//     destructive — data lives on in the encrypted DB).
+//
+// Face ID toggle stays in its own BiometricUnlockSection above —
+// that already has the hardware-availability + Keychain-enrolment
+// state machine, no need to duplicate it here.
+private struct LockSection: View {
+    @ObservedObject var client: Peer2PearClient
+    let dismiss: DismissAction
+
+    /// Auto-lock options.  Encoded as the int we persist in
+    /// UserDefaults — keep these in sync with `maybeAutoLock` in
+    /// Peer2PearClient.
+    private static let autoLockChoices: [(label: String, minutes: Int)] = [
+        ("Immediately",    0),
+        ("After 1 minute", 1),
+        ("After 5 minutes", 5),
+        ("After 15 minutes", 15),
+        ("After 1 hour",   60),
+        ("Never",          -1),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "lock.fill")
+                    .foregroundStyle(.red)
+                Text("App Lock")
+                    .font(.headline)
+            }
+
+            // ── Auto-lock delay ─────────────────────────────────────
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Auto-Lock")
+                    .font(.subheadline)
+                Picker("Auto-Lock", selection: Binding(
+                    get: { client.autoLockMinutes },
+                    set: { client.autoLockMinutes = $0 }
+                )) {
+                    ForEach(Self.autoLockChoices, id: \.minutes) { c in
+                        Text(c.label).tag(c.minutes)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text("Locks the app after this much time in the background.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            // ── Wipe-on-failure ─────────────────────────────────────
+            Toggle(isOn: Binding(
+                get: { client.wipeOnFailedAttempts },
+                set: { client.wipeOnFailedAttempts = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Erase After 12 Failed Attempts")
+                        .font(.subheadline)
+                    Text("Permanently deletes identity, contacts, messages, and saved files from this device.  No recovery.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.red)
+            if client.wipeOnFailedAttempts && client.failedUnlockAttempts > 0 {
+                Text("\(client.failedUnlockAttempts) of \(Peer2PearClient.kFailedUnlockAttemptsThreshold) failed attempts so far.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+
+            Divider()
+
+            // ── Manual lock ─────────────────────────────────────────
+            Button(role: .destructive) {
+                // Dismiss the sheet first so the parent's
+                // `if myPeerId.isEmpty` swap to OnboardingView
+                // happens against a fully-unwound presentation stack.
+                dismiss()
+                DispatchQueue.main.async { client.lock() }
+            } label: {
+                Label("Lock Now", systemImage: "lock.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+
+            Text("Clears the unlocked session from memory.  Re-entering requires your passphrase \(BiometricUnlock.isEnabled ? "or \(BiometricUnlock.biometryName) " : "")— message history stays safely on disk in the encrypted database.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
     }
 }

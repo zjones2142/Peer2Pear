@@ -11,7 +11,7 @@
 #include <QSpinBox>
 #include <QComboBox>
 
-class DatabaseManager;
+class AppDataStore;
 
 class SettingsPanel : public QWidget
 {
@@ -42,8 +42,8 @@ public:
     // Call after construction to populate profile fields
     void setProfileInfo(const QString &displayName, const QString &publicKey);
 
-    // Attach a DatabaseManager for persisting settings, then load saved state
-    void setDatabase(DatabaseManager *db);
+    // Attach the app-data store for persisting settings, then load saved state
+    void setAppDataStore(AppDataStore *store);
 
 signals:
     void backClicked();
@@ -56,6 +56,11 @@ signals:
     void fileAutoAcceptMaxChanged(int mb);
     void fileHardMaxChanged(int mb);
     void fileRequireP2PToggled(bool on);
+
+    // When on, files from peers whose safety number isn't verified are
+    // silently declined.  Pure UI-side filter — desktop ChatView's
+    // onFileAcceptRequested checks this before raising the QMessageBox.
+    void fileRequireVerifiedToggled(bool on);
 
     // Relay URL the client should connect to.  MainWindow hooks this and
     // drops the existing WS connection + reconnects with the new URL.
@@ -77,6 +82,7 @@ private slots:
     void onFileAutoAcceptSpin(int mb);
     void onFileHardMaxSpin(int mb);
     void onToggleRequireP2P();
+    void onToggleRequireVerifiedFiles();
     void onApplyRelayUrl();
     void onResetRelayUrl();
     void onPrivacyLevelChanged(int level);
@@ -87,6 +93,7 @@ private:
     void applyNotificationState();   // sync UI labels to m_notificationsEnabled
     void applyDndState();            // sync UI labels to m_dndEnabled
     void applyRequireP2PState();
+    void applyRequireVerifiedFilesState();
     QWidget *makeProfileSection();
     QWidget *makeSection(const QString &sectionTitle,
                          const QList<QPair<QString, QString>> &rows);
@@ -103,7 +110,7 @@ private:
     QString      m_fullPublicKey;
 
     // Database (not owned)
-    DatabaseManager *m_db               = nullptr;
+    AppDataStore *m_store               = nullptr;
 
     // Notifications
     bool             m_notificationsEnabled = true;
@@ -125,6 +132,10 @@ private:
     bool         m_requireP2PEnabled    = false;
     QPushButton *m_requireP2PToggleBtn  = nullptr;
     QLabel      *m_requireP2PStatusLbl  = nullptr;
+
+    bool         m_requireVerifiedFilesEnabled    = false;
+    QPushButton *m_requireVerifiedFilesToggleBtn  = nullptr;
+    QLabel      *m_requireVerifiedFilesStatusLbl  = nullptr;
 
     // Relay URL
     QLineEdit   *m_relayUrlEdit         = nullptr;

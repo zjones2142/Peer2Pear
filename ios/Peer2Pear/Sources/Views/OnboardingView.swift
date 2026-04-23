@@ -14,10 +14,10 @@ struct OnboardingView: View {
     // after the user dismisses the first auto-prompt.
     @State private var biometricAutoAttempted = false
 
-    // Computed once at view construction.  If the user creates an
-    // identity, then later re-enters Onboarding after a crash, the
-    // view is rebuilt — so we re-query the filesystem at that point.
-    private let returning: Bool = Peer2PearClient.identityExists(
+    // Mutable so we can re-evaluate after a panic-wipe (12 failed
+    // attempts) flips the on-disk state from "identity present" back
+    // to "no identity" without rebuilding the view.
+    @State private var returning: Bool = Peer2PearClient.identityExists(
         documentDir: Peer2PearClient.documentsPath)
 
     // Biometric opt-in is only meaningful when (a) hardware supports
@@ -135,6 +135,12 @@ struct OnboardingView: View {
                     tryBiometric()
                 }
             }
+            .alert("All Data Erased",
+                   isPresented: $client.dataWipedNotice) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Too many failed unlock attempts.  Identity, contacts, messages, and saved files have been permanently removed from this device.")
+            }
         }
     }
 
@@ -166,6 +172,20 @@ struct OnboardingView: View {
                 // wipes it after first read.
                 if !client.myPeerId.isEmpty {
                     client.setLastUnlockPassphrase(pass)
+                    client.resetFailedUnlockCounter()
+                } else if returning {
+                    // Only count failures against EXISTING identities —
+                    // a fresh install's first "Get Started" attempt with
+                    // a too-short passphrase shouldn't count toward wipe.
+                    let wiped = client.recordFailedUnlock(
+                        documentDir: Peer2PearClient.documentsPath)
+                    if wiped {
+                        // Sandbox is empty now; rebuild the view's
+                        // returning flag so the UI flips to the
+                        // "Get Started" branch instead of "Unlock".
+                        returning = false
+                        passphrase = ""
+                    }
                 }
                 starting = false
             }
