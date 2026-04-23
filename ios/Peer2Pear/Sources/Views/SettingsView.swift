@@ -28,7 +28,7 @@ struct SettingsView: View {
                     PrivacyLevelSection(client: client)
                     TrustSection(client: client)
                     FileTransferSection(client: client)
-                    RelayURLSection()
+                    RelayServersSection(client: client)
                     LockSection(client: client, dismiss: dismiss)
                 }
                 .padding(.horizontal)
@@ -209,24 +209,35 @@ private struct NotificationPrivacySection: View {
     }
 }
 
-// Relay URL — advanced setting for users self-hosting a relay or
+// Relay servers — advanced setting for users self-hosting a relay or
 // switching federation.  Off the Onboarding screen because the vast
 // majority of users will stay on the default, and asking about it
 // up front is a cognitive-load tax for a decision that doesn't matter
-// to them.  Applies on next app launch; changing the live WebSocket
-// mid-session would need a reconnect orchestration we haven't built.
-private struct RelayURLSection: View {
+// to them.  Primary URL applies on next app launch; changing the live
+// WebSocket mid-session would need a reconnect orchestration we haven't
+// built.  Backup relays populate the send pool used by Privacy=Maximum
+// multi-hop forwarding — the core gates multi-hop on
+// `m_sendRelays.size() >= 2`, so a single backup silently falls back
+// to Enhanced-tier behavior; the footer copy makes that honest.
+private struct RelayServersSection: View {
+    @ObservedObject var client: Peer2PearClient
     @State private var url: String = Peer2PearClient.storedRelayUrl
     @State private var saved = false
+    @State private var showAddSheet = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Image(systemName: "server.rack")
                     .foregroundStyle(.green)
-                Text("Relay server")
+                Text("Relay Servers")
                     .font(.headline)
             }
+
+            // ── Primary relay ───────────────────────────────────────
+            Text("Primary")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
 
             TextField("Relay URL", text: $url)
                 .textFieldStyle(.roundedBorder)
@@ -248,19 +259,117 @@ private struct RelayURLSection: View {
                 }
             }
 
-            Text("Relays forward encrypted envelopes between peers; they never see message content.  Takes effect on next launch.")
+            Divider()
+
+            // ── Backup relays ───────────────────────────────────────
+            HStack {
+                Text("Backup Relays")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    showAddSheet = true
+                } label: {
+                    Label("Add Relay", systemImage: "plus")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            if client.backupRelayUrls.isEmpty {
+                Text("No backup relays configured.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(client.backupRelayUrls, id: \.self) { entry in
+                    HStack(spacing: 8) {
+                        Text(entry)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button(role: .destructive) {
+                            client.removeBackupRelay(entry)
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                                .foregroundStyle(.red)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+            }
+
+            Text("Relays forward encrypted envelopes between peers; they never see message content.  Additional relays enable multi-hop forwarding when Privacy is set to Maximum.  Without backup relays, Maximum behaves like Enhanced.  Takes effect on next launch.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(12)
         .background(Color(.secondarySystemBackground))
         .cornerRadius(10)
+        .sheet(isPresented: $showAddSheet) {
+            AddBackupRelaySheet(client: client, isPresented: $showAddSheet)
+        }
     }
 
     private func save() {
         UserDefaults.standard.set(url, forKey: Peer2PearClient.kDefaultsRelayUrlKey)
         saved = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { saved = false }
+    }
+}
+
+// Modal for entering a new backup relay URL.  Validation happens in
+// Peer2PearClient.addBackupRelay (trim + https/wss prefix + URL parse +
+// dedupe); on failure we surface a single error line rather than branch
+// the message per cause — the user only needs to know the URL didn't
+// stick, and the example placeholder tells them the expected shape.
+private struct AddBackupRelaySheet: View {
+    @ObservedObject var client: Peer2PearClient
+    @Binding var isPresented: Bool
+    @State private var url: String = ""
+    @State private var errorMessage: String = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Add a relay URL to use for multi-hop forwarding.  Must start with https:// or wss://.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                TextField("https://relay.example.com", text: $url)
+                    .textFieldStyle(.roundedBorder)
+                    .autocapitalization(.none)
+                    .keyboardType(.URL)
+                    .textContentType(.URL)
+                    .autocorrectionDisabled(true)
+
+                if !errorMessage.isEmpty {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Add Backup Relay")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { isPresented = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add") {
+                        if client.addBackupRelay(url) {
+                            isPresented = false
+                        } else {
+                            errorMessage = "Invalid or duplicate URL.  Must start with https:// or wss://."
+                        }
+                    }
+                    .disabled(url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
     }
 }
 
@@ -323,6 +432,12 @@ private struct PrivacyLevelSection: View {
                         "High-frequency cover traffic (continuous decoys)",
                     ],
                     footer: "Slowest delivery + highest battery cost.  For high-risk users.")
+                if client.backupRelayUrls.isEmpty {
+                    Text("Add backup relays under Settings → Relay Servers to enable multi-hop.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .padding(.top, 2)
+                }
             }
         }
         .padding(12)

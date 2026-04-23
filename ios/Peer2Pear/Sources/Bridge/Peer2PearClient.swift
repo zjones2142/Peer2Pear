@@ -147,6 +147,56 @@ final class Peer2PearClient: ObservableObject {
             ?? kDefaultRelayUrl
     }
 
+    // MARK: - Backup relays (send pool for multi-hop)
+
+    // Stored as a JSON-encoded [String] in UserDefaults.  Multi-hop
+    // forwarding in RelayClient gates on `m_sendRelays.size() >= 2`,
+    // so a user on Privacy=Maximum with fewer than two backup relays
+    // silently falls back to Enhanced-tier behavior.  The SettingsView
+    // explainer reflects that honestly.
+    static let kBackupRelayUrlsKey = "p2p.backupRelayUrls"
+
+    @Published var backupRelayUrls: [String] = {
+        guard let data = UserDefaults.standard
+                .data(forKey: Peer2PearClient.kBackupRelayUrlsKey),
+              let arr = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return arr
+    }() {
+        didSet {
+            if let data = try? JSONEncoder().encode(backupRelayUrls) {
+                UserDefaults.standard.set(data, forKey: Self.kBackupRelayUrlsKey)
+            }
+        }
+    }
+
+    /// Validate + append a backup relay URL.  Returns false when the URL
+    /// is empty, malformed, uses a non-TLS scheme, or duplicates one
+    /// already in the list.  On success, also pushes the new relay to
+    /// the live send pool so multi-hop can pick it up without waiting
+    /// for a relaunch — the core deduplicates, so the next start() call
+    /// replaying the persisted list is a no-op.
+    @discardableResult
+    func addBackupRelay(_ url: String) -> Bool {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lowered = trimmed.lowercased()
+        guard lowered.hasPrefix("https://") || lowered.hasPrefix("wss://")
+        else { return false }
+        guard URL(string: trimmed) != nil else { return false }
+        guard !backupRelayUrls.contains(trimmed) else { return false }
+        backupRelayUrls.append(trimmed)
+        addSendRelay(url: trimmed)
+        return true
+    }
+
+    /// Remove a backup relay from the persisted list.  The live send
+    /// pool is not mutated — the core has no remove-send-relay entry
+    /// point, so the deletion takes effect on the next start().
+    func removeBackupRelay(_ url: String) {
+        backupRelayUrls.removeAll { $0 == url }
+    }
+
     /// True when a passphrase-unlockable identity already lives on disk.
     /// Drives the Onboarding "Unlock" vs. "Create" branching — mirrors
     /// what `p2p_set_passphrase_v2` in the core checks (the salt file is
@@ -704,6 +754,15 @@ final class Peer2PearClient: ObservableObject {
         applyEffectiveAutoAcceptThreshold()
 
         p2p_set_relay_url(rawContext, relayUrl)
+        // Replay the persisted backup-relay list into the core's send
+        // pool so Privacy=Maximum's multi-hop path (gated on
+        // m_sendRelays.size() >= 2) has forwarders to choose from.
+        // Order is stable (primary via set_relay_url, then backups in
+        // insertion order) so the pool composition matches across
+        // relaunches — keeps forwarder selection consistent.
+        for backup in backupRelayUrls {
+            addSendRelay(url: backup)
+        }
         p2p_connect(rawContext)
 
         // If APNs registered before start() completed, the AppDelegate
@@ -1469,6 +1528,15 @@ final class Peer2PearClient: ObservableObject {
     func setPrivacyLevel(_ level: Int) {
         guard let ctx = rawContext else { return }
         p2p_set_privacy_level(ctx, Int32(level))
+    }
+
+    /// Append a relay URL to the core's send pool for multi-hop
+    /// forwarding.  Safe to call before start() — becomes a no-op when
+    /// rawContext is nil, and the persisted list is replayed on every
+    /// start() anyway.  Deduplication happens in the core.
+    func addSendRelay(url: String) {
+        guard let ctx = rawContext else { return }
+        p2p_add_send_relay(ctx, url)
     }
 
     // MARK: - Safety numbers (key verification)
