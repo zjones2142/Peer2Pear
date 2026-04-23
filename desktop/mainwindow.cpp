@@ -118,7 +118,9 @@ bool migratePlaintextDbToSqlCipher(const QString &dbPath, const QByteArray &dbKe
     }
 
     SqlCipherDb encDb;
-    if (!encDb.open(encPath.toStdString(), appData::qByteArrayToBytes(dbKey))) {
+    AppDataStore::Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
+                                    reinterpret_cast<const uint8_t*>(dbKey.constData()) + dbKey.size());
+    if (!encDb.open(encPath.toStdString(), dbKeyBytes)) {
         qWarning() << "Migration: failed to create encrypted DB";
         QFile::remove(encPath);
         return false;
@@ -187,7 +189,9 @@ bool openAppDataDb(SqlCipherDb &db, const QByteArray &dbKey)
         if (marker.open(QIODevice::WriteOnly)) marker.close();
     }
 
-    return db.open(dbPath.toStdString(), appData::qByteArrayToBytes(dbKey));
+    AppDataStore::Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
+                                    reinterpret_cast<const uint8_t*>(dbKey.constData()) + dbKey.size());
+    return db.open(dbPath.toStdString(), dbKeyBytes);
 }
 
 }  // namespace
@@ -353,7 +357,13 @@ MainWindow::MainWindow(QWidget *parent)
                 bytesConcat(m_controller.myIdB64u(), "peer2pear-dbkey")));
             QByteArray legacyGen2 = p2p::bridge::toQByteArray(ChatController::blake2b256(
                 bytesConcat(pass.toStdString(), "peer2pear-dbkey")));
-            appData::setEncryptionKey(&m_store, fieldKey, {legacyGen2, legacyGen1});
+            auto qbaToBytes = [](const QByteArray& b) -> AppDataStore::Bytes {
+                return AppDataStore::Bytes(
+                    reinterpret_cast<const uint8_t*>(b.constData()),
+                    reinterpret_cast<const uint8_t*>(b.constData()) + b.size());
+            };
+            m_store.setEncryptionKey(qbaToBytes(fieldKey),
+                                      {qbaToBytes(legacyGen2), qbaToBytes(legacyGen1)});
             p2p::bridge::secureZeroQ(fieldKey);
             p2p::bridge::secureZeroQ(legacyGen1);
             p2p::bridge::secureZeroQ(legacyGen2);
@@ -374,17 +384,17 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // ── First-time onboarding ─────────────────────────────────────────────────
-    if (appData::loadSetting(&m_store, "displayName").isEmpty()) {
+    if (m_store.loadSetting("displayName").empty()) {
         OnboardingDialog dlg(this);
         if (dlg.exec() != QDialog::Accepted) {
             QTimer::singleShot(0, qApp, &QCoreApplication::quit);
             return;
         }
-        appData::saveSetting(&m_store, "displayName", dlg.displayName());
+        m_store.saveSetting("displayName", dlg.displayName().toStdString());
         if (!dlg.avatarData().isEmpty()) {
-            appData::saveSetting(&m_store, "avatarData", dlg.avatarData());
-            appData::saveSetting(&m_store, "avatarIsPhoto",
-                                  dlg.isPhotoAvatar() ? "true" : "false");
+            m_store.saveSetting("avatarData", dlg.avatarData().toStdString());
+            m_store.saveSetting("avatarIsPhoto",
+                                 dlg.isPhotoAvatar() ? "true" : "false");
         }
 
         // ── Welcome guide (shown once after first onboarding) ────────────────
@@ -417,34 +427,34 @@ MainWindow::MainWindow(QWidget *parent)
     // obsolete endpoints so they land on the current production relay without
     // having to wipe their local DB.
     {
-        const QString old = appData::loadSetting(&m_store, "relayUrl",
-                                appData::loadSetting(&m_store, "serverUrl")); // fallback to old key
+        const std::string old = m_store.loadSetting("relayUrl",
+                                m_store.loadSetting("serverUrl")); // fallback to old key
         const bool staleIp      = (old == "http://3.141.14.234" ||
                                    old == "http://3.141.14.234/");
         const bool staleLocal   = (old == "http://localhost:8443" ||
                                    old == "http://localhost:8443/");
         if (staleIp || staleLocal) {
-            appData::saveSetting(&m_store, "relayUrl", "https://peer2pear.com");
+            m_store.saveSetting("relayUrl", "https://peer2pear.com");
         }
     }
     // Default for a fresh install: the production relay on peer2pear.com.
     // Users who self-host can override this via the settings table (no UI
     // yet — edit `SELECT value FROM settings WHERE key='relayUrl';` via
     // SQLCipher, or plumb in a Settings field).
-    const QString relayUrl = appData::loadSetting(&m_store, "relayUrl",
-                                                    "https://peer2pear.com");
-    m_controller.setRelayUrl(relayUrl.toStdString());
+    const std::string relayUrl = m_store.loadSetting("relayUrl", "https://peer2pear.com");
+    m_controller.setRelayUrl(relayUrl);
 
 #ifdef PEER2PEAR_P2P
     // TURN relay for symmetric NAT fallback — only meaningful when P2P is
     // compiled in.  setTurnServer() itself is declared behind the same flag.
-    const QString turnHost = appData::loadSetting(&m_store, "turnHost", "peer2pear.com");
-    const int     turnPort = appData::loadSetting(&m_store, "turnPort", "3478").toInt();
-    const QString turnUser = appData::loadSetting(&m_store, "turnUser", "peer2pear");
-    const QString turnPass = appData::loadSetting(&m_store, "turnPass", "peer2pear");
-    if (!turnHost.isEmpty())
-        m_controller.setTurnServer(turnHost.toStdString(), turnPort,
-                                    turnUser.toStdString(), turnPass.toStdString());
+    const std::string turnHost = m_store.loadSetting("turnHost", "peer2pear.com");
+    int turnPort = 3478;
+    try { turnPort = std::stoi(m_store.loadSetting("turnPort", "3478")); }
+    catch (...) { turnPort = 3478; }
+    const std::string turnUser = m_store.loadSetting("turnUser", "peer2pear");
+    const std::string turnPass = m_store.loadSetting("turnPass", "peer2pear");
+    if (!turnHost.empty())
+        m_controller.setTurnServer(turnHost, turnPort, turnUser, turnPass);
 #endif
 
     m_controller.connectToRelay();
@@ -472,7 +482,7 @@ MainWindow::MainWindow(QWidget *parent)
     m_mainStack->addWidget(ui->contentWidget);  // index 0 – chat
 
     m_settingsPanel = new SettingsPanel(ui->rootWidget);
-    m_settingsPanel->setProfileInfo(appData::loadSetting(&m_store, "displayName"),
+    m_settingsPanel->setProfileInfo(qtbridge::qstr(m_store.loadSetting("displayName")),
                                     QString::fromStdString(m_controller.myIdB64u()));
     m_settingsPanel->setAppDataStore(&m_store);
     m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
@@ -693,14 +703,17 @@ void MainWindow::onExportContacts()
         "JSON Files (*.json)");
     if (path.isEmpty()) return;
 
-    const QVector<ChatData> contacts = appData::loadAllContacts(&m_store);
+    std::vector<AppDataStore::Contact> contacts;
+    m_store.loadAllContacts([&contacts](const AppDataStore::Contact &c) {
+        contacts.push_back(c);
+    });
 
     QJsonArray arr;
     for (const auto &c : contacts) {
         if (c.isBlocked) continue; // never export blocked contacts
         QJsonObject obj;
-        obj["name"] = c.name;
-        obj["keys"] = QJsonArray::fromStringList(c.keys);
+        obj["name"] = qtbridge::qstr(c.name);
+        obj["keys"] = QJsonArray::fromStringList(qtbridge::qstrList(c.keys));
         arr.append(obj);
     }
 
@@ -754,47 +767,46 @@ void MainWindow::onImportContacts()
 
     // Build a set of existing contact identifiers so we never overwrite them.
     // Contacts with a real peer ID use that; name-only contacts use "name:<name>".
-    const QVector<ChatData> existing = appData::loadAllContacts(&m_store);
     QSet<QString> existingIds;
-    for (const auto &e : existing) {
-        if (!e.peerIdB64u.isEmpty())
-            existingIds.insert(e.peerIdB64u);
-        else if (!e.name.isEmpty())
-            existingIds.insert(QLatin1String("name:") + e.name);
-    }
+    m_store.loadAllContacts([&existingIds](const AppDataStore::Contact &e) {
+        if (!e.peerIdB64u.empty())
+            existingIds.insert(qtbridge::qstr(e.peerIdB64u));
+        else if (!e.name.empty())
+            existingIds.insert(QLatin1String("name:") + qtbridge::qstr(e.name));
+    });
 
     int imported = 0;
     for (const QJsonValue &v : arr) {
         const QJsonObject obj = v.toObject();
 
-        ChatData chat;
-        chat.name = obj["name"].toString().trimmed();
+        AppDataStore::Contact chat;
+        chat.name = obj["name"].toString().trimmed().toStdString();
         const QJsonArray keysArr = obj["keys"].toArray();
         for (const QJsonValue &k : keysArr)
-            chat.keys.append(k.toString());
+            chat.keys.push_back(k.toString().toStdString());
 
         // Derive peerIdB64u from the first key when available.
         // In this app the first public key doubles as the peer identifier.
-        if (!chat.keys.isEmpty())
-            chat.peerIdB64u = chat.keys.first();
+        if (!chat.keys.empty())
+            chat.peerIdB64u = chat.keys.front();
 
         // Skip entries with no name and no keys
-        if (chat.name.isEmpty() && chat.keys.isEmpty())
+        if (chat.name.empty() && chat.keys.empty())
             continue;
 
         // Determine the effective storage key — for unnamed groups
         // we fall back to "name:Foo" so the row has SOMETHING to key
         // off; named contacts always use peerIdB64u.
-        const QString effectiveKey = chat.peerIdB64u.isEmpty()
-            ? QLatin1String("name:") + chat.name
-            : chat.peerIdB64u;
+        const QString effectiveKey = chat.peerIdB64u.empty()
+            ? QLatin1String("name:") + qtbridge::qstr(chat.name)
+            : qtbridge::qstr(chat.peerIdB64u);
 
         // Skip if the contact already exists — never overwrite
         if (existingIds.contains(effectiveKey))
             continue;
 
         chat.subtitle = "Secure chat";
-        appData::saveContact(&m_store, chat);
+        m_store.saveContact(chat);
         existingIds.insert(effectiveKey); // prevent duplicates within the file
         ++imported;
     }

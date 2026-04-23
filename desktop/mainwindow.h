@@ -11,7 +11,7 @@
 #include "settingspanel.h"
 #include "chatview.h"
 #include "ChatNotifier.h"
-#include "AppDataStoreQt.hpp"
+#include "qt_str_helpers.hpp"
 #include "AppDataStore.hpp"
 #include "SqlCipherDb.hpp"
 
@@ -39,9 +39,9 @@ private:
     Ui::MainWindow  *ui;
     // App-data layer.  m_db is the raw SQLCipher handle (page-level
     // encryption); m_store is the table-level CRUD that lives on top
-    // and adds per-field XChaCha20-Poly1305.  Both replace the old
-    // legacy Qt facade — chatview/settingspanel hit m_store via the
-    // free-function helpers in AppDataStoreQt.hpp.
+    // and adds per-field XChaCha20-Poly1305.  chatview / settingspanel
+    // call m_store directly with AppDataStore types; Qt↔std conversion
+    // happens at render/save sites via qt_str_helpers.hpp.
     SqlCipherDb      m_db;
     AppDataStore     m_store;
     QtWebSocket      m_webSocket;

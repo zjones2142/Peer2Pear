@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <utility>
+#include <unordered_set>
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -189,8 +190,8 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                                              bool showDestructiveActions = true,
                                              bool isBlocked = false,
                                              bool isGroup = false,
-                                             const QVector<ChatData> *allContacts = nullptr,
-                                             std::function<void(const ChatData&)> onNewContact = nullptr,
+                                             const std::vector<AppDataStore::Contact> *allContacts = nullptr,
+                                             std::function<void(const AppDataStore::Contact&)> onNewContact = nullptr,
                                              QString *avatarInOut = nullptr,
                                              ChatController *controller = nullptr)
 {
@@ -314,9 +315,10 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
         for (const QString &key : keysInOut) {
             QString displayName = "Unknown Contact";
-            for (const ChatData &c : *allContacts) {
-                if (!c.isGroup && c.keys.contains(key)) {
-                    displayName = c.name;
+            const std::string keyStd = key.toStdString();
+            for (const AppDataStore::Contact &c : *allContacts) {
+                if (!c.isGroup && std::find(c.keys.begin(), c.keys.end(), keyStd) != c.keys.end()) {
+                    displayName = qtbridge::qstr(c.name);
                     break;
                 }
             }
@@ -345,21 +347,22 @@ static ContactEditorResult openContactEditor(QWidget *parent,
                         == ContactEditorResult::Saved && !newName.isEmpty()) {
                     item->setText(newName);
                     if (onNewContact) {
-                        ChatData newContact;
-                        newContact.name       = newName;
+                        AppDataStore::Contact newContact;
+                        newContact.name       = newName.toStdString();
                         newContact.subtitle   = "Secure chat";
-                        newContact.keys       = newKeys;
-                        newContact.peerIdB64u = newKeys.isEmpty() ? QString() : newKeys.first();
+                        newContact.keys       = qtbridge::stdstrList(newKeys);
+                        newContact.peerIdB64u = newKeys.isEmpty() ? std::string() : newKeys.first().toStdString();
                         onNewContact(newContact);
                     }
                 }
             } else {
                 // Known contact — open their contact editor
                 if (allContacts) {
-                    for (const ChatData &c : *allContacts) {
-                        if (!c.isGroup && c.keys.contains(key)) {
-                            QString contactName = c.name;
-                            QStringList contactKeys = c.keys;
+                    const std::string keyStd = key.toStdString();
+                    for (const AppDataStore::Contact &c : *allContacts) {
+                        if (!c.isGroup && std::find(c.keys.begin(), c.keys.end(), keyStd) != c.keys.end()) {
+                            QString contactName = qtbridge::qstr(c.name);
+                            QStringList contactKeys = qtbridge::qstrList(c.keys);
                             openContactEditor(nullptr, "Edit Contact", contactName, contactKeys,
                                               false); // no destructive actions from inside group editor
                             // Update display name in case they were renamed
@@ -386,18 +389,19 @@ static ContactEditorResult openContactEditor(QWidget *parent,
             pLayout->addWidget(pTitle);
 
             auto *pList = new QListWidget(&picker);
-            for (const ChatData &c : *allContacts) {
-                if (c.isGroup || c.keys.isEmpty()) continue;
+            for (const AppDataStore::Contact &c : *allContacts) {
+                if (c.isGroup || c.keys.empty()) continue;
+                const QString firstKey = qtbridge::qstr(c.keys.front());
                 bool alreadyIn = false;
                 for (int i = 0; i < memberList->count(); ++i) {
-                    if (memberList->item(i)->data(Qt::UserRole).toString() == c.keys.first()) {
+                    if (memberList->item(i)->data(Qt::UserRole).toString() == firstKey) {
                         alreadyIn = true;
                         break;
                     }
                 }
                 if (alreadyIn) continue;
-                auto *item = new QListWidgetItem(c.name, pList);
-                item->setData(Qt::UserRole, c.keys.join('|'));
+                auto *item = new QListWidgetItem(qtbridge::qstr(c.name), pList);
+                item->setData(Qt::UserRole, qtbridge::qstrList(c.keys).join('|'));
             }
             pLayout->addWidget(pList);
 
@@ -665,11 +669,11 @@ static ContactEditorResult openContactEditor(QWidget *parent,
 
 // Returns a stable string key for file-record lookup: peerIdB64u for DMs,
 // groupId for group chats.  Never changes when the chat is reordered.
-QString ChatView::chatKey(const ChatData &c)
+QString ChatView::chatKey(const AppDataStore::Contact &c)
 {
-    if (c.isGroup)             return c.groupId;
-    if (!c.peerIdB64u.isEmpty()) return c.peerIdB64u;
-    return "name:" + c.name;
+    if (c.isGroup)             return qtbridge::qstr(c.groupId);
+    if (!c.peerIdB64u.empty()) return qtbridge::qstr(c.peerIdB64u);
+    return "name:" + qtbridge::qstr(c.name);
 }
 
 ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
@@ -753,16 +757,19 @@ void ChatView::startPresencePolling(int /*intervalMs*/)
 
 void ChatView::subscribeAllPresence()
 {
-    QSet<QString> seen;
+    std::unordered_set<std::string> seen;
     std::vector<std::string> peerIds;
-    const QString myKey = QString::fromStdString(m_controller->myIdB64u());
-    for (const ChatData &c : std::as_const(m_chats)) {
-        for (const QString &k : c.keys) {
-            const QString trimmed = k.trimmed();
-            if (!trimmed.isEmpty() && trimmed != myKey && !seen.contains(trimmed)) {
-                seen.insert(trimmed);
-                peerIds.push_back(trimmed.toStdString());
-            }
+    const std::string myKey = m_controller->myIdB64u();
+    for (const auto &c : m_chats) {
+        for (const std::string &k : c.keys) {
+            // Trim whitespace in place (keys may carry newlines from paste).
+            const auto first = k.find_first_not_of(" \t\r\n");
+            const auto last  = k.find_last_not_of(" \t\r\n");
+            if (first == std::string::npos) continue;
+            std::string trimmed = k.substr(first, last - first + 1);
+            if (trimmed == myKey) continue;
+            if (seen.insert(trimmed).second)
+                peerIds.push_back(std::move(trimmed));
         }
     }
     if (!peerIds.empty())
@@ -773,28 +780,36 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
 {
     // Update global member-online map
     m_memberOnline[peerIdB64u] = online;
+    const std::string peerIdStd = peerIdB64u.toStdString();
 
-    for (int i = 0; i < m_chats.size(); ++i) {
+    auto trimStd = [](const std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
+
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
         if (m_chats[i].isGroup) {
             // Check if this peer is a member of the group
             bool isMember = false;
-            for (const QString &k : std::as_const(m_chats[i].keys))
-                if (k.trimmed() == peerIdB64u) { isMember = true; break; }
+            for (const std::string &k : m_chats[i].keys)
+                if (trimStd(k) == peerIdStd) { isMember = true; break; }
             if (!isMember) continue;
 
             // Update group header if this is the currently selected chat
             if (i == m_currentChat) {
-                const QString myKey = QString::fromStdString(m_controller->myIdB64u());
+                const std::string myKey = m_controller->myIdB64u();
                 int onlineCount = 0, totalMembers = 0;
-                for (const QString &k : std::as_const(m_chats[i].keys)) {
-                    const QString trimmed = k.trimmed();
-                    if (trimmed.isEmpty() || trimmed == myKey) continue;
+                for (const std::string &k : m_chats[i].keys) {
+                    const std::string trimmed = trimStd(k);
+                    if (trimmed.empty() || trimmed == myKey) continue;
                     ++totalMembers;
-                    if (m_memberOnline.value(trimmed, false))
+                    if (m_memberOnline.value(qtbridge::qstr(trimmed), false))
                         ++onlineCount;
                 }
                 const QString statusText = (totalMembers == 0)
-                    ? m_chats[i].subtitle
+                    ? qtbridge::qstr(m_chats[i].subtitle)
                     : QString("%1 of %2 members online").arg(onlineCount).arg(totalMembers);
                 m_ui->chatSubLabel->setText(statusText);
                 themeStyles::applyRole(m_ui->chatSubLabel,
@@ -807,37 +822,35 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
         }
 
         // 1:1 DM chat
-        bool match = (m_chats[i].peerIdB64u.trimmed() == peerIdB64u);
+        bool match = (trimStd(m_chats[i].peerIdB64u) == peerIdStd);
         if (!match) {
-            for (const QString &k : std::as_const(m_chats[i].keys))
-                if (k.trimmed() == peerIdB64u) { match = true; break; }
+            for (const std::string &k : m_chats[i].keys)
+                if (trimStd(k) == peerIdStd) { match = true; break; }
         }
         if (!match) continue;
 
-        if (m_chats[i].isOnline != online) {
-            m_chats[i].isOnline = online;
+        const bool wasOnline = m_memberOnline.value(peerIdB64u, false);
+        (void)wasOnline;
 
-            // Send our avatar on first contact only if it's a real photo
-            if (online && m_chats[i].avatarData.isEmpty() && m_store
-                    && appData::loadSetting(m_store,"avatarIsPhoto") == "true") {
-                const QString myName   = appData::loadSetting(m_store,"displayName");
-                const QString myAvatar = appData::loadSetting(m_store,"avatarData");
-                if (!myName.isEmpty())
-                    m_controller->sendAvatar(peerIdB64u.toStdString(),
-                                              myName.toStdString(), myAvatar.toStdString());
-            }
+        // Send our avatar on first contact only if it's a real photo
+        if (online && m_chats[i].avatarB64.empty() && m_store
+                && m_store->loadSetting("avatarIsPhoto") == "true") {
+            const std::string myName   = m_store->loadSetting("displayName");
+            const std::string myAvatar = m_store->loadSetting("avatarData");
+            if (!myName.empty())
+                m_controller->sendAvatar(peerIdStd, myName, myAvatar);
+        }
 
-            // Update the header if this is the currently selected chat
-            if (i == m_currentChat) {
-                const QString statusText = online
-                                               ? "Online"
-                                               : formatLastSeen(m_chats[i].lastActive);
-                m_ui->chatSubLabel->setText("● " + statusText);
-                themeStyles::applyRole(m_ui->chatSubLabel,
-                    online ? "onlineStatus" : "offlineStatus",
-                    online ? themeStyles::onlineStatusCss(ThemeManager::instance().current())
-                           : themeStyles::offlineStatusCss(ThemeManager::instance().current()));
-            }
+        // Update the header if this is the currently selected chat
+        if (i == m_currentChat) {
+            const QString statusText = online
+                                           ? "Online"
+                                           : formatLastSeen(qtbridge::qdate(m_chats[i].lastActiveSecs));
+            m_ui->chatSubLabel->setText("● " + statusText);
+            themeStyles::applyRole(m_ui->chatSubLabel,
+                online ? "onlineStatus" : "offlineStatus",
+                online ? themeStyles::onlineStatusCss(ThemeManager::instance().current())
+                       : themeStyles::offlineStatusCss(ThemeManager::instance().current()));
         }
     }
 }
@@ -847,7 +860,7 @@ void ChatView::reloadCurrentChat()
     if (m_emptyLabel) {
         m_emptyLabel->resize(m_ui->contentWidget->size());
         m_emptyLabel->raise();
-        m_emptyLabel->setVisible(m_chats.isEmpty());
+        m_emptyLabel->setVisible(m_chats.empty());
     }
 }
 
@@ -859,32 +872,45 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
                                  const QString &msgId)
 {
     const QString from = fromPeerIdB64u.trimmed();
+    const std::string fromStd  = from.toStdString();
+    const std::string textStd  = text.toStdString();
+    const std::string msgIdStd = msgId.toStdString();
+    const int64_t tsSecs       = qtbridge::epochSecs(timestamp);
     ensureUnreadSize();
 
     auto shouldToast = [&]() { return m_shouldToastFn ? m_shouldToastFn() : true; };
 
-    for (int i = 0; i < m_chats.size(); ++i) {
+    auto trimStd = [](const std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
+
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
         if (m_chats[i].isGroup) continue;
 
-        bool hit = (m_chats[i].peerIdB64u.trimmed() == from);
-        if (!hit) for (const QString &k : std::as_const(m_chats[i].keys))
-                if (k.trimmed() == from) { hit = true; break; }
+        bool hit = (trimStd(m_chats[i].peerIdB64u) == fromStd);
+        if (!hit) for (const std::string &k : m_chats[i].keys)
+                if (trimStd(k) == fromStd) { hit = true; break; }
         if (!hit) continue;
 
         if (m_chats[i].isBlocked) return;
 
+        auto &msgs = m_messagesByPeer[m_chats[i].peerIdB64u];
+
         // UI-side dedup against already-stored messages
-        if (!msgId.isEmpty())
-            for (const Message &m : std::as_const(m_chats[i].messages))
-                if (m.msgId == msgId) return;
+        if (!msgIdStd.empty())
+            for (const auto &m : msgs)
+                if (m.msgId == msgIdStd) return;
 
-        const bool needsSep = m_chats[i].messages.isEmpty() ||
-                              m_chats[i].messages.last().timestamp.secsTo(timestamp) >= kDateSepSecs;
+        const bool needsSep = msgs.empty() ||
+                              (tsSecs - msgs.back().timestampSecs) >= kDateSepSecs;
 
-        Message msg{false, text, timestamp, msgId};
-        m_chats[i].messages.append(msg);
-        m_chats[i].lastActive = QDateTime::currentDateTimeUtc();
-        if (m_store) { appData::saveContact(m_store,m_chats[i]); appData::saveMessage(m_store,m_chats[i].peerIdB64u, msg); }
+        AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, ""};
+        msgs.push_back(msg);
+        m_chats[i].lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+        if (m_store) { m_store->saveContact(m_chats[i]); m_store->saveMessage(m_chats[i].peerIdB64u, msg); }
 
         if (i == m_currentChat) {
             if (needsSep) addDateSeparator(timestamp);
@@ -896,17 +922,21 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
             emit unreadChanged(totalUnread());
             promoteChatToTop(i);
             rebuildChatList();
-            if (m_notifier && shouldToast()) m_notifier->notify(m_chats[0].name, text);
+            if (m_notifier && shouldToast()) m_notifier->notify(qtbridge::qstr(m_chats[0].name), text);
         }
         return;
     }
 
     // Unknown sender — auto-create chat
-    Message msg{false, text, timestamp, msgId};
-    ChatData nc; nc.name = "Unknown contact"; nc.subtitle = "Secure chat";
-    nc.peerIdB64u = from; nc.keys.append(from); nc.messages.append(msg);
-    m_chats.prepend(nc);
-    if (m_store) { appData::saveContact(m_store,nc); appData::saveMessage(m_store,from, msg); }
+    AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, ""};
+    AppDataStore::Contact nc;
+    nc.name = "Unknown contact";
+    nc.subtitle = "Secure chat";
+    nc.peerIdB64u = fromStd;
+    nc.keys.push_back(fromStd);
+    m_messagesByPeer[nc.peerIdB64u].push_back(msg);
+    m_chats.insert(m_chats.begin(), nc);
+    if (m_store) { m_store->saveContact(nc); m_store->saveMessage(fromStd, msg); }
     ensureUnreadSize();
     m_unread.prepend(0);
     if (m_currentChat >= 0) m_currentChat += 1;
@@ -926,66 +956,86 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
                                       const QDateTime &ts,
                                       const QString &msgId)
 {
+    const std::string groupIdStd  = groupId.toStdString();
+    const std::string fromStd     = fromPeerIdB64u.toStdString();
+    const std::string textStd     = text.toStdString();
+    const std::string msgIdStd    = msgId.toStdString();
+    const int64_t     tsSecs      = qtbridge::epochSecs(ts);
+
     int idx = -1;
-    for (int i = 0; i < m_chats.size(); ++i)
-        if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { idx = i; break; }
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i)
+        if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) { idx = i; break; }
 
     if (idx == -1) {
-        ChatData ng; ng.isGroup = true; ng.groupId = groupId;
-        ng.peerIdB64u = groupId;
-        ng.name = groupName.isEmpty() ? "Group Chat" : groupName;
-        ng.subtitle = "Group chat"; ng.keys.append(fromPeerIdB64u);
-        m_chats.append(ng);
-        if (m_store) appData::saveContact(m_store,ng);
-        idx = m_chats.size() - 1;
+        AppDataStore::Contact ng;
+        ng.isGroup = true;
+        ng.groupId = groupIdStd;
+        ng.peerIdB64u = groupIdStd;
+        ng.name = groupName.isEmpty() ? std::string("Group Chat") : groupName.toStdString();
+        ng.subtitle = "Group chat";
+        ng.keys.push_back(fromStd);
+        m_chats.push_back(ng);
+        if (m_store) m_store->saveContact(ng);
+        idx = static_cast<int>(m_chats.size()) - 1;
         ensureUnreadSize();
         rebuildChatList();
     }
 
-    ChatData &chat = m_chats[idx];
+    AppDataStore::Contact &chat = m_chats[idx];
     if (chat.isBlocked) return;
+
+    auto trimStd = [](const std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
 
     // Merge any new member keys we didn't know about before
     // This is how members discover each other without manual key exchange
     bool keysUpdated = false;
-    const QString myKey = QString::fromStdString(m_controller->myIdB64u());
+    const std::string myKey = m_controller->myIdB64u();
     for (const QString &key : memberKeys) {
-        if (key.trimmed().isEmpty()) continue;
-        if (key.trimmed() == myKey) continue; // don't add own key to group member list
-        if (!chat.keys.contains(key)) {
-            chat.keys << key;
+        const std::string keyStd = key.toStdString();
+        const std::string keyTrimmed = trimStd(keyStd);
+        if (keyTrimmed.empty()) continue;
+        if (keyTrimmed == myKey) continue; // don't add own key to group member list
+        if (std::find(chat.keys.begin(), chat.keys.end(), keyStd) == chat.keys.end()) {
+            chat.keys.push_back(keyStd);
             keysUpdated = true;
         }
     }
     if (keysUpdated && m_store)
-        appData::saveContact(m_store,chat); // persist the updated key list
+        m_store->saveContact(chat); // persist the updated key list
 
     // If text is empty this was a member-update-only message (no chat bubble needed).
     // Key merge above already ran, so just bail out.
     if (text.isEmpty())
         return;
 
-    if (!msgId.isEmpty())
-        for (const Message &m : std::as_const(chat.messages))
-            if (m.msgId == msgId) return;
+    const std::string dbKey = chat.groupId.empty() ? ("name:" + chat.name) : chat.groupId;
+    auto &msgs = m_messagesByPeer[dbKey];
 
-    const bool needsSep = chat.messages.isEmpty() ||
-                          chat.messages.last().timestamp.secsTo(ts) >= kDateSepSecs;
+    if (!msgIdStd.empty())
+        for (const auto &m : msgs)
+            if (m.msgId == msgIdStd) return;
+
+    const bool needsSep = msgs.empty() ||
+                          (tsSecs - msgs.back().timestampSecs) >= kDateSepSecs;
 
     // Look up sender name from contacts
     QString senderName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
-    for (const ChatData &c : std::as_const(m_chats)) {
-        if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
-            senderName = c.name;
+    for (const auto &c : m_chats) {
+        if (!c.isGroup && std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
+            senderName = qtbridge::qstr(c.name);
             break;
         }
     }
 
-    Message msg{false, text, ts, msgId};
-    msg.senderName = senderName;
-    chat.messages.append(msg);
-    chat.lastActive = QDateTime::currentDateTimeUtc();
-    if (m_store) appData::saveMessage(m_store,chat.groupId.isEmpty() ? "name:"+chat.name : chat.groupId, msg);
+    AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, senderName.toStdString()};
+    msgs.push_back(msg);
+    chat.lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+    if (m_store) m_store->saveMessage(dbKey, msg);
 
     if (idx == m_currentChat) {
         if (needsSep) addDateSeparator(ts);
@@ -993,7 +1043,7 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         promoteChatToTop(idx);
         rebuildChatList();
     } else {
-        const QString chatName = chat.name;
+        const QString chatName = qtbridge::qstr(chat.name);
 
         m_unread[idx] += 1;
         emit unreadChanged(totalUnread());
@@ -1006,41 +1056,46 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
 void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
                                  const QString& groupId,
                                  const QString& groupName,
-                                 const QStringList& memberKeys,
+                                 const QStringList& /*memberKeys*/,
                                  const QDateTime& ts,
-                                 const QString& msgId)
+                                 const QString& /*msgId*/)
 {
+    Q_UNUSED(groupName);
+    const std::string fromStd    = fromPeerIdB64u.toStdString();
+    const std::string groupIdStd = groupId.toStdString();
+    const int64_t     tsSecs     = qtbridge::epochSecs(ts);
+
     // Find the group
     int targetIndex = -1;
-    for (int i = 0; i < m_chats.size(); ++i) {
-        if (m_chats[i].isGroup && m_chats[i].groupId == groupId) {
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
+        if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) {
             targetIndex = i;
             break;
         }
     }
     if (targetIndex == -1) return;
 
-    ChatData &chat = m_chats[targetIndex];
+    AppDataStore::Contact &chat = m_chats[targetIndex];
 
     // Remove the leaver's key from our local group member list
-    chat.keys.removeAll(fromPeerIdB64u);
-    if (m_store) appData::saveContact(m_store,chat);
+    chat.keys.erase(std::remove(chat.keys.begin(), chat.keys.end(), fromStd), chat.keys.end());
+    if (m_store) m_store->saveContact(chat);
 
     // Find a display name for the leaver
     QString leaverName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
-    for (const ChatData &c : std::as_const(m_chats)) {
-        if (!c.isGroup && c.keys.contains(fromPeerIdB64u)) {
-            leaverName = c.name;
+    for (const auto &c : m_chats) {
+        if (!c.isGroup && std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
+            leaverName = qtbridge::qstr(c.name);
             break;
         }
     }
 
     // Show system message like Snapchat
     const QString systemText = leaverName + " left the group";
-    Message systemMsg{ false, systemText, ts };
-    chat.messages.append(systemMsg);
-    if (m_store) appData::saveMessage(m_store,
-            chat.groupId.isEmpty() ? "name:" + chat.name : chat.groupId, systemMsg);
+    AppDataStore::Message systemMsg{ false, systemText.toStdString(), tsSecs, "", "" };
+    const std::string dbKey = chat.groupId.empty() ? ("name:" + chat.name) : chat.groupId;
+    m_messagesByPeer[dbKey].push_back(systemMsg);
+    if (m_store) m_store->saveMessage(dbKey, systemMsg);
 
     if (targetIndex == m_currentChat) {
         addMessageBubble(systemText, false);
@@ -1065,22 +1120,28 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
                                    const QString &groupName)
 {
     const QString from = fromPeerIdB64u.trimmed();
+    const std::string fromStd     = from.toStdString();
+    const std::string groupIdStd  = groupId.toStdString();
+    const std::string transferStd = transferId.toStdString();
 
     // Locate the chat this file belongs to — group chat or 1:1
     int chatIndex = -1;
-    if (!groupId.isEmpty()) {
+    if (!groupIdStd.empty()) {
         // Find existing group chat by groupId, or create one
-        for (int i = 0; i < m_chats.size(); ++i)
-            if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { chatIndex = i; break; }
+        for (int i = 0; i < static_cast<int>(m_chats.size()); ++i)
+            if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) { chatIndex = i; break; }
 
         if (chatIndex == -1) {
-            ChatData ng; ng.isGroup = true; ng.groupId = groupId;
-            ng.peerIdB64u = groupId;
-            ng.name = groupName.isEmpty() ? "Group Chat" : groupName;
-            ng.subtitle = "Group chat"; ng.keys.append(from);
-            m_chats.append(ng);
-            if (m_store) appData::saveContact(m_store,ng);
-            chatIndex = m_chats.size() - 1;
+            AppDataStore::Contact ng;
+            ng.isGroup = true;
+            ng.groupId = groupIdStd;
+            ng.peerIdB64u = groupIdStd;
+            ng.name = groupName.isEmpty() ? std::string("Group Chat") : groupName.toStdString();
+            ng.subtitle = "Group chat";
+            ng.keys.push_back(fromStd);
+            m_chats.push_back(ng);
+            if (m_store) m_store->saveContact(ng);
+            chatIndex = static_cast<int>(m_chats.size()) - 1;
             ensureUnreadSize();
             rebuildChatList();
         }
@@ -1093,25 +1154,26 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
 
     // Find an existing in-progress record for this transferId, or create one
     auto &records = m_filesByKey[key];
-    FileTransferRecord *rec = nullptr;
+    AppDataStore::FileRecord *rec = nullptr;
     for (auto &r : records)
-        if (r.transferId == transferId) { rec = &r; break; }
+        if (r.transferId == transferStd) { rec = &r; break; }
 
     if (!rec) {
         // First chunk we've heard about — create the record
-        FileTransferRecord newRec;
-        newRec.transferId    = transferId;
-        newRec.fileName      = fileName;
+        AppDataStore::FileRecord newRec;
+        newRec.transferId    = transferStd;
+        newRec.chatKey       = key.toStdString();
+        newRec.fileName      = fileName.toStdString();
         newRec.fileSize      = fileSize;
-        newRec.peerIdB64u    = from;
+        newRec.peerIdB64u    = fromStd;
         newRec.peerName      = m_chats[chatIndex].name;
-        newRec.timestamp     = timestamp;
+        newRec.timestampSecs = qtbridge::epochSecs(timestamp);
         newRec.sent          = false;
-        newRec.status        = FileTransferStatus::Receiving;
+        newRec.status        = static_cast<int>(FileTransferStatus::Receiving);
         newRec.chunksTotal   = chunksTotal;
         newRec.chunksComplete = 0;
-        records.append(newRec);
-        rec = &records.last();
+        records.push_back(newRec);
+        rec = &records.back();
     }
 
     rec->chunksComplete = chunksReceived;
@@ -1120,24 +1182,24 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
     const bool complete = (chunksReceived == chunksTotal);
 
     if (complete) {
-        m_chats[chatIndex].lastActive = QDateTime::currentDateTimeUtc();
+        m_chats[chatIndex].lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
 
         // FileTransferManager has already streamed the file to disk at savedPath.
         // An empty savedPath means the transfer failed (hash mismatch, write error, etc).
         const bool saved = !savedPath.isEmpty() && QFileInfo::exists(savedPath);
         if (saved) {
-            rec->status    = FileTransferStatus::Complete;
-            rec->savedPath = savedPath;
+            rec->status    = static_cast<int>(FileTransferStatus::Complete);
+            rec->savedPath = savedPath.toStdString();
         } else {
-            rec->status = FileTransferStatus::Failed;
+            rec->status = static_cast<int>(FileTransferStatus::Failed);
             qWarning() << "File transfer failed:" << fileName << "(no savedPath)";
         }
 
-        if (m_store) appData::saveFileRecord(m_store,key, *rec);
+        if (m_store) m_store->saveFileRecord(key.toStdString(), *rec);
 
         // In-app toast + system tray notification
         {
-            const QString senderName = m_chats[chatIndex].name;
+            const QString senderName = qtbridge::qstr(m_chats[chatIndex].name);
             const QString toastMsg = saved
                 ? QString("📎 %1 from %2").arg(fileName, senderName)
                 : QString("⚠ File from %1 failed: %2").arg(senderName, fileName);
@@ -1165,7 +1227,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
 }
 
 // ── File chunk sent (sender-side progress) ────────────────────────────────────
-// Updates the outbound FileTransferRecord created in onAttachFile to show
+// Updates the outbound FileRecord created in onAttachFile to show
 // the running chunk count.  On the last chunk we flip status → Complete.
 // Delivery confirmation arrives separately via onFileTransferDelivered.
 
@@ -1179,12 +1241,15 @@ void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
                                 const QString &groupId,
                                 const QString & /*groupName*/)
 {
+    const std::string groupIdStd  = groupId.toStdString();
+    const std::string transferStd = transferId.toStdString();
+
     // Locate the chat — group or 1:1.  For groups we key off groupId
     // (the transfer is per-group even though chunks fan out per-member).
     int chatIndex = -1;
-    if (!groupId.isEmpty()) {
-        for (int i = 0; i < m_chats.size(); ++i)
-            if (m_chats[i].isGroup && m_chats[i].groupId == groupId) { chatIndex = i; break; }
+    if (!groupIdStd.empty()) {
+        for (int i = 0; i < static_cast<int>(m_chats.size()); ++i)
+            if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) { chatIndex = i; break; }
     } else {
         chatIndex = findChatForPeer(toPeerIdB64u.trimmed());
     }
@@ -1192,9 +1257,9 @@ void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
 
     const QString key = chatKey(m_chats[chatIndex]);
     auto &records = m_filesByKey[key];
-    FileTransferRecord *rec = nullptr;
+    AppDataStore::FileRecord *rec = nullptr;
     for (auto &r : records) {
-        if (r.transferId == transferId && r.sent) { rec = &r; break; }
+        if (r.transferId == transferStd && r.sent) { rec = &r; break; }
     }
     // No record yet?  onAttachFile creates the Sending record before chunks
     // fly, so this shouldn't happen — but guard against group fan-out races
@@ -1204,8 +1269,8 @@ void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
     rec->chunksComplete = chunksSent;
     rec->chunksTotal    = chunksTotal;
     if (chunksSent >= chunksTotal && chunksTotal > 0) {
-        rec->status = FileTransferStatus::Complete;
-        if (m_store) appData::saveFileRecord(m_store,key, *rec);
+        rec->status = static_cast<int>(FileTransferStatus::Complete);
+        if (m_store) m_store->saveFileRecord(key.toStdString(), *rec);
     }
 
     if (chatIndex == m_currentChat)
@@ -1218,36 +1283,46 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
                                 const QString &displayName,
                                 const QString &avatarB64)
 {
-    for (int i = 0; i < m_chats.size(); ++i) {
+    const std::string peerIdStd   = peerIdB64u.toStdString();
+    const std::string avatarStd   = avatarB64.toStdString();
+    const std::string displayStd  = displayName.toStdString();
+
+    auto trimStd = [](const std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
+
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
         if (m_chats[i].isGroup) continue;
-        if (m_chats[i].peerIdB64u.trimmed() != peerIdB64u) continue;
+        if (trimStd(m_chats[i].peerIdB64u) != peerIdStd) continue;
 
         // First genuine contact = had no avatar and now receiving one
-        const bool firstTime = m_chats[i].avatarData.isEmpty() && !avatarB64.isEmpty();
+        const bool firstTime = m_chats[i].avatarB64.empty() && !avatarStd.empty();
 
         // If this was previously an auto-created "Unknown contact" (text
         // arrived before any avatar), upgrade the name now that we know it.
-        if (!displayName.isEmpty() && m_chats[i].name == "Unknown contact") {
-            m_chats[i].name = displayName;
-            if (m_store) appData::saveContact(m_store,m_chats[i]);
+        if (!displayStd.empty() && m_chats[i].name == "Unknown contact") {
+            m_chats[i].name = displayStd;
+            if (m_store) m_store->saveContact(m_chats[i]);
         }
 
         // Empty avatarB64 means the sender reset to default — clear so the UI
         // falls back to initials derived from our locally saved name for them
-        m_chats[i].avatarData = avatarB64;
+        m_chats[i].avatarB64 = avatarStd;
 
         // Persist to DB
-        if (m_store) appData::saveContactAvatar(m_store,peerIdB64u, avatarB64);
+        if (m_store) m_store->saveContactAvatar(peerIdStd, avatarStd);
 
         // Send our avatar back only on first receive to avoid infinite exchange loop
         if (firstTime && m_store) {
-            const QString myName   = appData::loadSetting(m_store,"displayName");
-            const QString myAvatar = appData::loadSetting(m_store,"avatarData");
-            if (!myName.isEmpty()) {
-                const QString myAvatarIsPhoto = appData::loadSetting(m_store,"avatarIsPhoto");
-                const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
-                m_controller->sendAvatar(peerIdB64u.toStdString(),
-                                          myName.toStdString(), broadcastAvatar.toStdString());
+            const std::string myName   = m_store->loadSetting("displayName");
+            const std::string myAvatar = m_store->loadSetting("avatarData");
+            if (!myName.empty()) {
+                const std::string myAvatarIsPhoto = m_store->loadSetting("avatarIsPhoto");
+                const std::string broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : std::string();
+                m_controller->sendAvatar(peerIdStd, myName, broadcastAvatar);
             }
         }
 
@@ -1264,16 +1339,17 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
                     m_ui->chatAvatarLabel->setText("");
                 }
             } else {
-                const QString ch = m_chats[i].name.isEmpty() ? "?" : QString(m_chats[i].name[0]);
+                const QString qName = qtbridge::qstr(m_chats[i].name);
+                const QString ch = qName.isEmpty() ? "?" : QString(qName[0]);
                 m_ui->chatAvatarLabel->setPixmap(
-                    renderInitialsAvatar(ch, avatarColorForName(m_chats[i].name), 44));
+                    renderInitialsAvatar(ch, avatarColorForName(qName), 44));
                 m_ui->chatAvatarLabel->setText("");
             }
-            m_ui->chatTitleLabel->setText(m_chats[i].name);
+            m_ui->chatTitleLabel->setText(qtbridge::qstr(m_chats[i].name));
         }
 
         if (firstTime)
-            showToast(m_chats[i].name + "'s profile has been updated");
+            showToast(qtbridge::qstr(m_chats[i].name) + "'s profile has been updated");
         return;
     }
 
@@ -1283,18 +1359,18 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
     // here using the peer's announced display name + avatar so the chat
     // list shows them correctly from the first message (otherwise the
     // follow-up text would create an "Unknown contact" row with no name).
-    ChatData nc;
-    nc.name        = displayName.isEmpty() ? "Unknown contact" : displayName;
+    AppDataStore::Contact nc;
+    nc.name        = displayStd.empty() ? std::string("Unknown contact") : displayStd;
     nc.subtitle    = "Secure chat";
-    nc.peerIdB64u  = peerIdB64u;
-    nc.keys.append(peerIdB64u);
-    nc.avatarData  = avatarB64;
-    nc.lastActive  = QDateTime::currentDateTimeUtc();
+    nc.peerIdB64u  = peerIdStd;
+    nc.keys.push_back(peerIdStd);
+    nc.avatarB64   = avatarStd;
+    nc.lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
 
-    m_chats.prepend(nc);
+    m_chats.insert(m_chats.begin(), nc);
     if (m_store) {
-        appData::saveContact(m_store,nc);
-        if (!avatarB64.isEmpty()) appData::saveContactAvatar(m_store,peerIdB64u, avatarB64);
+        m_store->saveContact(nc);
+        if (!avatarStd.empty()) m_store->saveContactAvatar(peerIdStd, avatarStd);
     }
 
     ensureUnreadSize();
@@ -1306,25 +1382,25 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
     // Reciprocate with our own avatar so the peer also gets our display
     // name / picture.  Only done on first-contact creation to avoid loops.
     if (m_store) {
-        const QString myName   = appData::loadSetting(m_store,"displayName");
-        if (!myName.isEmpty()) {
-            const QString myAvatar        = appData::loadSetting(m_store,"avatarData");
-            const QString myAvatarIsPhoto = appData::loadSetting(m_store,"avatarIsPhoto");
-            const QString broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : QString();
-            m_controller->sendAvatar(peerIdB64u.toStdString(),
-                                      myName.toStdString(), broadcastAvatar.toStdString());
+        const std::string myName = m_store->loadSetting("displayName");
+        if (!myName.empty()) {
+            const std::string myAvatar        = m_store->loadSetting("avatarData");
+            const std::string myAvatarIsPhoto = m_store->loadSetting("avatarIsPhoto");
+            const std::string broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : std::string();
+            m_controller->sendAvatar(peerIdStd, myName, broadcastAvatar);
         }
     }
 
-    showToast("New contact: " + nc.name);
+    showToast("New contact: " + qtbridge::qstr(nc.name));
 }
 
 void ChatView::onGroupRenamed(const QString &groupId, const QString &newName)
 {
-    for (int i = 0; i < m_chats.size(); ++i) {
-        if (!m_chats[i].isGroup || m_chats[i].groupId != groupId) continue;
-        m_chats[i].name = newName;
-        if (m_store) appData::saveContact(m_store,m_chats[i]);
+    const std::string groupIdStd = groupId.toStdString();
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
+        if (!m_chats[i].isGroup || m_chats[i].groupId != groupIdStd) continue;
+        m_chats[i].name = newName.toStdString();
+        if (m_store) m_store->saveContact(m_chats[i]);
         rebuildChatList();
         if (m_currentChat == i)
             m_ui->chatTitleLabel->setText(newName);
@@ -1334,19 +1410,20 @@ void ChatView::onGroupRenamed(const QString &groupId, const QString &newName)
 
 void ChatView::onGroupAvatarReceived(const QString &groupId, const QString &avatarB64)
 {
-    for (int i = 0; i < m_chats.size(); ++i) {
-        if (!m_chats[i].isGroup || m_chats[i].groupId != groupId) continue;
+    const std::string groupIdStd = groupId.toStdString();
+    const std::string avatarStd  = avatarB64.toStdString();
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
+        if (!m_chats[i].isGroup || m_chats[i].groupId != groupIdStd) continue;
 
         // Only relay and persist if this is actually new to us
-        if (m_chats[i].avatarData == avatarB64) return;
+        if (m_chats[i].avatarB64 == avatarStd) return;
 
-        m_chats[i].avatarData = avatarB64;
-        if (m_store) appData::saveContactAvatar(m_store,m_chats[i].peerIdB64u, avatarB64);
+        m_chats[i].avatarB64 = avatarStd;
+        if (m_store) m_store->saveContactAvatar(m_chats[i].peerIdB64u, avatarStd);
 
         // Relay to all group members so stragglers receive it too
-        if (m_controller && !m_chats[i].keys.isEmpty())
-            m_controller->sendGroupAvatar(groupId.toStdString(), avatarB64.toStdString(),
-                                           qListToStd(m_chats[i].keys));
+        if (m_controller && !m_chats[i].keys.empty())
+            m_controller->sendGroupAvatar(groupIdStd, avatarStd, m_chats[i].keys);
 
         rebuildChatList();
         if (m_currentChat == i) loadChat(i);
@@ -1360,9 +1437,9 @@ void ChatView::onAttachFile()
 {
     if (m_currentChat < 0) return;
 
-    const ChatData &chat = m_chats[m_currentChat];
+    const AppDataStore::Contact &chat = m_chats[m_currentChat];
 
-    if (chat.keys.isEmpty()) {
+    if (chat.keys.empty()) {
         QMessageBox::warning(m_ui->centralwidget, "No Keys",
                              "This contact has no public keys — cannot send a file securely.");
         return;
@@ -1391,30 +1468,38 @@ void ChatView::onAttachFile()
     const QString fileName = finfo.fileName();
 
     // ── Send to all keys for this contact / group ──────────────────────────────
-    QString localTransferId;
+    std::string localTransferId;
     int totalChunks = 0;
     constexpr qint64 kChunk = 240LL * 1024;
 
+    auto trimStd = [](const std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
+
     if (chat.isGroup) {
-        localTransferId = QString::fromStdString(m_controller->sendGroupFile(
-            chat.groupId.toStdString(), chat.name.toStdString(),
-            qListToStd(chat.keys), fileName.toStdString(), path.toStdString()));
-        if (!localTransferId.isEmpty())
+        localTransferId = m_controller->sendGroupFile(
+            chat.groupId, chat.name,
+            chat.keys, fileName.toStdString(), path.toStdString());
+        if (!localTransferId.empty())
             totalChunks = int((fileSize + kChunk - 1) / kChunk);
     } else {
         // 1:1: send to every key belonging to this contact
-        for (const QString &key : chat.keys) {
-            if (key.trimmed().isEmpty()) continue;
-            const QString tid = QString::fromStdString(m_controller->sendFile(
-                key.trimmed().toStdString(), fileName.toStdString(), path.toStdString()));
-            if (!tid.isEmpty() && localTransferId.isEmpty()) {
+        for (const std::string &key : chat.keys) {
+            const std::string keyTrim = trimStd(key);
+            if (keyTrim.empty()) continue;
+            const std::string tid = m_controller->sendFile(
+                keyTrim, fileName.toStdString(), path.toStdString());
+            if (!tid.empty() && localTransferId.empty()) {
                 localTransferId = tid;
                 totalChunks = int((fileSize + kChunk - 1) / kChunk);
             }
         }
     }
 
-    if (localTransferId.isEmpty()) return; // all keys failed
+    if (localTransferId.empty()) return; // all keys failed
 
     // Record the outbound transfer as IN-FLIGHT.  Chunks don't fly until
     // the receiver ack's the file_key announcement (Phase 2), so marking
@@ -1423,20 +1508,21 @@ void ChatView::onAttachFile()
     // chunk.  savedPath = original path so the Download/Open button
     // always points at the still-local source file.
     const QString key = chatKey(chat);
-    FileTransferRecord rec;
+    AppDataStore::FileRecord rec;
     rec.transferId     = localTransferId;
-    rec.fileName       = fileName;
+    rec.chatKey        = key.toStdString();
+    rec.fileName       = fileName.toStdString();
     rec.fileSize       = fileSize;
     rec.peerIdB64u     = chat.peerIdB64u;
     rec.peerName       = chat.name;
-    rec.timestamp      = QDateTime::currentDateTime();
+    rec.timestampSecs  = QDateTime::currentDateTime().toSecsSinceEpoch();
     rec.sent           = true;
-    rec.status         = FileTransferStatus::Sending;
+    rec.status         = static_cast<int>(FileTransferStatus::Sending);
     rec.chunksTotal    = totalChunks;
     rec.chunksComplete = 0;
-    rec.savedPath      = path;
-    m_filesByKey[key].append(rec);
-    if (m_store) appData::saveFileRecord(m_store,key, rec);
+    rec.savedPath      = path.toStdString();
+    m_filesByKey[key].push_back(rec);
+    if (m_store) m_store->saveFileRecord(key.toStdString(), rec);
 
     rebuildFilesTab();
 
@@ -1449,7 +1535,7 @@ void ChatView::onAttachFile()
 
 void ChatView::onChatSelected(int index)
 {
-    if (index < 0 || index >= m_chats.size() || index == m_currentChat) return;
+    if (index < 0 || index >= static_cast<int>(m_chats.size()) || index == m_currentChat) return;
     m_currentChat = index;
     loadChat(index);
     ensureUnreadSize();
@@ -1463,10 +1549,14 @@ void ChatView::onChatSelected(int index)
     if (!m_searchQuery.isEmpty()) {
         m_searchMatchIndices.clear();
         m_searchMatchCurrent = -1;
-        const auto &msgs = m_chats[m_currentChat].messages;
-        for (int i = 0; i < msgs.size(); ++i)
-            if (msgs[i].text.toLower().contains(m_searchQuery))
+        const std::string queryStd = m_searchQuery.toLower().toStdString();
+        const auto &msgs = m_messagesByPeer[m_chats[m_currentChat].peerIdB64u];
+        for (int i = 0; i < static_cast<int>(msgs.size()); ++i) {
+            QString lowered = qtbridge::qstr(msgs[i].text).toLower();
+            if (lowered.contains(m_searchQuery))
                 m_searchMatchIndices.append(i);
+        }
+        (void)queryStd;
         highlightSearchMatches();
     }
 }
@@ -1477,44 +1567,53 @@ void ChatView::onSendMessage()
     QString text = m_ui->messageInput->text().trimmed();
     if (text.isEmpty()) return;
 
-    if (m_chats[m_currentChat].keys.isEmpty()) {
+    AppDataStore::Contact &cur = m_chats[m_currentChat];
+    if (cur.keys.empty()) {
         addMessageBubble("No keys saved for this contact.", false);
         return;
     }
 
     const QDateTime now = QDateTime::currentDateTime();
-    const auto &msgs = m_chats[m_currentChat].messages;
-    if (msgs.isEmpty() || msgs.last().timestamp.secsTo(now) >= kDateSepSecs)
+    const int64_t nowSecs = now.toSecsSinceEpoch();
+    auto &msgs = m_messagesByPeer[cur.peerIdB64u];
+    if (msgs.empty() || (nowSecs - msgs.back().timestampSecs) >= kDateSepSecs)
         addDateSeparator(now);
 
     const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    Message msg{true, text, now, msgId};
-    m_chats[m_currentChat].messages.append(msg);
+    AppDataStore::Message msg{true, text.toStdString(), nowSecs, msgId.toStdString(), ""};
+    msgs.push_back(msg);
+
+    auto trimStd = [](const std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
 
     if (m_store) {
-        const QString dbKey = m_chats[m_currentChat].isGroup
-                                  ? (m_chats[m_currentChat].groupId.isEmpty()
-                                         ? "name:" + m_chats[m_currentChat].name
-                                         : m_chats[m_currentChat].groupId)
-                                  : (m_chats[m_currentChat].keys.isEmpty()
-                                         ? "name:" + m_chats[m_currentChat].name
-                                         : m_chats[m_currentChat].keys.first());
-        appData::saveMessage(m_store,dbKey, msg);
+        const std::string dbKey = cur.isGroup
+                                  ? (cur.groupId.empty()
+                                         ? ("name:" + cur.name)
+                                         : cur.groupId)
+                                  : (cur.keys.empty()
+                                         ? ("name:" + cur.name)
+                                         : cur.keys.front());
+        m_store->saveMessage(dbKey, msg);
     }
 
     addMessageBubble(text, true);
     m_ui->messageInput->clear();
 
-    if (m_chats[m_currentChat].isGroup) {
-        const QString gid = m_chats[m_currentChat].groupId.isEmpty()
-        ? m_chats[m_currentChat].name : m_chats[m_currentChat].groupId;
+    if (cur.isGroup) {
+        const std::string gid = cur.groupId.empty() ? cur.name : cur.groupId;
         m_controller->sendGroupMessageViaMailbox(
-            gid.toStdString(), m_chats[m_currentChat].name.toStdString(),
-            qListToStd(m_chats[m_currentChat].keys), text.toStdString());
+            gid, cur.name, cur.keys, text.toStdString());
     } else {
-        for (const QString &k : std::as_const(m_chats[m_currentChat].keys))
-            if (!k.trimmed().isEmpty())
-                m_controller->sendText(k.trimmed().toStdString(), text.toStdString());
+        for (const std::string &k : cur.keys) {
+            const std::string trimmed = trimStd(k);
+            if (!trimmed.empty())
+                m_controller->sendText(trimmed, text.toStdString());
+        }
     }
 }
 
@@ -1527,10 +1626,15 @@ void ChatView::onSearchChanged(const QString &text)
 
     // ── 1. Filter sidebar chats ──────────────────────────────────────────────
     for (int i = 0; i < m_ui->chatList->count(); ++i) {
-        const ChatData &c = m_chats[i];
-        bool match = q.isEmpty() || c.name.toLower().contains(q);
-        if (!match) for (const auto &m : std::as_const(c.messages))
-                if (m.text.toLower().contains(q)) { match = true; break; }
+        const AppDataStore::Contact &c = m_chats[i];
+        bool match = q.isEmpty() || qtbridge::qstr(c.name).toLower().contains(q);
+        if (!match) {
+            const auto it = m_messagesByPeer.find(c.peerIdB64u);
+            if (it != m_messagesByPeer.end()) {
+                for (const auto &m : it->second)
+                    if (qtbridge::qstr(m.text).toLower().contains(q)) { match = true; break; }
+            }
+        }
         m_ui->chatList->item(i)->setHidden(!match);
     }
     if (m_currentChat >= 0) {
@@ -1539,10 +1643,10 @@ void ChatView::onSearchChanged(const QString &text)
     }
 
     // ── 2. Highlight matching messages in current chat ────────────────────────
-    if (m_currentChat >= 0 && m_currentChat < m_chats.size() && !q.isEmpty()) {
-        const auto &msgs = m_chats[m_currentChat].messages;
-        for (int i = 0; i < msgs.size(); ++i)
-            if (msgs[i].text.toLower().contains(q))
+    if (m_currentChat >= 0 && m_currentChat < static_cast<int>(m_chats.size()) && !q.isEmpty()) {
+        const auto &msgs = m_messagesByPeer[m_chats[m_currentChat].peerIdB64u];
+        for (int i = 0; i < static_cast<int>(msgs.size()); ++i)
+            if (qtbridge::qstr(msgs[i].text).toLower().contains(q))
                 m_searchMatchIndices.append(i);
     }
     highlightSearchMatches();
@@ -1654,7 +1758,7 @@ void ChatView::onEditProfile()
     QPixmap uploadedPhoto;
     QColor avatarColor(0x2e, 0x8b, 0x3a);
 
-    const QString currentAvatarB64 = m_store ? appData::loadSetting(m_store,"avatarData") : QString();
+    const QString currentAvatarB64 = m_store ? qtbridge::qstr(m_store->loadSetting("avatarData")) : QString();
     if (!currentAvatarB64.isEmpty()) {
         QPixmap px;
         px.loadFromData(QByteArray::fromBase64(currentAvatarB64.toUtf8()));
@@ -1904,29 +2008,28 @@ void ChatView::onEditProfile()
     m_ui->profileAvatarLabel->setText("");
 
     if (m_store) {
-        appData::saveSetting(m_store,"displayName",  displayName);
-        appData::saveSetting(m_store,"avatarData",   newAvatarB64);
-        appData::saveSetting(m_store,"avatarIsPhoto", usingPhoto ? "true" : "false");
+        m_store->saveSetting("displayName",  displayName.toStdString());
+        m_store->saveSetting("avatarData",   newAvatarB64.toStdString());
+        m_store->saveSetting("avatarIsPhoto", usingPhoto ? "true" : "false");
     }
 
     // Broadcast to all contacts. Send empty avatar when using default so the
     // receiver falls back to initials derived from their own saved name for us.
     {
-        const QString broadcastAvatar = usingPhoto ? newAvatarB64 : QString();
-        for (const ChatData &chat : std::as_const(m_chats)) {
-            if (!chat.isGroup && !chat.peerIdB64u.isEmpty())
-                m_controller->sendAvatar(chat.peerIdB64u.toStdString(),
-                                          displayName.toStdString(), broadcastAvatar.toStdString());
+        const std::string broadcastAvatar = usingPhoto ? newAvatarB64.toStdString() : std::string();
+        for (const auto &chat : m_chats) {
+            if (!chat.isGroup && !chat.peerIdB64u.empty())
+                m_controller->sendAvatar(chat.peerIdB64u, displayName.toStdString(), broadcastAvatar);
         }
     }
 }
 
 void ChatView::onEditContact(int index)
 {
-    if (index < 0 || index >= m_chats.size()) return;
-    QString     name       = m_chats[index].name;
-    QStringList keys       = m_chats[index].keys;
-    QString     avatar     = m_chats[index].avatarData;
+    if (index < 0 || index >= static_cast<int>(m_chats.size())) return;
+    QString     name       = qtbridge::qstr(m_chats[index].name);
+    QStringList keys       = qtbridge::qstrList(m_chats[index].keys);
+    QString     avatar     = qtbridge::qstr(m_chats[index].avatarB64);
     const bool  wasGroup   = m_chats[index].isGroup;
     const QString oldName  = name;
     const QString oldAvatar = avatar;
@@ -1939,9 +2042,9 @@ void ChatView::onEditContact(int index)
                           m_chats[index].isBlocked,
                           wasGroup,
                           &m_chats,
-                          [this](const ChatData &newContact) {
-                              m_chats.append(newContact);
-                              if (m_store) appData::saveContact(m_store,newContact);
+                          [this](const AppDataStore::Contact &newContact) {
+                              m_chats.push_back(newContact);
+                              if (m_store) m_store->saveContact(newContact);
                               rebuildChatList();
                           },
                           wasGroup ? &avatar : nullptr,
@@ -1964,11 +2067,13 @@ void ChatView::onEditContact(int index)
             // Prevent duplicate keys: check if any new key collides with another contact.
             bool conflict = false;
             for (const QString &k : std::as_const(keys)) {
-                for (int i = 0; i < m_chats.size(); ++i) {
+                const std::string kStd = k.toStdString();
+                for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
                     if (i == index || m_chats[i].isGroup) continue;
-                    if (m_chats[i].peerIdB64u == k || m_chats[i].keys.contains(k)) {
+                    if (m_chats[i].peerIdB64u == kStd ||
+                        std::find(m_chats[i].keys.begin(), m_chats[i].keys.end(), kStd) != m_chats[i].keys.end()) {
                         QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
-                                             QString("Key already belongs to contact \"%1\".").arg(m_chats[i].name));
+                                             QString("Key already belongs to contact \"%1\".").arg(qtbridge::qstr(m_chats[i].name)));
                         conflict = true; break;
                     }
                 }
@@ -1977,71 +2082,70 @@ void ChatView::onEditContact(int index)
             if (conflict) return;
         }
 
-        m_chats[index].name = name; m_chats[index].keys = keys;
-        if (wasGroup) m_chats[index].avatarData = avatar;
-        if (m_chats[index].peerIdB64u.isEmpty() && !keys.isEmpty())
-            m_chats[index].peerIdB64u = keys.first();
-        if (m_store) appData::saveContact(m_store,m_chats[index]);
+        m_chats[index].name = name.toStdString();
+        m_chats[index].keys = qtbridge::stdstrList(keys);
+        if (wasGroup) m_chats[index].avatarB64 = avatar.toStdString();
+        if (m_chats[index].peerIdB64u.empty() && !keys.isEmpty())
+            m_chats[index].peerIdB64u = keys.first().toStdString();
+        if (m_store) m_store->saveContact(m_chats[index]);
         if (wasGroup && !avatar.isEmpty())
-            appData::saveContactAvatar(m_store,m_chats[index].peerIdB64u, avatar);
+            m_store->saveContactAvatar(m_chats[index].peerIdB64u, avatar.toStdString());
         rebuildChatList();
         if (m_currentChat == index)
             m_ui->chatTitleLabel->setText(name);
 
         // Broadcast group changes to all members
         if (wasGroup) {
-            const std::vector<std::string> stdKeys = qListToStd(keys);
+            const std::vector<std::string> stdKeys = qtbridge::stdstrList(keys);
             if (name != oldName)
-                m_controller->sendGroupRename(m_chats[index].groupId.toStdString(),
+                m_controller->sendGroupRename(m_chats[index].groupId,
                                                name.toStdString(), stdKeys);
             if (avatar != oldAvatar)
-                m_controller->sendGroupAvatar(m_chats[index].groupId.toStdString(),
+                m_controller->sendGroupAvatar(m_chats[index].groupId,
                                                avatar.toStdString(), stdKeys);
             if (keys != oldKeys)
-                m_controller->sendGroupMemberUpdate(m_chats[index].groupId.toStdString(),
-                                                     m_chats[index].name.toStdString(), stdKeys);
+                m_controller->sendGroupMemberUpdate(m_chats[index].groupId,
+                                                     m_chats[index].name, stdKeys);
         }
     } else if (result == ContactEditorResult::Removed) {
         // Use the same key logic as saveContact
-        const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
-                                  ? "name:" + m_chats[index].name
+        const std::string dbKey = m_chats[index].peerIdB64u.empty()
+                                  ? ("name:" + m_chats[index].name)
                                   : m_chats[index].peerIdB64u;
-        if (m_store) appData::deleteContact(m_store,dbKey);
-        m_chats.remove(index);
+        if (m_store) m_store->deleteContact(dbKey);
+        m_chats.erase(m_chats.begin() + index);
         m_unread.remove(index);
         m_currentChat = -1;
         rebuildChatList();
-        if (!m_chats.isEmpty()) m_ui->chatList->setCurrentRow(0);
+        if (!m_chats.empty()) m_ui->chatList->setCurrentRow(0);
     } else if (result == ContactEditorResult::Blocked) {
         m_chats[index].isBlocked = !m_chats[index].isBlocked;
-        if (m_store) appData::saveContact(m_store,m_chats[index]);
+        if (m_store) m_store->saveContact(m_chats[index]);
         rebuildChatList();
 
     } else if (result == ContactEditorResult::SessionReset) {
         // Wipe ratchet state so next message triggers a fresh handshake.
-        const QString peerId = m_chats[index].peerIdB64u;
-        if (!peerId.isEmpty())
-            m_controller->resetSession(peerId.toStdString());
-        if (m_store) appData::saveContact(m_store,m_chats[index]);
+        const std::string peerId = m_chats[index].peerIdB64u;
+        if (!peerId.empty())
+            m_controller->resetSession(peerId);
+        if (m_store) m_store->saveContact(m_chats[index]);
         rebuildChatList();
     } else if (result == ContactEditorResult::Left) {
         // Notify all members you're leaving
-        const QString groupId = m_chats[index].groupId;
+        const std::string groupId = m_chats[index].groupId;
         m_controller->sendGroupLeaveNotification(
-            groupId.toStdString(),
-            m_chats[index].name.toStdString(),
-            qListToStd(m_chats[index].keys));
+            groupId, m_chats[index].name, m_chats[index].keys);
 
         // Remove group locally
-        const QString dbKey = m_chats[index].peerIdB64u.isEmpty()
-                                  ? "name:" + m_chats[index].name
+        const std::string dbKey = m_chats[index].peerIdB64u.empty()
+                                  ? ("name:" + m_chats[index].name)
                                   : m_chats[index].peerIdB64u;
-        if (m_store) appData::deleteContact(m_store,dbKey);
-        m_chats.remove(index);
+        if (m_store) m_store->deleteContact(dbKey);
+        m_chats.erase(m_chats.begin() + index);
         m_unread.remove(index);
         m_currentChat = -1;
         rebuildChatList();
-        if (!m_chats.isEmpty())
+        if (!m_chats.empty())
             m_ui->chatList->setCurrentRow(0);
     }
 
@@ -2102,7 +2206,7 @@ void ChatView::onAddContact()
     if (dlg.exec() != QDialog::Accepted) return;
 
     if (createGroup) {
-        if (m_chats.isEmpty()) {
+        if (m_chats.empty()) {
             QMessageBox::information(m_ui->centralwidget,"No Contacts",
                                      "Add some contacts first before creating a group."); return; }
 
@@ -2115,9 +2219,9 @@ void ChatView::onAddContact()
         auto *gn = new QLineEdit(&gd); gn->setPlaceholderText("Enter group name…");
         gl->addWidget(gn); gl->addWidget(new QLabel("Select Members",&gd));
         auto *ml = new QListWidget(&gd); ml->setFixedHeight(160);
-        for (const ChatData &c : std::as_const(m_chats)) {
+        for (const auto &c : m_chats) {
             if (c.isGroup) continue;
-            auto *it = new QListWidgetItem(c.name, ml); it->setCheckState(Qt::Unchecked);
+            auto *it = new QListWidgetItem(qtbridge::qstr(c.name), ml); it->setCheckState(Qt::Unchecked);
         }
         gl->addWidget(ml);
         auto *gbr = new QHBoxLayout;
@@ -2130,26 +2234,34 @@ void ChatView::onAddContact()
         if (gd.exec() != QDialog::Accepted) return;
 
         const QString gname = gn->text().trimmed(); if(gname.isEmpty()) return;
-        QStringList gkeys, mnames;
+        std::vector<std::string> gkeys;
+        QStringList mnames;
         for(int i=0;i<ml->count();++i) {
-            if(ml->item(i)->checkState()==Qt::Checked)
-                for(const ChatData &c:std::as_const(m_chats))
-                    if(c.name==ml->item(i)->text()&&!c.isGroup){
-                        gkeys<<c.keys; mnames<<c.name; break; }
+            if(ml->item(i)->checkState()==Qt::Checked) {
+                const QString itemText = ml->item(i)->text();
+                const std::string itemTextStd = itemText.toStdString();
+                for(const auto &c : m_chats)
+                    if(c.name==itemTextStd && !c.isGroup){
+                        gkeys.insert(gkeys.end(), c.keys.begin(), c.keys.end());
+                        mnames<<itemText;
+                        break;
+                    }
+            }
         }
-        if(gkeys.isEmpty()){ QMessageBox::warning(m_ui->centralwidget,"No Members",
+        if(gkeys.empty()){ QMessageBox::warning(m_ui->centralwidget,"No Members",
                                  "Select at least one member."); return; }
 
-        ChatData ng; ng.name = gname;
+        AppDataStore::Contact ng;
+        ng.name = gname.toStdString();
         ng.subtitle = QString("Group · %1 member%2").arg(mnames.size())
-                          .arg(mnames.size()==1?"":"s");
+                          .arg(mnames.size()==1?"":"s").toStdString();
         ng.isGroup = true; ng.keys = gkeys;
-        ng.groupId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ng.groupId = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
         ng.peerIdB64u = ng.groupId;
-        m_chats.append(ng);
-        if(m_store) appData::saveContact(m_store,ng);
+        m_chats.push_back(ng);
+        if(m_store) m_store->saveContact(ng);
         rebuildChatList();
-        m_ui->chatList->setCurrentRow(m_chats.size()-1);
+        m_ui->chatList->setCurrentRow(static_cast<int>(m_chats.size())-1);
         return;
     }
 
@@ -2161,44 +2273,55 @@ void ChatView::onAddContact()
                              "Public key must be exactly 43 base64url characters.");
         return;
     }
+    const std::string singleKeyStd = singleKey.toStdString();
     // Prevent duplicate contacts
-    for (const ChatData &c : std::as_const(m_chats)) {
+    for (const auto &c : m_chats) {
         if (c.isGroup) continue;
-        if (c.peerIdB64u == singleKey || c.keys.contains(singleKey)) {
+        if (c.peerIdB64u == singleKeyStd ||
+            std::find(c.keys.begin(), c.keys.end(), singleKeyStd) != c.keys.end()) {
             QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
-                QString("Key already belongs to contact \"%1\".").arg(c.name));
+                QString("Key already belongs to contact \"%1\".").arg(qtbridge::qstr(c.name)));
             return;
         }
     }
     keys << singleKey;
 
-    ChatData nc; nc.name=name; nc.subtitle="Secure chat"; nc.keys=keys;
-    if(!keys.isEmpty()) nc.peerIdB64u=keys.first();
-    m_chats.append(nc);
-    if(m_store) appData::saveContact(m_store,nc);
+    AppDataStore::Contact nc;
+    nc.name = name.toStdString();
+    nc.subtitle = "Secure chat";
+    nc.keys = qtbridge::stdstrList(keys);
+    if(!nc.keys.empty()) nc.peerIdB64u = nc.keys.front();
+    m_chats.push_back(nc);
+    if(m_store) m_store->saveContact(nc);
 
     // Send our avatar to the new contact
-    if (!nc.peerIdB64u.isEmpty()) {
-        const QString myName   = m_store ? appData::loadSetting(m_store,"displayName") : QString();
-        const QString myAvatar = m_store ? appData::loadSetting(m_store,"avatarData")  : QString();
-        if (!myName.isEmpty())
-            m_controller->sendAvatar(nc.peerIdB64u.toStdString(),
-                                      myName.toStdString(), myAvatar.toStdString());
+    if (!nc.peerIdB64u.empty()) {
+        const std::string myName   = m_store ? m_store->loadSetting("displayName") : std::string();
+        const std::string myAvatar = m_store ? m_store->loadSetting("avatarData")  : std::string();
+        if (!myName.empty())
+            m_controller->sendAvatar(nc.peerIdB64u, myName, myAvatar);
     }
 
     rebuildChatList();
-    m_ui->chatList->setCurrentRow(m_chats.size()-1);
+    m_ui->chatList->setCurrentRow(static_cast<int>(m_chats.size())-1);
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 int ChatView::findChatForPeer(const QString &peerIdB64u) const
 {
-    for (int i = 0; i < m_chats.size(); ++i) {
+    const std::string peerStd = peerIdB64u.toStdString();
+    auto trimStd = [](const std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
         if (m_chats[i].isGroup) continue;
-        if (m_chats[i].peerIdB64u.trimmed() == peerIdB64u) return i;
-        for (const QString &k : std::as_const(m_chats[i].keys))
-            if (k.trimmed() == peerIdB64u) return i;
+        if (trimStd(m_chats[i].peerIdB64u) == peerStd) return i;
+        for (const std::string &k : m_chats[i].keys)
+            if (trimStd(k) == peerStd) return i;
     }
     return -1;
 }
@@ -2209,10 +2332,13 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
     if (existing >= 0) return existing;
 
     // Unknown sender — auto-create at the top of the list.
-    ChatData nc; nc.name = "Unknown contact"; nc.subtitle = "Secure chat";
-    nc.peerIdB64u = peerIdB64u; nc.keys.append(peerIdB64u);
-    m_chats.prepend(nc);
-    if (m_store) appData::saveContact(m_store,nc);
+    AppDataStore::Contact nc;
+    nc.name = "Unknown contact";
+    nc.subtitle = "Secure chat";
+    nc.peerIdB64u = peerIdB64u.toStdString();
+    nc.keys.push_back(peerIdB64u.toStdString());
+    m_chats.insert(m_chats.begin(), nc);
+    if (m_store) m_store->saveContact(nc);
     ensureUnreadSize();
     m_unread.prepend(0);
     if (m_currentChat >= 0) m_currentChat += 1;
@@ -2223,13 +2349,13 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
 void ChatView::initChats()
 {
     if (m_store) {
-        const QString savedName = appData::loadSetting(m_store,"displayName");
+        const QString savedName = qtbridge::qstr(m_store->loadSetting("displayName"));
         if (!savedName.isEmpty()) {
             m_ui->profileNameLabel->setText(savedName);
             m_ui->profileAvatarLabel->setText(QString(savedName[0]).toUpper());
         }
 
-        const QString avatarB64 = appData::loadSetting(m_store,"avatarData");
+        const QString avatarB64 = qtbridge::qstr(m_store->loadSetting("avatarData"));
         if (!avatarB64.isEmpty()) {
             QPixmap px;
             px.loadFromData(QByteArray::fromBase64(avatarB64.toUtf8()));
@@ -2240,18 +2366,35 @@ void ChatView::initChats()
         }
     }
 
+    m_chats.clear();
+    m_messagesByPeer.clear();
+    m_filesByKey.clear();
+
     if (m_store) {
-        m_chats = appData::loadAllContacts(m_store);
-        for (const auto &c : std::as_const(m_chats)) {
+        m_store->loadAllContacts([this](const AppDataStore::Contact &c) {
+            m_chats.push_back(c);
+        });
+
+        // Load messages + file records per contact.  Done after the
+        // contacts finish streaming so we don't hit the store recursively.
+        for (const auto &c : m_chats) {
+            auto &msgs = m_messagesByPeer[c.peerIdB64u];
+            m_store->loadMessages(c.peerIdB64u, [&msgs](const AppDataStore::Message &m) {
+                msgs.push_back(m);
+            });
+
             const QString ck = chatKey(c);
-            const auto records = appData::loadFileRecords(m_store,ck);
-            if (!records.isEmpty())
-                m_filesByKey[ck] = records;
+            std::vector<AppDataStore::FileRecord> records;
+            m_store->loadFileRecords(ck.toStdString(), [&records](const AppDataStore::FileRecord &r) {
+                records.push_back(r);
+            });
+            if (!records.empty())
+                m_filesByKey[ck] = std::move(records);
         }
     }
 
     m_ui->chatList->clear();
-    for (const auto &c : std::as_const(m_chats)) m_ui->chatList->addItem(c.name);
+    for (const auto &c : m_chats) m_ui->chatList->addItem(qtbridge::qstr(c.name));
 
     // Show first 8 chars of public key as handle
     const QString fullKey = QString::fromStdString(m_controller->myIdB64u());
@@ -2269,9 +2412,9 @@ void ChatView::rebuildChatList()
     // Prune m_memberOnline: drop keys that no longer belong to any contact/group
     {
         QSet<QString> activeKeys;
-        for (const ChatData &c : std::as_const(m_chats))
-            for (const QString &k : c.keys) {
-                const QString t = k.trimmed();
+        for (const auto &c : m_chats)
+            for (const std::string &k : c.keys) {
+                const QString t = qtbridge::qstr(k).trimmed();
                 if (!t.isEmpty()) activeKeys.insert(t);
             }
         for (auto it = m_memberOnline.begin(); it != m_memberOnline.end(); ) {
@@ -2286,7 +2429,7 @@ void ChatView::rebuildChatList()
                this, &ChatView::onChatSelected);
     m_ui->chatList->clear();
 
-    for (int i = 0; i < m_chats.size(); ++i) {
+    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
         auto *item = new QListWidgetItem(m_ui->chatList);
         item->setSizeHint(QSize(0, 64));
         auto *row = new QWidget;
@@ -2294,7 +2437,7 @@ void ChatView::rebuildChatList()
         auto *hl = new QHBoxLayout(row);
         hl->setContentsMargins(14,0,14,0); hl->setSpacing(6);
 
-        auto *nameLbl = new QLabel(m_chats[i].name, row);
+        auto *nameLbl = new QLabel(qtbridge::qstr(m_chats[i].name), row);
         nameLbl->setStyleSheet("color:#d0d0d0;font-size:14px;background:transparent;");
         hl->addWidget(nameLbl, 1);
 
@@ -2303,9 +2446,9 @@ void ChatView::rebuildChatList()
         // editor's member list).  Green check = Verified; orange "!" =
         // Mismatch (peer's safety number changed vs stored); no indicator
         // for Unverified (the default first-contact state).
-        if (!m_chats[i].isGroup && m_controller && !m_chats[i].keys.isEmpty()) {
+        if (!m_chats[i].isGroup && m_controller && !m_chats[i].keys.empty()) {
             const std::string peerIdB64u =
-                m_chats[i].keys.first().trimmed().toStdString();
+                qtbridge::qstr(m_chats[i].keys.front()).trimmed().toStdString();
             const auto trust = m_controller->peerTrust(peerIdB64u);
             if (trust != ChatController::PeerTrust::Unverified) {
                 auto *badge = new QLabel(row);
@@ -2340,9 +2483,9 @@ void ChatView::rebuildChatList()
         auto *avatarLbl = new QLabel(row);
         avatarLbl->setFixedSize(34, 34);
         avatarLbl->setAlignment(Qt::AlignCenter);
-        if (!m_chats[i].avatarData.isEmpty()) {
+        if (!m_chats[i].avatarB64.empty()) {
             QPixmap px;
-            px.loadFromData(QByteArray::fromBase64(m_chats[i].avatarData.toUtf8()));
+            px.loadFromData(QByteArray::fromBase64(QByteArray::fromStdString(m_chats[i].avatarB64)));
             if (!px.isNull())
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
         } else {
@@ -2350,7 +2493,7 @@ void ChatView::rebuildChatList()
                 QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
                 QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
             };
-            const QString &nm = m_chats[i].name;
+            const QString nm = qtbridge::qstr(m_chats[i].name);
             const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
             const uint hash = qHash(nm);
             const QColor bg = m_chats[i].isGroup
@@ -2385,7 +2528,7 @@ void ChatView::rebuildChatList()
     }
     m_emptyLabel->resize(m_ui->contentWidget->size());
     m_emptyLabel->move(0,0); m_emptyLabel->raise();
-    if (m_chats.isEmpty()) {
+    if (m_chats.empty()) {
         QTimer::singleShot(0, this, [this](){ if(m_emptyLabel){
             m_emptyLabel->resize(m_ui->contentWidget->size());
             m_emptyLabel->raise(); m_emptyLabel->show(); } });
@@ -2396,17 +2539,19 @@ void ChatView::rebuildChatList()
 
 void ChatView::loadChat(int index)
 {
-    const ChatData &chat = m_chats[index];
-    m_ui->chatTitleLabel->setText(chat.name);
+    const AppDataStore::Contact &chat = m_chats[index];
+    const QString chatName = qtbridge::qstr(chat.name);
+    m_ui->chatTitleLabel->setText(chatName);
 
     // Show online / last-seen for DM chats, group subtitle for groups
     if (!chat.isGroup) {
-        const QString statusText = chat.isOnline
+        const bool isOnline = m_memberOnline.value(qtbridge::qstr(chat.peerIdB64u), false);
+        const QString statusText = isOnline
                                        ? "Online"
-                                       : formatLastSeen(chat.lastActive);
+                                       : formatLastSeen(qtbridge::qdate(chat.lastActiveSecs));
         m_ui->chatSubLabel->setText("● " + statusText);
         m_ui->chatSubLabel->setStyleSheet(
-            chat.isOnline
+            isOnline
                 ? "color: #3a9e48; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
                 : "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
     } else {
@@ -2416,8 +2561,8 @@ void ChatView::loadChat(int index)
         const QString myKey = QString::fromStdString(m_controller->myIdB64u());
         int onlineCount = 0, totalMembers = 0;
         bool anyResolved = false;
-        for (const QString &k : std::as_const(chat.keys)) {
-            const QString trimmed = k.trimmed();
+        for (const std::string &k : chat.keys) {
+            const QString trimmed = qtbridge::qstr(k).trimmed();
             if (trimmed.isEmpty() || trimmed == myKey) continue;
             ++totalMembers;
             if (m_memberOnline.contains(trimmed)) {
@@ -2428,7 +2573,7 @@ void ChatView::loadChat(int index)
         }
         if (!anyResolved || totalMembers == 0) {
             // No presence data yet — show the original subtitle
-            m_ui->chatSubLabel->setText(chat.subtitle);
+            m_ui->chatSubLabel->setText(qtbridge::qstr(chat.subtitle));
             m_ui->chatSubLabel->setStyleSheet(
                 "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
         } else {
@@ -2441,15 +2586,15 @@ void ChatView::loadChat(int index)
         }
     }
 
-    if (!chat.avatarData.isEmpty()) {
+    if (!chat.avatarB64.empty()) {
         QPixmap px;
-        px.loadFromData(QByteArray::fromBase64(chat.avatarData.toUtf8()));
+        px.loadFromData(QByteArray::fromBase64(QByteArray::fromStdString(chat.avatarB64)));
         if (!px.isNull()) {
             m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
             m_ui->chatAvatarLabel->setText("");
         }
     } else if (chat.isGroup) {
-        const QString ch = chat.name.isEmpty() ? "#" : QString(chat.name[0]);
+        const QString ch = chatName.isEmpty() ? "#" : QString(chatName[0]);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor(0x2e, 0x8b, 0x3a), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
@@ -2457,25 +2602,27 @@ void ChatView::loadChat(int index)
             QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
             QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
         };
-        const QString ch = chat.name.isEmpty() ? "?" : QString(chat.name[0]);
-        const QColor bg = avatarColorForName(chat.name);
+        const QString ch = chatName.isEmpty() ? "?" : QString(chatName[0]);
+        const QColor bg = avatarColorForName(chatName);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));
         m_ui->chatAvatarLabel->setText("");
     }
     clearMessages();
 
     QDateTime lastShown;
-    for (const Message &msg : chat.messages) {
-        if (!lastShown.isValid() || lastShown.secsTo(msg.timestamp) >= kDateSepSecs) {
-            addDateSeparator(msg.timestamp);
-            lastShown = msg.timestamp;
+    const auto &msgs = m_messagesByPeer[chat.peerIdB64u];
+    for (const auto &msg : msgs) {
+        const QDateTime msgTs = qtbridge::qdate(msg.timestampSecs);
+        if (!lastShown.isValid() || lastShown.secsTo(msgTs) >= kDateSepSecs) {
+            addDateSeparator(msgTs);
+            lastShown = msgTs;
         }
 
         QString senderName;
-        if (chat.isGroup && !msg.sent && !msg.senderName.isEmpty()) {
-            senderName = msg.senderName;
+        if (chat.isGroup && !msg.sent && !msg.senderName.empty()) {
+            senderName = qtbridge::qstr(msg.senderName);
         }
-        addMessageBubble(msg.text, msg.sent, senderName);
+        addMessageBubble(qtbridge::qstr(msg.text), msg.sent, senderName);
     }
     rebuildFilesTab();
 }
@@ -2484,10 +2631,11 @@ void ChatView::promoteChatToTop(int index)
 {
     // promoteChatToTop does NOT remap m_filesByKey because that map is keyed by
     // the stable peer ID — not by list index.  Only m_unread needs adjustment.
-    if (index <= 0 || index >= m_chats.size()) return;
+    if (index <= 0 || index >= static_cast<int>(m_chats.size())) return;
 
-    ChatData promoted = m_chats.takeAt(index);
-    m_chats.prepend(promoted);
+    AppDataStore::Contact promoted = std::move(m_chats[index]);
+    m_chats.erase(m_chats.begin() + index);
+    m_chats.insert(m_chats.begin(), std::move(promoted));
 
     ensureUnreadSize();
     int u = m_unread[index];
@@ -2716,17 +2864,17 @@ void ChatView::rebuildFilesTab()
     const auto   &records = m_filesByKey.value(key);
 
     // ── Filter records by search query if active ───────────────────────────
-    QVector<FileTransferRecord> filtered;
+    std::vector<AppDataStore::FileRecord> filtered;
     if (!m_searchQuery.isEmpty()) {
         for (const auto &r : records)
-            if (r.fileName.toLower().contains(m_searchQuery) ||
-                r.peerName.toLower().contains(m_searchQuery))
-                filtered.append(r);
+            if (qtbridge::qstr(r.fileName).toLower().contains(m_searchQuery) ||
+                qtbridge::qstr(r.peerName).toLower().contains(m_searchQuery))
+                filtered.push_back(r);
     } else {
         filtered = records;
     }
 
-    if (filtered.isEmpty()) {
+    if (filtered.empty()) {
         // ── Empty state ───────────────────────────────────────────────────────
         auto *ph = new QLabel(m_ui->filesScrollContents);
         if (!m_searchQuery.isEmpty())
@@ -2751,7 +2899,7 @@ void ChatView::rebuildFilesTab()
     grid->setContentsMargins(0, 0, 0, 0);
 
     static constexpr int kCols = 3;
-    for (int i = 0; i < filtered.size(); ++i)
+    for (int i = 0; i < static_cast<int>(filtered.size()); ++i)
         grid->addWidget(buildFileCard(filtered[i], gridWidget), i / kCols, i % kCols);
 
     // Equal-width columns so cards fill the available space
@@ -2762,10 +2910,14 @@ void ChatView::rebuildFilesTab()
     outer->addStretch();
 }
 
-QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
+QFrame *ChatView::buildFileCard(const AppDataStore::FileRecord &rec, QWidget *parent)
 {
-    const bool inFlight = (rec.status == FileTransferStatus::Sending ||
-                           rec.status == FileTransferStatus::Receiving);
+    const auto recStatus = static_cast<FileTransferStatus>(rec.status);
+    const bool inFlight = (recStatus == FileTransferStatus::Sending ||
+                           recStatus == FileTransferStatus::Receiving);
+    const QString recFileName  = qtbridge::qstr(rec.fileName);
+    const QString recSavedPath = qtbridge::qstr(rec.savedPath);
+    const QString recTransferId = qtbridge::qstr(rec.transferId);
 
     // ── Card shell ────────────────────────────────────────────────────────────
     auto *card = new QFrame(parent);
@@ -2784,8 +2936,8 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
     vl->setSpacing(0);
 
     // ── Thumbnail / icon area ─────────────────────────────────────────────────
-    const FilePreviewType previewType = filePreviewType(rec.fileName);
-    const bool hasFile = (rec.status == FileTransferStatus::Complete && !rec.savedPath.isEmpty());
+    const FilePreviewType previewType = filePreviewType(recFileName);
+    const bool hasFile = (recStatus == FileTransferStatus::Complete && !recSavedPath.isEmpty());
     const bool isImage = (previewType == FilePreviewType::Image && hasFile);
     const bool isText  = (previewType == FilePreviewType::Text  && hasFile);
 
@@ -2838,8 +2990,8 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         thumbLayout->addLayout(delRow);
     }
 
-    const QString delTransferId = rec.transferId;
-    const QString delSavedPath  = rec.savedPath;
+    const QString delTransferId = recTransferId;
+    const QString delSavedPath  = recSavedPath;
     QObject::connect(delBtn, &QPushButton::clicked, [this, delTransferId, delSavedPath]() {
         auto reply = QMessageBox::question(
             m_ui->centralwidget, "Delete File",
@@ -2849,14 +3001,15 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         if (reply != QMessageBox::Yes) return;
 
         // 1. Delete from database
-        appData::deleteFileRecord(m_store,delTransferId);
+        if (m_store) m_store->deleteFileRecord(delTransferId.toStdString());
 
         // 3. Remove from in-memory map
-        if (m_currentChat >= 0 && m_currentChat < m_chats.size()) {
+        if (m_currentChat >= 0 && m_currentChat < static_cast<int>(m_chats.size())) {
             const QString ck = chatKey(m_chats[m_currentChat]);
+            const std::string delIdStd = delTransferId.toStdString();
             auto &files = m_filesByKey[ck];
             files.erase(std::remove_if(files.begin(), files.end(),
-                [&](const FileTransferRecord &r){ return r.transferId == delTransferId; }),
+                [&](const AppDataStore::FileRecord &r){ return r.transferId == delIdStd; }),
                 files.end());
         }
 
@@ -2865,7 +3018,7 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
     });
 
     if (isImage) {
-        QPixmap px(rec.savedPath);
+        QPixmap px(recSavedPath);
         auto *imgLbl = new QLabel(thumbWidget);
         imgLbl->setAlignment(Qt::AlignCenter);
         imgLbl->setStyleSheet("background:transparent;border:none;");
@@ -2873,15 +3026,15 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
             imgLbl->setPixmap(
                 px.scaled(QSize(400, 200), Qt::KeepAspectRatio, Qt::SmoothTransformation));
         } else {
-            imgLbl->setText(fileIcon(rec.fileName));
+            imgLbl->setText(fileIcon(recFileName));
             imgLbl->setStyleSheet("background:transparent;color:#555555;font-size:64px;border:none;");
         }
         thumbLayout->addStretch();
         thumbLayout->addWidget(imgLbl);
         thumbLayout->addStretch();
 
-        const QString savedPath = rec.savedPath;
-        const QString imgName   = rec.fileName;
+        const QString savedPath = recSavedPath;
+        const QString imgName   = recFileName;
         QObject::connect(thumbBtn, &QPushButton::clicked, [=] {
             auto *dlg = new QDialog(m_ui->centralwidget);
             dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -2903,12 +3056,12 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         });
 
     } else if (isText) {
-        auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
+        auto *iconLbl = new QLabel(fileIcon(recFileName), thumbWidget);
         iconLbl->setAlignment(Qt::AlignCenter);
         iconLbl->setStyleSheet("background:transparent;color:#555555;font-size:40px;border:none;");
 
         QString preview;
-        QFile tf(rec.savedPath);
+        QFile tf(recSavedPath);
         if (tf.open(QIODevice::ReadOnly | QIODevice::Text)) {
             for (int i = 0; i < 3 && !tf.atEnd(); ++i)
                 preview += QString::fromUtf8(tf.readLine());
@@ -2928,7 +3081,7 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         thumbLayout->addStretch();
 
     } else {
-        auto *iconLbl = new QLabel(fileIcon(rec.fileName), thumbWidget);
+        auto *iconLbl = new QLabel(fileIcon(recFileName), thumbWidget);
         iconLbl->setAlignment(Qt::AlignCenter);
         iconLbl->setStyleSheet("background:transparent;color:#555555;font-size:64px;border:none;");
         thumbLayout->addStretch();
@@ -2967,9 +3120,9 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
         nameLbl->setFont(nf);
     }
     nameLbl->setStyleSheet("color:#eeeeee;background:transparent;border:none;");
-    nameLbl->setToolTip(rec.fileName);
+    nameLbl->setToolTip(recFileName);
     // Elide done after card is painted; use a sizePolicy hint for now
-    nameLbl->setText(rec.fileName);
+    nameLbl->setText(recFileName);
     nameLbl->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
     // Size label
@@ -2995,7 +3148,7 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
     vl->addWidget(textWidget);
 
     // ── Download button (complete state only) ─────────────────────────────────
-    if (rec.status == FileTransferStatus::Complete && !rec.savedPath.isEmpty()) {
+    if (recStatus == FileTransferStatus::Complete && !recSavedPath.isEmpty()) {
         auto *btnContainer = new QWidget(card);
         btnContainer->setStyleSheet("background:transparent;");
         auto *bl = new QVBoxLayout(btnContainer);
@@ -3017,8 +3170,8 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
             "QPushButton:pressed{ background-color:#226228; }"
             );
 
-        const QString savedPath = rec.savedPath;
-        const QString fileName  = rec.fileName;
+        const QString savedPath = recSavedPath;
+        const QString fileName  = recFileName;
         const bool    isSent    = rec.sent;
 
         QObject::connect(dlBtn, &QPushButton::clicked, [=]() {
@@ -3082,7 +3235,7 @@ QFrame *ChatView::buildFileCard(const FileTransferRecord &rec, QWidget *parent)
             "QPushButton:hover{ background-color:#3a2020; }"
             );
 
-        const QString transferId = rec.transferId;
+        const QString transferId = recTransferId;
         QObject::connect(cancelFileBtn, &QPushButton::clicked, [this, transferId]() {
             m_controller->cancelFileTransfer(transferId.toStdString());
         });
@@ -3152,9 +3305,10 @@ void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
 
     // Figure out which contact/chat this is so we can show a friendly name.
     QString senderName = fromPeerIdB64u.left(8) + "...";
-    for (const ChatData &c : m_chats) {
-        if (c.keys.contains(fromPeerIdB64u)) {
-            senderName = c.name;
+    const std::string fromStd = fromPeerIdB64u.toStdString();
+    for (const auto &c : m_chats) {
+        if (std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
+            senderName = qtbridge::qstr(c.name);
             break;
         }
     }
@@ -3184,14 +3338,15 @@ void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
 
 void ChatView::onFileTransferCanceled(const QString &transferId, bool byReceiver)
 {
+    const std::string transferStd = transferId.toStdString();
     // Walk every chat's file records and mark the matching transfer as failed.
     for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
         auto &records = it.value();
         for (auto &rec : records) {
-            if (rec.transferId != transferId) continue;
-            if (rec.status == FileTransferStatus::Complete) return; // too late
-            rec.status = FileTransferStatus::Failed;
-            if (m_store) appData::saveFileRecord(m_store,it.key(), rec);
+            if (rec.transferId != transferStd) continue;
+            if (static_cast<FileTransferStatus>(rec.status) == FileTransferStatus::Complete) return; // too late
+            rec.status = static_cast<int>(FileTransferStatus::Failed);
+            if (m_store) m_store->saveFileRecord(it.key().toStdString(), rec);
             rebuildFilesTab();
             break;
         }
@@ -3205,18 +3360,19 @@ void ChatView::onFileTransferCanceled(const QString &transferId, bool byReceiver
 
 void ChatView::onFileTransferDelivered(const QString &transferId)
 {
+    const std::string transferStd = transferId.toStdString();
     // Sender-side: flip the record's status to Complete with a confirmation.
     for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
         auto &records = it.value();
         for (auto &rec : records) {
-            if (rec.transferId != transferId) continue;
+            if (rec.transferId != transferStd) continue;
             if (!rec.sent) return; // only meaningful on sender side
             // Transfer landed + hash verified. Keep status Complete but reflect delivery.
             rec.chunksComplete = rec.chunksTotal;
-            rec.status         = FileTransferStatus::Complete;
-            if (m_store) appData::saveFileRecord(m_store,it.key(), rec);
+            rec.status         = static_cast<int>(FileTransferStatus::Complete);
+            if (m_store) m_store->saveFileRecord(it.key().toStdString(), rec);
             rebuildFilesTab();
-            showToast(QString("Delivered: %1").arg(rec.fileName));
+            showToast(QString("Delivered: %1").arg(qtbridge::qstr(rec.fileName)));
             return;
         }
     }
@@ -3224,13 +3380,14 @@ void ChatView::onFileTransferDelivered(const QString &transferId)
 
 void ChatView::onFileTransferBlocked(const QString &transferId, bool byReceiver)
 {
+    const std::string transferStd = transferId.toStdString();
     // Mark as failed + toast explanation.
     for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
         auto &records = it.value();
         for (auto &rec : records) {
-            if (rec.transferId != transferId) continue;
-            rec.status = FileTransferStatus::Failed;
-            if (m_store) appData::saveFileRecord(m_store,it.key(), rec);
+            if (rec.transferId != transferStd) continue;
+            rec.status = static_cast<int>(FileTransferStatus::Failed);
+            if (m_store) m_store->saveFileRecord(it.key().toStdString(), rec);
             rebuildFilesTab();
             break;
         }

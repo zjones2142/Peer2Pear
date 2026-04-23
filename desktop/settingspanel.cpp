@@ -1,5 +1,6 @@
 #include "settingspanel.h"
-#include "AppDataStoreQt.hpp"
+#include "AppDataStore.hpp"
+#include "qt_str_helpers.hpp"
 #include "theme.h"
 #include "theme_styles.h"
 
@@ -234,7 +235,7 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
     m_store = store;
     if (!m_store) return;
     // Load persisted notification state
-    const QString saved = appData::loadSetting(m_store,"notificationsEnabled", "true");
+    const std::string saved = m_store->loadSetting("notificationsEnabled", "true");
     m_notificationsEnabled = (saved == "true");
     applyNotificationState();
     // DND has no persisted value today (session-only); paint the
@@ -245,7 +246,7 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
     // generic "New message" banners keep plaintext out of the OS-
     // level notification store.  Users can opt up in the UI.
     {
-        const QString raw = appData::loadSetting(m_store,"notificationMode", "hidden");
+        const std::string raw = m_store->loadSetting("notificationMode", "hidden");
         if (raw == "full")         m_notifMode = NotificationMode::Full;
         else if (raw == "sender")  m_notifMode = NotificationMode::SenderOnly;
         else                        m_notifMode = NotificationMode::Hidden;
@@ -258,8 +259,12 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
 
     // Load file-transfer consent settings.  Defaults: everything ≤100 MB
     // accepts, no relay requirement.
-    const int softMB = appData::loadSetting(m_store,"fileAutoAcceptMaxMB", "100").toInt();
-    const int hardMB = appData::loadSetting(m_store,"fileHardMaxMB",       "100").toInt();
+    auto parseIntSetting = [this](const std::string& key, int defaultValue) {
+        try { return std::stoi(m_store->loadSetting(key, std::to_string(defaultValue))); }
+        catch (...) { return defaultValue; }
+    };
+    const int softMB = parseIntSetting("fileAutoAcceptMaxMB", 100);
+    const int hardMB = parseIntSetting("fileHardMaxMB",       100);
     if (m_fileAutoAcceptSpin) {
         QSignalBlocker blocker(m_fileAutoAcceptSpin);
         m_fileAutoAcceptSpin->setValue(softMB);
@@ -269,14 +274,14 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
         m_fileHardMaxSpin->setValue(hardMB);
     }
 
-    m_requireP2PEnabled = (appData::loadSetting(m_store,"fileRequireP2P", "false") == "true");
+    m_requireP2PEnabled = (m_store->loadSetting("fileRequireP2P", "false") == "true");
     m_requireVerifiedFilesEnabled =
-        (appData::loadSetting(m_store,"fileRequireVerified", "false") == "true");
+        (m_store->loadSetting("fileRequireVerified", "false") == "true");
     applyRequireP2PState();
     applyRequireVerifiedFilesState();
 
     m_hardBlockKeyChangeEnabled =
-        (appData::loadSetting(m_store,"hardBlockOnKeyChange", "false") == "true");
+        (m_store->loadSetting("hardBlockOnKeyChange", "false") == "true");
     applyHardBlockKeyChangeState();
 
     // Emit initial values so MainWindow/ChatController sync up.
@@ -291,7 +296,7 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
     // actually in the DB so what the user sees matches what the client
     // is connected to).
     if (m_relayUrlEdit) {
-        const QString url = appData::loadSetting(m_store,"relayUrl", "https://peer2pear.com");
+        const QString url = qtbridge::qstr(m_store->loadSetting("relayUrl", "https://peer2pear.com"));
         QSignalBlocker blocker(m_relayUrlEdit);
         m_relayUrlEdit->setText(url);
         m_lastAppliedRelayUrl = url;
@@ -300,7 +305,9 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
 
     // Privacy level — 0 (Standard), 1 (Enhanced), 2 (Maximum).
     {
-        const int lvl = appData::loadSetting(m_store,"privacyLevel", "0").toInt();
+        int lvl = 0;
+        try { lvl = std::stoi(m_store->loadSetting("privacyLevel", "0")); }
+        catch (...) { lvl = 0; }
         // Triggers the slot which updates the visual + persists again +
         // emits privacyLevelChanged so MainWindow syncs RelayClient on load.
         onPrivacyLevelChanged(lvl);
@@ -311,7 +318,7 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
     // applyThemeStyles + applyThemeButtonStyles via the connection in
     // our constructor.
     {
-        const QString raw = appData::loadSetting(m_store,"themePreference", "dark");
+        const std::string raw = m_store->loadSetting("themePreference", "dark");
         const auto pref = raw == "light"  ? ThemeManager::Preference::Light
                         : raw == "system" ? ThemeManager::Preference::System
                         :                    ThemeManager::Preference::Dark;
@@ -566,7 +573,7 @@ QWidget *SettingsPanel::makeNotificationsSection()
                         m_notifMode == NotificationMode::Full       ? "full"
                       : m_notifMode == NotificationMode::SenderOnly ? "sender"
                       :                                                "hidden";
-                    appData::saveSetting(m_store,"notificationMode", raw);
+                    m_store->saveSetting("notificationMode", raw);
                 }
                 if (m_notifModeHelp) {
                     switch (m_notifMode) {
@@ -756,8 +763,8 @@ void SettingsPanel::onToggleNotifications()
 
     // Persist to DB
     if (m_store)
-        appData::saveSetting(m_store,"notificationsEnabled",
-                          m_notificationsEnabled ? "true" : "false");
+        m_store->saveSetting("notificationsEnabled",
+                             m_notificationsEnabled ? "true" : "false");
 
     // DND overrides: if DND is on, keep notifications suppressed regardless
     emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
@@ -1101,21 +1108,21 @@ QWidget *SettingsPanel::makeFileTransferSection()
 
 void SettingsPanel::onFileAutoAcceptSpin(int mb)
 {
-    if (m_store) appData::saveSetting(m_store,"fileAutoAcceptMaxMB", QString::number(mb));
+    if (m_store) m_store->saveSetting("fileAutoAcceptMaxMB", std::to_string(mb));
     emit fileAutoAcceptMaxChanged(mb);
 }
 
 void SettingsPanel::onFileHardMaxSpin(int mb)
 {
-    if (m_store) appData::saveSetting(m_store,"fileHardMaxMB", QString::number(mb));
+    if (m_store) m_store->saveSetting("fileHardMaxMB", std::to_string(mb));
     emit fileHardMaxChanged(mb);
 }
 
 void SettingsPanel::onToggleRequireP2P()
 {
     m_requireP2PEnabled = !m_requireP2PEnabled;
-    if (m_store) appData::saveSetting(m_store,"fileRequireP2P",
-                                 m_requireP2PEnabled ? "true" : "false");
+    if (m_store) m_store->saveSetting("fileRequireP2P",
+                                      m_requireP2PEnabled ? "true" : "false");
     applyRequireP2PState();
     emit fileRequireP2PToggled(m_requireP2PEnabled);
 }
@@ -1140,8 +1147,8 @@ void SettingsPanel::applyRequireP2PState()
 void SettingsPanel::onToggleRequireVerifiedFiles()
 {
     m_requireVerifiedFilesEnabled = !m_requireVerifiedFilesEnabled;
-    if (m_store) appData::saveSetting(m_store,"fileRequireVerified",
-                                 m_requireVerifiedFilesEnabled ? "true" : "false");
+    if (m_store) m_store->saveSetting("fileRequireVerified",
+                                      m_requireVerifiedFilesEnabled ? "true" : "false");
     applyRequireVerifiedFilesState();
     emit fileRequireVerifiedToggled(m_requireVerifiedFilesEnabled);
 }
@@ -1295,7 +1302,7 @@ void SettingsPanel::onApplyRelayUrl()
     const QString url = m_relayUrlEdit->text().trimmed();
     if (url.isEmpty()) return;
 
-    if (m_store) appData::saveSetting(m_store,"relayUrl", url);
+    if (m_store) m_store->saveSetting("relayUrl", url.toStdString());
     m_lastAppliedRelayUrl = url;
     if (m_relayApplyBtn) m_relayApplyBtn->setEnabled(false);
 
@@ -1461,8 +1468,8 @@ QWidget *SettingsPanel::makePrivacySection()
 void SettingsPanel::onToggleHardBlockOnKeyChange()
 {
     m_hardBlockKeyChangeEnabled = !m_hardBlockKeyChangeEnabled;
-    if (m_store) appData::saveSetting(m_store,"hardBlockOnKeyChange",
-                                 m_hardBlockKeyChangeEnabled ? "true" : "false");
+    if (m_store) m_store->saveSetting("hardBlockOnKeyChange",
+                                      m_hardBlockKeyChangeEnabled ? "true" : "false");
     applyHardBlockKeyChangeState();
     emit hardBlockOnKeyChangeToggled(m_hardBlockKeyChangeEnabled);
 }
@@ -1540,7 +1547,7 @@ void SettingsPanel::onPrivacyLevelChanged(int level)
     }
 
     // Persist and notify.
-    if (m_store) appData::saveSetting(m_store,"privacyLevel", QString::number(level));
+    if (m_store) m_store->saveSetting("privacyLevel", std::to_string(level));
     emit privacyLevelChanged(level);
 }
 
@@ -1615,7 +1622,7 @@ QWidget *SettingsPanel::makeAppearanceSection()
             const char* raw = pref == ThemeManager::Preference::Light  ? "light"
                              : pref == ThemeManager::Preference::System ? "system"
                                                                           : "dark";
-            appData::saveSetting(m_store,"themePreference", raw);
+            m_store->saveSetting("themePreference", raw);
         }
         // Single source of truth — ThemeManager fires themeChanged
         // which our constructor's connection routes to applyThemeStyles

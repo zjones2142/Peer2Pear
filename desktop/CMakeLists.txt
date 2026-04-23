@@ -7,8 +7,8 @@ set(DESKTOP_SOURCES
     main.cpp
     mainwindow.cpp      mainwindow.h        mainwindow.ui
     chatview.cpp         chatview.h
-    chattypes.h
     filetransfer.h
+    qt_str_helpers.hpp
     settingspanel.cpp    settingspanel.h
     theme.cpp            theme.h
     onboardingdialog.cpp onboardingdialog.h
@@ -16,7 +16,6 @@ set(DESKTOP_SOURCES
     QtWebSocket.hpp
     QtHttpClient.hpp
     QrImage.cpp          QrImage.hpp
-    AppDataStoreQt.hpp
     resources.qrc
 )
 
