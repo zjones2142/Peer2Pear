@@ -1156,6 +1156,16 @@ Bytes CryptoEngine::deriveSubkey(const Bytes& masterKey,
     return hkdf(masterKey, {}, info, len);
 }
 
+Bytes CryptoEngine::deriveFileKey(const Bytes& ratchetMsgKey,
+                                    const std::string& transferId)
+{
+    if (ratchetMsgKey.size() != 32 || transferId.empty()) return {};
+    const std::string infoStr = "peer2pear:file-key-v1:" + transferId;
+    Bytes info(reinterpret_cast<const uint8_t*>(infoStr.data()),
+               reinterpret_cast<const uint8_t*>(infoStr.data()) + infoStr.size());
+    return hkdf(ratchetMsgKey, {}, info, 32);
+}
+
 // Audit #3 M1 — file-key wrap.  Both methods derive a 32-byte AEAD
 // key from m_identityKey on demand (stable across sessions because
 // m_identityKey is stable post-unlock).  Wrapped blob layout is

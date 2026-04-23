@@ -192,8 +192,89 @@ TEST(AppDataStore, EncryptedFieldsAreOpaqueInRawStorage) {
     const std::string raw = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
     sqlite3_finalize(stmt);
 
-    EXPECT_EQ(raw.substr(0, 4), "ENC:");
+    // Arch-review #1b: new writes emit `ENC2:` (AAD-bound).  Legacy
+    // `ENC:` rows continue to decrypt but aren't written anymore.
+    EXPECT_EQ(raw.substr(0, 5), "ENC2:");
     EXPECT_EQ(raw.find("UNIQUE_SENTINEL_NAME_42"), std::string::npos);
+}
+
+// Arch-review #1b: an attacker with SQLCipher write access must not
+// be able to swap an ENC2-blob from one row/column into another.  The
+// AAD binds `<table>|<column>|<row-key>`, so a swap flips one of
+// those fields and AEAD verification fails.
+TEST(AppDataStore, RowSwapAcrossColumnsFailsAadCheck) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Contact a;
+    a.peerIdB64u = "peer-A";
+    a.name       = "AliceName";
+    a.subtitle   = "AliceSubtitle";
+    ASSERT_TRUE(env.store->saveContact(a));
+
+    // Copy the encrypted `name` blob into `subtitle` (column swap
+    // within the same row).  A pre-#1b build would decrypt this fine.
+    sqlite3_stmt* read = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(env.db->handle(),
+        "SELECT name FROM contacts WHERE peer_id='peer-A';",
+        -1, &read, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(read), SQLITE_ROW);
+    const std::string nameCt = reinterpret_cast<const char*>(sqlite3_column_text(read, 0));
+    sqlite3_finalize(read);
+
+    sqlite3_stmt* write = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(env.db->handle(),
+        "UPDATE contacts SET subtitle=? WHERE peer_id='peer-A';",
+        -1, &write, nullptr), SQLITE_OK);
+    sqlite3_bind_text(write, 1, nameCt.c_str(), int(nameCt.size()), SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(write), SQLITE_DONE);
+    sqlite3_finalize(write);
+
+    std::vector<AppDataStore::Contact> out;
+    env.store->loadAllContacts([&](const AppDataStore::Contact& c) { out.push_back(c); });
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].name, "AliceName");
+    EXPECT_EQ(out[0].subtitle, std::string{})
+        << "swapped blob must fail to decrypt — AAD mismatch";
+}
+
+// Same but across peer rows (peer-A.name → peer-B.name).  AAD
+// includes the row-key (peer_id), so this swap also fails.
+TEST(AppDataStore, RowSwapAcrossPeersFailsAadCheck) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Contact a;
+    a.peerIdB64u = "peer-A";
+    a.name       = "AliceName";
+    AppDataStore::Contact b;
+    b.peerIdB64u = "peer-B";
+    b.name       = "BobName";
+    ASSERT_TRUE(env.store->saveContact(a));
+    ASSERT_TRUE(env.store->saveContact(b));
+
+    sqlite3_stmt* read = nullptr;
+    sqlite3_prepare_v2(env.db->handle(),
+        "SELECT name FROM contacts WHERE peer_id='peer-A';",
+        -1, &read, nullptr);
+    sqlite3_step(read);
+    const std::string aliceCt = reinterpret_cast<const char*>(sqlite3_column_text(read, 0));
+    sqlite3_finalize(read);
+
+    sqlite3_stmt* write = nullptr;
+    sqlite3_prepare_v2(env.db->handle(),
+        "UPDATE contacts SET name=? WHERE peer_id='peer-B';",
+        -1, &write, nullptr);
+    sqlite3_bind_text(write, 1, aliceCt.c_str(), int(aliceCt.size()), SQLITE_TRANSIENT);
+    sqlite3_step(write);
+    sqlite3_finalize(write);
+
+    std::vector<AppDataStore::Contact> out;
+    env.store->loadAllContacts([&](const AppDataStore::Contact& c) { out.push_back(c); });
+
+    AppDataStore::Contact* bob = nullptr;
+    for (auto& c : out) if (c.peerIdB64u == "peer-B") bob = &c;
+    ASSERT_NE(bob, nullptr);
+    EXPECT_EQ(bob->name, std::string{})
+        << "cross-peer blob swap must fail AAD check";
 }
 
 TEST(AppDataStore, LegacyKeyFallback) {

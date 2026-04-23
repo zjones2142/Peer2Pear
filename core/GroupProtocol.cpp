@@ -51,23 +51,28 @@ void GroupProtocol::sendText(const std::string& groupId,
 
     const std::string me = myId();
 
-    // Pack the user content into an inner JSON that the sender chain
-    // will encrypt.  Metadata that needs to stay plaintext for
-    // routing (groupId, members, ts, msgId) rides on the outer
-    // payload; user content lives inside the ciphertext.
-    const json plaintext = { {"text", text} };
+    // Arch-review #3: groupName + members move inside the sender-
+    // chain ciphertext, matching sendRename / sendAvatar / sendLeave
+    // / sendMemberUpdate.  Before this change a 1:1 ratchet
+    // compromise would still read every group's full member list and
+    // display name out of the plaintext outer envelope.  Outer now
+    // carries only routing-critical fields.
+    json membersArray = json::array();
+    for (const std::string& key : memberPeerIds) {
+        if (trimmed(key) == me) continue;
+        membersArray.push_back(key);
+    }
+
+    json plaintext = json::object();
+    plaintext["text"]      = text;
+    plaintext["groupName"] = groupName;
+    plaintext["members"]   = membersArray;
     GroupCiphertext enc = encryptForGroup(
         "group_msg", groupId, memberPeerIds, plaintext);
     if (enc.ciphertextB64.empty()) return;
 
     const int64_t     ts    = nowSecs();
     const std::string msgId = p2p::makeUuid();
-
-    json membersArray = json::array();
-    for (const std::string& key : memberPeerIds) {
-        if (trimmed(key) == me) continue;
-        membersArray.push_back(key);
-    }
 
     for (const std::string& peerIdRaw : memberPeerIds) {
         const std::string peerId = trimmed(peerIdRaw);
@@ -77,8 +82,6 @@ void GroupProtocol::sendText(const std::string& groupId,
         payload["from"]       = me;
         payload["type"]       = "group_msg";
         payload["groupId"]    = groupId;
-        payload["groupName"]  = groupName;
-        payload["members"]    = membersArray;
         payload["skey_epoch"] = enc.epoch;
         payload["skey_idx"]   = enc.idx;
         payload["ciphertext"] = enc.ciphertextB64;

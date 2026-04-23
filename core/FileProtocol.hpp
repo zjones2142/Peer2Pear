@@ -90,6 +90,34 @@ public:
     void sendControlMessage(const std::string& peerIdB64u,
                              const nlohmann::json& msg);
 
+    // Arch-review #5: file_ack composition used to live in a lambda
+    // in ChatController's ctor.  Lifting it here keeps every outbound
+    // file control message in one place (sendControlMessage family).
+    void sendFileAck(const std::string& peerIdB64u,
+                      const std::string& transferId);
+
+    // Wire FileTransferManager's per-chunk seal callback to
+    // SessionSealer::sealPreEncryptedForPeer.  Called by
+    // ChatController once the FTM + sealer are both ready.
+    // Arch-review #5: the wiring was previously open-coded in
+    // ChatController, which meant the choke-point invariant had
+    // to be re-verified there; now FileProtocol owns it.
+    void installChunkSealCallback();
+
+    // Install the per-file AEAD key for (peer, transfer) so
+    // FileTransferManager's chunk handler can find it.  Used both
+    // on live accept and on DB-restore rehydration.  Arch-review
+    // #5: callers previously reached through `fileKeys()` directly.
+    void installIncomingKey(const std::string& peerIdB64u,
+                             const std::string& transferId,
+                             const Bytes& fileKey);
+
+    // Drop every key belonging to a transfer (keyed "<peer>:<tid>"
+    // or bare "<tid>" for test shim callers).  Zeroes the cached
+    // key material before erasing.  Called on transfer completion
+    // and on explicit cancellation.  Arch-review #5.
+    void eraseFileKeysFor(const std::string& transferId);
+
     // ── State accessors for inbound handlers ──────────────────────────
     // These are the minimum public API the onEnvelope file_* branches
     // need to mutate per-transfer state without reaching across an

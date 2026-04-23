@@ -77,6 +77,20 @@ public:
     //   - SealedEnvelope::seal failed
     Bytes sealForPeer(const std::string& peerIdB64u, const Bytes& plaintext);
 
+    // Seal an already-encrypted payload for a peer without advancing
+    // the ratchet.  File chunks use this: the chunk is already sealed
+    // under a per-file AEAD key (derived from the ratchet at
+    // file_key-announce time), so the ratchet state MUST NOT advance
+    // on every chunk.  Arch-review #2: the hard-block-on-key-change
+    // policy still applies here — before this change the setSealFn
+    // path went straight to SealedEnvelope::seal and bypassed the
+    // trust check, letting chunks stream to a peer whose safety
+    // number just flipped.  Output is `SEALEDFC:\n<sealed>` wrapped
+    // for the relay.  Returns empty on the same failure modes as
+    // sealForPeer, plus hard-block rejection.
+    Bytes sealPreEncryptedForPeer(const std::string& peerIdB64u,
+                                    const Bytes& preEncryptedPayload);
+
     // ── Safety numbers ────────────────────────────────────────────────
     // 60-digit display string for out-of-band verification, or empty
     // if `peerIdB64u` is not a valid Ed25519 pub.

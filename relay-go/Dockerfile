@@ -1,13 +1,18 @@
 # Build stage — produces a statically linked binary
 FROM golang:1.22-alpine AS build
-RUN apk add --no-cache gcc musl-dev sqlite-dev
+# sqlite-dev no longer needed — mutecomm/go-sqlcipher bundles
+# SQLCipher + libtomcrypt headers as vendored source (arch-review #8).
+RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
 
-# CGO is required for go-sqlite3. Static link everything.
+# CGO is required for the SQLCipher-fork sqlite driver.  The netgo /
+# osusergo tags keep the resolver + uid lookups pure-Go so the final
+# binary is fully static.  sqlite_omit_load_extension shaves a bit
+# more off the bundled SQLite — we don't use loadable extensions.
 RUN CGO_ENABLED=1 GOOS=linux go build \
     -ldflags='-s -w -extldflags "-static"' \
     -tags 'sqlite_omit_load_extension netgo osusergo' \

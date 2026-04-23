@@ -231,6 +231,8 @@ protocol but required for a conforming deployment):
 | `RELAY_KEY_KEK` | Base64url 32-byte key that wraps the on-disk onion private key (audit #3 C3).  Without this the key is persisted in plaintext with file-perm 0o600 only; a container / shared-host deploy SHOULD set this. |
 | `RELAY_KEY_KEK_FILE` | Alternative to `RELAY_KEY_KEK`: path to a file containing the raw 32-byte KEK. |
 | `DB_PATH` | SQLite file for mailbox + push-token storage. |
+| `RELAY_DB_KEY` | Base64url 32-byte SQLCipher page key (arch-review #8).  When set, the mailbox SQLite file is encrypted at rest — timing metadata, schema, and HMAC-hashed peer routing keys are all opaque to anyone with filesystem access.  When unset, the file stays plaintext SQLite (current default), but peer IDs in routing columns are still HMAC-hashed via HKDF from the onion priv so a snapshot alone can't reveal the social graph.  Peer ID HMAC + SQLCipher compose (both layers apply when both are configured). |
+| `RELAY_DB_KEY_FILE` | Alternative to `RELAY_DB_KEY`: path to a file containing the raw 32-byte SQLCipher key. |
 | `PORT` | TCP port to listen on (default 8443). |
 | `TLS_CERT`, `TLS_KEY` | PEM cert + key for native TLS termination. |
 | `TRUST_PROXY` | When set, trust `X-Forwarded-For` for rate-limit bucketing. |
@@ -445,6 +447,19 @@ envelopes:
   unseal at the receiver and be dropped)
 - SHOULD follow bursty timing (not uniform intervals) to mimic real
   conversation patterns
+- SHOULD distribute cover envelopes across **all three padding buckets**
+  (§3.1.1), not only the small or only the large bucket.  A cover
+  generator that only ever hits one bucket leaks a fingerprint: the
+  relay can identify users whose real-traffic bucket histogram differs
+  from the cover distribution.  Reference distributions that the
+  Peer2Pear clients implement:
+  - Bandwidth-biased mode (privacy level 1 default): 60 % small / 30 %
+    medium / 10 % large.  Covers every bucket but keeps average cover
+    packet size close to typical user traffic.
+  - Uniform mode (privacy level 2 default): 1/3 / 1/3 / 1/3 across the
+    buckets.  Every user's observed cover-bucket histogram is
+    identical regardless of their real sends; costs roughly 3× the
+    bandwidth of biased mode.
 
 ### 5.4 Onion routing
 
@@ -470,6 +485,134 @@ Mitigations clients can apply:
 - Connect through Tor/VPN for network-layer anonymity
 - Use multiple relays for send (round-robin) to split knowledge
 - Use onion routing when privacy matters
+
+### 5.6 Traffic-analysis model and its limits
+
+This section documents what the combination of §5.1-§5.5 actually
+guarantees against a passive or operator-level adversary, and what it
+does **not**.  It is deliberately conservative: we prefer an honest
+"we do not claim X" over an aspirational "X is probably fine."
+
+**Observer capabilities assumed.**  A single honest-but-curious relay
+operator sees every envelope's wire-padded size, its arrival time,
+the (IP-level) source of each POST /v1/send, and the TLS-level
+metadata of every WebSocket connection.  The operator does **not**
+see the sender pubkey (sealed sender) nor the envelope payload
+(authenticated end-to-end encryption).
+
+**Claims we make.**
+
+1. *Size uniformity at bucket granularity.*  Every envelope on the
+   wire is one of exactly three sizes (§3.1.1).  A single envelope's
+   byte count reveals at most which bucket it fell into, not the
+   real inner length.
+2. *Sender unlinkability within a bucket.*  For envelopes in the
+   same bucket at approximately the same time, the operator cannot
+   distinguish "Alice sent to Bob" from "Carol sent to Bob" — the
+   sealed-sender construction leaves no sender identifier in the
+   routing header.
+3. *Per-send timing decoupling (with jitter enabled).*  With jitter
+   at privacy level ≥ 1, the operator cannot pinpoint which user
+   action produced which envelope within the jitter window (50-
+   500 ms depending on level).
+4. *Cover-traffic bucket indistinguishability (with uniform mode).*
+   At privacy level 2 the cover generator emits each padding bucket
+   with equal probability, so the operator's observed bucket
+   histogram for a user becomes statistically independent of that
+   user's actual send distribution.
+
+**Claims we deliberately DO NOT make.**
+
+1. We do not claim the operator cannot link a user's sending times
+   to an off-relay event.  Jitter is bounded; an operator with a
+   side-channel (e.g., "Alice tweeted, then an envelope arrived 200
+   ms later") can narrow causation.
+2. We do not claim the operator cannot separate cover from real
+   traffic by aggregate rate.  If a user closes their app, cover
+   stops; the operator sees "offline" vs "cover-rate" as distinct
+   regimes.  The self-addressed fallback (§5.3) covers short peer-
+   offline windows but not a genuine app-closed state.
+3. We do not claim resistance to a *colluding pair* of relays on
+   the single-hop path.  Multi-hop onion routing (§5.4) plus
+   privacy level 2 raise the bar but do not eliminate it.
+4. We do not make a formal indistinguishability claim of the form
+   "the operator's advantage in identifying a specific envelope is
+   at most ε."  Such a claim would require an end-to-end traffic-
+   analysis proof (Poisson rate matching, bucket-histogram chi-
+   square analysis, etc.) that is outside the scope of this spec.
+   The protocol gives operators a toolbox of well-known defences;
+   their concrete composition is tuned empirically.
+
+**Interaction between the three defences.**  Padding (always on) is
+independent of both jitter and cover traffic and composes trivially:
+every envelope is bucketed regardless of its origin.  Jitter and
+cover traffic operate on different timing distributions by design
+(jitter is a per-send uniform delay, cover is a bursty Poisson-ish
+process).  This means a timing-correlation adversary can in
+principle separate the two streams; the mitigation is (a) bucket-
+uniform cover so each stream's sizes look the same, and (b) using
+onion routing and multi-hop forwarding for traffic whose
+observability must be minimised.
+
+### 5.7 P2P (ICE/QUIC) path: security properties
+
+The P2P transport is an OPTIONAL direct path between two peers,
+negotiated via ICE candidates exchanged over the relay and carried
+over QUIC.  When active, file chunks flow directly peer-to-peer
+instead of through the relay's mailbox.  Its security properties
+are deliberately different from the relay path:
+
+**What the P2P path DOES claim (parity with the relay path):**
+
+1. *End-to-end confidentiality.*  File chunks are AEAD-encrypted
+   under a per-file key derived from the ratchet (§7.3.1).  The
+   direct transport never sees plaintext.
+2. *Authenticated bucket sizes.*  The sender wraps every chunk
+   with `SealedEnvelope::padForP2P` before it touches the QUIC
+   stream.  Wire layout is `innerLen(4 BE) || chunk || random
+   pad`, padded to the same 2 / 16 / 256 KiB buckets §3.1.1
+   defines.  A passive network observer between the peers (ISP,
+   Wi-Fi sniffer, corporate DLP) sees only the bucket class, not
+   the real chunk length.
+3. *Hard-block-on-key-change policy.*  If a user enabled
+   hard-block and the peer's safety number flipped, the P2P
+   file-send refuses the direct path and falls the chunk back
+   to the relay path, which runs the same check and drops
+   authoritatively.  Pre-audit-#10 builds bypassed this check
+   entirely on the QUIC path — every remaining chunk of an
+   in-flight transfer streamed to a potentially-compromised
+   peer.
+
+**What the P2P path does NOT claim (intrinsic to the transport):**
+
+1. *Sender anonymity.*  A P2P connection is direct IP-to-IP.
+   The peer sees your IP address by construction.  No crypto
+   trick reclaims this — it is the defining difference between
+   the P2P path and the sealed-sender relay path.  Users who
+   need sender anonymity MUST use privacy level ≤ 1 (no P2P).
+2. *Relay-observer timing defences.*  Jitter (§5.2) and cover
+   traffic (§5.3) exist to defeat a relay operator correlating
+   user actions with wire timing.  The P2P peer is not the
+   relay — they already see the app-level event that triggered
+   the send.  Applying jitter / cover to P2P would waste
+   bandwidth between two peers who chose direct transport *for*
+   throughput, without gaining a defence the threat model needs.
+   If a user wants those defences, dropping to privacy level 1
+   disables P2P and routes everything through the relay.
+3. *Persistent replay dedup.*  The P2P chunk handler dedups on
+   `(transferId, chunkIndex)` via a non-persistent in-memory
+   cache.  ICE sessions don't survive process restart — a new
+   connection must renegotiate — so persistent dedup would
+   protect a scenario that can't actually occur.
+
+**User-visible policy.**  A client SHOULD make the P2P-vs-relay
+choice explicit to the user — either a global "no direct
+connections" toggle (a user who wants IP-level anonymity flips it
+once) or a per-contact preference.  Silently preferring P2P when
+the user has chosen a max-privacy mode is user-hostile.  The
+reference implementation exposes the `requireP2P` flag on file
+transfers plus a sender-side "require direct connection" setting;
+either end can force the relay path for a given transfer.
 
 ---
 

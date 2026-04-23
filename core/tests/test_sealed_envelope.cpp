@@ -287,3 +287,79 @@ TEST(SealedEnvelope, UnwrapFromRelayRejectsMalformed) {
     tooLong[33] = 0xFF; tooLong[34] = 0xFF; tooLong[35] = 0xFF; tooLong[36] = 0xFF;
     EXPECT_TRUE(SealedEnvelope::unwrapFromRelay(tooLong).empty());
 }
+
+// ── 11. padForP2P → unpadFromP2P round-trip + bucket size ────────────────
+//
+// Arch-review #10: P2P file chunks get the same padding buckets as
+// relay envelopes so a network observer between the two peers can't
+// distinguish chunk-sized traffic from control frames by size alone.
+
+TEST(SealedEnvelope, P2PPadUnpadRoundTripSmallBucket) {
+    Bytes payload(500);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i);
+
+    Bytes padded = SealedEnvelope::padForP2P(payload);
+    // 500 bytes + 4-byte header fits in the 2 KiB bucket.
+    EXPECT_EQ(padded.size(), 2u * 1024);
+
+    Bytes roundTripped = SealedEnvelope::unpadFromP2P(padded);
+    EXPECT_EQ(roundTripped, payload);
+}
+
+TEST(SealedEnvelope, P2PPadUnpadRoundTripMediumBucket) {
+    Bytes payload(8000);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i * 7);
+
+    Bytes padded = SealedEnvelope::padForP2P(payload);
+    EXPECT_EQ(padded.size(), 16u * 1024);
+
+    Bytes roundTripped = SealedEnvelope::unpadFromP2P(padded);
+    EXPECT_EQ(roundTripped, payload);
+}
+
+TEST(SealedEnvelope, P2PPadUnpadRoundTripLargeBucket) {
+    // A typical file chunk body: 240 KiB + small framing overhead.
+    Bytes payload(240 * 1024 + 128);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i * 13);
+
+    Bytes padded = SealedEnvelope::padForP2P(payload);
+    EXPECT_EQ(padded.size(), 256u * 1024);
+
+    Bytes roundTripped = SealedEnvelope::unpadFromP2P(padded);
+    EXPECT_EQ(roundTripped, payload);
+}
+
+TEST(SealedEnvelope, P2PUnpadRejectsMalformed) {
+    // Too short for even the 4-byte length header.
+    EXPECT_TRUE(SealedEnvelope::unpadFromP2P(Bytes{}).empty());
+    EXPECT_TRUE(SealedEnvelope::unpadFromP2P(Bytes(3, 0)).empty());
+
+    // innerLen claims more bytes than the framed buffer has.
+    Bytes overclaim(16, 0);
+    overclaim[0] = 0xFF; overclaim[1] = 0xFF; overclaim[2] = 0xFF; overclaim[3] = 0xFF;
+    EXPECT_TRUE(SealedEnvelope::unpadFromP2P(overclaim).empty());
+
+    // Zero-length payload is also rejected (callers pass real chunks).
+    Bytes zeroLen(8, 0);
+    EXPECT_TRUE(SealedEnvelope::unpadFromP2P(zeroLen).empty());
+}
+
+TEST(SealedEnvelope, P2PPadOpaqueAcrossPayloadSizes) {
+    // Two different-sized payloads that fall in the same bucket must
+    // produce identical on-wire sizes — that's the whole point of the
+    // bucket padding.  An observer sees only "256 KiB chunk" both
+    // times; they can't tell whether the inner is 50 KiB or 250 KiB.
+    Bytes a(50 * 1024);
+    Bytes b(250 * 1024);
+    for (size_t i = 0; i < a.size(); ++i) a[i] = 0xAA;
+    for (size_t i = 0; i < b.size(); ++i) b[i] = 0xBB;
+
+    Bytes paddedA = SealedEnvelope::padForP2P(a);
+    Bytes paddedB = SealedEnvelope::padForP2P(b);
+    EXPECT_EQ(paddedA.size(), paddedB.size());
+    EXPECT_EQ(paddedA.size(), 256u * 1024);
+
+    // And the round-trip still recovers the original payload sizes.
+    EXPECT_EQ(SealedEnvelope::unpadFromP2P(paddedA).size(), a.size());
+    EXPECT_EQ(SealedEnvelope::unpadFromP2P(paddedB).size(), b.size());
+}

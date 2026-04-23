@@ -264,11 +264,20 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 
 // InitPush wires up the at-rest-encrypted push token store using the
 // relay's persistent X25519 private key as HKDF input.  Idempotent —
-// safe to call multiple times if the relay key is rotated.
+// safe to call multiple times if the relay key is rotated.  Also
+// installs the global peer-ID hasher (Arch-review #8) so subsequent
+// Mailbox / PushStore writes land with HMAC-hashed row keys rather
+// than raw base64url peer IDs.
 func (h *Hub) InitPush(relayPriv *[32]byte) {
 	if h.mbox == nil || h.mbox.db == nil || relayPriv == nil {
 		return
 	}
+	// Install the hasher first so the PushStore's CREATE TABLE path
+	// doesn't transiently write raw peer IDs — the table itself is
+	// schema-only, but any migration logic that runs under NewPushStore
+	// already sees the hashed form.
+	setGlobalPeerHasher(derivePeerHasher(relayPriv))
+
 	key := derivePushTokenKey(relayPriv)
 	store, err := NewPushStore(h.mbox.db, key)
 	if err != nil {

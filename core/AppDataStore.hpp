@@ -153,8 +153,15 @@ private:
     void createTables();
     void updateLastActive(const std::string& peerIdB64u);
 
-    std::string encryptField(const std::string& plaintext) const;
-    std::string decryptField(const std::string& stored) const;
+    // Arch-review #1b: every per-field encrypt MUST supply an AAD
+    // that binds the row's logical identity (table, column, row key)
+    // so an attacker with SQLCipher write access cannot cross-swap
+    // blobs between rows / columns / tables.  Callers use the
+    // `fieldAad(...)` helper to build the string consistently.
+    std::string encryptField(const std::string& plaintext,
+                              const std::string& aad = {}) const;
+    std::string decryptField(const std::string& stored,
+                              const std::string& aad = {}) const;
 
     SqlCipherDb*       m_db = nullptr;
     Bytes              m_encKey;       // 32-byte primary key; empty = plaintext

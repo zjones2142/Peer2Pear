@@ -153,6 +153,28 @@ private:
     int                     m_coverIntervalSec = 0;
     int                     m_burstRemaining   = 0;
 
+    // Cover-traffic size distribution (arch-review #9).  The inner
+    // body of a cover envelope picks a padding bucket first, then
+    // fills to land inside it, so the relay's view of cover bucket
+    // frequencies is independent of the user's real-traffic shape
+    // (before #9 cover was 95% small / 5% large / 0% medium — a
+    // trivial fingerprint for users who never send files).  The two
+    // modes trade bandwidth against indistinguishability:
+    //
+    //   BandwidthBiased  — 60% small / 30% medium / 10% large.  Covers
+    //                      every bucket at least some of the time so
+    //                      a text-only user can't be identified by
+    //                      bucket-histogram analysis, but still biased
+    //                      toward the most common real-traffic sizes.
+    //                      Used at privacy level 1.
+    //
+    //   UniformBuckets   — 1/3 / 1/3 / 1/3.  Every user's cover
+    //                      distribution looks the same regardless of
+    //                      their real sends.  Costs ~3x bandwidth vs
+    //                      the biased mode.  Used at privacy level 2.
+    enum class CoverSizeMode { BandwidthBiased, UniformBuckets };
+    CoverSizeMode           m_coverSizeMode    = CoverSizeMode::BandwidthBiased;
+
     std::vector<std::string> m_knownPeers;
     std::set<std::string>    m_onlinePeers;
 

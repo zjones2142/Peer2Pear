@@ -145,14 +145,22 @@ func (s *PushStore) decryptToken(peerID, platform, stored string) (string, error
 // client contract is "empty token means unregister."  The token is
 // sealed with XChaCha20-Poly1305 before it touches the DB; only the
 // relay process (which holds the AEAD key) can read it back.
+//
+// Arch-review #8: the peer_id column stores hashPeerID(peerID), not
+// the raw base64url peer ID.  The token AAD binds the *raw* peer ID
+// + platform (so an AAD check still links the token to the specific
+// user), but the row key on disk is the hash.  The hash preserves
+// the uniqueness needed for ON CONFLICT targeting because HMAC-
+// SHA256 collisions are out of reach at 128-bit truncation.
 func (s *PushStore) Upsert(peerID, platform, token string) error {
 	if peerID == "" || platform == "" {
 		return nil
 	}
+	peerKey := hashPeerID(peerID)
 	if token == "" {
 		_, err := s.db.Exec(
 			`DELETE FROM push_tokens WHERE peer_id=? AND platform=?;`,
-			peerID, platform)
+			peerKey, platform)
 		return err
 	}
 	sealed, err := s.encryptToken(peerID, platform, token)
@@ -165,7 +173,7 @@ func (s *PushStore) Upsert(peerID, platform, token string) error {
         ON CONFLICT(peer_id, platform) DO UPDATE SET
             token      = excluded.token,
             updated_at = excluded.updated_at;
-    `, peerID, platform, sealed, time.Now().Unix())
+    `, peerKey, platform, sealed, time.Now().Unix())
 	return err
 }
 
@@ -175,13 +183,20 @@ func (s *PushStore) Upsert(peerID, platform, token string) error {
 // fails to decrypt (legacy plaintext rows, or AEAD failures from a
 // rotated relay key) are skipped silently — the client re-registers
 // on next auth_ok and the next NotifyOffline picks up the fresh row.
+//
+// Arch-review #8: the row key on disk is hashPeerID(peerID); the
+// AEAD AAD still binds the *raw* peer ID + platform, so we pass raw
+// peerID into decryptToken.  PushRecord.PeerID is populated from the
+// caller-supplied raw peerID (not re-read from the DB) so downstream
+// callers don't see the opaque hash.
 func (s *PushStore) GetForPeer(peerID string) ([]PushRecord, error) {
 	if peerID == "" {
 		return nil, nil
 	}
+	peerKey := hashPeerID(peerID)
 	rows, err := s.db.Query(
-		`SELECT peer_id, platform, token, updated_at FROM push_tokens WHERE peer_id=?;`,
-		peerID)
+		`SELECT platform, token, updated_at FROM push_tokens WHERE peer_id=?;`,
+		peerKey)
 	if err != nil {
 		return nil, err
 	}
@@ -192,18 +207,15 @@ func (s *PushStore) GetForPeer(peerID string) ([]PushRecord, error) {
 		var r PushRecord
 		var sealed string
 		var ts int64
-		if err := rows.Scan(&r.PeerID, &r.Platform, &sealed, &ts); err != nil {
+		if err := rows.Scan(&r.Platform, &sealed, &ts); err != nil {
 			return nil, err
 		}
-		plain, derr := s.decryptToken(r.PeerID, r.Platform, sealed)
+		r.PeerID = peerID  // raw — what NotifyOffline / push.go expect
+		plain, derr := s.decryptToken(peerID, r.Platform, sealed)
 		if derr != nil || plain == "" {
-			// Decrypt failure or legacy-row prefix mismatch — drop the
-			// row from the response.  Logging the platform (not the
-			// ciphertext) helps an operator notice a key-rotation
-			// fallout without leaking token material to the log.
 			if derr != nil {
 				log.Printf("push: token decrypt failed for %s… platform=%s: %v",
-					truncID(r.PeerID), r.Platform, derr)
+					truncID(peerID), r.Platform, derr)
 			}
 			continue
 		}
@@ -222,7 +234,8 @@ func (s *PushStore) DeleteForPeer(peerID string) error {
 	if peerID == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`DELETE FROM push_tokens WHERE peer_id=?;`, peerID)
+	_, err := s.db.Exec(`DELETE FROM push_tokens WHERE peer_id=?;`,
+		hashPeerID(peerID))
 	return err
 }
 

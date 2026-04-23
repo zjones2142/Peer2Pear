@@ -418,13 +418,18 @@ func TestWsAuth_RejectsReplay(t *testing.T) {
 func TestWsAuth_ReplayPersistsAcrossRelayRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "relay.db")
 
+	// Arch-review #8 makes the auth-nonce HMAC key a function of the
+	// relay's onion private key — a production-faithful "restart on
+	// the same DB" test must also restore the same onion key, the
+	// way loadOrCreateRelayKey would.  Generate once, reuse both boots.
+	pub, priv := testRelayOnionKey(t)
+
 	bootHub := func() *testRelay {
 		mbox, err := NewMailbox(dbPath)
 		if err != nil {
 			t.Fatalf("mbox: %v", err)
 		}
 		hub := NewHub(mbox, false)
-		pub, priv := testRelayOnionKey(t)
 		hub.relayX25519Pub, hub.relayX25519Priv = pub, priv
 		hub.InitPush(priv)
 		mux := http.NewServeMux()
@@ -458,13 +463,18 @@ func TestWsAuth_ReplayPersistsAcrossRelayRestart(t *testing.T) {
 func TestMailboxDelivery_SurvivesRelayRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "relay.db")
 
+	// Arch-review #8: same constraint as TestWsAuth_ReplayPersists
+	// — the HMAC key under mailbox row lookups is derived from the
+	// onion key, so the test must reuse it across reboots the way
+	// loadOrCreateRelayKey would.
+	pub, priv := testRelayOnionKey(t)
+
 	bootHub := func() *testRelay {
 		mbox, err := NewMailbox(dbPath)
 		if err != nil {
 			t.Fatalf("mbox: %v", err)
 		}
 		hub := NewHub(mbox, false)
-		pub, priv := testRelayOnionKey(t)
 		hub.relayX25519Pub, hub.relayX25519Priv = pub, priv
 		hub.InitPush(priv)
 		mux := http.NewServeMux()

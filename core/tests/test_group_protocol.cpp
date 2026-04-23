@@ -298,14 +298,18 @@ TEST_F(GroupProtocolSuite, SendText_FanoutExcludesSelfAdvancesSkeyIdx) {
     ASSERT_EQ(msgs.size(), 2U);
 
     const auto& first = msgs[0];
-    EXPECT_EQ(first["type"],      "group_msg");
-    EXPECT_EQ(first["groupId"],   "gid");
-    EXPECT_EQ(first["groupName"], "My Group");
-    EXPECT_EQ(first["from"],      s_meId);
+    EXPECT_EQ(first["type"],    "group_msg");
+    EXPECT_EQ(first["groupId"], "gid");
+    EXPECT_EQ(first["from"],    s_meId);
     EXPECT_EQ(first["skey_epoch"].get<uint64_t>(), 0U);
     EXPECT_EQ(first["skey_idx"].get<uint32_t>(), 0U);
-    EXPECT_FALSE(first.contains("text")) << "plaintext leaked into group_msg";
-    EXPECT_FALSE(first.contains("seq"))  << "seq should not be present on group_msg";
+    EXPECT_FALSE(first.contains("text"))      << "plaintext leaked into group_msg";
+    EXPECT_FALSE(first.contains("seq"))       << "seq should not be present on group_msg";
+    // Arch-review #3: groupName + members live inside the ciphertext,
+    // not on the outer envelope.  A 1:1 ratchet peek no longer leaks
+    // the group's roster or display name.
+    EXPECT_FALSE(first.contains("groupName")) << "plaintext groupName leaked";
+    EXPECT_FALSE(first.contains("members"))   << "plaintext members leaked";
     ASSERT_TRUE(first.contains("ciphertext"));
     EXPECT_FALSE(first["ciphertext"].get<std::string>().empty());
 
@@ -315,11 +319,6 @@ TEST_F(GroupProtocolSuite, SendText_FanoutExcludesSelfAdvancesSkeyIdx) {
         EXPECT_EQ(m["ciphertext"], first["ciphertext"]);
         EXPECT_EQ(m["skey_idx"],   first["skey_idx"]);
         EXPECT_EQ(m["skey_epoch"], first["skey_epoch"]);
-
-        // members array still excludes self.
-        const auto& members = m["members"];
-        ASSERT_TRUE(members.is_array());
-        for (const auto& k : members) EXPECT_NE(k.get<std::string>(), s_meId);
     }
 
     // A second send must NOT re-announce the chain, and skey_idx

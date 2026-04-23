@@ -12,8 +12,17 @@
 // rows.  Mirrors desktop/databasemanager.cpp's kEncPrefix exactly so values
 // written by either code path round-trip cleanly.
 namespace {
-constexpr const char* kEncPrefix    = "ENC:";
-constexpr size_t      kEncPrefixLen = 4;
+// Per-field ciphertext prefixes.
+//   ENC:   — legacy (pre-arch-review #1b) format, no AAD.  Rows
+//            written by older builds decrypt through this path.
+//   ENC2:  — current format, AAD binds `<table>|<column>|<row-key>`
+//            so an attacker with SQLCipher write access cannot swap
+//            a blob from e.g. contacts.name into contacts.subtitle
+//            without tripping AEAD verification.
+constexpr const char* kEncPrefix     = "ENC:";
+constexpr size_t      kEncPrefixLen  = 4;
+constexpr const char* kEnc2Prefix    = "ENC2:";
+constexpr size_t      kEnc2PrefixLen = 5;
 
 // Base64 (no padding, standard alphabet) — small inline helpers so we
 // don't pull in a dependency.  libsodium's sodium_bin2base64 is here
@@ -130,7 +139,19 @@ void AppDataStore::setEncryptionKey(const Bytes& key32,
 
 // ── Per-field encryption ────────────────────────────────────────────────────
 
-std::string AppDataStore::encryptField(const std::string& plaintext) const
+// Build the per-row AAD string for encryptField / decryptField.  Layout
+// is `<table>|<column>|<row-key>` — the pipe-delimited form mirrors
+// SessionStore::sessionAad / handshakeAad so the two AAD conventions
+// look the same at a glance.  Kept internal (no AAD reuse across the
+// codebase) because the exact wording is not a wire contract.
+static std::string fieldAad(const std::string& table,
+                              const std::string& column,
+                              const std::string& rowKey) {
+    return table + "|" + column + "|" + rowKey;
+}
+
+std::string AppDataStore::encryptField(const std::string& plaintext,
+                                         const std::string& aad) const
 {
     if (m_encKey.empty()) return plaintext;
 
@@ -141,29 +162,40 @@ std::string AppDataStore::encryptField(const std::string& plaintext) const
     randombytes_buf(buf.data(), nonceLen);
 
     unsigned long long ctLen = 0;
+    const unsigned char* aadPtr = aad.empty()
+        ? nullptr
+        : reinterpret_cast<const unsigned char*>(aad.data());
     crypto_aead_xchacha20poly1305_ietf_encrypt(
         buf.data() + nonceLen, &ctLen,
         reinterpret_cast<const unsigned char*>(plaintext.data()), plaintext.size(),
-        nullptr, 0,
+        aadPtr, aad.size(),
         nullptr,
         buf.data(),
         m_encKey.data());
 
     buf.resize(nonceLen + ctLen);
-    return std::string(kEncPrefix) + base64Encode(buf.data(), buf.size());
+    // Always emit the v2 prefix post-arch-review #1b.  Legacy rows
+    // written under the v1 (no-AAD) path continue to decrypt via
+    // decryptField's fallback branch; new writes are AAD-bound.
+    return std::string(kEnc2Prefix) + base64Encode(buf.data(), buf.size());
 }
 
-std::string AppDataStore::decryptField(const std::string& stored) const
+std::string AppDataStore::decryptField(const std::string& stored,
+                                         const std::string& aad) const
 {
+    const bool isV2 = stored.compare(0, kEnc2PrefixLen, kEnc2Prefix) == 0;
+    const bool isV1 = !isV2 &&
+        stored.compare(0, kEncPrefixLen, kEncPrefix) == 0;
+
     // Legacy plaintext row — no prefix, return verbatim.
-    if (stored.compare(0, kEncPrefixLen, kEncPrefix) != 0)
-        return stored;
+    if (!isV1 && !isV2) return stored;
 
     if (m_encKey.empty() && m_legacyKeys.empty())
         return {}; // no key — never expose ciphertext
 
     Bytes blob;
-    if (!base64Decode(stored.substr(kEncPrefixLen), blob)) return {};
+    const size_t prefixLen = isV2 ? kEnc2PrefixLen : kEncPrefixLen;
+    if (!base64Decode(stored.substr(prefixLen), blob)) return {};
 
     const size_t nonceLen = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
     const size_t tagLen   = crypto_aead_xchacha20poly1305_ietf_ABYTES;
@@ -172,12 +204,22 @@ std::string AppDataStore::decryptField(const std::string& stored) const
     Bytes pt(blob.size() - nonceLen - tagLen, 0);
     unsigned long long ptLen = 0;
 
+    // v2 rows MUST verify under the caller-supplied AAD.  v1 (legacy)
+    // rows have no AAD — try with empty AAD only, never cross-use
+    // the v2 AAD value.  Cross-version fallback is deliberately
+    // NOT supported: that would let an attacker strip the v2 prefix
+    // to bypass the AAD binding.
+    const std::string aadForRow = isV2 ? aad : std::string{};
+    const unsigned char* aadPtr = aadForRow.empty()
+        ? nullptr
+        : reinterpret_cast<const unsigned char*>(aadForRow.data());
+
     auto tryKey = [&](const Bytes& key) -> bool {
         return crypto_aead_xchacha20poly1305_ietf_decrypt(
             pt.data(), &ptLen,
             nullptr,
             blob.data() + nonceLen, blob.size() - nonceLen,
-            nullptr, 0,
+            aadPtr, aadForRow.size(),
             blob.data(),
             key.data()) == 0;
     };
@@ -316,17 +358,22 @@ bool AppDataStore::saveContact(const Contact& c)
         "   in_address_book=excluded.in_address_book;"
     );
     q.bindValue(":peer_id",     c.peerIdB64u);
-    q.bindValue(":name",        encryptField(c.name));
-    q.bindValue(":subtitle",    encryptField(c.subtitle));
-    q.bindValue(":keys",        encryptField(joinKeys(c.keys)));
+    q.bindValue(":name",        encryptField(c.name,
+                                  fieldAad("contacts", "name", c.peerIdB64u)));
+    q.bindValue(":subtitle",    encryptField(c.subtitle,
+                                  fieldAad("contacts", "subtitle", c.peerIdB64u)));
+    q.bindValue(":keys",        encryptField(joinKeys(c.keys),
+                                  fieldAad("contacts", "keys", c.peerIdB64u)));
     q.bindValue(":is_blocked",  c.isBlocked ? 1 : 0);
     q.bindValue(":is_group",    c.isGroup   ? 1 : 0);
     // Audit #3 L1: encrypt group_id alongside name/keys/avatar.  All
     // other PII-shaped contact fields are field-encrypted; leaving
     // group_id plaintext meant a SQLCipher-page-key compromise still
     // leaked group membership topology.
-    q.bindValue(":group_id",    encryptField(c.groupId));
-    q.bindValue(":avatar",      encryptField(c.avatarB64));
+    q.bindValue(":group_id",    encryptField(c.groupId,
+                                  fieldAad("contacts", "group_id", c.peerIdB64u)));
+    q.bindValue(":avatar",      encryptField(c.avatarB64,
+                                  fieldAad("contacts", "avatar", c.peerIdB64u)));
     q.bindValue(":last_active", c.lastActiveSecs);
     q.bindValue(":in_ab",       c.inAddressBook ? 1 : 0);
     return q.exec();
@@ -354,13 +401,18 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
     while (q.next()) {
         Contact c;
         c.peerIdB64u     = q.valueText(0);
-        c.name           = decryptField(q.valueText(1));
-        c.subtitle       = decryptField(q.valueText(2));
-        c.keys           = splitKeys(decryptField(q.valueText(3)));
+        c.name           = decryptField(q.valueText(1),
+                                          fieldAad("contacts", "name",     c.peerIdB64u));
+        c.subtitle       = decryptField(q.valueText(2),
+                                          fieldAad("contacts", "subtitle", c.peerIdB64u));
+        c.keys           = splitKeys(decryptField(q.valueText(3),
+                                          fieldAad("contacts", "keys",     c.peerIdB64u)));
         c.isBlocked      = q.valueInt(4) == 1;
         c.isGroup        = q.valueInt(5) == 1;
-        c.groupId        = decryptField(q.valueText(6));
-        c.avatarB64      = decryptField(q.valueText(7));
+        c.groupId        = decryptField(q.valueText(6),
+                                          fieldAad("contacts", "group_id", c.peerIdB64u));
+        c.avatarB64      = decryptField(q.valueText(7),
+                                          fieldAad("contacts", "avatar",   c.peerIdB64u));
         c.lastActiveSecs = q.valueInt64(8);
         c.inAddressBook  = q.valueInt(9) == 1;
         cb(c);
@@ -373,7 +425,8 @@ bool AppDataStore::saveContactAvatar(const std::string& peerIdB64u,
     if (!m_db || peerIdB64u.empty()) return false;
     SqlCipherQuery q(*m_db);
     q.prepare("UPDATE contacts SET avatar=:av WHERE peer_id=:pid;");
-    q.bindValue(":av",  encryptField(avatarB64));
+    q.bindValue(":av",  encryptField(avatarB64,
+                           fieldAad("contacts", "avatar", peerIdB64u)));
     q.bindValue(":pid", peerIdB64u);
     return q.exec();
 }
@@ -437,10 +490,15 @@ bool AppDataStore::saveMessage(const std::string& peerIdB64u, const Message& m)
         );
         q.bindValue(":peer_id",     peerIdB64u);
         q.bindValue(":sent",        m.sent ? 1 : 0);
-        q.bindValue(":text",        encryptField(m.text));
+        // Messages bind (peer_id, msg_id) into the AAD so a blob from
+        // alice@msg1 cannot be swapped into bob@msg1 or alice@msg2.
+        const std::string rowKey = peerIdB64u + "|" + m.msgId;
+        q.bindValue(":text",        encryptField(m.text,
+                                      fieldAad("messages", "text", rowKey)));
         q.bindValue(":ts",          m.timestampSecs);
         q.bindValue(":msg_id",      m.msgId);
-        q.bindValue(":sender_name", encryptField(m.senderName));
+        q.bindValue(":sender_name", encryptField(m.senderName,
+                                      fieldAad("messages", "sender_name", rowKey)));
         if (!q.exec()) return false;
     }
     updateLastActive(peerIdB64u);
@@ -461,10 +519,13 @@ void AppDataStore::loadMessages(const std::string& peerIdB64u,
     while (q.next()) {
         Message m;
         m.sent          = q.valueInt(0) == 1;
-        m.text          = decryptField(q.valueText(1));
         m.timestampSecs = q.valueInt64(2);
         m.msgId         = q.valueText(3);
-        m.senderName    = decryptField(q.valueText(4));
+        const std::string rowKey = peerIdB64u + "|" + m.msgId;
+        m.text          = decryptField(q.valueText(1),
+                                          fieldAad("messages", "text",        rowKey));
+        m.senderName    = decryptField(q.valueText(4),
+                                          fieldAad("messages", "sender_name", rowKey));
         cb(m);
     }
 }
@@ -490,8 +551,11 @@ bool AppDataStore::saveSetting(const std::string& key, const std::string& value)
     // page-key compromise can't harvest relay URLs / TURN creds /
     // display name / similar.  The old comment "callers encrypt
     // sensitive settings themselves" was a paper policy with zero
-    // enforcement — now the field is always wrapped.
-    q.bindValue(":v", encryptField(value));
+    // enforcement — now the field is always wrapped.  Arch-review
+    // #1b: AAD binds the setting key so one setting's blob cannot
+    // be swapped into another.
+    q.bindValue(":v", encryptField(value,
+                        fieldAad("settings", "value", key)));
     return q.exec();
 }
 
@@ -506,7 +570,8 @@ std::string AppDataStore::loadSetting(const std::string& key,
         // decryptField handles both the new encrypted form AND the
         // legacy plaintext rows — it returns the input unchanged if
         // the ciphertext prefix is missing.  See encryptField impl.
-        return decryptField(q.valueText(0));
+        return decryptField(q.valueText(0),
+                             fieldAad("settings", "value", key));
     }
     return defaultValue;
 }
@@ -572,16 +637,19 @@ bool AppDataStore::saveFileRecord(const std::string& chatKey, const FileRecord& 
     );
     q.bindValue(":tid",    r.transferId);
     q.bindValue(":ck",     chatKey);
-    q.bindValue(":fn",     encryptField(r.fileName));
+    q.bindValue(":fn",     encryptField(r.fileName,
+                             fieldAad("file_transfers", "file_name",  r.transferId)));
     q.bindValue(":fs",     r.fileSize);
     q.bindValue(":pid",    r.peerIdB64u);
-    q.bindValue(":pn",     encryptField(r.peerName));
+    q.bindValue(":pn",     encryptField(r.peerName,
+                             fieldAad("file_transfers", "peer_name",  r.transferId)));
     q.bindValue(":ts",     r.timestampSecs);
     q.bindValue(":sent",   r.sent ? 1 : 0);
     q.bindValue(":status", r.status);
     q.bindValue(":ct",     r.chunksTotal);
     q.bindValue(":cc",     r.chunksComplete);
-    q.bindValue(":sp",     encryptField(r.savedPath));
+    q.bindValue(":sp",     encryptField(r.savedPath,
+                             fieldAad("file_transfers", "saved_path", r.transferId)));
     return q.exec();
 }
 
@@ -618,16 +686,19 @@ void AppDataStore::loadFileRecords(const std::string& chatKey,
     while (q.next()) {
         FileRecord r;
         r.transferId      = q.valueText(0);
-        r.fileName        = decryptField(q.valueText(1));
+        r.fileName        = decryptField(q.valueText(1),
+                              fieldAad("file_transfers", "file_name",  r.transferId));
         r.fileSize        = q.valueInt64(2);
         r.peerIdB64u      = q.valueText(3);
-        r.peerName        = decryptField(q.valueText(4));
+        r.peerName        = decryptField(q.valueText(4),
+                              fieldAad("file_transfers", "peer_name",  r.transferId));
         r.timestampSecs   = q.valueInt64(5);
         r.sent            = q.valueInt(6) == 1;
         r.status          = q.valueInt(7);
         r.chunksTotal     = q.valueInt(8);
         r.chunksComplete  = q.valueInt(9);
-        r.savedPath       = decryptField(q.valueText(10));
+        r.savedPath       = decryptField(q.valueText(10),
+                              fieldAad("file_transfers", "saved_path", r.transferId));
         r.chatKey         = chatKey;
         cb(r);
     }
