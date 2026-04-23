@@ -61,9 +61,12 @@ public:
     // if seed isn't 32 bytes.  Starts at index 0.
     static SenderChain fromSeed(const Bytes& seed);
 
-    // Valid = constructed from a proper 32-byte seed.  Default-
-    // constructed instances are invalid placeholders.
-    bool isValid() const { return m_seed.size() == 32; }
+    // Valid = we hold a live 32-byte chain key (the thing that
+    // actually derives message keys).  m_seed is only used for
+    // outbound fan-out via sendSkeyAnnounce — after forgetSeed()
+    // runs (Audit #3 M3) the chain is still valid and can decrypt
+    // without holding the seed.
+    bool isValid() const { return m_chainKey.size() == 32; }
 
     SenderChain() = default;
 
@@ -118,6 +121,29 @@ public:
     // rekey to ensure old message keys don't linger in memory past
     // their grace window.
     void clearSkipped();
+
+    // Drop the stored seed without touching the chain key or cache
+    // (Audit #3 M3 — limit persistence of the "rewind to idx 0"
+    // material).  GroupProtocol calls this on inbound chains once
+    // the seed has been written to the SQLCipher blob; the in-memory
+    // copy then only carries chainKey, so a later memory scrape
+    // cannot re-derive message keys back to idx 0.  No-op if the
+    // seed was already empty.  Outbound chains do NOT forget their
+    // seed — sendSkeyAnnounce still needs it to add new members.
+    void forgetSeed();
+
+    // Erase a single skipped key (Audit #3 H3 — forward secrecy).
+    // GroupProtocol calls this immediately after a successful AEAD
+    // decrypt at `idx`, so a later compromise of this chain's in-
+    // memory or on-disk state cannot recover the message key for an
+    // already-delivered message.  No-op if idx isn't cached (the key
+    // was either evicted by LRU or already consumed).
+    //
+    // We deliberately don't erase inside messageKeyFor itself: an AEAD
+    // failure (forged ciphertext, AAD mismatch) should leave the key
+    // in place so a legitimate retransmit at the same idx can still
+    // decrypt.  Only the caller knows whether the decrypt succeeded.
+    void eraseSkipped(uint32_t idx);
 
     // --- Persistence ------------------------------------------------
 

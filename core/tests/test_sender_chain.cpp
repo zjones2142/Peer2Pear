@@ -225,6 +225,75 @@ TEST(SenderChain, CacheNeverExceedsMaxSkippedViaSuccessiveCalls) {
     EXPECT_EQ(c.messageKeyFor(1).size(), 32U);  // next-oldest still cached
 }
 
+// Audit #3 M3: forgetSeed() drops the ability to re-derive message
+// keys from idx 0 without breaking ongoing decryption.  The chain
+// remains valid (isValid() still true) and messageKeyFor continues
+// to work for forward messages — only the seed fan-out material is
+// gone.  A serialize+deserialize round-trip preserves the forgotten
+// state so a restart doesn't resurrect the seed.
+TEST(SenderChain, ForgetSeedRetainsDecryptButDropsSeedAccess) {
+    SenderChain c = SenderChain::fromSeed(Bytes(32, 0x55));
+    const Bytes seedBefore = c.seed();
+    ASSERT_EQ(seedBefore.size(), 32U);
+    ASSERT_TRUE(c.isValid());
+
+    // Advance a couple of messages, then forget the seed.
+    (void)c.messageKeyFor(0);
+    (void)c.messageKeyFor(1);
+    c.forgetSeed();
+
+    EXPECT_TRUE(c.isValid()) << "chain still valid — chainKey intact";
+    EXPECT_EQ(c.seed().size(), 0U) << "seed should have been zeroed/cleared";
+
+    // Forward decryption still works.
+    Bytes k2 = c.messageKeyFor(2);
+    EXPECT_EQ(k2.size(), 32U);
+
+    // Serialize + deserialize preserves the "forgotten" state.
+    Bytes blob = c.serialize();
+    SenderChain restored = SenderChain::deserialize(blob);
+    ASSERT_TRUE(restored.isValid());
+    EXPECT_EQ(restored.seed().size(), 0U)
+        << "deserialize should recognise all-zero seed as forgotten";
+
+    // And the restored chain can still decrypt forward.
+    Bytes k3restored = restored.messageKeyFor(3);
+    EXPECT_EQ(k3restored.size(), 32U);
+}
+
+// forgetSeed is idempotent — calling twice is a no-op.
+TEST(SenderChain, ForgetSeedIdempotent) {
+    SenderChain c = SenderChain::fromSeed(Bytes(32, 0x77));
+    c.forgetSeed();
+    c.forgetSeed();
+    EXPECT_EQ(c.seed().size(), 0U);
+    EXPECT_TRUE(c.isValid());
+}
+
+// Audit #3 H3: explicit single-index erase (caller-driven forward
+// secrecy).  GroupProtocol calls this after a successful AEAD verify
+// at idx so the message key for an already-delivered envelope can't
+// be recovered from a later in-memory or on-disk compromise.
+TEST(SenderChain, EraseSkippedRemovesOnlyTheNamedIdx) {
+    SenderChain c = SenderChain::fromSeed(Bytes(32, 0x77));
+    // messageKeyFor(5) caches 0..5 then advances chain to nextIdx=6.
+    Bytes k5 = c.messageKeyFor(5);
+    ASSERT_EQ(k5.size(), 32U);
+    ASSERT_EQ(c.messageKeyFor(3).size(), 32U) << "setup: 3 should be cached";
+
+    c.eraseSkipped(3);
+
+    // 3 is gone; siblings remain.
+    EXPECT_TRUE(c.messageKeyFor(3).empty());
+    EXPECT_EQ(c.messageKeyFor(0).size(), 32U);
+    EXPECT_EQ(c.messageKeyFor(4).size(), 32U);
+
+    // No-op on idx that's not cached (already-erased / never-cached).
+    c.eraseSkipped(3);    // already gone
+    c.eraseSkipped(999);  // never derived
+    EXPECT_EQ(c.nextIdx(), 6U) << "eraseSkipped must not advance chain";
+}
+
 TEST(SenderChain, ClearSkippedDropsAllCachedKeys) {
     SenderChain c = SenderChain::fromSeed(Bytes(32, 0x99));
     (void)c.messageKeyFor(5);  // caches 0..5

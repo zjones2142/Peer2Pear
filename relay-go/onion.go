@@ -16,6 +16,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"net/url"
 	"os"
 
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
 )
@@ -30,7 +32,98 @@ import (
 const (
 	onionVersion        = 0x01
 	relayKeyPathDefault = "/data/peer2pear_relay_x25519.key"
+
+	// On-disk relay-key formats (Audit #3 C3):
+	//   0x01 = legacy plaintext layout — 32 raw scalar bytes, file
+	//          perms only.  Pre-C3 deploys wrote this.
+	//   0x02 = KEK-wrapped:
+	//             [0x02][nonce(24)][ciphertext(32+16 MAC)]
+	//          Unwraps with XChaCha20-Poly1305 using the 32-byte KEK
+	//          from env RELAY_KEY_KEK (base64url) or file at
+	//          RELAY_KEY_KEK_FILE.  Container / shared-host deploys
+	//          should set this so a file-perm bypass alone cannot
+	//          recover the onion private scalar.
+	relayKeyVersionPlaintext = byte(0x01)
+	relayKeyVersionWrapped   = byte(0x02)
 )
+
+// loadRelayKek returns the operator-configured KEK.  Env takes
+// precedence over the file path.  Returns (nil, nil) when no KEK is
+// configured — callers log a warning + persist plaintext.
+func loadRelayKek() ([]byte, error) {
+	if b64 := os.Getenv("RELAY_KEY_KEK"); b64 != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(b64)
+		if err != nil {
+			// Try standard base64 as a convenience — operators copy/paste
+			// from different tools and the distinction shouldn't break startup.
+			raw2, err2 := base64.StdEncoding.DecodeString(b64)
+			if err2 != nil {
+				return nil, fmt.Errorf("RELAY_KEY_KEK: not base64url or base64: %w", err)
+			}
+			raw = raw2
+		}
+		if len(raw) != chacha20poly1305.KeySize {
+			return nil, fmt.Errorf("RELAY_KEY_KEK must decode to %d bytes, got %d",
+				chacha20poly1305.KeySize, len(raw))
+		}
+		return raw, nil
+	}
+	if path := os.Getenv("RELAY_KEY_KEK_FILE"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read RELAY_KEY_KEK_FILE: %w", err)
+		}
+		if len(raw) != chacha20poly1305.KeySize {
+			return nil, fmt.Errorf("RELAY_KEY_KEK_FILE must contain exactly %d bytes, got %d",
+				chacha20poly1305.KeySize, len(raw))
+		}
+		return raw, nil
+	}
+	return nil, nil
+}
+
+// wrapRelayKey encrypts the 32-byte scalar under the KEK and returns
+// [0x02][nonce(24)][ct||tag].
+func wrapRelayKey(priv *[32]byte, kek []byte) ([]byte, error) {
+	aead, err := chacha20poly1305.NewX(kek)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	ct := aead.Seal(nil, nonce, priv[:], nil)
+	out := make([]byte, 0, 1+len(nonce)+len(ct))
+	out = append(out, relayKeyVersionWrapped)
+	out = append(out, nonce...)
+	out = append(out, ct...)
+	return out, nil
+}
+
+// unwrapRelayKey reverses wrapRelayKey.  Returns (priv, nil) on success.
+func unwrapRelayKey(blob []byte, kek []byte) (*[32]byte, error) {
+	aead, err := chacha20poly1305.NewX(kek)
+	if err != nil {
+		return nil, err
+	}
+	ns := aead.NonceSize()
+	if len(blob) < 1+ns+aead.Overhead()+32 {
+		return nil, fmt.Errorf("wrapped key too short (%d bytes)", len(blob))
+	}
+	nonce := blob[1 : 1+ns]
+	ct := blob[1+ns:]
+	pt, err := aead.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return nil, fmt.Errorf("relay key unwrap failed (wrong KEK?): %w", err)
+	}
+	if len(pt) != 32 {
+		return nil, fmt.Errorf("unwrapped relay key has bad length %d", len(pt))
+	}
+	var priv [32]byte
+	copy(priv[:], pt)
+	return &priv, nil
+}
 
 // loadOrCreateRelayKey loads this relay's persistent X25519 keypair from
 // disk, or generates + persists a fresh one if the file doesn't exist.
@@ -41,18 +134,54 @@ func loadOrCreateRelayKey() (*[32]byte, *[32]byte, error) {
 		path = relayKeyPathDefault
 	}
 
-	if data, err := os.ReadFile(path); err == nil && len(data) == 32 {
-		var priv [32]byte
-		copy(priv[:], data)
-		var pub [32]byte
-		// Derive pub from priv by scalarmult with base point.  box.GenerateKey
-		// doesn't expose a "given priv, give me pub" primitive, but
-		// curve25519.ScalarBaseMult does.  We use the fact that NaCl uses
-		// curve25519 under the hood — the "priv" is a clamped scalar.
-		if err := derivePubFromPriv(&pub, &priv); err != nil {
-			return nil, nil, err
+	kek, kekErr := loadRelayKek()
+	if kekErr != nil {
+		// Misconfigured KEK is a fatal startup problem — better to
+		// fail loudly than silently fall back to plaintext.
+		return nil, nil, kekErr
+	}
+
+	if data, err := os.ReadFile(path); err == nil {
+		// Auto-detect the on-disk format.  Legacy plaintext is
+		// exactly 32 bytes; wrapped is 0x02 + 24-byte nonce + 48-byte
+		// ct+tag = 73 bytes.
+		if len(data) == 32 {
+			var priv [32]byte
+			copy(priv[:], data)
+			var pub [32]byte
+			if err := derivePubFromPriv(&pub, &priv); err != nil {
+				return nil, nil, err
+			}
+			// If a KEK is available now, migrate the file on next save.
+			// We don't re-write opportunistically on load — that would
+			// race with concurrent reads and doesn't add much value
+			// given the file is already there.
+			if kek != nil {
+				fmt.Fprintf(os.Stderr,
+					"notice: relay key at %s is still plaintext; delete it to re-generate a KEK-wrapped key\n",
+					path)
+			}
+			return &pub, &priv, nil
 		}
-		return &pub, &priv, nil
+		if len(data) > 0 && data[0] == relayKeyVersionWrapped {
+			if kek == nil {
+				return nil, nil, fmt.Errorf(
+					"relay key at %s is KEK-wrapped but no RELAY_KEY_KEK / RELAY_KEY_KEK_FILE is set",
+					path)
+			}
+			priv, uerr := unwrapRelayKey(data, kek)
+			if uerr != nil {
+				return nil, nil, uerr
+			}
+			var pub [32]byte
+			if err := derivePubFromPriv(&pub, priv); err != nil {
+				return nil, nil, err
+			}
+			return &pub, priv, nil
+		}
+		// Unknown format — refuse to start rather than silently
+		// overwrite something the operator put here on purpose.
+		return nil, nil, fmt.Errorf("relay key at %s has unknown format", path)
 	}
 
 	pub, priv, err := box.GenerateKey(rand.Reader)
@@ -62,8 +191,23 @@ func loadOrCreateRelayKey() (*[32]byte, *[32]byte, error) {
 	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
 		// Best-effort — we can still run in memory if persistence fails.
 		fmt.Fprintf(os.Stderr, "warning: could not mkdir %s: %v\n", dirOf(path), err)
-	} else if err := os.WriteFile(path, priv[:], 0o600); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not persist relay key: %v\n", err)
+	} else {
+		// Prefer wrapped persistence when a KEK is configured.
+		var blob []byte
+		if kek != nil {
+			wrapped, werr := wrapRelayKey(priv, kek)
+			if werr != nil {
+				return nil, nil, fmt.Errorf("wrap relay key: %w", werr)
+			}
+			blob = wrapped
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"warning: RELAY_KEY_KEK not set — persisting relay key in plaintext. Set it to enable KEK wrapping (Audit #3 C3).\n")
+			blob = priv[:]
+		}
+		if err := os.WriteFile(path, blob, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not persist relay key: %v\n", err)
+		}
 	}
 	return pub, priv, nil
 }

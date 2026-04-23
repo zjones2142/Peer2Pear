@@ -436,3 +436,29 @@ TEST_F(SessionSealerSuite, SealForPeer_EmptyWithoutSessionManager) {
     Bytes pt = {1, 2, 3};
     EXPECT_TRUE(m_sealer->sealForPeer(s_peerIdB64u, pt).empty());
 }
+
+// Audit #3 M7: peerIdB64u that decodes to anything other than 32 bytes
+// must be rejected up front.  Without this guard the libsodium
+// call crypto_sign_ed25519_pk_to_curve25519 reads past the end of the
+// underlying Bytes buffer (UB).  A no-session sealer is enough to
+// exercise the size check because the validation now runs before the
+// SessionManager wiring is touched.
+TEST_F(SessionSealerSuite, SealForPeer_RejectsTruncatedPeerId) {
+    Bytes pt = {1, 2, 3};
+
+    // Empty + various short truncations of a real peer ID.  Each should
+    // return empty (silent reject) instead of crashing on the missing
+    // SessionManager guard further down.
+    EXPECT_TRUE(m_sealer->sealForPeer("", pt).empty());
+    EXPECT_TRUE(m_sealer->sealForPeer("abc", pt).empty());
+    EXPECT_TRUE(m_sealer->sealForPeer(s_peerIdB64u.substr(0, 10), pt).empty());
+
+    // Garbage non-base64url string also decodes to fewer than 32 bytes
+    // (or empty, depending on the codec) — must reject the same way.
+    EXPECT_TRUE(m_sealer->sealForPeer(std::string(43, '!'), pt).empty());
+
+    // A correctly-shaped but oversized blob (extra padding) likewise
+    // decodes past 32 bytes; reject.
+    std::string oversized = s_peerIdB64u + s_peerIdB64u;  // 86 chars → 64+ bytes
+    EXPECT_TRUE(m_sealer->sealForPeer(oversized, pt).empty());
+}

@@ -475,12 +475,25 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
     const Bytes encChunk = tail (payload, 4 + size_t(metaLen));
 
     // ── Key selection: ratchet keys only ───────────────────────────────────
+    //
+    // Audit #3 M4: bound trial decryption to keys from THIS sender.
+    // Production fileKeys is keyed by "<peerId>:<transferId>"; some
+    // tests pass the bare "<peerId>".  Accept both: a key matches if
+    // the map key equals fromId OR starts with "fromId:".  Keys for
+    // other peers are skipped outright.  With 50 concurrent transfers
+    // across 5 peers the old loop ran ~50 AEAD verifies per chunk;
+    // the filter takes that to ~10.
     Bytes metaJson;
     Bytes key32;
+    const std::string fromPrefix = fromId + ":";
 
-    for (const auto& [peer, key] : fileKeys) {
-        (void)peer;
+    for (const auto& [compound, key] : fileKeys) {
         if (key.size() != 32) continue;
+        const bool matchesPeer =
+            compound == fromId ||
+            (compound.size() >= fromPrefix.size() &&
+             compound.compare(0, fromPrefix.size(), fromPrefix) == 0);
+        if (!matchesPeer) continue;
         metaJson = m_crypto.aeadDecrypt(key, encMeta);
         if (!metaJson.empty()) {
             key32 = key;
@@ -852,7 +865,7 @@ void FileTransferManager::abandonOutboundTransfer(const std::string& transferId)
         m_outboundPending.erase(it);
         if (onOutboundAbandoned) onOutboundAbandoned(transferId, peerId);
     }
-    m_abortedTransfers.insert(transferId);
+    rememberAborted(transferId);
 }
 
 void FileTransferManager::cancelInboundTransfer(const std::string& transferId)
@@ -1062,7 +1075,19 @@ void FileTransferManager::persistIncomingFull(const std::string& transferId,
     q.bindValue(":size",    int64_t(xfer.fileSize));
     q.bindValue(":chunks",  xfer.totalChunks);
     q.bindValue(":hash",    xfer.fileHash);
-    q.bindValue(":key",     fileKey);
+    // Audit #3 M1: wrap the raw file key with an identity-derived
+    // AEAD key before it touches SQLite.  SQLCipher's page key
+    // encrypts the row too, but a page-key compromise alone still
+    // exposes the wrapped blob — the second layer requires the
+    // attacker to also break the Argon2-gated identity key.
+    {
+        Bytes wrapped = m_crypto.wrapFileKey(transferId, fileKey);
+        // If wrap fails (pre-unlock or other error), fall back to
+        // plaintext — refusing to persist here would lose the
+        // transfer entirely.  Size distinction (32 plaintext vs
+        // 72-byte nonce||ct||tag) lets the load path auto-detect.
+        q.bindValue(":key", wrapped.empty() ? fileKey : wrapped);
+    }
     q.bindValue(":gid",     xfer.groupId);
     q.bindValue(":gname",   xfer.groupName);
     q.bindValue(":ppath",   xfer.partialPath);
@@ -1100,12 +1125,24 @@ void FileTransferManager::forgetSentTransfer(const std::string& transferId)
     }
     deleteSentRow(transferId);
 
-    m_abortedTransfers.insert(transferId);
+    rememberAborted(transferId);
 }
 
 void FileTransferManager::setSenderRequiresP2P(bool require)
 {
     m_senderRequiresP2PLive = require;
+}
+
+void FileTransferManager::rememberAborted(const std::string& transferId)
+{
+    if (transferId.empty()) return;
+    auto [_it, inserted] = m_abortedTransfers.insert(transferId);
+    if (!inserted) return;  // already present — don't grow the order deque
+    m_abortedTransfersOrder.push_back(transferId);
+    while (m_abortedTransfersOrder.size() > kMaxAbortedTransfers) {
+        m_abortedTransfers.erase(m_abortedTransfersOrder.front());
+        m_abortedTransfersOrder.pop_front();
+    }
 }
 
 void FileTransferManager::registerSentTransfer(const std::string& senderIdB64u,
@@ -1147,7 +1184,11 @@ void FileTransferManager::registerSentTransfer(const std::string& senderIdB64u,
             q.bindValue(":path",    filePath);
             q.bindValue(":size",    int64_t(fileSize));
             q.bindValue(":hash",    fileHash);
-            q.bindValue(":key",     fileKey);
+            // Audit #3 M1 — see parallel comment in persistIncomingFull.
+            {
+                Bytes wrapped = m_crypto.wrapFileKey(transferId, fileKey);
+                q.bindValue(":key", wrapped.empty() ? fileKey : wrapped);
+            }
             q.bindValue(":gid",     groupId);
             q.bindValue(":gname",   groupName);
             q.bindValue(":created", int64_t(s.createdSecs));
@@ -1174,7 +1215,15 @@ void FileTransferManager::loadPersistedTransfers()
                 const int64_t     fsize    = q.valueInt64(3);
                 const int         chunks   = q.valueInt(4);
                 const Bytes       fhash    = q.valueBlob(5);
-                const Bytes       fkey     = q.valueBlob(6);
+                Bytes             fkey     = q.valueBlob(6);
+                // Audit #3 M1: new rows carry the AEAD-wrapped blob;
+                // legacy rows carry the raw 32-byte key.  Size-based
+                // detection: unwrap returns 32 bytes on success, empty
+                // on failure — the 32-byte fallback preserves legacy.
+                if (fkey.size() != 32) {
+                    Bytes unwrapped = m_crypto.unwrapFileKey(tid, fkey);
+                    if (unwrapped.size() == 32) fkey = std::move(unwrapped);
+                }
                 const std::string gid      = q.valueText(7);
                 const std::string gname    = q.valueText(8);
                 const std::string ppath    = q.valueText(9);
@@ -1242,6 +1291,13 @@ void FileTransferManager::loadPersistedTransfers()
                 s.fileSize    = q.valueInt64(5);
                 s.fileHash    = q.valueBlob(6);
                 s.fileKey     = q.valueBlob(7);
+                // Audit #3 M1 — see parallel comment in the incoming-
+                // loader above.  Legacy 32-byte rows pass through; new
+                // wrapped rows get unwrapped here.
+                if (s.fileKey.size() != 32) {
+                    Bytes unwrapped = m_crypto.unwrapFileKey(tid, s.fileKey);
+                    if (unwrapped.size() == 32) s.fileKey = std::move(unwrapped);
+                }
                 s.groupId     = q.valueText(8);
                 s.groupName   = q.valueText(9);
                 s.createdSecs = q.valueInt64(10);

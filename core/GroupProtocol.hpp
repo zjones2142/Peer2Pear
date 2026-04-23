@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -283,21 +284,39 @@ private:
     };
 
     // Inbound chain state per (gid, senderId).  Holds the current-
-    // epoch chain the peer is actively using, plus optionally a
-    // previous-epoch chain retained for a grace window so in-flight
-    // messages at the prior epoch still decrypt.  The grace slot is
-    // populated on installRemoteChain when an existing entry's epoch
-    // is being superseded; it expires `graceWindowSecs` seconds after
-    // install and is discarded on next access.
+    // epoch chain the peer is actively using, plus a small ring of
+    // previous-epoch chains retained for a grace window so in-flight
+    // messages at prior epochs still decrypt.  Audit #3 L4: a single
+    // prev slot dropped epoch N-1 the moment epoch N+1 arrived, so a
+    // rapid back-to-back rekey (member leaves + another joins +
+    // another leaves) made stragglers from the oldest epoch
+    // undecryptable even within the grace window.  Two slots cover
+    // the typical "two consecutive membership changes" case; further
+    // slots are diminishing returns for unbounded memory growth.
+    struct PrevChainSlot {
+        SenderChain chain;
+        uint64_t    epoch     = 0;
+        int64_t     expiresAt = 0;
+
+        bool valid() const {
+            return chain.isValid() && expiresAt > 0;
+        }
+        void clear() {
+            if (chain.isValid()) chain.clearSkipped();
+            chain     = SenderChain{};
+            epoch     = 0;
+            expiresAt = 0;
+        }
+    };
+    static constexpr size_t kPrevChainSlots = 2;
     struct InboundChainState {
         SenderChain chain;
         uint64_t    epoch = 0;
-
-        // Previous-epoch chain retained for grace-window decryption.
-        // Valid iff prevChain.isValid() AND prevExpiresAt > nowSecs().
-        SenderChain prevChain;
-        uint64_t    prevEpoch     = 0;
-        int64_t     prevExpiresAt = 0;
+        // prevSlots[0] is the most-recently-rotated chain; older
+        // slots have higher index.  rotateInboundPrevSlots shifts the
+        // contents one position toward the back so new rotations land
+        // in slot 0.
+        std::array<PrevChainSlot, kPrevChainSlots> prevSlots;
     };
 
     // gid -> my outbound chain state for that group.

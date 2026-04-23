@@ -351,22 +351,36 @@ TEST_F(GroupProtocolSuite, SendText_SkeyIdxIsPerGroup) {
     EXPECT_EQ(msgs[2]["skey_idx"].get<uint32_t>(), 1U);
 }
 
-TEST_F(GroupProtocolSuite, SendLeave_IncludesSelfInMembersArray) {
+TEST_F(GroupProtocolSuite, SendLeave_EncryptsGroupNameAndMembers) {
+    // Audit #3 H2: groupName + members must NOT ride on the outer
+    // envelope.  They live inside the sender-chain ciphertext so a
+    // relay operator can't harvest "alice left group X with members
+    // B,C,D" as plaintext metadata.
     m_gp->sendLeave("gid", "My Group", {s_meId, s_aliceId, s_bobId});
 
-    // group_leave fans out to everyone BUT self.
-    ASSERT_EQ(m_captured.size(), 2U);
+    auto leaves = capturedOfType("group_leave");
+    ASSERT_EQ(leaves.size(), 2U);
     EXPECT_EQ(countTo(s_meId), 0);
 
-    // Unlike group_msg, the `members` array on group_leave keeps self so
-    // receivers can update their local roster accordingly.
-    const auto& members = m_captured[0].payload["members"];
-    ASSERT_TRUE(members.is_array());
-    bool sawSelf = false;
-    for (const auto& m : members)
-        if (m.get<std::string>() == s_meId) sawSelf = true;
-    EXPECT_TRUE(sawSelf);
-    EXPECT_EQ(m_captured[0].payload["type"], "group_leave");
+    // Lazy chain creation also fans skey_announce to each non-self
+    // member, same as sendRename / sendAvatar.
+    EXPECT_EQ(countTypeTo("group_skey_announce", s_aliceId), 1);
+    EXPECT_EQ(countTypeTo("group_skey_announce", s_bobId),   1);
+
+    for (const auto& l : leaves) {
+        EXPECT_EQ(l["type"],    "group_leave");
+        EXPECT_EQ(l["groupId"], "gid");
+        EXPECT_EQ(l["from"],    s_meId);
+        EXPECT_FALSE(l.contains("members"))
+            << "plaintext members leaked";
+        EXPECT_FALSE(l.contains("groupName"))
+            << "plaintext groupName leaked";
+        ASSERT_TRUE(l.contains("ciphertext"));
+        EXPECT_FALSE(l["ciphertext"].get<std::string>().empty());
+    }
+    // Every fan-out shares the same msgId + ciphertext (one logical action).
+    EXPECT_EQ(leaves[0]["msgId"],      leaves[1]["msgId"]);
+    EXPECT_EQ(leaves[0]["ciphertext"], leaves[1]["ciphertext"]);
 }
 
 TEST_F(GroupProtocolSuite, SendRename_EncryptsNewNameFansToNonSelf) {
@@ -629,6 +643,75 @@ TEST_F(GroupProtocolSuite, InstallRemoteChain_RejectsInvalidSeed) {
     EXPECT_EQ(m_gp->inboundChainCount(), 0U);
 }
 
+TEST_F(GroupProtocolSuite, InstallRemoteChain_RejectsEpochDowngrade) {
+    // Audit #3 H1: an attacker who captured a previous epoch's seed
+    // (e.g., from a compromised member's disk or a stale relay log)
+    // could replay group_skey_announce at epoch N-1 after the group
+    // rotated to epoch N.  Pre-fix, the receiver overwrote the
+    // current chain with the stale seed — downgrading the group
+    // back to a known-compromised epoch.  This test pins the
+    // rejection.
+
+    // 1. Sender (m_gp) emits a real epoch-0 skey + msg.
+    m_gp->sendText("gid", "G", {s_meId, s_aliceId}, "hello-epoch0");
+    auto announces0 = capturedOfType("group_skey_announce");
+    auto msgs0      = capturedOfType("group_msg");
+    ASSERT_EQ(announces0.size(), 1U);
+    ASSERT_EQ(msgs0.size(),      1U);
+    const uint64_t epoch0 = announces0[0]["epoch"].get<uint64_t>();
+
+    GroupProtocol receiver(*s_aliceCrypto);
+    receiver.installRemoteChain("gid", s_meId, epoch0,
+        CryptoEngine::fromBase64Url(announces0[0]["seed"].get<std::string>()));
+
+    // Sanity: epoch-0 message decrypts.
+    Bytes pt0 = receiver.decryptGroupMessage("group_msg", "gid", s_meId,
+        msgs0[0]["skey_epoch"].get<uint64_t>(),
+        msgs0[0]["skey_idx"].get<uint32_t>(),
+        CryptoEngine::fromBase64Url(msgs0[0]["ciphertext"].get<std::string>()));
+    ASSERT_FALSE(pt0.empty());
+
+    // 2. Sender genuinely rotates to epoch 1 + sends.
+    m_captured.clear();
+    m_gp->rotateMyChain("gid", {s_meId, s_aliceId});
+    m_gp->sendText("gid", "G", {s_meId, s_aliceId}, "hello-epoch1");
+    auto announces1 = capturedOfType("group_skey_announce");
+    auto msgs1      = capturedOfType("group_msg");
+    ASSERT_EQ(announces1.size(), 1U);
+    ASSERT_EQ(msgs1.size(),      1U);
+    const uint64_t epoch1 = announces1[0]["epoch"].get<uint64_t>();
+    ASSERT_GT(epoch1, epoch0);
+
+    receiver.installRemoteChain("gid", s_meId, epoch1,
+        CryptoEngine::fromBase64Url(announces1[0]["seed"].get<std::string>()));
+    Bytes pt1 = receiver.decryptGroupMessage("group_msg", "gid", s_meId,
+        msgs1[0]["skey_epoch"].get<uint64_t>(),
+        msgs1[0]["skey_idx"].get<uint32_t>(),
+        CryptoEngine::fromBase64Url(msgs1[0]["ciphertext"].get<std::string>()));
+    ASSERT_FALSE(pt1.empty());
+
+    // 3. Attacker re-injects epoch 0 with a seed they control.
+    //    Pre-fix: this overwrites receiver's chain with attackerSeed,
+    //    silently downgrading.  Post-fix: ignored.
+    const Bytes attackerSeed(32, 0xCC);
+    receiver.installRemoteChain("gid", s_meId, epoch0, attackerSeed);
+
+    // 4. Proof: the sender's NEXT epoch-1 message must still decrypt.
+    //    If the downgrade had taken effect, the receiver's chain would
+    //    now be derived from attackerSeed (at epoch 0), and the new
+    //    epoch-1 ciphertext would be undecryptable because the chain
+    //    is at the wrong epoch + wrong seed.
+    m_captured.clear();
+    m_gp->sendText("gid", "G", {s_meId, s_aliceId}, "hello-epoch1-again");
+    auto msgs1b = capturedOfType("group_msg");
+    ASSERT_EQ(msgs1b.size(), 1U);
+    Bytes pt1b = receiver.decryptGroupMessage("group_msg", "gid", s_meId,
+        msgs1b[0]["skey_epoch"].get<uint64_t>(),
+        msgs1b[0]["skey_idx"].get<uint32_t>(),
+        CryptoEngine::fromBase64Url(msgs1b[0]["ciphertext"].get<std::string>()));
+    EXPECT_FALSE(pt1b.empty()) << "downgrade attack overwrote the epoch-1 chain";
+}
+
 TEST_F(GroupProtocolSuite, ForgetRemoteChain_RemovesEntry) {
     m_gp->installRemoteChain("gid", s_aliceId, 0, Bytes(32, 0xAA));
     EXPECT_EQ(m_gp->inboundChainCount(), 1U);
@@ -790,6 +873,102 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_WrongSenderIdBreaksAad) {
         msg["skey_idx"].get<uint32_t>(),
         ct);
     EXPECT_TRUE(pt.empty());
+}
+
+// Audit #3 H3: forward secrecy on the skipped-key window.  After a
+// successful AEAD decrypt at idx=N the message key for N must be
+// dropped from the chain's cache so a later in-memory or on-disk
+// compromise cannot recover already-delivered keys.  Re-running the
+// same decrypt after success therefore returns empty — the second
+// call has nothing to look up.  AEAD failures don't trigger erasure
+// (covered by `_ForgedCiphertextLeavesKeyForLegitimateRetry` below).
+TEST_F(GroupProtocolSuite, DecryptGroupMessage_ErasesSkippedKeyAfterSuccess) {
+    // Alice sends one message in a group containing me.
+    std::vector<CapturedSend> aliceCaptured;
+    GroupProtocol aliceGp(*s_aliceCrypto);
+    aliceGp.setSendSealedFn(
+        [&](const std::string& peer, const nlohmann::json& payload) {
+            aliceCaptured.push_back({peer, payload});
+        });
+    aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "once");
+
+    nlohmann::json announce, msg;
+    for (const auto& c : aliceCaptured) {
+        if (c.peerId != s_meId) continue;
+        const std::string t = c.payload.value("type", std::string());
+        if (t == "group_skey_announce") announce = c.payload;
+        if (t == "group_msg")            msg      = c.payload;
+    }
+    ASSERT_FALSE(announce.is_null());
+    ASSERT_FALSE(msg.is_null());
+
+    m_gp->installRemoteChain("gid", s_aliceId,
+                              announce["epoch"].get<uint64_t>(),
+                              CryptoEngine::fromBase64Url(
+                                  announce["seed"].get<std::string>()));
+
+    const Bytes ct    = CryptoEngine::fromBase64Url(
+        msg["ciphertext"].get<std::string>());
+    const uint64_t ep = msg["skey_epoch"].get<uint64_t>();
+    const uint32_t ix = msg["skey_idx"].get<uint32_t>();
+
+    Bytes first = m_gp->decryptGroupMessage(
+        "group_msg", "gid", s_aliceId, ep, ix, ct);
+    ASSERT_FALSE(first.empty());
+
+    // Second call on the same idx must return empty — the key was
+    // erased from the skipped cache after the first successful AEAD
+    // verify.  In production the envelope-id dedup at ChatController
+    // catches retransmits before they reach this layer; the second
+    // decrypt being impossible is a security property, not a
+    // correctness regression.
+    Bytes second = m_gp->decryptGroupMessage(
+        "group_msg", "gid", s_aliceId, ep, ix, ct);
+    EXPECT_TRUE(second.empty()) << "skipped key not erased after success";
+}
+
+// Companion to the above: a forged ciphertext at the same idx must
+// NOT consume the key, so a legitimate retransmit can still decrypt.
+TEST_F(GroupProtocolSuite, DecryptGroupMessage_ForgedCiphertextLeavesKeyForLegitimateRetry) {
+    std::vector<CapturedSend> aliceCaptured;
+    GroupProtocol aliceGp(*s_aliceCrypto);
+    aliceGp.setSendSealedFn(
+        [&](const std::string& peer, const nlohmann::json& payload) {
+            aliceCaptured.push_back({peer, payload});
+        });
+    aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "real");
+
+    nlohmann::json announce, msg;
+    for (const auto& c : aliceCaptured) {
+        if (c.peerId != s_meId) continue;
+        const std::string t = c.payload.value("type", std::string());
+        if (t == "group_skey_announce") announce = c.payload;
+        if (t == "group_msg")            msg      = c.payload;
+    }
+    m_gp->installRemoteChain("gid", s_aliceId,
+                              announce["epoch"].get<uint64_t>(),
+                              CryptoEngine::fromBase64Url(
+                                  announce["seed"].get<std::string>()));
+
+    Bytes goodCt = CryptoEngine::fromBase64Url(
+        msg["ciphertext"].get<std::string>());
+    Bytes badCt = goodCt;
+    ASSERT_GT(badCt.size(), 25U);
+    badCt[25] ^= 0x01;
+
+    const uint64_t ep = msg["skey_epoch"].get<uint64_t>();
+    const uint32_t ix = msg["skey_idx"].get<uint32_t>();
+
+    // Forged ciphertext fails AEAD — must NOT erase the key.
+    EXPECT_TRUE(m_gp->decryptGroupMessage(
+        "group_msg", "gid", s_aliceId, ep, ix, badCt).empty());
+
+    // Legitimate ciphertext at same idx still decrypts.
+    Bytes pt = m_gp->decryptGroupMessage(
+        "group_msg", "gid", s_aliceId, ep, ix, goodCt);
+    ASSERT_FALSE(pt.empty());
+    auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+    EXPECT_EQ(inner.value("text", std::string()), "real");
 }
 
 // ── 7. Persistence of outbound chain ─────────────────────────────────────
@@ -1098,6 +1277,65 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_PrevEpochAfterGraceExpiresFails) 
         CryptoEngine::fromBase64Url(msg0["ciphertext"].get<std::string>()));
     EXPECT_TRUE(pt.empty())
         << "prev-chain decrypt past grace window should fail";
+}
+
+// Audit #3 L4: with only one prev slot, a rapid 0→1→2 rekey dropped
+// epoch 0's chain when epoch 2 arrived.  In-flight messages from epoch
+// 0 within the grace window then became undecryptable.  With the slot
+// array bumped to two, both prior epochs stay reachable across a
+// double rotation.
+TEST_F(GroupProtocolSuite, DecryptGroupMessage_RapidDoubleRekeyKeepsBothPrevEpochs) {
+    std::vector<CapturedSend> aliceCaptured;
+    GroupProtocol aliceGp(*s_aliceCrypto);
+    aliceGp.setSendSealedFn(
+        [&](const std::string& peer, const nlohmann::json& payload) {
+            aliceCaptured.push_back({peer, payload});
+        });
+
+    // Alice sends one message at each of three epochs (0, 1, 2),
+    // rotating between them — the back-to-back-rotation case.
+    aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "msg @ 0");
+    aliceGp.rotateMyChain("gid", {s_aliceId, s_meId});
+    aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "msg @ 1");
+    aliceGp.rotateMyChain("gid", {s_aliceId, s_meId});
+    aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "msg @ 2");
+
+    // Walk Alice's captured fan-out, picking out the per-epoch announce
+    // and msg payloads addressed to me.  Order in the capture list is
+    // deterministic (one outbound per call).
+    nlohmann::json an[3], msg[3];
+    int seenAnnounces = 0, seenMsgs = 0;
+    for (const auto& c : aliceCaptured) {
+        if (c.peerId != s_meId) continue;
+        const std::string t = c.payload.value("type", std::string());
+        if (t == "group_skey_announce" && seenAnnounces < 3)
+            an[seenAnnounces++] = c.payload;
+        else if (t == "group_msg" && seenMsgs < 3)
+            msg[seenMsgs++] = c.payload;
+    }
+    ASSERT_EQ(seenAnnounces, 3);
+    ASSERT_EQ(seenMsgs,      3);
+
+    // Install all three chains in order — second install moves epoch 0
+    // into prevSlots[0]; third install pushes it back to prevSlots[1].
+    for (int i = 0; i < 3; ++i) {
+        m_gp->installRemoteChain("gid", s_aliceId,
+            an[i]["epoch"].get<uint64_t>(),
+            CryptoEngine::fromBase64Url(an[i]["seed"].get<std::string>()));
+    }
+
+    // All three messages must decrypt within the (default) grace window.
+    for (int i = 0; i < 3; ++i) {
+        Bytes pt = m_gp->decryptGroupMessage("group_msg", "gid", s_aliceId,
+            msg[i]["skey_epoch"].get<uint64_t>(),
+            msg[i]["skey_idx"].get<uint32_t>(),
+            CryptoEngine::fromBase64Url(msg[i]["ciphertext"].get<std::string>()));
+        ASSERT_FALSE(pt.empty())
+            << "epoch " << i << " unreachable after double rekey (L4 regression)";
+        auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+        EXPECT_EQ(inner.value("text", std::string()),
+                  std::string("msg @ ") + char('0' + i));
+    }
 }
 
 TEST_F(GroupProtocolSuite, RemovedPeerCannotDecryptPostRotationMessages) {

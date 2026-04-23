@@ -146,6 +146,21 @@ void SenderChain::clearSkipped()
     m_skipped.clear();
 }
 
+void SenderChain::forgetSeed()
+{
+    if (m_seed.empty()) return;
+    sodium_memzero(m_seed.data(), m_seed.size());
+    m_seed.clear();
+}
+
+void SenderChain::eraseSkipped(uint32_t idx)
+{
+    auto it = m_skipped.find(idx);
+    if (it == m_skipped.end()) return;
+    sodium_memzero(it->second.data(), it->second.size());
+    m_skipped.erase(it);
+}
+
 void SenderChain::evictOldestIfOverCap()
 {
     // std::map iterates in ascending key order; begin() is the
@@ -167,13 +182,22 @@ SenderChain::Bytes SenderChain::serialize() const
 
     out.push_back(kVersion);
 
-    if (m_seed.size() != 32 || m_chainKey.size() != 32) {
+    if (m_chainKey.size() != 32) {
         // Invalid chain — emit the version byte alone so deserialize
         // returns an invalid placeholder rather than crashing.
         return out;
     }
 
-    out.insert(out.end(), m_seed.begin(),     m_seed.end());
+    // Audit #3 M3: seed may be empty (forgotten post-distribution).
+    // In that case we emit 32 zero bytes so the layout is stable;
+    // deserialize recognises the all-zero pattern as "forgotten" and
+    // leaves m_seed empty rather than treating zeros as a real seed.
+    // Cryptographic collision with a real random seed is 2^-256.
+    if (m_seed.size() == 32) {
+        out.insert(out.end(), m_seed.begin(), m_seed.end());
+    } else {
+        out.insert(out.end(), 32, uint8_t{0});
+    }
     out.insert(out.end(), m_chainKey.begin(), m_chainKey.end());
     writeU32LE(out, m_nextIdx);
     writeU32LE(out, static_cast<uint32_t>(m_skipped.size()));
@@ -198,7 +222,17 @@ SenderChain SenderChain::deserialize(const Bytes& blob)
     size_t pos = 1;
 
     SenderChain c;
-    c.m_seed.assign(blob.begin() + pos, blob.begin() + pos + 32);
+    // Audit #3 M3: an all-zero seed on disk means "forgotten post-
+    // distribution" — leave m_seed empty so callers can't re-distribute
+    // zeros as a key.  Cryptographic probability of a real random seed
+    // colliding with all-zero is 2^-256.
+    bool seedIsZero = true;
+    for (size_t i = 0; i < 32; ++i) {
+        if (blob[pos + i] != 0) { seedIsZero = false; break; }
+    }
+    if (!seedIsZero) {
+        c.m_seed.assign(blob.begin() + pos, blob.begin() + pos + 32);
+    }
     pos += 32;
     c.m_chainKey.assign(blob.begin() + pos, blob.begin() + pos + 32);
     pos += 32;

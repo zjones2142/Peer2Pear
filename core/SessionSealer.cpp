@@ -43,6 +43,20 @@ Bytes SessionSealer::sealForPeer(const std::string& peerIdB64u,
 {
     if (!m_sessionMgr) return {};
 
+    // Audit #3 M7: validate the peer ID up front, before we spend
+    // crypto on it.  crypto_sign_ed25519_pk_to_curve25519 reads
+    // exactly 32 bytes from its input with no length check; a
+    // truncated or non-base64url peerIdB64u would do an out-of-bounds
+    // read.  Reject here so the failure mode is "empty result" not
+    // "UB after we've already paid for an encryptForPeer."
+    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEdPub.size() != 32) {
+        P2P_WARN("[SEND] sealForPeer rejecting bad peerId length="
+                 << peerEdPub.size() << " for "
+                 << peerIdB64u.substr(0, 8) << "...");
+        return {};
+    }
+
     // detectKeyChange fires onPeerKeyChanged once per session per peer.
     // When the hard-block toggle is on, a Mismatch returns empty here
     // and the caller sees "seal failed" → surfaces as a status message.
@@ -57,7 +71,6 @@ Bytes SessionSealer::sealForPeer(const std::string& peerIdB64u,
     Bytes sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext, peerKemPub);
     if (sessionBlob.empty()) return {};
 
-    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
     unsigned char peerCurvePub[32];
     if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0)
         return {};

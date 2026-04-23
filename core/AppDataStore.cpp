@@ -321,7 +321,11 @@ bool AppDataStore::saveContact(const Contact& c)
     q.bindValue(":keys",        encryptField(joinKeys(c.keys)));
     q.bindValue(":is_blocked",  c.isBlocked ? 1 : 0);
     q.bindValue(":is_group",    c.isGroup   ? 1 : 0);
-    q.bindValue(":group_id",    c.groupId);
+    // Audit #3 L1: encrypt group_id alongside name/keys/avatar.  All
+    // other PII-shaped contact fields are field-encrypted; leaving
+    // group_id plaintext meant a SQLCipher-page-key compromise still
+    // leaked group membership topology.
+    q.bindValue(":group_id",    encryptField(c.groupId));
     q.bindValue(":avatar",      encryptField(c.avatarB64));
     q.bindValue(":last_active", c.lastActiveSecs);
     q.bindValue(":in_ab",       c.inAddressBook ? 1 : 0);
@@ -355,7 +359,7 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
         c.keys           = splitKeys(decryptField(q.valueText(3)));
         c.isBlocked      = q.valueInt(4) == 1;
         c.isGroup        = q.valueInt(5) == 1;
-        c.groupId        = q.valueText(6);
+        c.groupId        = decryptField(q.valueText(6));
         c.avatarB64      = decryptField(q.valueText(7));
         c.lastActiveSecs = q.valueInt64(8);
         c.inAddressBook  = q.valueInt(9) == 1;
@@ -482,7 +486,12 @@ bool AppDataStore::saveSetting(const std::string& key, const std::string& value)
     SqlCipherQuery q(*m_db);
     q.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES(:k,:v);");
     q.bindValue(":k", key);
-    q.bindValue(":v", value);
+    // Audit #3 M5: encrypt every value at the storage layer so a
+    // page-key compromise can't harvest relay URLs / TURN creds /
+    // display name / similar.  The old comment "callers encrypt
+    // sensitive settings themselves" was a paper policy with zero
+    // enforcement — now the field is always wrapped.
+    q.bindValue(":v", encryptField(value));
     return q.exec();
 }
 
@@ -493,7 +502,12 @@ std::string AppDataStore::loadSetting(const std::string& key,
     SqlCipherQuery q(m_db->handle());
     q.prepare("SELECT value FROM settings WHERE key=:k;");
     q.bindValue(":k", key);
-    if (q.exec() && q.next()) return q.valueText(0);
+    if (q.exec() && q.next()) {
+        // decryptField handles both the new encrypted form AND the
+        // legacy plaintext rows — it returns the input unchanged if
+        // the ciphertext prefix is missing.  See encryptField impl.
+        return decryptField(q.valueText(0));
+    }
     return defaultValue;
 }
 

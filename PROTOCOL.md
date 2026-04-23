@@ -222,6 +222,19 @@ A conforming relay MUST expose these endpoints over HTTPS:
 
 No other endpoints are defined at the protocol level.
 
+Operator configuration (environment variables; not part of the wire
+protocol but required for a conforming deployment):
+
+| Variable | Purpose |
+|---|---|
+| `RELAY_KEY_PATH` | File path for the persistent X25519 onion keypair. |
+| `RELAY_KEY_KEK` | Base64url 32-byte key that wraps the on-disk onion private key (audit #3 C3).  Without this the key is persisted in plaintext with file-perm 0o600 only; a container / shared-host deploy SHOULD set this. |
+| `RELAY_KEY_KEK_FILE` | Alternative to `RELAY_KEY_KEK`: path to a file containing the raw 32-byte KEK. |
+| `DB_PATH` | SQLite file for mailbox + push-token storage. |
+| `PORT` | TCP port to listen on (default 8443). |
+| `TLS_CERT`, `TLS_KEY` | PEM cert + key for native TLS termination. |
+| `TRUST_PROXY` | When set, trust `X-Forwarded-For` for rate-limit bucketing. |
+
 ### 4.2 POST /v1/send
 
 Request body: raw routing envelope bytes (see §3.1).
@@ -299,8 +312,11 @@ Note the two shapes: `presence_result` is the aggregated reply to a
 query, `presence` is an individual push notification.  Subscription
 sizes are capped at 200 peer IDs per connection (audit H4).
 
-No other client-originated frames are defined. Servers MUST reject
-unknown `type`s or garbage frames.
+No other client-originated frames are defined.  Servers MUST NOT
+act on unknown `type`s or garbage frames: silently dropping the frame
+is conforming; closing the connection or replying with an error is
+not required.  Clients MUST be prepared to receive no response to
+an unknown frame they sent.
 
 ### 4.4 POST /v1/forward
 
@@ -722,19 +738,34 @@ metadata (`from`, `groupId`, `ts`, `msgId`, `skey_epoch`, `skey_idx`,
 
 #### 7.2.5 `group_leave`
 
-Plaintext payload — no sender-chain encryption.  The leaver's
-departure is a metadata-level signal with no user content; it rides
-the 1:1 sealed ratchet like any other control message.
+Sender-chain encrypted — the `groupName` and full member roster go
+inside the `ciphertext`, not the outer envelope, matching every
+other `group_*` control message (audit #3 H2).  Only routing fields
+are plaintext; a relay operator can no longer harvest "Alice left
+group X, whose members are B, C, D" as metadata.
+
+Outer envelope:
 
 ```json
 {
-  "type":      "group_leave",
-  "groupId":   "<UUID>",
+  "type":       "group_leave",
+  "groupId":    "<UUID>",
+  "skey_epoch": <uint64>,
+  "skey_idx":   <uint32>,
+  "ciphertext": "<base64url(AEAD_encrypt(msg_key, inner))>",
+  "from":       "...",
+  "ts":         ...,
+  "msgId":      "..."
+}
+```
+
+Inner plaintext (JSON, AEAD-decrypted with the sender chain's
+`msg_key` for `(epoch, idx)`):
+
+```json
+{
   "groupName": "...",
-  "members":   [...],
-  "from":      "...",
-  "ts":        ...,
-  "msgId":     "..."
+  "members":   [<full roster, including the leaver's own id>]
 }
 ```
 
@@ -750,6 +781,17 @@ When a member is removed from a group via `group_member_update`:
    remaining members; inside its ciphertext is the new roster.
 4. Receivers install the new chain, moving the previous-epoch chain
    to a grace slot with a ~5-minute expiry for in-flight decryption.
+   Receivers retain TWO previous-epoch slots (audit #3 L4), so a
+   rapid 0→1→2 sequence still lets stragglers from epoch 0 decrypt
+   within the grace window.
+5. After a successful AEAD verify the receiver drops the consumed
+   skipped-key entry from the chain's cache (audit #3 H3), so a
+   later compromise of the chain state cannot recover message keys
+   for messages already delivered.
+6. Inbound chains forget their originating `seed` right after
+   construction (audit #3 M3).  The chain key evolves independently
+   of the seed, so inbound decrypts do not need it; dropping it
+   limits what an attacker with a heap dump can recover.
 
 The removed peer keeps their copy of the pre-rekey seed in memory,
 but it is useless against any future outbound message from the
@@ -1229,7 +1271,31 @@ function unseal(recipient_curve_priv, recipient_ed_pub,
 
 ## Appendix C: Changelog
 
-- **v2.1.0 (current)** — Sender keys for group messaging: `group_msg`,
+- **v2.1.1 (current)** — Audit #3 hardening.  Wire changes:
+  `group_leave` joins the sender-keys family — `groupName` and
+  `members` move inside `ciphertext` with `skey_epoch` / `skey_idx`
+  on the outer envelope (§7.2.5).  Non-wire hardening that clients
+  and relays MUST apply:
+  - SenderChain drops the consumed skipped-key cache entry after
+    each successful AEAD verify (forward secrecy on the skipped
+    window).
+  - Inbound SenderChain forgets its originating seed after
+    construction (in-memory defense-in-depth).
+  - Receivers retain two previous-epoch slots, not one, so a rapid
+    0→1→2 rekey still decrypts stragglers from epoch 0.
+  - `installRemoteChain` rejects lower-epoch offers from the same
+    sender (epoch downgrade).
+  - Relay persists push tokens wrapped in XChaCha20-Poly1305 keyed
+    by HKDF of the onion priv; operator-supplied `RELAY_KEY_KEK`
+    wraps the onion priv itself (§4.1).
+  - `presence_subscribe` is rate-limited per connection (6 per
+    minute by default); unknown-type frames are silently dropped.
+  - C FFI hardening: `p2p_ws_on_binary`, `p2p_http_response`, and
+    `p2p_check_presence` / `_subscribe_presence` reject null / bad-
+    length inputs instead of UB-ing.  `p2p_app_load_contacts`
+    snapshots rows before firing the user callback so a reentrant
+    callback can't deadlock on the non-recursive ctrl mutex.
+- **v2.1.0** — Sender keys for group messaging: `group_msg`,
   `group_rename`, `group_avatar`, and `group_member_update` all
   encrypt their user-content fields inside a sender-chain-derived
   AEAD ciphertext with AAD binding

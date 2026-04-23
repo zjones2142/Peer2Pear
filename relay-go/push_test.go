@@ -10,6 +10,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,7 +26,15 @@ func newTestPushStore(t *testing.T) *PushStore {
 		t.Fatalf("NewMailbox: %v", err)
 	}
 	t.Cleanup(func() { m.Close() })
-	s, err := NewPushStore(m.db)
+	// Deterministic per-test key — production derives this from the
+	// relay's persistent X25519 priv via HKDF (Audit #3 C2).  Tests
+	// don't need real key isolation, just a valid 32-byte key so
+	// chacha20poly1305.NewX accepts it.
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	s, err := NewPushStore(m.db, key)
 	if err != nil {
 		t.Fatalf("NewPushStore: %v", err)
 	}
@@ -142,6 +151,89 @@ func TestPushStore_RejectsEmptyInputs(t *testing.T) {
 	}
 	if rs, _ := s.GetForPeer(""); len(rs) != 0 {
 		t.Fatalf("empty-peer GetForPeer should return no rows")
+	}
+}
+
+// Audit #3 C2: tokens MUST be sealed with XChaCha20-Poly1305 before
+// they touch SQLite.  Read the raw token column out from under the
+// store and assert (a) it carries the v1: prefix and (b) the cleartext
+// token doesn't appear anywhere in the stored bytes.  A regression
+// that reverted Upsert to plaintext would trip this test immediately.
+func TestPushStore_TokensEncryptedAtRest(t *testing.T) {
+	s := newTestPushStore(t)
+	const plain = "apns-token-deadbeefcafef00d"
+
+	if err := s.Upsert("alice", "ios", plain); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	var stored string
+	row := s.db.QueryRow(
+		`SELECT token FROM push_tokens WHERE peer_id=? AND platform=?;`,
+		"alice", "ios")
+	if err := row.Scan(&stored); err != nil {
+		t.Fatalf("raw scan: %v", err)
+	}
+	if !strings.HasPrefix(stored, tokenCipherPrefix) {
+		t.Fatalf("stored value missing %q prefix: %q", tokenCipherPrefix, stored)
+	}
+	if strings.Contains(stored, plain) {
+		t.Fatalf("plaintext token leaked into storage: %q", stored)
+	}
+
+	// Sanity check the round trip still works through the public API.
+	rs, err := s.GetForPeer("alice")
+	if err != nil || len(rs) != 1 || rs[0].Token != plain {
+		t.Fatalf("round-trip decrypt failed: err=%v rows=%+v", err, rs)
+	}
+}
+
+// AAD ties each row to its (peer_id, platform) coordinates.  If a
+// hostile relay operator copies the encrypted token from alice/ios into
+// bob/ios, the AEAD tag verification must fail — otherwise we'd be
+// vulnerable to row-swap attacks even with encryption on.  Models the
+// "DBA can edit SQLite directly" threat that motivated C2.
+func TestPushStore_RejectsRowSwap(t *testing.T) {
+	s := newTestPushStore(t)
+	if err := s.Upsert("alice", "ios", "alice-token"); err != nil {
+		t.Fatalf("Upsert alice: %v", err)
+	}
+	if err := s.Upsert("bob", "ios", "bob-token"); err != nil {
+		t.Fatalf("Upsert bob: %v", err)
+	}
+
+	// Swap alice's token blob into bob's row.
+	var aliceCt string
+	s.db.QueryRow(
+		`SELECT token FROM push_tokens WHERE peer_id='alice' AND platform='ios';`,
+	).Scan(&aliceCt)
+	if _, err := s.db.Exec(
+		`UPDATE push_tokens SET token=? WHERE peer_id='bob' AND platform='ios';`,
+		aliceCt); err != nil {
+		t.Fatalf("row swap: %v", err)
+	}
+
+	// bob's row now decrypts under bob/ios AAD — must fail and be
+	// silently dropped (NotifyOffline gets nothing for bob).
+	rs, _ := s.GetForPeer("bob")
+	if len(rs) != 0 {
+		t.Fatalf("expected swapped row to be rejected, got %+v", rs)
+	}
+}
+
+// NewPushStore must reject keys of the wrong size — fail-closed
+// behaviour so a misconfigured caller can't silently disable the
+// encryption Audit #3 C2 added.
+func TestNewPushStore_RejectsBadKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "push.db")
+	m, _ := NewMailbox(path)
+	defer m.Close()
+
+	if _, err := NewPushStore(m.db, nil); err == nil {
+		t.Fatalf("nil key accepted")
+	}
+	if _, err := NewPushStore(m.db, make([]byte, 16)); err == nil {
+		t.Fatalf("16-byte key accepted (want 32)")
 	}
 }
 

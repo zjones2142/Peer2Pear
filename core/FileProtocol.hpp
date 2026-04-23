@@ -157,7 +157,14 @@ private:
     std::map<std::string, std::vector<std::string>> m_groupFileMembers;
 
     // Consent policy.  Readable + writable via the accessors above.
-    int  m_autoAcceptMaxMB = 100;
+    // Defaults split (Audit #3 H5): with the previous 100/100 the
+    // `autoAccept < size <= hardMax` prompt range was empty, so every
+    // file under 100 MB silently auto-accepted — the consent prompt
+    // was dead code.  25/100 means files up to 25 MB auto-accept,
+    // 25-100 MB prompt the user, > 100 MB auto-decline.  iOS already
+    // overrides via UI; this default protects desktop callers that
+    // never set explicit thresholds.
+    int  m_autoAcceptMaxMB = 25;
     int  m_hardMaxMB       = 100;
     bool m_requireP2P      = false;
 };

@@ -36,6 +36,9 @@ public:
     explicit ChatController(IWebSocket& ws, IHttpClient& http,
                             ITimerFactory& timers);
 
+    // Zero TURN creds + key material on destruction (Audit #3 L3).
+    ~ChatController();
+
     // Set the app data directory (where identity.json + per-user DB live).
     // Must be called before setPassphrase() on hosts that don't have a
     // platform default (iOS, Android).  Desktop builds pick up the platform
@@ -431,11 +434,20 @@ private:
     std::map<std::string, int> m_fileRequestCount;
 
 #ifdef PEER2PEAR_P2P
-    // TURN relay config for symmetric NAT fallback
-    std::string m_turnHost;
+    // TURN relay config for symmetric NAT fallback.
+    //
+    // Audit #3 L3: creds used to sit plaintext in m_turnUser/m_turnPass
+    // for the full session, so a crash dump or memory-scraping attack
+    // would surface them.  Now we keep an ephemeral per-session AEAD
+    // key and only hold the ciphertext between calls; setupP2PConnection
+    // decrypts into scratch buffers, hands them to QuicConnection, and
+    // zeroes the scratch immediately.  The key itself is 32 bytes of
+    // sodium randomness generated once in ChatController's ctor.
+    std::string m_turnHost;   // host is not a secret — keep as-is
     int         m_turnPort = 0;
-    std::string m_turnUser;
-    std::string m_turnPass;
+    Bytes       m_turnCredsKey;   // 32 bytes; never rotates within a session
+    Bytes       m_turnUserCt;     // nonce||ct of username
+    Bytes       m_turnPassCt;     // nonce||ct of password
 #endif
 
     // Periodic maintenance (handshake pruning, file key cleanup)

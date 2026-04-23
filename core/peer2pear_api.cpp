@@ -831,9 +831,14 @@ void p2p_set_file_require_p2p(p2p_context* ctx, int enabled)
 void p2p_check_presence(p2p_context* ctx, const char** peer_ids, int count)
 {
     if (!ctx || !peer_ids) return;
+    // Audit #3 FFI hardening: a buggy caller could pass count<0,
+    // which would underflow the reserve(size_t) and allocate SIZE_MAX
+    // bytes.  Silent no-op matches the defensive posture of the
+    // p2p_ws_on_binary null/length guard.
+    if (count <= 0) return;
     P2P_CTX_GUARD(ctx);
     std::vector<std::string> ids;
-    ids.reserve(count);
+    ids.reserve(static_cast<size_t>(count));
     for (int i = 0; i < count; i++)
         if (peer_ids[i]) ids.emplace_back(peer_ids[i]);
     ctx->controller.checkPresence(ids);
@@ -842,9 +847,10 @@ void p2p_check_presence(p2p_context* ctx, const char** peer_ids, int count)
 void p2p_subscribe_presence(p2p_context* ctx, const char** peer_ids, int count)
 {
     if (!ctx || !peer_ids) return;
+    if (count <= 0) return;  // see p2p_check_presence — same guard
     P2P_CTX_GUARD(ctx);
     std::vector<std::string> ids;
-    ids.reserve(count);
+    ids.reserve(static_cast<size_t>(count));
     for (int i = 0; i < count; i++)
         if (peer_ids[i]) ids.emplace_back(peer_ids[i]);
     ctx->controller.subscribePresence(ids);
@@ -907,9 +913,18 @@ void p2p_ws_on_disconnected(p2p_context* ctx)
 void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len)
 {
     if (!ctx) return;
+    // FFI hardening (Audit #3 C1): a buggy or hostile platform adapter
+    // could pass (NULL, anything) or (anything, negative).  Constructing
+    // Bytes(data, data + len) under those conditions is UB — even
+    // (nullptr, 0) is technically UB per [expr.add]/4 since pointer
+    // arithmetic on null is undefined.  Treat malformed inputs as
+    // "drop the frame" rather than crash.
+    if (len < 0) return;
+    if (!data && len > 0) return;
     P2P_CTX_GUARD(ctx);
     if (ctx->ws.onBinaryMessage) {
-        IWebSocket::Bytes buf(data, data + len);
+        IWebSocket::Bytes buf;
+        if (data && len > 0) buf.assign(data, data + len);
         ctx->ws.onBinaryMessage(buf);
     }
 }
@@ -927,6 +942,13 @@ void p2p_http_response(p2p_context* ctx, int request_id,
                        const char* error)
 {
     if (!ctx) return;
+    // FFI hardening (Audit #3 C1): same null/length contract as
+    // p2p_ws_on_binary above.  CHttpClient::onResponse already guards
+    // its assign() with `body && bodyLen > 0`, but enforcing here too
+    // means any future consumer of (body, body_len) downstream gets
+    // sane inputs without re-checking.
+    if (body_len < 0) return;
+    if (!body && body_len > 0) return;
     P2P_CTX_GUARD(ctx);
     ctx->http.onResponse(request_id, status, body, body_len, error);
 }
@@ -1162,9 +1184,22 @@ int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id)
 void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
 {
     if (!ctx || !cb) return;
-    P2P_CTX_GUARD(ctx);
+
+    // Audit #3 test-gap fix: do NOT hold ctrlMu across the callback.
+    // std::mutex is non-recursive, so a caller whose callback re-enters
+    // any p2p_app_* function (commonly seen on iOS, which layers a
+    // SwiftUI update inside the loop) would deadlock.  Snapshot the
+    // rows under the lock, then release before firing callbacks.
+    std::vector<AppDataStore::Contact> snapshot;
+    {
+        P2P_CTX_GUARD(ctx);
+        ctx->appData.loadAllContacts([&](const AppDataStore::Contact& c) {
+            snapshot.push_back(c);
+        });
+    }
+
     std::vector<const char*> keysStorage;
-    ctx->appData.loadAllContacts([&](const AppDataStore::Contact& c) {
+    for (const auto& c : snapshot) {
         toCArray(c.keys, keysStorage);
         cb(c.peerIdB64u.c_str(),
            c.name.c_str(),
@@ -1177,7 +1212,7 @@ void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
            c.lastActiveSecs,
            c.inAddressBook ? 1 : 0,
            ud);
-    });
+    }
 }
 
 int p2p_app_save_contact_avatar(p2p_context* ctx,

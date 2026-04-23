@@ -1,16 +1,34 @@
 package main
 
 import (
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"fmt"
+	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 )
 
 // PushStore persists (peer_id, platform, token) tuples so the relay
 // can wake an offline recipient's device via APNs / FCM when a new
 // envelope arrives.  Tokens are upserted by (peer_id, platform);
 // empty tokens act as "unregister" and delete the row.
+//
+// Tokens are encrypted at rest with XChaCha20-Poly1305 (Audit #3 C2).
+// The AEAD key is derived from the relay's persistent X25519 private
+// key via HKDF, so it lives only in memory and shares fate with the
+// relay binary — a snapshot of the SQLite file alone does NOT expose
+// any APNs/FCM tokens.  Stored format is `v1:` + base64(nonce||ct);
+// the prefix lets us migrate any pre-encryption rows on read without
+// a schema change.
 //
 // The store does NOT need to be durable across restarts for
 // correctness — if it empties, clients re-register on their next
@@ -19,7 +37,26 @@ import (
 // a freshly-restarted relay can wake offline recipients before they
 // reconnect.
 type PushStore struct {
-	db *sql.DB
+	db   *sql.DB
+	aead cipher.AEAD
+}
+
+// tokenCipherPrefix tags rows whose token column holds an encrypted
+// blob (vs. a legacy plaintext token).  Pre-encryption deployments
+// could have rows without this prefix; on read those are dropped
+// (token returned empty) and the client re-registers on next auth_ok.
+const tokenCipherPrefix = "v1:"
+
+// derivePushTokenKey runs HKDF-SHA256 over the relay's X25519 private
+// key to produce a 32-byte XChaCha20-Poly1305 key.  Tying it to the
+// relay key means rotating the relay key invalidates all stored
+// tokens (which is what we want — a key rotation should not leave
+// reachable APNs tokens behind).
+func derivePushTokenKey(relayPriv *[32]byte) []byte {
+	h := hkdf.New(sha256.New, relayPriv[:], nil, []byte("peer2pear:push-token-v1"))
+	out := make([]byte, chacha20poly1305.KeySize)
+	io.ReadFull(h, out)
+	return out
 }
 
 // PushRecord is what loadAll / GetForPeer return; tokens are stored
@@ -32,8 +69,21 @@ type PushRecord struct {
 	UpdatedAt time.Time
 }
 
-func NewPushStore(db *sql.DB) (*PushStore, error) {
-	_, err := db.Exec(`
+// NewPushStore opens (or creates) the push_tokens table and prepares
+// the AEAD used for at-rest token encryption.  `key` must be 32 bytes
+// — derive it via derivePushTokenKey from the relay's persistent
+// X25519 private key.  An empty or wrong-sized key returns an error
+// rather than silently disabling encryption (fail closed).
+func NewPushStore(db *sql.DB, key []byte) (*PushStore, error) {
+	if len(key) != chacha20poly1305.KeySize {
+		return nil, fmt.Errorf("push token key must be %d bytes, got %d",
+			chacha20poly1305.KeySize, len(key))
+	}
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, fmt.Errorf("init push token cipher: %w", err)
+	}
+	_, err = db.Exec(`
         CREATE TABLE IF NOT EXISTS push_tokens (
             peer_id    TEXT NOT NULL,
             platform   TEXT NOT NULL,
@@ -45,12 +95,56 @@ func NewPushStore(db *sql.DB) (*PushStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PushStore{db: db}, nil
+	return &PushStore{db: db, aead: aead}, nil
+}
+
+// encryptToken seals a plaintext token with a fresh random 24-byte
+// nonce and returns "v1:" + base64(nonce||ciphertext).  AAD ties the
+// row to its (peer_id, platform) coordinates so a swapped row from a
+// different peer fails AEAD verification.
+func (s *PushStore) encryptToken(peerID, platform, plain string) (string, error) {
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	aad := []byte(peerID + "|" + platform)
+	ct := s.aead.Seal(nil, nonce, []byte(plain), aad)
+	payload := make([]byte, 0, len(nonce)+len(ct))
+	payload = append(payload, nonce...)
+	payload = append(payload, ct...)
+	return tokenCipherPrefix + base64.RawStdEncoding.EncodeToString(payload), nil
+}
+
+// decryptToken reverses encryptToken.  Rows missing the v1: prefix
+// are pre-encryption legacy data — return empty so the caller treats
+// them as missing and the client re-registers on next auth_ok rather
+// than us silently exposing the plaintext.
+func (s *PushStore) decryptToken(peerID, platform, stored string) (string, error) {
+	if !strings.HasPrefix(stored, tokenCipherPrefix) {
+		return "", nil
+	}
+	payload, err := base64.RawStdEncoding.DecodeString(stored[len(tokenCipherPrefix):])
+	if err != nil {
+		return "", err
+	}
+	if len(payload) < s.aead.NonceSize() {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	nonce := payload[:s.aead.NonceSize()]
+	ct := payload[s.aead.NonceSize():]
+	aad := []byte(peerID + "|" + platform)
+	pt, err := s.aead.Open(nil, nonce, ct, aad)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
 }
 
 // Upsert writes or replaces the (peer_id, platform) row.  An empty
 // token deletes the row instead of writing an empty string — the
-// client contract is "empty token means unregister."
+// client contract is "empty token means unregister."  The token is
+// sealed with XChaCha20-Poly1305 before it touches the DB; only the
+// relay process (which holds the AEAD key) can read it back.
 func (s *PushStore) Upsert(peerID, platform, token string) error {
 	if peerID == "" || platform == "" {
 		return nil
@@ -61,19 +155,26 @@ func (s *PushStore) Upsert(peerID, platform, token string) error {
 			peerID, platform)
 		return err
 	}
-	_, err := s.db.Exec(`
+	sealed, err := s.encryptToken(peerID, platform, token)
+	if err != nil {
+		return fmt.Errorf("encrypt token: %w", err)
+	}
+	_, err = s.db.Exec(`
         INSERT INTO push_tokens (peer_id, platform, token, updated_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(peer_id, platform) DO UPDATE SET
             token      = excluded.token,
             updated_at = excluded.updated_at;
-    `, peerID, platform, token, time.Now().Unix())
+    `, peerID, platform, sealed, time.Now().Unix())
 	return err
 }
 
 // GetForPeer returns every token registered for a peer — typically
 // one per platform, sometimes more if the user runs the app on both
-// iOS and Android.  Caller fires a push to each.
+// iOS and Android.  Caller fires a push to each.  Rows whose token
+// fails to decrypt (legacy plaintext rows, or AEAD failures from a
+// rotated relay key) are skipped silently — the client re-registers
+// on next auth_ok and the next NotifyOffline picks up the fresh row.
 func (s *PushStore) GetForPeer(peerID string) ([]PushRecord, error) {
 	if peerID == "" {
 		return nil, nil
@@ -89,10 +190,24 @@ func (s *PushStore) GetForPeer(peerID string) ([]PushRecord, error) {
 	var out []PushRecord
 	for rows.Next() {
 		var r PushRecord
+		var sealed string
 		var ts int64
-		if err := rows.Scan(&r.PeerID, &r.Platform, &r.Token, &ts); err != nil {
+		if err := rows.Scan(&r.PeerID, &r.Platform, &sealed, &ts); err != nil {
 			return nil, err
 		}
+		plain, derr := s.decryptToken(r.PeerID, r.Platform, sealed)
+		if derr != nil || plain == "" {
+			// Decrypt failure or legacy-row prefix mismatch — drop the
+			// row from the response.  Logging the platform (not the
+			// ciphertext) helps an operator notice a key-rotation
+			// fallout without leaking token material to the log.
+			if derr != nil {
+				log.Printf("push: token decrypt failed for %s… platform=%s: %v",
+					truncID(r.PeerID), r.Platform, derr)
+			}
+			continue
+		}
+		r.Token = plain
 		r.UpdatedAt = time.Unix(ts, 0)
 		out = append(out, r)
 	}

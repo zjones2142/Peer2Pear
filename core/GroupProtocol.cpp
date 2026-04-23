@@ -94,10 +94,9 @@ void GroupProtocol::sendLeave(const std::string& groupId,
                                const std::vector<std::string>& memberPeerIds)
 {
     if (!m_sendSealed) return;
+    if (groupId.empty()) return;
 
-    const std::string me   = myId();
-    const int64_t     ts   = nowSecs();
-    const std::string msg  = p2p::makeUuid();
+    const std::string me = myId();
 
     // Include full roster (including self) so receivers can update
     // their local group member list.
@@ -105,18 +104,37 @@ void GroupProtocol::sendLeave(const std::string& groupId,
     for (const std::string& key : memberPeerIds)
         membersArray.push_back(key);
 
+    // Audit #3 H2: encrypt groupName + members under the sender chain
+    // so the outer envelope leaks only the routing fields (groupId +
+    // type).  Previously sendLeave shipped these as plaintext JSON,
+    // unlike every other group_* sender, which would let a relay
+    // operator harvest "alice left group X containing B,C,D" as
+    // metadata.  encryptForGroup lazy-creates a chain if we never
+    // sent to this group — wasteful (we're leaving) but small, and
+    // it keeps the wire shape uniform with the rest of the family.
+    json plaintext = json::object();
+    plaintext["groupName"] = groupName;
+    plaintext["members"]   = membersArray;
+    GroupCiphertext enc = encryptForGroup(
+        "group_leave", groupId, memberPeerIds, plaintext);
+    if (enc.ciphertextB64.empty()) return;
+
+    const int64_t     ts    = nowSecs();
+    const std::string msgId = p2p::makeUuid();
+
     for (const std::string& peerIdRaw : memberPeerIds) {
         const std::string peerId = trimmed(peerIdRaw);
         if (peerId.empty() || peerId == me) continue;
 
         json payload = json::object();
-        payload["from"]      = me;
-        payload["type"]      = "group_leave";
-        payload["groupId"]   = groupId;
-        payload["groupName"] = groupName;
-        payload["members"]   = membersArray;
-        payload["ts"]        = ts;
-        payload["msgId"]     = msg;
+        payload["from"]       = me;
+        payload["type"]       = "group_leave";
+        payload["groupId"]    = groupId;
+        payload["skey_epoch"] = enc.epoch;
+        payload["skey_idx"]   = enc.idx;
+        payload["ciphertext"] = enc.ciphertextB64;
+        payload["ts"]         = ts;
+        payload["msgId"]      = msgId;
 
         m_sendSealed(peerId, payload);
     }
@@ -426,6 +444,12 @@ void GroupProtocol::installRemoteChain(const std::string& gid,
         s.epoch = epoch;
         m_recvChains[key] = std::move(s);
         persistRemoteChain(gid, senderId);
+        // Audit #3 M3: after the seed is on disk, drop it from the
+        // in-memory chain.  Inbound chains only need m_chainKey to
+        // decrypt; retaining the seed would let a process-memory
+        // scrape re-derive every past and future message key back
+        // to idx 0.
+        m_recvChains[key].chain.forgetSeed();
         return;
     }
 
@@ -437,31 +461,53 @@ void GroupProtocol::installRemoteChain(const std::string& gid,
     if (it->second.epoch == epoch) {
         it->second.chain = SenderChain::fromSeed(seed);
         persistRemoteChain(gid, senderId);
+        it->second.chain.forgetSeed();  // M3 — see note above
+        return;
+    }
+
+    // Epoch downgrade — REJECT (Audit #3 H1).  Without this guard, an
+    // attacker who captured a previous epoch's seed (e.g., from a
+    // compromised member's disk) could replay group_skey_announce at
+    // epoch N-1 after the group rotated to epoch N; the old code's
+    // fall-through would overwrite the current chain with the stale
+    // seed, downgrading the group back to a known-compromised epoch.
+    // Always reject lower epochs from the same sender.
+    if (epoch < it->second.epoch) {
+        P2P_WARN("[GROUP] reject epoch downgrade from "
+                 << senderId.substr(0, 8) << "... in "
+                 << gid.substr(0, 8) << "... current="
+                 << it->second.epoch << " offered=" << epoch);
         return;
     }
 
     // True rekey — epoch has advanced.  Move the current chain into
-    // the prev slot with a grace-window expiration so in-flight
+    // prevSlots[0] with a grace-window expiration so in-flight
     // messages at the old epoch still decrypt while new-epoch traffic
-    // ramps up.  Zero any prior prev slot's keys first to avoid
-    // leaking material indefinitely across multiple back-to-back
-    // rekeys.
-    if (it->second.prevChain.isValid()) {
-        it->second.prevChain.clearSkipped();
+    // ramps up.  Older slots shift toward the back; the oldest is
+    // dropped (key material zeroed) so memory stays bounded across
+    // back-to-back rekeys.  L4: kPrevChainSlots > 1 means a rapid
+    // 0-1-2 sequence keeps epoch 0 reachable.
+    const uint64_t supersededEpoch = it->second.epoch;
+    if (it->second.prevSlots.back().valid()) {
+        it->second.prevSlots.back().clear();
     }
-    it->second.prevChain     = std::move(it->second.chain);
-    it->second.prevEpoch     = it->second.epoch;
-    it->second.prevExpiresAt = nowSecs() + m_graceWindowSecs;
+    for (size_t i = it->second.prevSlots.size() - 1; i > 0; --i) {
+        it->second.prevSlots[i] = std::move(it->second.prevSlots[i - 1]);
+    }
+    it->second.prevSlots[0].chain     = std::move(it->second.chain);
+    it->second.prevSlots[0].epoch     = supersededEpoch;
+    it->second.prevSlots[0].expiresAt = nowSecs() + m_graceWindowSecs;
 
     it->second.chain = SenderChain::fromSeed(seed);
     it->second.epoch = epoch;
 
     P2P_LOG("[GROUP] rekey from " << senderId.substr(0, 8)
             << "... in " << gid.substr(0, 8) << "... epoch "
-            << it->second.prevEpoch << " -> " << epoch
+            << supersededEpoch << " -> " << epoch
             << " (grace window " << m_graceWindowSecs << "s)");
 
     persistRemoteChain(gid, senderId);
+    it->second.chain.forgetSeed();  // M3 — see fast-path note above
 }
 
 void GroupProtocol::forgetRemoteChain(const std::string& gid,
@@ -476,11 +522,12 @@ void GroupProtocol::forgetRemoteChain(const std::string& gid,
         if (m_store) m_store->deleteSenderChain(gid, senderId);
         return;
     }
-    // Wipe BOTH the current and any grace-window prev chain before
+    // Wipe BOTH the current and any grace-window prev chains before
     // erasing — defence-in-depth against later reads of freed memory.
     it->second.chain.clearSkipped();
-    if (it->second.prevChain.isValid())
-        it->second.prevChain.clearSkipped();
+    for (auto& slot : it->second.prevSlots) {
+        if (slot.valid()) slot.clear();
+    }
     m_recvChains.erase(it);
     if (m_store) m_store->deleteSenderChain(gid, senderId);
 }
@@ -537,7 +584,8 @@ GroupProtocol::decryptGroupMessage(const std::string& msgType,
 
     // Pick the right chain for the message's epoch:
     //   - current epoch: decrypt via `it->second.chain`
-    //   - prev epoch within grace window: decrypt via `prevChain`
+    //   - prev epoch within grace window: decrypt via the matching
+    //     prev slot (kPrevChainSlots back)
     //   - anything else: reject (stale or future)
     //
     // Refusing ahead-of-chain epochs is important — an attacker could
@@ -546,21 +594,22 @@ GroupProtocol::decryptGroupMessage(const std::string& msgType,
     SenderChain* chain = nullptr;
     if (it->second.epoch == epoch) {
         chain = &it->second.chain;
-    } else if (it->second.prevChain.isValid() &&
-                it->second.prevEpoch == epoch) {
-        if (nowSecs() < it->second.prevExpiresAt) {
-            chain = &it->second.prevChain;
-        } else {
-            // Grace window has expired — drop the prev chain so we
-            // stop holding onto dead key material and subsequent
-            // accesses fall through to the "epoch mismatch" path.
-            it->second.prevChain.clearSkipped();
-            it->second.prevChain = SenderChain{};
-            it->second.prevEpoch = 0;
-            it->second.prevExpiresAt = 0;
-            P2P_WARN("[GROUP] grace window expired for "
-                     << senderId.substr(0, 8) << "... in "
-                     << gid.substr(0, 8) << "... epoch " << epoch);
+    } else {
+        const int64_t now = nowSecs();
+        for (auto& slot : it->second.prevSlots) {
+            if (!slot.valid() || slot.epoch != epoch) continue;
+            if (now < slot.expiresAt) {
+                chain = &slot.chain;
+            } else {
+                // Grace window expired — drop this slot so we stop
+                // holding dead key material; subsequent accesses for
+                // this epoch fall through to "epoch mismatch."
+                slot.clear();
+                P2P_WARN("[GROUP] grace window expired for "
+                         << senderId.substr(0, 8) << "... in "
+                         << gid.substr(0, 8) << "... epoch " << epoch);
+            }
+            break;
         }
     }
 
@@ -581,6 +630,22 @@ GroupProtocol::decryptGroupMessage(const std::string& msgType,
     const Bytes aad = buildGroupAad(msgType, senderId, gid, epoch, idx);
     Bytes pt = m_crypto.aeadDecrypt(msgKey, ciphertext, aad);
     sodium_memzero(msgKey.data(), msgKey.size());
+
+    // Audit #3 H3 — forward secrecy on the skipped-key window.  After
+    // a successful AEAD verify we drop the cached key so a later
+    // compromise of this chain's in-memory or on-disk state cannot
+    // recover keys for messages already delivered.  We persist the
+    // mutation so the on-disk chain blob (re-loaded after restart)
+    // doesn't carry the now-erased key either.
+    //
+    // On AEAD failure we keep the key — a forged ciphertext shouldn't
+    // burn a legitimate retransmit's chance to decrypt.  Replay of a
+    // legitimate ciphertext is dropped at the envelope-id layer
+    // before we get here, so erase-on-success doesn't break dedup.
+    if (!pt.empty()) {
+        chain->eraseSkipped(idx);
+        persistRemoteChain(gid, senderId);
+    }
     return pt;
 }
 
@@ -711,7 +776,14 @@ void GroupProtocol::restorePersistedChains()
             InboundChainState s;
             s.chain = std::move(chain);
             s.epoch = r.epoch;
-            m_recvChains[std::make_pair(r.groupId, r.senderId)] = std::move(s);
+            const auto key = std::make_pair(r.groupId, r.senderId);
+            m_recvChains[key] = std::move(s);
+            // Audit #3 M3: on restart the deserialised chain may still
+            // carry a real seed if it was written under the legacy
+            // always-keep-seed scheme.  Drop it now so the in-memory
+            // image matches the post-install invariant; next persist
+            // writes the seedless blob back.
+            m_recvChains[key].chain.forgetSeed();
         }
     }
     P2P_LOG("[GROUP] restored " << rows.size() << " persisted sender chain(s)");

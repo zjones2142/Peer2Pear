@@ -353,8 +353,13 @@ func (m *Mailbox) PurgeExpired() (int, int) {
 	return before - after, after
 }
 
-// Count returns the total number of stored envelopes.
+// Count returns the total number of stored envelopes.  The lock
+// matches every other Mailbox accessor (Audit #3 M6) so a concurrent
+// Store / FetchAll can't race the COUNT(*) read against an insert
+// or delete in flight.
 func (m *Mailbox) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var count int
 	m.db.QueryRow("SELECT COUNT(*) FROM envelopes").Scan(&count)
 	return count

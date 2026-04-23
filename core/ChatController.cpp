@@ -60,6 +60,14 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     , m_timerFactory(&timers)
     , m_maintenanceTimer(timers.create())
 {
+#ifdef PEER2PEAR_P2P
+    // Audit #3 L3: session-random 32-byte AEAD key for TURN creds.
+    // Never persisted; never exposed outside this class.  Lifetime =
+    // this ChatController instance, so creds from one process can't
+    // be replayed against a later one.
+    m_turnCredsKey.assign(32, 0);
+    randombytes_buf(m_turnCredsKey.data(), m_turnCredsKey.size());
+#endif
     // Forward the sealer's key-change event through ChatController's own
     // public callback surface — keeps the onPeerKeyChanged(peerId,
     // oldFp, newFp) signature stable for the C API + desktop.
@@ -560,14 +568,42 @@ void ChatController::setSelfKeys(const std::vector<std::string>& keys) {
     m_selfKeys = keys;
 }
 
+ChatController::~ChatController()
+{
+#ifdef PEER2PEAR_P2P
+    // Audit #3 L3: make sure TURN creds + the session-AEAD key don't
+    // linger in freed pages after the controller goes away.
+    if (!m_turnCredsKey.empty()) CryptoEngine::secureZero(m_turnCredsKey);
+    if (!m_turnUserCt.empty())   CryptoEngine::secureZero(m_turnUserCt);
+    if (!m_turnPassCt.empty())   CryptoEngine::secureZero(m_turnPassCt);
+#endif
+}
+
 #ifdef PEER2PEAR_P2P
 void ChatController::setTurnServer(const std::string& host, int port,
                                     const std::string& username, const std::string& password)
 {
     m_turnHost = host;
     m_turnPort = port;
-    m_turnUser = username;
-    m_turnPass = password;
+
+    // Audit #3 L3: encrypt creds before they touch a long-lived member.
+    // The ciphertext sits in m_turnUserCt / m_turnPassCt; the key is
+    // session-ephemeral (m_turnCredsKey).  setupP2PConnection is the
+    // only reader and zeroes its scratch buffers right after use.
+    auto encCred = [this](const std::string& s) -> Bytes {
+        if (s.empty()) return {};
+        Bytes pt(s.begin(), s.end());
+        Bytes ct = m_crypto.aeadEncrypt(m_turnCredsKey, pt);
+        sodium_memzero(pt.data(), pt.size());
+        return ct;
+    };
+    if (!m_turnUserCt.empty())
+        sodium_memzero(m_turnUserCt.data(), m_turnUserCt.size());
+    if (!m_turnPassCt.empty())
+        sodium_memzero(m_turnPassCt.data(), m_turnPassCt.size());
+    m_turnUserCt = encCred(username);
+    m_turnPassCt = encCred(password);
+
     P2P_LOG("[ChatController] TURN server set: " << host << ":" << port);
 }
 #endif
@@ -721,8 +757,24 @@ QuicConnection* ChatController::setupP2PConnection(const std::string& peerIdB64u
     // Lifetime is managed by m_p2pConnections raw pointer ownership;
     // runMaintenance() deletes stale entries.
     QuicConnection* conn = new QuicConnection(*m_timerFactory);
-    if (!m_turnHost.empty())
-        conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
+    if (!m_turnHost.empty()) {
+        // Audit #3 L3: decrypt TURN creds just-in-time into scratch
+        // buffers, pass to QuicConnection, then zero.  QuicConnection
+        // is expected to copy what it needs before returning.
+        auto decCred = [this](const Bytes& ct) -> std::string {
+            if (ct.empty()) return {};
+            Bytes pt = m_crypto.aeadDecrypt(m_turnCredsKey, ct);
+            if (pt.empty()) return {};
+            std::string s(pt.begin(), pt.end());
+            sodium_memzero(pt.data(), pt.size());
+            return s;
+        };
+        std::string user = decCred(m_turnUserCt);
+        std::string pass = decCred(m_turnPassCt);
+        conn->setTurnServer(m_turnHost, m_turnPort, user, pass);
+        sodium_memzero(const_cast<char*>(user.data()), user.size());
+        sodium_memzero(const_cast<char*>(pass.data()), pass.size());
+    }
     m_p2pConnections[peerIdB64u] = conn;
     m_p2pCreatedSecs[peerIdB64u] = nowSecs();
 
@@ -1069,10 +1121,39 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                            << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
                 return;
             }
+            // Audit #3 H2: groupName + members live inside the sender-
+            // chain ciphertext now (matching every other group_* shape).
+            // Decrypt before reading either; a bad ciphertext drops the
+            // leave silently — same posture as group_rename / _avatar.
+            const uint64_t    skeyEpoch = o.value("skey_epoch", uint64_t(0));
+            const uint32_t    skeyIdx   = o.value("skey_idx", uint32_t(0));
+            const std::string ctB64     = o.value("ciphertext", std::string());
+            if (gid.empty() || ctB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_leave from "
+                         << senderId.substr(0, 8) << "...");
+                return;
+            }
+            const Bytes ct = CryptoEngine::fromBase64Url(ctB64);
+            const Bytes pt = m_groupProto.decryptGroupMessage(
+                "group_leave", gid, senderId, skeyEpoch, skeyIdx, ct);
+            if (pt.empty()) {
+                P2P_WARN("[GROUP] decrypt failed for group_leave from "
+                         << senderId.substr(0, 8) << "... in "
+                         << gid.substr(0, 8) << "...");
+                return;
+            }
+            std::string groupName;
             std::vector<std::string> memberKeys;
-            if (o.contains("members") && o["members"].is_array())
-                for (const auto& v : o["members"])
-                    if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+            try {
+                auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+                groupName = inner.value("groupName", std::string());
+                if (inner.contains("members") && inner["members"].is_array())
+                    for (const auto& v : inner["members"])
+                        if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+            } catch (...) {
+                P2P_WARN("[GROUP] malformed inner plaintext in group_leave");
+                return;
+            }
             // The sender left — strike them from our roster so they
             // can't push further member-update / rename / avatar
             // messages afterwards.  Also drop their sender-key chain:
@@ -1081,7 +1162,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             m_groupProto.removeMember(gid, senderId);
             m_groupProto.forgetRemoteChain(gid, senderId);
             if (onGroupMemberLeft) onGroupMemberLeft(senderId, gid,
-                                  o.value("groupName", std::string()),
+                                  groupName,
                                   memberKeys, tsSecs, msgId);
         } else if (type == "avatar") {
             if (onAvatarReceived) onAvatarReceived(senderId,

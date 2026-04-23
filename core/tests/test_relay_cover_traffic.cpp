@@ -129,6 +129,7 @@ public:
 class SimpleWebSocket : public IWebSocket {
 public:
     std::string lastOpenUrl;
+    std::vector<std::string> sentTexts;  // captures outbound text frames
 
     void open(const std::string& url) override {
         lastOpenUrl = url;
@@ -144,7 +145,12 @@ public:
     bool isConnected() const override { return m_connected; }
     bool isIdle() const override { return !m_connected; }
 
-    void sendTextMessage(const std::string& /*message*/) override {
+    void sendTextMessage(const std::string& message) override {
+        sentTexts.push_back(message);
+        // Only the first text frame is auth — subsequent frames
+        // (push_register, presence_query, etc.) don't need a reply.
+        if (m_authReplied) return;
+        m_authReplied = true;
         nlohmann::json r;
         r["type"] = "auth_ok";
         if (onTextMessage) onTextMessage(r.dump());
@@ -152,6 +158,7 @@ public:
 
 private:
     bool m_connected = false;
+    bool m_authReplied = false;
 };
 
 }  // namespace
@@ -274,4 +281,55 @@ TEST(RelayUrlScheme, RejectsNonTlsUrls) {
                 << "\" leaked through to ws.open(\"" << ws.lastOpenUrl << "\")";
         }
     }
+}
+
+// Audit #3 test gap: push token registration E2E.  A call to
+// RelayClient::registerPushToken on a connected relay must produce
+// exactly one push_register text frame with the right shape.  An
+// unconnected client should cache the token and replay it on the
+// next auth_ok (separate concern — tested inside RelayClient's
+// auth path; this test only pins the connected path).
+TEST(PushRegistration, SendsPushRegisterFrameOnConnectedRelay) {
+    ASSERT_GE(sodium_init(), 0);
+
+    const std::string dataDir = makeTempDir("p2p-push-e2e");
+    CryptoEngine crypto;
+    crypto.setDataDir(dataDir);
+    crypto.setPassphrase("push-test-passphrase");
+    ASSERT_NO_THROW(crypto.ensureIdentity());
+
+    FireableTimerFactory timers;
+    CapturingHttpClient  http;
+    SimpleWebSocket      ws;
+    RelayClient          relay(ws, http, timers, &crypto);
+
+    relay.setRelayUrl("wss://mock-relay.test");
+    relay.connectToRelay();
+    ASSERT_TRUE(relay.isConnected());
+
+    // Clear the auth frame so we can find the push_register frame alone.
+    const size_t framesBeforePush = ws.sentTexts.size();
+
+    relay.registerPushToken("ios", "deadbeefcafef00d");
+
+    ASSERT_GT(ws.sentTexts.size(), framesBeforePush)
+        << "registerPushToken did not send a frame while connected";
+
+    // The newest frame must be the push_register payload with the
+    // right platform + token.
+    const std::string& pushFrame = ws.sentTexts.back();
+    auto j = nlohmann::json::parse(pushFrame);
+    EXPECT_EQ(j.value("type",     std::string()), "push_register");
+    EXPECT_EQ(j.value("platform", std::string()), "ios");
+    EXPECT_EQ(j.value("token",    std::string()), "deadbeefcafef00d");
+
+    // Empty token → unregister.  Also goes on the wire as push_register
+    // with empty token (relay interprets empty as delete).
+    relay.registerPushToken("ios", "");
+    const std::string& unregFrame = ws.sentTexts.back();
+    auto jEmpty = nlohmann::json::parse(unregFrame);
+    EXPECT_EQ(jEmpty.value("type",     std::string()), "push_register");
+    EXPECT_EQ(jEmpty.value("token",    std::string()), "");
+
+    fs::remove_all(dataDir);
 }
