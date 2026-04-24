@@ -6,8 +6,7 @@
 // (relay-go/onion.go HandleForwardOnion) and a handful of Go tests
 // cover peel + SSRF rejection there.
 //
-// Audit #3 test gap: onion routing had zero C++-side tests.  This
-// binary pins the wire format, the crypto (NaCl Box with known
+// This binary pins the wire format, the crypto (NaCl Box with known
 // sender + relay keys), and the layering invariants — so a later
 // tweak to OnionWrap won't silently diverge from the Go peeler.
 //
@@ -15,6 +14,7 @@
 // test would need loopback forwarding enabled (currently the SSRF
 // guard refuses 127.0.0.1), which belongs in the Go suite.
 
+#include "types.hpp"
 #include "OnionWrap.hpp"
 
 #include <gtest/gtest.h>
@@ -25,7 +25,6 @@
 #include <string>
 #include <vector>
 
-using Bytes = std::vector<uint8_t>;
 
 namespace {
 

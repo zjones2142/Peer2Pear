@@ -5,6 +5,7 @@
 #include "SessionManager.hpp"
 #include "SessionSealer.hpp"
 #include "log.hpp"
+#include "shared.hpp"
 #include "uuid.hpp"
 
 #include <sodium.h>
@@ -15,21 +16,8 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-namespace {
-
-int64_t nowSecs() {
-    using namespace std::chrono;
-    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-}
-
-std::string trimmed(const std::string& s) {
-    auto lb = s.find_first_not_of(" \t\r\n");
-    if (lb == std::string::npos) return {};
-    auto rb = s.find_last_not_of(" \t\r\n");
-    return s.substr(lb, rb - lb + 1);
-}
-
-}  // namespace
+using p2p::nowSecs;
+using p2p::trimmed;
 
 FileProtocol::FileProtocol(CryptoEngine& crypto,
                             SessionSealer& sealer,
@@ -58,7 +46,7 @@ void FileProtocol::sendControlMessage(const std::string& peerIdB64u,
     Bytes sealed = m_sealer.sealForPeer(peerIdB64u, pt);
     if (sealed.empty()) {
         P2P_WARN("[FILE] BLOCKED — cannot seal " << msg.value("type", std::string())
-                   << " for " << peerIdB64u.substr(0, 8) << "...");
+                   << " for " << p2p::peerPrefix(peerIdB64u) << "...");
         return;
     }
     m_sendEnvelope(sealed);
@@ -102,7 +90,7 @@ std::string FileProtocol::sendFile(const std::string& peerIdB64u,
     const Bytes pt(ptStr.begin(), ptStr.end());
     Bytes sealedEnv = m_sealer.sealForPeer(peerIdB64u, pt);
     if (sealedEnv.empty()) {
-        P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerIdB64u.substr(0, 8) << "...");
+        P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << p2p::peerPrefix(peerIdB64u) << "...");
         return {};
     }
 
@@ -128,8 +116,8 @@ std::string FileProtocol::sendFile(const std::string& peerIdB64u,
     CryptoEngine::secureZero(fileKey);
 
     m_sendEnvelope(sealedEnv);
-    P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
-             << " to " << peerIdB64u.substr(0, 8) << "... size=" << fileSize);
+    P2P_LOG("[FILE] file_key announced for " << p2p::peerPrefix(transferId) << "..."
+             << " to " << p2p::peerPrefix(peerIdB64u) << "... size=" << fileSize);
     return transferId;
 }
 
@@ -186,7 +174,7 @@ std::string FileProtocol::sendGroupFile(const std::string& groupId,
         const Bytes pt(ptStr.begin(), ptStr.end());
         Bytes sealedEnv = m_sealer.sealForPeer(peerId, pt);
         if (sealedEnv.empty()) {
-            P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerId.substr(0, 8) << "...");
+            P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << p2p::peerPrefix(peerId) << "...");
             continue;
         }
 
@@ -203,8 +191,8 @@ std::string FileProtocol::sendGroupFile(const std::string& groupId,
         CryptoEngine::secureZero(fileKey);
 
         m_sendEnvelope(sealedEnv);
-        P2P_LOG("[FILE] file_key announced for " << memberTid.substr(0, 8) << "..."
-                 << " to " << peerId.substr(0, 8) << "... (group)");
+        P2P_LOG("[FILE] file_key announced for " << p2p::peerPrefix(memberTid) << "..."
+                 << " to " << p2p::peerPrefix(peerId) << "... (group)");
 
         memberTids.push_back(memberTid);
     }
@@ -221,7 +209,7 @@ void FileProtocol::acceptIncoming(const std::string& transferId, bool requireP2P
 {
     auto it = m_pendingIncomingFiles.find(transferId);
     if (it == m_pendingIncomingFiles.end()) {
-        P2P_WARN("[FILE] acceptIncoming: no pending transfer " << transferId.substr(0, 8));
+        P2P_WARN("[FILE] acceptIncoming: no pending transfer " << p2p::peerPrefix(transferId));
         return;
     }
 
@@ -240,7 +228,7 @@ void FileProtocol::acceptIncoming(const std::string& transferId, bool requireP2P
                                   it->second.groupId,
                                   it->second.groupName)) {
         P2P_WARN("[FILE] acceptIncoming: announceIncoming failed for "
-                   << transferId.substr(0, 8));
+                   << p2p::peerPrefix(transferId));
         sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
         m_pendingIncomingFiles.erase(it);
         return;
@@ -369,8 +357,8 @@ void FileProtocol::installChunkSealCallback()
     // Route every outbound file chunk through SessionSealer so the
     // hard-block-on-key-change policy applies (Arch-review #2).
     m_ftm.setSealFn([this](const std::string& peerId,
-                            const FileTransferManager::Bytes& payload)
-                              -> FileTransferManager::Bytes {
+                            const Bytes& payload)
+                              -> Bytes {
         return m_sealer.sealPreEncryptedForPeer(peerId, payload);
     });
 }

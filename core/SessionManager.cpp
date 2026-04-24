@@ -174,15 +174,9 @@ Bytes SessionManager::encryptForPeer(const std::string& peerIdB64u,
     }
 
     // Initiate Noise IK handshake + bundle first ratchet message
-
-    // Get peer's Ed25519 public key and convert to X25519
     Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    if (peerEdPub.size() != 32) return {};
-
-    unsigned char peerCurvePub[32];
-    if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0)
-        return {};
-    Bytes remoteCurvePub(peerCurvePub, peerCurvePub + 32);
+    Bytes remoteCurvePub = CryptoEngine::edPubToCurvePub(peerEdPub);
+    if (remoteCurvePub.empty()) return {};
 
     // Choose hybrid or classical Noise IK based on PQ key availability
     const bool useHybrid = (peerKemPub.size() == 1184 && m_crypto.hasPQKeys());

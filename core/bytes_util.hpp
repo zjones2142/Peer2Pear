@@ -1,4 +1,6 @@
 #pragma once
+
+#include "types.hpp"
 //
 // Pure-std byte utilities.  No Qt, no sodium — safe for every host.
 // The Qt-dependent boundary helpers (QByteArray ↔ Bytes, secureZeroQ) live
@@ -12,7 +14,6 @@
 
 namespace p2p::bridge {
 
-using Bytes = std::vector<uint8_t>;
 
 // Tag a C string literal as a Bytes buffer — handy for ad-hoc domain strings
 // passed into HKDF / keyed-hash calls (e.g. `strBytes("prekey-salt")`).

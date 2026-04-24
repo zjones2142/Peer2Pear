@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -22,7 +24,6 @@
  */
 class SessionStore {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     // db must outlive this SessionStore.
     // storeKey must be exactly 32 bytes to enable at-rest encryption.

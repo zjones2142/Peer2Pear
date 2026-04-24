@@ -46,14 +46,14 @@ std::string defaultDownloadsDir() { return {}; }
 
 namespace {
 
-inline void appendBE32(FileTransferManager::Bytes& dst, uint32_t v) {
+inline void appendBE32(Bytes& dst, uint32_t v) {
     dst.push_back(uint8_t((v >> 24) & 0xFF));
     dst.push_back(uint8_t((v >> 16) & 0xFF));
     dst.push_back(uint8_t((v >>  8) & 0xFF));
     dst.push_back(uint8_t( v        & 0xFF));
 }
 
-inline uint32_t readBE32(const FileTransferManager::Bytes& b, size_t off = 0) {
+inline uint32_t readBE32(const Bytes& b, size_t off = 0) {
     if (b.size() < off + 4) return 0;
     return (uint32_t(b[off])     << 24)
          | (uint32_t(b[off + 1]) << 16)
@@ -67,16 +67,16 @@ inline int64_t nowSecs() {
 }
 
 // Slice out a sub-range of Bytes.  Safe for out-of-range; returns empty.
-FileTransferManager::Bytes slice(const FileTransferManager::Bytes& b,
+Bytes slice(const Bytes& b,
                                   size_t off, size_t len) {
     if (off > b.size()) return {};
     const size_t n = std::min(len, b.size() - off);
-    return FileTransferManager::Bytes(b.begin() + off, b.begin() + off + n);
+    return Bytes(b.begin() + off, b.begin() + off + n);
 }
 
-FileTransferManager::Bytes tail(const FileTransferManager::Bytes& b, size_t off) {
+Bytes tail(const Bytes& b, size_t off) {
     if (off >= b.size()) return {};
-    return FileTransferManager::Bytes(b.begin() + off, b.end());
+    return Bytes(b.begin() + off, b.end());
 }
 
 // First 8 chars of a peer/transfer ID plus ellipsis (logging only).
@@ -129,7 +129,7 @@ void FileTransferManager::setPartialFileDir(const std::string& dir)
 
 // ── BLAKE2b-256 helpers ─────────────────────────────────────────────────────
 
-FileTransferManager::Bytes FileTransferManager::blake2b256(const Bytes& data)
+Bytes FileTransferManager::blake2b256(const Bytes& data)
 {
     Bytes hash(32, 0);
     crypto_generichash(hash.data(), 32,
@@ -139,7 +139,7 @@ FileTransferManager::Bytes FileTransferManager::blake2b256(const Bytes& data)
     return hash;
 }
 
-FileTransferManager::Bytes FileTransferManager::blake2b256File(const std::string& filePath)
+Bytes FileTransferManager::blake2b256File(const std::string& filePath)
 {
     std::ifstream f(filePath, std::ios::binary);
     if (!f.is_open()) {
@@ -216,7 +216,7 @@ bool FileTransferManager::dispatchChunk(const std::string& /*senderIdB64u*/,
     // wire.  ChatController installs m_sealFn as part of setDatabase(),
     // so this is normally always set.
     if (!m_sealFn) {
-        P2P_WARN("[FileTransfer] No seal callback set — chunk BLOCKED (H1 fix: sealed-only)");
+        P2P_WARN("[FileTransfer] No seal callback set — chunk BLOCKED (sealed-only)");
         return false;
     }
 
@@ -476,13 +476,13 @@ bool FileTransferManager::handleFileEnvelope(const std::string& fromId,
 
     // ── Key selection: ratchet keys only ───────────────────────────────────
     //
-    // Audit #3 M4: bound trial decryption to keys from THIS sender.
-    // Production fileKeys is keyed by "<peerId>:<transferId>"; some
-    // tests pass the bare "<peerId>".  Accept both: a key matches if
-    // the map key equals fromId OR starts with "fromId:".  Keys for
-    // other peers are skipped outright.  With 50 concurrent transfers
-    // across 5 peers the old loop ran ~50 AEAD verifies per chunk;
-    // the filter takes that to ~10.
+    // Bound trial decryption to keys from THIS sender.  Production
+    // fileKeys is keyed by "<peerId>:<transferId>"; some tests pass the
+    // bare "<peerId>".  Accept both: a key matches if the map key
+    // equals fromId OR starts with "fromId:".  Keys for other peers are
+    // skipped outright.  With 50 concurrent transfers across 5 peers
+    // the old loop ran ~50 AEAD verifies per chunk; the filter takes
+    // that to ~10.
     Bytes metaJson;
     Bytes key32;
     const std::string fromPrefix = fromId + ":";
@@ -1024,9 +1024,9 @@ void FileTransferManager::ensurePhase4Tables()
 // Serialize a std::vector<bool> to a compact blob.  Format:
 //   [4-byte bit count BE][packed bytes].  Byte-compatible with the prior
 //   QBitArray-based format so existing DB rows decode cleanly.
-static FileTransferManager::Bytes bitArrayToBlob(const std::vector<bool>& bits)
+static Bytes bitArrayToBlob(const std::vector<bool>& bits)
 {
-    FileTransferManager::Bytes blob(4 + (bits.size() + 7) / 8, 0);
+    Bytes blob(4 + (bits.size() + 7) / 8, 0);
     const uint32_t n = uint32_t(bits.size());
     blob[0] = uint8_t((n >> 24) & 0xFF);
     blob[1] = uint8_t((n >> 16) & 0xFF);
@@ -1039,7 +1039,7 @@ static FileTransferManager::Bytes bitArrayToBlob(const std::vector<bool>& bits)
     return blob;
 }
 
-static std::vector<bool> blobToBitArray(const FileTransferManager::Bytes& blob)
+static std::vector<bool> blobToBitArray(const Bytes& blob)
 {
     if (blob.size() < 4) return {};
     const uint32_t n = (uint32_t(blob[0]) << 24) |
@@ -1075,11 +1075,11 @@ void FileTransferManager::persistIncomingFull(const std::string& transferId,
     q.bindValue(":size",    int64_t(xfer.fileSize));
     q.bindValue(":chunks",  xfer.totalChunks);
     q.bindValue(":hash",    xfer.fileHash);
-    // Audit #3 M1: wrap the raw file key with an identity-derived
-    // AEAD key before it touches SQLite.  SQLCipher's page key
-    // encrypts the row too, but a page-key compromise alone still
-    // exposes the wrapped blob — the second layer requires the
-    // attacker to also break the Argon2-gated identity key.
+    // Wrap the raw file key with an identity-derived AEAD key before
+    // it touches SQLite.  SQLCipher's page key encrypts the row too,
+    // but a page-key compromise alone still exposes the wrapped blob —
+    // the second layer requires the attacker to also break the
+    // Argon2-gated identity key.
     {
         Bytes wrapped = m_crypto.wrapFileKey(transferId, fileKey);
         // If wrap fails (pre-unlock or other error), fall back to
@@ -1184,7 +1184,7 @@ void FileTransferManager::registerSentTransfer(const std::string& senderIdB64u,
             q.bindValue(":path",    filePath);
             q.bindValue(":size",    int64_t(fileSize));
             q.bindValue(":hash",    fileHash);
-            // Audit #3 M1 — see parallel comment in persistIncomingFull.
+            // See parallel file-key wrap comment in persistIncomingFull.
             {
                 Bytes wrapped = m_crypto.wrapFileKey(transferId, fileKey);
                 q.bindValue(":key", wrapped.empty() ? fileKey : wrapped);
@@ -1216,10 +1216,10 @@ void FileTransferManager::loadPersistedTransfers()
                 const int         chunks   = q.valueInt(4);
                 const Bytes       fhash    = q.valueBlob(5);
                 Bytes             fkey     = q.valueBlob(6);
-                // Audit #3 M1: new rows carry the AEAD-wrapped blob;
-                // legacy rows carry the raw 32-byte key.  Size-based
-                // detection: unwrap returns 32 bytes on success, empty
-                // on failure — the 32-byte fallback preserves legacy.
+                // New rows carry the AEAD-wrapped blob; legacy rows
+                // carry the raw 32-byte key.  Size-based detection:
+                // unwrap returns 32 bytes on success, empty on failure
+                // — the 32-byte fallback preserves legacy.
                 if (fkey.size() != 32) {
                     Bytes unwrapped = m_crypto.unwrapFileKey(tid, fkey);
                     if (unwrapped.size() == 32) fkey = std::move(unwrapped);
@@ -1291,9 +1291,9 @@ void FileTransferManager::loadPersistedTransfers()
                 s.fileSize    = q.valueInt64(5);
                 s.fileHash    = q.valueBlob(6);
                 s.fileKey     = q.valueBlob(7);
-                // Audit #3 M1 — see parallel comment in the incoming-
-                // loader above.  Legacy 32-byte rows pass through; new
-                // wrapped rows get unwrapped here.
+                // See parallel comment in the incoming loader above.
+                // Legacy 32-byte rows pass through; new wrapped rows
+                // get unwrapped here.
                 if (s.fileKey.size() != 32) {
                     Bytes unwrapped = m_crypto.unwrapFileKey(tid, s.fileKey);
                     if (unwrapped.size() == 32) s.fileKey = std::move(unwrapped);

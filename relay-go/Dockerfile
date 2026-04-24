@@ -1,7 +1,7 @@
 # Build stage — produces a statically linked binary
 FROM golang:1.22-alpine AS build
 # sqlite-dev no longer needed — mutecomm/go-sqlcipher bundles
-# SQLCipher + libtomcrypt headers as vendored source (arch-review #8).
+# SQLCipher + libtomcrypt headers as vendored source.
 RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /src

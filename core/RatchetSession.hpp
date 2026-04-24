@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -20,7 +22,6 @@
  * Types: std::vector<uint8_t> for all buffers.
  */
 
-using Bytes = std::vector<uint8_t>;
 
 struct RatchetHeader {
     Bytes    dhPub;          // 32 bytes — sender's current DH ratchet public key

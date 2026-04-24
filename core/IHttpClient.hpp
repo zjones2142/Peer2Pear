@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -19,7 +21,6 @@
  */
 class IHttpClient {
 public:
-    using Bytes = std::vector<uint8_t>;
     using Headers = std::map<std::string, std::string>;
 
     virtual ~IHttpClient() = default;

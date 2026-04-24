@@ -31,8 +31,8 @@ namespace {
 
 using p2p_test::makeTempPath;
 
-SqlCipherDb::Bytes randomKey32() {
-    SqlCipherDb::Bytes k(32);
+Bytes randomKey32() {
+    Bytes k(32);
     randombytes_buf(k.data(), k.size());
     return k;
 }

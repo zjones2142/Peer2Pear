@@ -26,6 +26,7 @@ class QuicConnection;  // forward declaration — full include in .cpp
 #include <functional>
 #include <memory>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -36,7 +37,7 @@ public:
     explicit ChatController(IWebSocket& ws, IHttpClient& http,
                             ITimerFactory& timers);
 
-    // Zero TURN creds + key material on destruction (Audit #3 L3).
+    // Zero TURN creds + key material on destruction.
     ~ChatController();
 
     // Set the app data directory (where identity.json + per-user DB live).
@@ -319,16 +320,47 @@ private:
                                 const std::string& msgId,
                                 const std::string& via,
                                 Bytes msgKey);
+
+    // Decrypt a `group_rename` / `group_avatar` / `group_leave` /
+    // `group_member_update` envelope and return the parsed inner JSON,
+    // or an empty optional on any failure (malformed envelope,
+    // unauthorized sender, decrypt failed, inner JSON malformed).
+    // Every branch used to open-code the same five-step pattern;
+    // collapsing here makes the control-message handlers one-liners
+    // and guarantees they stay in sync when the pattern evolves.
+    //
+    // `requireAuthorizedSender = false` is for bootstrap-capable
+    // messages (`group_member_update`) that have their own auth
+    // check after decryption.
+    std::optional<nlohmann::json> decryptGroupControlInner(
+        const std::string& msgType,
+        const std::string& senderId,
+        const nlohmann::json& outer,
+        bool requireAuthorizedSender);
 #ifdef PEER2PEAR_P2P
     void onP2PDataReceived(const std::string& peerIdB64u, const Bytes& data);
 #endif
     void handleRelayConnected();
 
 private:
+    // Transport preference for sendSealedPayload.  RelayOnly is the
+    // default — used for every message type that should never go
+    // direct (ICE / KEM announce / group fan-outs).  PreferP2P tries
+    // the direct QUIC stream first and falls back to the relay,
+    // initiating a new P2P connection on the way.  Only 1:1 text
+    // uses PreferP2P today.
+    enum class SendMode { RelayOnly, PreferP2P };
+
     // Seal + send.  Thin wrapper — the sealing itself lives on
     // SessionSealer (the choke point for safety-number enforcement);
-    // this just adds the "hand the sealed envelope to the relay" step.
-    void sendSealedPayload(const std::string& peerIdB64u, const nlohmann::json& payload);
+    // this just adds the "hand the sealed envelope to the relay /
+    // direct QUIC stream" step.  Arch-review #3: sendText used to
+    // open-code its own seal-then-dispatch inline; sendSealedPayload
+    // is now the single outbound code path for everything that goes
+    // through the ratchet.
+    void sendSealedPayload(const std::string& peerIdB64u,
+                            const nlohmann::json& payload,
+                            SendMode mode = SendMode::RelayOnly);
 
     // Roster authorization for inbound group control messages lives on
     // GroupProtocol.  onEnvelope calls m_groupProto.isAuthorizedSender
@@ -436,13 +468,13 @@ private:
 #ifdef PEER2PEAR_P2P
     // TURN relay config for symmetric NAT fallback.
     //
-    // Audit #3 L3: creds used to sit plaintext in m_turnUser/m_turnPass
-    // for the full session, so a crash dump or memory-scraping attack
-    // would surface them.  Now we keep an ephemeral per-session AEAD
-    // key and only hold the ciphertext between calls; setupP2PConnection
-    // decrypts into scratch buffers, hands them to QuicConnection, and
-    // zeroes the scratch immediately.  The key itself is 32 bytes of
-    // sodium randomness generated once in ChatController's ctor.
+    // Keep creds encrypted between calls so a crash dump or
+    // memory-scraping attack can't surface them.  We hold an
+    // ephemeral per-session AEAD key and only store the ciphertext;
+    // setupP2PConnection decrypts into scratch buffers, hands them to
+    // QuicConnection, and zeroes the scratch immediately.  The key
+    // itself is 32 bytes of sodium randomness generated once in
+    // ChatController's ctor.
     std::string m_turnHost;   // host is not a secret — keep as-is
     int         m_turnPort = 0;
     Bytes       m_turnCredsKey;   // 32 bytes; never rotates within a session

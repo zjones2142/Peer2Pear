@@ -99,19 +99,19 @@ public slots:
                          const QString &groupId = {},
                          const QString &groupName = {});
 
-    // Phase 2: a peer is offering a file and needs consent.
+    // A peer is offering a file and needs consent.
     void onFileAcceptRequested(const QString &fromPeerIdB64u,
                                const QString &transferId,
                                const QString &fileName,
                                qint64 fileSize);
 
-    // Phase 2: transfer was canceled/declined by either side.
+    // Transfer was canceled/declined by either side.
     void onFileTransferCanceled(const QString &transferId, bool byReceiver);
 
-    // Phase 3: sender-side — receiver confirmed delivery.
+    // Sender-side — receiver confirmed delivery.
     void onFileTransferDelivered(const QString &transferId);
 
-    // Phase 3: transport policy blocked the transfer (no P2P + requireP2P on).
+    // Transport policy blocked the transfer (no P2P + requireP2P on).
     void onFileTransferBlocked(const QString &transferId, bool byReceiver);
 
 signals:
@@ -149,9 +149,8 @@ private:
     void addFileBubble(const QString &fileName, qint64 fileSize, bool sent);
     void addDateSeparator(const QDateTime &dt);
 
-    // File tab — buildFileCard returns an owned QFrame; rebuildFilesTab places it
-    void    rebuildFilesTab();
-    QFrame *buildFileCard(const AppDataStore::FileRecord &rec, QWidget *parent);
+    // File tab — the per-file card lives in desktop/dialogs.{h,cpp}
+    void rebuildFilesTab();
 
     // Find the 1:1 chat index for a peer (-1 if none).  Skips group
     // chats — groups are matched by groupId via their own helpers.

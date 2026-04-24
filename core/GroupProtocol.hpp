@@ -24,12 +24,12 @@ class SessionStore;
  * a `SendSealedFn` callback for every group member; the callback
  * routes it through SessionSealer + RelayClient.
  *
- * Roster authorization (the H2 gate): inbound group control messages
- * (rename / avatar / leave / member_update) must check
- * `isAuthorizedSender` before taking effect.  The roster is seeded
- * from either (a) `setKnownMembers` at app start (UI's persisted
- * state), or (b) `upsertMembersFromTrustedMessage` when a valid
- * group_msg arrives with the sender in its declared member list.
+ * Roster authorization: inbound group control messages (rename /
+ * avatar / leave / member_update) must check `isAuthorizedSender`
+ * before taking effect.  The roster is seeded from either
+ * (a) `setKnownMembers` at app start (UI's persisted state), or
+ * (b) `upsertMembersFromTrustedMessage` when a valid group_msg
+ * arrives with the sender in its declared member list.
  *
  * Sequence counters:
  *   - `nextOutboundSeq(gid)` returns a monotonic per-group counter
@@ -286,10 +286,10 @@ private:
     // Inbound chain state per (gid, senderId).  Holds the current-
     // epoch chain the peer is actively using, plus a small ring of
     // previous-epoch chains retained for a grace window so in-flight
-    // messages at prior epochs still decrypt.  Audit #3 L4: a single
-    // prev slot dropped epoch N-1 the moment epoch N+1 arrived, so a
-    // rapid back-to-back rekey (member leaves + another joins +
-    // another leaves) made stragglers from the oldest epoch
+    // messages at prior epochs still decrypt.  A single prev slot
+    // would drop epoch N-1 the moment epoch N+1 arrived, so a rapid
+    // back-to-back rekey (member leaves + another joins + another
+    // leaves) would make stragglers from the oldest epoch
     // undecryptable even within the grace window.  Two slots cover
     // the typical "two consecutive membership changes" case; further
     // slots are diminishing returns for unbounded memory growth.

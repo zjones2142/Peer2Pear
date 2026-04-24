@@ -19,9 +19,13 @@
 #include "SessionStore.hpp"
 #include "AppDataStore.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -29,6 +33,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 
 // ── CWebSocket: IWebSocket backed by C function pointers ────────────────────
 
@@ -192,21 +197,34 @@ struct p2p_context {
     CHttpClient       http;
     StdTimerFactory   timers;
 
-    // SQLCipher DB for Noise/Ratchet session persistence + file-transfer
-    // state.  Opened lazily inside p2p_set_passphrase_v2 once the
-    // identity is unlocked.  MUST be declared before `controller` so
-    // the controller's SessionStore/FileTransferManager — which hold a
-    // reference into db — destruct first (C++ destroys members in
-    // reverse declaration order).
-    SqlCipherDb       db;
+    // Arch-review #7: db / appData / controller used to be value
+    // members with carefully-ordered declarations.  The controller's
+    // submembers (SessionStore, SessionSealer, FileTransferManager,
+    // AppDataStore) hold non-owning raw SqlCipherDb* pointers into
+    // `db` — if anyone reordered these three declarations, reverse-
+    // declaration-order destruction would run ~SqlCipherDb BEFORE
+    // the consumers' dtors, triggering use-after-free on the key +
+    // sqlite3 handle.  Wrapping them in unique_ptr + explicit
+    // reset() sequencing in ~p2p_context makes teardown order
+    // independent of declaration order.  Primary ownership stays
+    // here; no shared_ptr lifetime-extension risk (a consumer that
+    // captured shared_ptr into a long-lived callback would keep the
+    // DB key in memory past p2p_destroy — with unique_ptr that's
+    // impossible because no one else owns it).
+    std::unique_ptr<SqlCipherDb>    db;
+    std::unique_ptr<AppDataStore>   appData;
+    std::unique_ptr<ChatController> controller;
 
-    // App-data layer (contacts / messages / settings / file_transfers /
-    // group_seq_counters) on the same SQLCipher handle.  Bound right
-    // after `db.open()` succeeds in p2p_set_passphrase_v2.  Must
-    // outlive `controller` for the same destruction-order reason as db.
-    AppDataStore      appData;
-
-    ChatController    controller;
+    ~p2p_context()
+    {
+        // Explicit teardown order (Arch-review #7).  Consumers that
+        // hold raw views into *db MUST be destroyed first so their
+        // destructors don't observe a freed handle.  Member-
+        // declaration order no longer affects correctness.
+        controller.reset();
+        appData.reset();
+        db.reset();
+    }
 
     // Scratch buffer for returning strings (valid until next call)
     std::string  scratch;
@@ -279,7 +297,9 @@ struct p2p_context {
         : ws(platform)
         , http(platform)
         , timers(&ctrlMu)
-        , controller(ws, http, timers)
+        , db(std::make_unique<SqlCipherDb>())
+        , appData(std::make_unique<AppDataStore>())
+        , controller(std::make_unique<ChatController>(ws, http, timers))
     {}
 };
 
@@ -306,7 +326,7 @@ static std::vector<const char*> cPtrArrayFromStrings(
 
 static void wire_signals(p2p_context* ctx)
 {
-    auto& c = ctx->controller;
+    auto& c = *ctx->controller;
 
     c.onStatus = [ctx](const std::string& s) {
         if (ctx->cb.on_status)
@@ -455,7 +475,7 @@ p2p_context* p2p_create(const char* data_dir, p2p_platform platform)
     // Without this, iOS/Android would try to read/write to a non-existent
     // AppDataLocation path.
     if (!ctx->dataDir.empty())
-        ctx->controller.setDataDir(ctx->dataDir);
+        ctx->controller->setDataDir(ctx->dataDir);
     wire_signals(ctx);
     return ctx;
 }
@@ -471,7 +491,7 @@ void p2p_destroy(p2p_context* ctx)
     ctx->timers.shutdown();
     {
         std::lock_guard<std::mutex> lk(ctx->ctrlMu);
-        ctx->controller.disconnectFromRelay();
+        ctx->controller->disconnectFromRelay();
     }
     delete ctx;
 }
@@ -486,7 +506,7 @@ void p2p_set_passphrase(p2p_context* ctx, const char* passphrase)
     // `passphrase` C string is out of our control — the header documents
     // that they must zero it.
     std::string pass = passphrase ? passphrase : "";
-    ctx->controller.setPassphrase(pass);
+    ctx->controller->setPassphrase(pass);
     CryptoEngine::secureZero(pass);
 }
 
@@ -551,28 +571,28 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
 
     int rc = 0;
     try {
-        ctx->controller.setPassphrase(pass, identityKey);
+        ctx->controller->setPassphrase(pass, identityKey);
     } catch (...) {
         rc = -1;  // wrong passphrase or corrupted identity.json
     }
     CryptoEngine::secureZero(identityKey);
 
     // SQLCipher session store — mirrors desktop mainwindow.cpp's flow.
-    // Without this, `ctx->controller.m_sessionMgr` stays null and every
+    // Without this, `ctx->controller->m_sessionMgr` stays null and every
     // outbound send fails with "cannot seal" (mobile FFI regression
     // discovered during test_c_api_e2e round-trip writeup).
     if (rc == 0) {
         const std::string dbPath = ctx->dataDir + "/peer2pear.db";
-        if (ctx->db.open(dbPath, dbKey)) {
-            ctx->controller.setDatabase(ctx->db);
+        if (ctx->db->open(dbPath, dbKey)) {
+            ctx->controller->setDatabase(*ctx->db);
             // Bind the app-data layer to the same SQLCipher handle and
             // give it the same key for per-field XChaCha20-Poly1305.
             // Page-level (SQLCipher) + field-level (libsodium) gives
             // defense-in-depth: a memory dump that captures the page
             // key still doesn't yield message bodies until the field
             // key is also recovered.
-            ctx->appData.bind(ctx->db);
-            ctx->appData.setEncryptionKey(dbKey);
+            ctx->appData->bind(*ctx->db);
+            ctx->appData->setEncryptionKey(dbKey);
         } else {
             rc = -1;
         }
@@ -587,7 +607,7 @@ const char* p2p_my_id(p2p_context* ctx)
 {
     if (!ctx) return "";
     P2P_CTX_GUARD(ctx);
-    ctx->scratch = ctx->controller.myIdB64u();
+    ctx->scratch = ctx->controller->myIdB64u();
     return ctx->scratch.c_str();
 }
 
@@ -595,7 +615,7 @@ const char* p2p_safety_number(p2p_context* ctx, const char* peer_id)
 {
     if (!ctx || !peer_id) return "";
     P2P_CTX_GUARD(ctx);
-    ctx->scratch = ctx->controller.safetyNumber(peer_id);
+    ctx->scratch = ctx->controller->safetyNumber(peer_id);
     return ctx->scratch.c_str();
 }
 
@@ -603,7 +623,7 @@ int p2p_peer_trust(p2p_context* ctx, const char* peer_id)
 {
     if (!ctx || !peer_id) return P2P_PEER_UNVERIFIED;
     P2P_CTX_GUARD(ctx);
-    switch (ctx->controller.peerTrust(peer_id)) {
+    switch (ctx->controller->peerTrust(peer_id)) {
         case ChatController::PeerTrust::Unverified: return P2P_PEER_UNVERIFIED;
         case ChatController::PeerTrust::Verified:   return P2P_PEER_VERIFIED;
         case ChatController::PeerTrust::Mismatch:   return P2P_PEER_MISMATCH;
@@ -615,56 +635,56 @@ int p2p_mark_peer_verified(p2p_context* ctx, const char* peer_id)
 {
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->controller.markPeerVerified(peer_id) ? 0 : -1;
+    return ctx->controller->markPeerVerified(peer_id) ? 0 : -1;
 }
 
 void p2p_unverify_peer(p2p_context* ctx, const char* peer_id)
 {
     if (!ctx || !peer_id) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.unverifyPeer(peer_id);
+    ctx->controller->unverifyPeer(peer_id);
 }
 
 void p2p_set_hard_block_on_key_change(p2p_context* ctx, int enabled)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.setHardBlockOnKeyChange(enabled != 0);
+    ctx->controller->setHardBlockOnKeyChange(enabled != 0);
 }
 
 void p2p_reset_session(p2p_context* ctx, const char* peer_id)
 {
     if (!ctx || !peer_id) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.resetSession(peer_id);
+    ctx->controller->resetSession(peer_id);
 }
 
 void p2p_set_relay_url(p2p_context* ctx, const char* url)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.setRelayUrl(url ? url : "");
+    ctx->controller->setRelayUrl(url ? url : "");
 }
 
 void p2p_connect(p2p_context* ctx)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.connectToRelay();
+    ctx->controller->connectToRelay();
 }
 
 void p2p_disconnect(p2p_context* ctx)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.disconnectFromRelay();
+    ctx->controller->disconnectFromRelay();
 }
 
 int p2p_send_text(p2p_context* ctx, const char* peer_id, const char* text)
 {
     if (!ctx || !peer_id || !text) return -1;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.sendText(peer_id, text);
+    ctx->controller->sendText(peer_id, text);
     return 0;
 }
 
@@ -685,7 +705,7 @@ int p2p_send_group_text(p2p_context* ctx,
 {
     if (!ctx || !group_id || !text || !member_ids) return -1;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.sendGroupMessageViaMailbox(
+    ctx->controller->sendGroupMessageViaMailbox(
         group_id,
         group_name ? group_name : "",
         cStringArrayToVector(member_ids), text);
@@ -701,7 +721,7 @@ const char* p2p_send_group_file(p2p_context* ctx,
 {
     if (!ctx || !group_id || !member_ids || !file_name || !file_path) return nullptr;
     P2P_CTX_GUARD(ctx);
-    std::string tid = ctx->controller.sendGroupFile(
+    std::string tid = ctx->controller->sendGroupFile(
         group_id, group_name ? group_name : "",
         cStringArrayToVector(member_ids),
         file_name, file_path);
@@ -717,7 +737,7 @@ int p2p_rename_group(p2p_context* ctx,
 {
     if (!ctx || !group_id || !new_name || !member_ids) return -1;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.sendGroupRename(
+    ctx->controller->sendGroupRename(
         group_id, new_name, cStringArrayToVector(member_ids));
     return 0;
 }
@@ -729,7 +749,7 @@ int p2p_leave_group(p2p_context* ctx,
 {
     if (!ctx || !group_id || !member_ids) return -1;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.sendGroupLeaveNotification(
+    ctx->controller->sendGroupLeaveNotification(
         group_id, group_name ? group_name : "",
         cStringArrayToVector(member_ids));
     return 0;
@@ -742,7 +762,7 @@ int p2p_send_group_avatar(p2p_context* ctx,
 {
     if (!ctx || !group_id || !avatar_b64 || !member_ids) return -1;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.sendGroupAvatar(
+    ctx->controller->sendGroupAvatar(
         group_id, avatar_b64, cStringArrayToVector(member_ids));
     return 0;
 }
@@ -754,7 +774,7 @@ int p2p_update_group_members(p2p_context* ctx,
 {
     if (!ctx || !group_id || !member_ids) return -1;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.sendGroupMemberUpdate(
+    ctx->controller->sendGroupMemberUpdate(
         group_id, group_name ? group_name : "",
         cStringArrayToVector(member_ids));
     return 0;
@@ -766,7 +786,7 @@ void p2p_set_known_group_members(p2p_context* ctx,
 {
     if (!ctx || !group_id || !member_ids) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.setKnownGroupMembers(
+    ctx->controller->setKnownGroupMembers(
         group_id, cStringArrayToVector(member_ids));
 }
 
@@ -777,7 +797,7 @@ const char* p2p_send_file(p2p_context* ctx,
 {
     if (!ctx || !peer_id || !file_name || !file_path) return nullptr;
     P2P_CTX_GUARD(ctx);
-    std::string tid = ctx->controller.sendFile(peer_id, file_name, file_path);
+    std::string tid = ctx->controller->sendFile(peer_id, file_name, file_path);
     if (tid.empty()) return nullptr;
     ctx->scratch = std::move(tid);
     return ctx->scratch.c_str();
@@ -794,9 +814,9 @@ void p2p_respond_file_request(p2p_context* ctx,
     P2P_CTX_GUARD(ctx);
     const std::string tid = transfer_id;
     if (accept) {
-        ctx->controller.acceptFileTransfer(tid, require_p2p != 0);
+        ctx->controller->acceptFileTransfer(tid, require_p2p != 0);
     } else {
-        ctx->controller.declineFileTransfer(tid);
+        ctx->controller->declineFileTransfer(tid);
     }
 }
 
@@ -804,44 +824,44 @@ void p2p_cancel_transfer(p2p_context* ctx, const char* transfer_id)
 {
     if (!ctx || !transfer_id) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.cancelFileTransfer(transfer_id);
+    ctx->controller->cancelFileTransfer(transfer_id);
 }
 
 void p2p_set_file_auto_accept_mb(p2p_context* ctx, int mb)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.setFileAutoAcceptMaxMB(mb);
+    ctx->controller->setFileAutoAcceptMaxMB(mb);
 }
 
 void p2p_set_file_hard_max_mb(p2p_context* ctx, int mb)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.setFileHardMaxMB(mb);
+    ctx->controller->setFileHardMaxMB(mb);
 }
 
 void p2p_set_file_require_p2p(p2p_context* ctx, int enabled)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.setFileRequireP2P(enabled != 0);
+    ctx->controller->setFileRequireP2P(enabled != 0);
 }
 
 void p2p_check_presence(p2p_context* ctx, const char** peer_ids, int count)
 {
     if (!ctx || !peer_ids) return;
-    // Audit #3 FFI hardening: a buggy caller could pass count<0,
-    // which would underflow the reserve(size_t) and allocate SIZE_MAX
-    // bytes.  Silent no-op matches the defensive posture of the
-    // p2p_ws_on_binary null/length guard.
+    // A buggy caller could pass count<0, which would underflow the
+    // reserve(size_t) and allocate SIZE_MAX bytes.  Silent no-op
+    // matches the defensive posture of the p2p_ws_on_binary
+    // null/length guard.
     if (count <= 0) return;
     P2P_CTX_GUARD(ctx);
     std::vector<std::string> ids;
     ids.reserve(static_cast<size_t>(count));
     for (int i = 0; i < count; i++)
         if (peer_ids[i]) ids.emplace_back(peer_ids[i]);
-    ctx->controller.checkPresence(ids);
+    ctx->controller->checkPresence(ids);
 }
 
 void p2p_subscribe_presence(p2p_context* ctx, const char** peer_ids, int count)
@@ -853,21 +873,21 @@ void p2p_subscribe_presence(p2p_context* ctx, const char** peer_ids, int count)
     ids.reserve(static_cast<size_t>(count));
     for (int i = 0; i < count; i++)
         if (peer_ids[i]) ids.emplace_back(peer_ids[i]);
-    ctx->controller.subscribePresence(ids);
+    ctx->controller->subscribePresence(ids);
 }
 
 void p2p_add_send_relay(p2p_context* ctx, const char* url)
 {
     if (!ctx || !url) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.relay().addSendRelay(url ? std::string(url) : std::string());
+    ctx->controller->relay().addSendRelay(url ? std::string(url) : std::string());
 }
 
 void p2p_set_privacy_level(p2p_context* ctx, int level)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    ctx->controller.relay().setPrivacyLevel(level);
+    ctx->controller->relay().setPrivacyLevel(level);
 }
 
 void p2p_set_push_token(p2p_context* ctx,
@@ -878,7 +898,7 @@ void p2p_set_push_token(p2p_context* ctx,
     P2P_CTX_GUARD(ctx);
     const std::string tok = token    ? std::string(token)    : std::string();
     const std::string plt = platform ? std::string(platform) : std::string();
-    ctx->controller.relay().registerPushToken(plt, tok);
+    ctx->controller->relay().registerPushToken(plt, tok);
 }
 
 void p2p_wake_for_push(p2p_context* ctx)
@@ -890,8 +910,8 @@ void p2p_wake_for_push(p2p_context* ctx)
     // ensure the relay WS is up.  If already connected, this is a
     // no-op; if disconnected, nudge a (re)connect which drains the
     // mailbox as part of normal auth flow.
-    if (!ctx->controller.relay().isConnected())
-        ctx->controller.relay().connectToRelay();
+    if (!ctx->controller->relay().isConnected())
+        ctx->controller->relay().connectToRelay();
 }
 
 // ── Platform → Core events ──────────────────────────────────────────────────
@@ -913,8 +933,8 @@ void p2p_ws_on_disconnected(p2p_context* ctx)
 void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len)
 {
     if (!ctx) return;
-    // FFI hardening (Audit #3 C1): a buggy or hostile platform adapter
-    // could pass (NULL, anything) or (anything, negative).  Constructing
+    // FFI hardening: a buggy or hostile platform adapter could pass
+    // (NULL, anything) or (anything, negative).  Constructing
     // Bytes(data, data + len) under those conditions is UB — even
     // (nullptr, 0) is technically UB per [expr.add]/4 since pointer
     // arithmetic on null is undefined.  Treat malformed inputs as
@@ -923,7 +943,7 @@ void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len)
     if (!data && len > 0) return;
     P2P_CTX_GUARD(ctx);
     if (ctx->ws.onBinaryMessage) {
-        IWebSocket::Bytes buf;
+        Bytes buf;
         if (data && len > 0) buf.assign(data, data + len);
         ctx->ws.onBinaryMessage(buf);
     }
@@ -942,11 +962,11 @@ void p2p_http_response(p2p_context* ctx, int request_id,
                        const char* error)
 {
     if (!ctx) return;
-    // FFI hardening (Audit #3 C1): same null/length contract as
-    // p2p_ws_on_binary above.  CHttpClient::onResponse already guards
-    // its assign() with `body && bodyLen > 0`, but enforcing here too
-    // means any future consumer of (body, body_len) downstream gets
-    // sane inputs without re-checking.
+    // FFI hardening: same null/length contract as p2p_ws_on_binary
+    // above.  CHttpClient::onResponse already guards its assign() with
+    // `body && bodyLen > 0`, but enforcing here too means any future
+    // consumer of (body, body_len) downstream gets sane inputs without
+    // re-checking.
     if (body_len < 0) return;
     if (!body && body_len > 0) return;
     P2P_CTX_GUARD(ctx);
@@ -1171,29 +1191,29 @@ int p2p_app_save_contact(p2p_context* ctx,
     c.avatarB64      = avatar_b64 ? avatar_b64 : "";
     c.lastActiveSecs = last_active_secs;
     c.inAddressBook  = in_address_book != 0;
-    return ctx->appData.saveContact(c) ? 0 : -1;
+    return ctx->appData->saveContact(c) ? 0 : -1;
 }
 
 int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id)
 {
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData.deleteContact(peer_id) ? 0 : -1;
+    return ctx->appData->deleteContact(peer_id) ? 0 : -1;
 }
 
 void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
 {
     if (!ctx || !cb) return;
 
-    // Audit #3 test-gap fix: do NOT hold ctrlMu across the callback.
-    // std::mutex is non-recursive, so a caller whose callback re-enters
-    // any p2p_app_* function (commonly seen on iOS, which layers a
+    // Do NOT hold ctrlMu across the callback.  std::mutex is
+    // non-recursive, so a caller whose callback re-enters any
+    // p2p_app_* function (commonly seen on iOS, which layers a
     // SwiftUI update inside the loop) would deadlock.  Snapshot the
     // rows under the lock, then release before firing callbacks.
     std::vector<AppDataStore::Contact> snapshot;
     {
         P2P_CTX_GUARD(ctx);
-        ctx->appData.loadAllContacts([&](const AppDataStore::Contact& c) {
+        ctx->appData->loadAllContacts([&](const AppDataStore::Contact& c) {
             snapshot.push_back(c);
         });
     }
@@ -1221,7 +1241,7 @@ int p2p_app_save_contact_avatar(p2p_context* ctx,
 {
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData.saveContactAvatar(peer_id,
+    return ctx->appData->saveContactAvatar(peer_id,
                                            avatar_b64 ? avatar_b64 : "")
         ? 0 : -1;
 }
@@ -1242,7 +1262,7 @@ int p2p_app_save_message(p2p_context* ctx,
     m.timestampSecs = timestamp_secs;
     m.msgId         = msg_id      ? msg_id      : "";
     m.senderName    = sender_name ? sender_name : "";
-    return ctx->appData.saveMessage(peer_id, m) ? 0 : -1;
+    return ctx->appData->saveMessage(peer_id, m) ? 0 : -1;
 }
 
 void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
@@ -1250,7 +1270,7 @@ void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
 {
     if (!ctx || !peer_id || !cb) return;
     P2P_CTX_GUARD(ctx);
-    ctx->appData.loadMessages(peer_id, [&](const AppDataStore::Message& m) {
+    ctx->appData->loadMessages(peer_id, [&](const AppDataStore::Message& m) {
         cb(m.sent ? 1 : 0,
            m.text.c_str(),
            m.timestampSecs,
@@ -1264,14 +1284,14 @@ int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id)
 {
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData.deleteMessages(peer_id) ? 0 : -1;
+    return ctx->appData->deleteMessages(peer_id) ? 0 : -1;
 }
 
 int p2p_app_save_setting(p2p_context* ctx, const char* key, const char* value)
 {
     if (!ctx || !key) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData.saveSetting(key, value ? value : "") ? 0 : -1;
+    return ctx->appData->saveSetting(key, value ? value : "") ? 0 : -1;
 }
 
 const char* p2p_app_load_setting(p2p_context* ctx, const char* key,
@@ -1279,7 +1299,7 @@ const char* p2p_app_load_setting(p2p_context* ctx, const char* key,
 {
     if (!ctx || !key) return default_value ? default_value : "";
     P2P_CTX_GUARD(ctx);
-    ctx->scratch = ctx->appData.loadSetting(key, default_value ? default_value : "");
+    ctx->scratch = ctx->appData->loadSetting(key, default_value ? default_value : "");
     return ctx->scratch.c_str();
 }
 
@@ -1312,21 +1332,21 @@ int p2p_app_save_file_record(p2p_context* ctx,
     r.chunksTotal     = chunks_total;
     r.chunksComplete  = chunks_complete;
     r.savedPath       = saved_path ? saved_path : "";
-    return ctx->appData.saveFileRecord(chat_key, r) ? 0 : -1;
+    return ctx->appData->saveFileRecord(chat_key, r) ? 0 : -1;
 }
 
 int p2p_app_delete_file_record(p2p_context* ctx, const char* transfer_id)
 {
     if (!ctx || !transfer_id) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData.deleteFileRecord(transfer_id) ? 0 : -1;
+    return ctx->appData->deleteFileRecord(transfer_id) ? 0 : -1;
 }
 
 int p2p_app_delete_file_records_for_chat(p2p_context* ctx, const char* chat_key)
 {
     if (!ctx || !chat_key) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData.deleteFileRecordsForChat(chat_key) ? 0 : -1;
+    return ctx->appData->deleteFileRecordsForChat(chat_key) ? 0 : -1;
 }
 
 void p2p_app_load_file_records(p2p_context* ctx, const char* chat_key,
@@ -1334,7 +1354,7 @@ void p2p_app_load_file_records(p2p_context* ctx, const char* chat_key,
 {
     if (!ctx || !chat_key || !cb) return;
     P2P_CTX_GUARD(ctx);
-    ctx->appData.loadFileRecords(chat_key, [&](const AppDataStore::FileRecord& r) {
+    ctx->appData->loadFileRecords(chat_key, [&](const AppDataStore::FileRecord& r) {
         cb(r.transferId.c_str(),
            r.fileName.c_str(),
            r.fileSize,
@@ -1348,4 +1368,49 @@ void p2p_app_load_file_records(p2p_context* ctx, const char* chat_key,
            r.savedPath.c_str(),
            ud);
     });
+}
+
+// ── Stateless validators ───────────────────────────────────────────────────
+
+int p2p_is_valid_peer_id(const char* key)
+{
+    if (!key) return 0;
+    // Peer IDs are Ed25519 public keys base64url-encoded without padding:
+    // 32 bytes → exactly 43 characters from [A-Z a-z 0-9 _ -].
+    const size_t n = std::strlen(key);
+    if (n != 43) return 0;
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(key[i]);
+        const bool ok = (c >= 'A' && c <= 'Z')
+                     || (c >= 'a' && c <= 'z')
+                     || (c >= '0' && c <= '9')
+                     || c == '_' || c == '-';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+// ── Contacts import/export (JSON wire format) ─────────────────────────────
+
+int p2p_export_contacts_json(p2p_context* ctx, char** out_json)
+{
+    if (!ctx || !out_json) return -1;
+    std::string s;
+    {
+        P2P_CTX_GUARD(ctx);
+        s = ctx->appData->exportContactsJson();
+    }
+    char* buf = static_cast<char*>(std::malloc(s.size() + 1));
+    if (!buf) return -1;
+    std::memcpy(buf, s.data(), s.size());
+    buf[s.size()] = '\0';
+    *out_json = buf;
+    return 0;
+}
+
+int p2p_import_contacts_json(p2p_context* ctx, const char* json)
+{
+    if (!ctx || !json) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->importContactsJson(json);
 }

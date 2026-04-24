@@ -31,8 +31,8 @@ namespace {
 
 using p2p_test::makeTempDir;
 
-SqlCipherDb::Bytes randomKey32() {
-    SqlCipherDb::Bytes k(32);
+Bytes randomKey32() {
+    Bytes k(32);
     randombytes_buf(k.data(), k.size());
     return k;
 }
@@ -46,8 +46,8 @@ struct TestEnv {
     std::unique_ptr<AppDataStore> store;
 };
 
-TestEnv makeEnv(const SqlCipherDb::Bytes& dbKey,
-                const SqlCipherDb::Bytes& fieldKey) {
+TestEnv makeEnv(const Bytes& dbKey,
+                const Bytes& fieldKey) {
     TestEnv e;
     e.dir = makeTempDir("app-data");
     e.db  = std::make_unique<SqlCipherDb>();
@@ -192,16 +192,16 @@ TEST(AppDataStore, EncryptedFieldsAreOpaqueInRawStorage) {
     const std::string raw = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
     sqlite3_finalize(stmt);
 
-    // Arch-review #1b: new writes emit `ENC2:` (AAD-bound).  Legacy
-    // `ENC:` rows continue to decrypt but aren't written anymore.
+    // New writes emit `ENC2:` (AAD-bound).  Legacy `ENC:` rows
+    // continue to decrypt but aren't written anymore.
     EXPECT_EQ(raw.substr(0, 5), "ENC2:");
     EXPECT_EQ(raw.find("UNIQUE_SENTINEL_NAME_42"), std::string::npos);
 }
 
-// Arch-review #1b: an attacker with SQLCipher write access must not
-// be able to swap an ENC2-blob from one row/column into another.  The
-// AAD binds `<table>|<column>|<row-key>`, so a swap flips one of
-// those fields and AEAD verification fails.
+// An attacker with SQLCipher write access must not be able to swap
+// an ENC2-blob from one row/column into another.  The AAD binds
+// `<table>|<column>|<row-key>`, so a swap flips one of those fields
+// and AEAD verification fails.
 TEST(AppDataStore, RowSwapAcrossColumnsFailsAadCheck) {
     auto env = makeEnv(randomKey32(), randomKey32());
 

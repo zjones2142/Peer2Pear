@@ -1183,11 +1183,12 @@ func TestPresence_QueryRateLimitDropsAfterCap(t *testing.T) {
 }
 
 // ── 24b. presence_subscribe is rate-limited per connection ───────────
-// Audit #3 H4: previously the handler accepted unlimited subscribe
-// calls per connection, letting an authenticated peer churn the 200-id
-// watched set repeatedly to enumerate the social graph at WebSocket
-// speed.  With the cap in place, the (maxPresenceSubsPerWin+1)th call
-// in a window must be silently dropped (no presence_result reply).
+// Without the rate cap the handler would accept unlimited subscribe
+// calls per connection, letting an authenticated peer churn the
+// 200-id watched set repeatedly to enumerate the social graph at
+// WebSocket speed.  With the cap in place, the
+// (maxPresenceSubsPerWin+1)th call in a window must be silently
+// dropped (no presence_result reply).
 
 func TestPresence_SubscribeRateLimitDropsAfterCap(t *testing.T) {
 	r := newTestRelay(t)

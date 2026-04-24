@@ -100,7 +100,7 @@ RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http,
 {
     m_ws.onConnected     = [this]()                           { onWsConnected(); };
     m_ws.onDisconnected  = [this]()                           { onWsDisconnected(); };
-    m_ws.onBinaryMessage = [this](const IWebSocket::Bytes& d) { onWsBinaryMessage(d); };
+    m_ws.onBinaryMessage = [this](const Bytes& d) { onWsBinaryMessage(d); };
     m_ws.onTextMessage   = [this](const std::string& m)       { onWsTextMessage(m); };
 
     m_reconnectTimer = m_timers.create();
@@ -681,7 +681,7 @@ void RelayClient::forwardEnvelope(const std::string& viaRelay, const std::string
     // onion-wrap properly.
     emitStatus("multi-hop send deferred — entry relay X25519 pubkey not cached yet");
     P2P_WARN("[Relay] refusing /v1/forward fallback for " << baseOf(viaRelay)
-              << " — pubkey not cached (M4)");
+              << " — pubkey not cached");
     if (cb) {
         IHttpClient::Response r;
         r.status = 0;

@@ -79,9 +79,9 @@ void p2p_destroy(p2p_context* ctx);
 /* ── Identity ──────────────────────────────────────────────────────────── */
 
 /**
- * Minimum accepted passphrase length at the v2 FFI entry (M3 audit).
- * Measured in UTF-8 bytes — 8 ASCII chars minimum, or any UTF-8 string
- * whose encoded form is ≥ 8 bytes.  Platforms should enforce stronger
+ * Minimum accepted passphrase length at the v2 FFI entry.  Measured
+ * in UTF-8 bytes — 8 ASCII chars minimum, or any UTF-8 string whose
+ * encoded form is >= 8 bytes.  Platforms should enforce stronger
  * requirements in their onboarding UI (entropy, common-passwords list,
  * etc.); this is a library-side floor, not a policy.
  */
@@ -96,15 +96,15 @@ void p2p_destroy(p2p_context* ctx);
  * runs Argon2id three times (once per private key) and can't be
  * migrated to v5 identity storage.
  *
- * Memory hygiene (M2 audit): the library zeros its own copies of the
- * passphrase after using them, but the caller's `passphrase` buffer is
- * out of its control.  Zero it yourself as soon as this function
- * returns if you want the bytes gone from process memory.
+ * Memory hygiene: the library zeros its own copies of the passphrase
+ * after using them, but the caller's `passphrase` buffer is out of
+ * its control.  Zero it yourself as soon as this function returns if
+ * you want the bytes gone from process memory.
  */
 void p2p_set_passphrase(p2p_context* ctx, const char* passphrase);
 
 /**
- * Set the passphrase via the v5 unified key-derivation path (audit H4).
+ * Set the passphrase via the v5 unified key-derivation path.
  *
  * Runs Argon2id MODERATE once over (passphrase, salt) → 32-byte master
  * key, then HKDFs `identity-unlock` → 32-byte identity key and installs
@@ -117,14 +117,13 @@ void p2p_set_passphrase(p2p_context* ctx, const char* passphrase);
  * legacy function pay ~3x the Argon2 cost and are pinned to the older
  * on-disk layout.
  *
- * Memory hygiene (M2 audit): same contract as p2p_set_passphrase —
- * every intermediate copy the library makes is zeroed on return, but
- * the caller's `passphrase` buffer is not.  Wipe it yourself.
+ * Memory hygiene: same contract as p2p_set_passphrase — every
+ * intermediate copy the library makes is zeroed on return, but the
+ * caller's `passphrase` buffer is not.  Wipe it yourself.
  *
- * Strength floor (M3 audit): passphrases shorter than
- * P2P_MIN_PASSPHRASE_BYTES (8) are rejected outright.  This is a
- * defense-in-depth check — platform UIs should enforce a stronger
- * policy before calling.
+ * Strength floor: passphrases shorter than P2P_MIN_PASSPHRASE_BYTES
+ * (8) are rejected outright.  This is a defense-in-depth check —
+ * platform UIs should enforce a stronger policy before calling.
  *
  * @return 0 on success, non-zero on failure (null args, empty or too-
  *         short passphrase, p2p_create() was called without a
@@ -260,7 +259,7 @@ int p2p_send_group_text(p2p_context* ctx,
 /**
  * Send an encrypted file to every member of a group.
  * Same semantics as p2p_send_file; chunks stream to each recipient once
- * their file_accept arrives (Phase 2 consent).
+ * their file_accept arrives (consent step).
  *
  * @return Transfer ID string (valid until next call), or NULL on failure.
  */
@@ -321,13 +320,13 @@ int p2p_update_group_members(p2p_context* ctx,
  * Apps should call this on startup for every group the user is a member
  * of, using their own persisted roster.
  *
- * Without this call the core uses a cold-start bootstrap (H2 audit fix):
- * the first inbound group_msg is accepted only if the sender included
- * themselves in the message's declared member list.  sendGroupText on
- * the sender side strips self from that list (so the list reflects
- * recipients), meaning peers that don't already have a roster for this
- * group will drop subsequent control messages (rename / avatar / leave)
- * as "from non-member".
+ * Without this call the core uses a cold-start bootstrap: the first
+ * inbound group_msg is accepted only if the sender included themselves
+ * in the message's declared member list.  sendGroupText on the sender
+ * side strips self from that list (so the list reflects recipients),
+ * meaning peers that don't already have a roster for this group will
+ * drop subsequent control messages (rename / avatar / leave) as
+ * "from non-member".
  *
  * Call this once per known group after p2p_set_passphrase_v2 succeeds.
  */
@@ -355,7 +354,7 @@ const char* p2p_send_file(p2p_context* ctx,
                           const char* file_path);
 
 /**
- * Respond to a pending incoming file transfer (Phase 2 consent).
+ * Respond to a pending incoming file transfer.
  * Called from the app after the user taps Accept or Decline in response to
  * an on_file_request callback.
  *
@@ -378,7 +377,7 @@ void p2p_cancel_transfer(p2p_context* ctx, const char* transfer_id);
 /* ── File-transfer consent settings ───────────────────────────────────── */
 
 /**
- * Phase 2 consent settings. Files ≤ auto_accept_mb auto-accept.
+ * Consent settings. Files <= auto_accept_mb auto-accept.
  * Files > hard_max_mb auto-decline. Between the two prompts the user.
  * If require_p2p is true, file_accept responses tell the sender to abort
  * unless a direct P2P connection is available.
@@ -537,7 +536,7 @@ void p2p_set_on_avatar(p2p_context* ctx,
     void* ud);
 
 /**
- * Phase 2: an incoming file transfer needs the user's consent.
+ * An incoming file transfer needs the user's consent.
  * The app should display a prompt with sender + filename + size and then
  * call p2p_respond_file_request() with the user's choice.
  */
@@ -550,7 +549,7 @@ void p2p_set_on_file_request(p2p_context* ctx,
     void* ud);
 
 /**
- * Phase 2: a transfer was canceled, declined, or abandoned.
+ * A transfer was canceled, declined, or abandoned.
  * by_receiver == 1 → receiver declined or canceled
  * by_receiver == 0 → sender canceled or the outbound-pending timer expired
  */
@@ -559,14 +558,14 @@ void p2p_set_on_file_canceled(p2p_context* ctx,
     void* ud);
 
 /**
- * Phase 3: sender-side — receiver confirmed the full file landed + hash ok.
+ * Sender-side — receiver confirmed the full file landed + hash ok.
  */
 void p2p_set_on_file_delivered(p2p_context* ctx,
     void (*cb)(const char* transfer_id, void* ud),
     void* ud);
 
 /**
- * Phase 3: transport policy blocked the transfer (P2P required, P2P failed).
+ * Transport policy blocked the transfer (P2P required, P2P failed).
  * by_receiver == 1 → recipient's requireP2P refused relay fallback
  * by_receiver == 0 → our own require_p2p setting refused relay fallback
  */
@@ -706,6 +705,38 @@ typedef void (*p2p_file_record_cb)(const char* transfer_id,
                                     void* ud);
 void p2p_app_load_file_records(p2p_context* ctx, const char* chat_key,
                                 p2p_file_record_cb cb, void* ud);
+
+/* ── Stateless validators ───────────────────────────────────────────────
+ *
+ * Pure helpers exposed so desktop + iOS share one implementation of
+ * format checks that were previously hand-rolled in each UI.  No
+ * p2p_context required — safe to call from any thread at any time.
+ */
+
+/** Returns 1 when `key` is a 43-character base64url string (the exact
+ *  shape of a Peer2Pear peer ID — Ed25519 public key, no padding), 0
+ *  otherwise.  Accepts A-Z, a-z, 0-9, '_', '-'.  NULL or wrong length
+ *  rejects. */
+int p2p_is_valid_peer_id(const char* key);
+
+/* ── Contacts import/export (JSON wire format) ─────────────────────────
+ *
+ * Desktop and iOS used to ship parallel JSON serializers that silently
+ * drifted.  These two functions own the wire format — schema is:
+ *   { "version": 1, "contacts": [ { "name": "...", "keys": [...] }, ... ] }
+ */
+
+/** Serialize the address book to the v1 JSON format.  Writes a
+ *  heap-allocated NUL-terminated UTF-8 string into *out_json; caller
+ *  must free() it.  Returns 0 on success, -1 on error.  Blocked
+ *  contacts are skipped. */
+int p2p_export_contacts_json(p2p_context* ctx, char** out_json);
+
+/** Merge contacts from a v1 JSON string into the local AppDataStore.
+ *  Existing rows (keyed by peer ID, or by "name:<name>" for unnamed
+ *  group rows) are left untouched — the import never overwrites.
+ *  Returns the number of rows inserted, or -1 on parse error. */
+int p2p_import_contacts_json(p2p_context* ctx, const char* json);
 
 #ifdef __cplusplus
 }

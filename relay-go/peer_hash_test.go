@@ -1,11 +1,11 @@
-// peer_hash_test.go — opacity tests for arch-review #8.
+// peer_hash_test.go — opacity tests for peer-ID hashing.
 //
 // The production invariant: a snapshot of the relay's SQLite file
-// must not reveal which peer IDs have used this relay.  Before #8,
-// `envelopes.recipient_id`, `push_tokens.peer_id`, and
-// `seen_auth_nonces.key` all held raw base64url peer IDs.  After
-// #8, each row keys off HMAC-SHA256(relayKey, peerID)[:16] — a
-// snapshot alone is opaque without the onion private key.
+// must not reveal which peer IDs have used this relay.  The three
+// writer columns (`envelopes.recipient_id`, `push_tokens.peer_id`,
+// and `seen_auth_nonces.key`) all key off
+// HMAC-SHA256(relayKey, peerID)[:16], so a snapshot alone is opaque
+// without the onion private key.
 //
 // These tests drive the three writers (Mailbox.Store,
 // PushStore.Upsert, Mailbox.RegisterAuthNonce), then drop down to

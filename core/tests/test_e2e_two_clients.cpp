@@ -19,6 +19,7 @@
 // regression in any of the underlying modules is most likely to show up
 // as the user-visible failure "the message didn't arrive."
 
+#include "types.hpp"
 #include "ChatController.hpp"
 #include "CryptoEngine.hpp"
 #include "IHttpClient.hpp"
@@ -42,7 +43,6 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using Bytes = std::vector<uint8_t>;
 
 namespace {
 
@@ -287,7 +287,7 @@ protected:
         // per-test — we don't care about persistence semantics here).
         p.dbPath = makeTempPath(("p2p-e2e-db-" + tag).c_str(), ".db");
         p.db     = std::make_unique<SqlCipherDb>();
-        SqlCipherDb::Bytes dbKey(32);
+        Bytes dbKey(32);
         randombytes_buf(dbKey.data(), dbKey.size());
         ASSERT_TRUE(p.db->open(p.dbPath, dbKey)) << p.db->lastError();
         p.ctrl->setDatabase(*p.db);

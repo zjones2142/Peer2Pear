@@ -18,6 +18,7 @@
 // The single test enables cover traffic, fires the timer with zero
 // known peers, and asserts the captured envelope is self-addressed.
 
+#include "types.hpp"
 #include "RelayClient.hpp"
 #include "CryptoEngine.hpp"
 #include "IHttpClient.hpp"
@@ -40,7 +41,6 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using Bytes = std::vector<uint8_t>;
 
 namespace {
 
@@ -342,7 +342,7 @@ TEST(RelayUrlScheme, RejectsNonTlsUrls) {
     }
 }
 
-// Audit #3 test gap: push token registration E2E.  A call to
+// Push token registration E2E.  A call to
 // RelayClient::registerPushToken on a connected relay must produce
 // exactly one push_register text frame with the right shape.  An
 // unconnected client should cache the token and replay it on the

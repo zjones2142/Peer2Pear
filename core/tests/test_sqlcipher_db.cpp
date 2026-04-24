@@ -47,8 +47,8 @@ std::string makeTempDbPath(const char* tag) {
     return p.string();
 }
 
-SqlCipherDb::Bytes randomKey32() {
-    SqlCipherDb::Bytes k(32);
+Bytes randomKey32() {
+    Bytes k(32);
     randombytes_buf(k.data(), k.size());
     return k;
 }
@@ -99,7 +99,7 @@ TEST(SqlCipherDb, LinkedBuildIsSqlCipher) {
 
 TEST(SqlCipherDb, EncryptedRoundTripWithCorrectKey) {
     const std::string path = makeTempDbPath("sqlcipher-roundtrip");
-    const SqlCipherDb::Bytes key = randomKey32();
+    const Bytes key = randomKey32();
     const std::string canary = "hello from the encrypted side";
 
     {
@@ -126,8 +126,8 @@ TEST(SqlCipherDb, EncryptedRoundTripWithCorrectKey) {
 
 TEST(SqlCipherDb, WrongKeyIsRejected) {
     const std::string path = makeTempDbPath("sqlcipher-wrongkey");
-    const SqlCipherDb::Bytes keyA = randomKey32();
-    SqlCipherDb::Bytes keyB = randomKey32();
+    const Bytes keyA = randomKey32();
+    Bytes keyB = randomKey32();
     // Belt-and-suspenders: make sure keyB isn't coincidentally equal to keyA.
     if (keyA == keyB) keyB[0] ^= 0xFF;
 
@@ -183,7 +183,7 @@ TEST(SqlCipherDb, EmptyKeyIsRejectedWhenRequired) {
 
 TEST(SqlCipherDb, MultiPageRoundTrip) {
     const std::string path = makeTempDbPath("sqlcipher-multipage");
-    const SqlCipherDb::Bytes key = randomKey32();
+    const Bytes key = randomKey32();
     constexpr int kRows = 400;              // ~400 * 200 B ≈ 80 KB → ~20 pages
     const std::string pad(200, 'x');
 
@@ -227,14 +227,14 @@ TEST(SqlCipherDb, MultiPageRoundTrip) {
 
 TEST(SqlCipherDb, BlobWithEmbeddedNulsRoundTrips) {
     const std::string path = makeTempDbPath("sqlcipher-nulblob");
-    const SqlCipherDb::Bytes key = randomKey32();
+    const Bytes key = randomKey32();
     SqlCipherDb db;
     ASSERT_TRUE(db.open(path, key)) << db.lastError();
 
     SqlCipherQuery c(db);
     ASSERT_TRUE(c.exec("CREATE TABLE b (data BLOB);")) << c.lastError();
 
-    const SqlCipherQuery::Bytes blob = {
+    const Bytes blob = {
         0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0x7F, 0x00, 0xAB
     };
 
@@ -259,7 +259,7 @@ TEST(SqlCipherDb, BlobWithEmbeddedNulsRoundTrips) {
 
 TEST(SqlCipherDb, IsNullReportsNullColumn) {
     const std::string path = makeTempDbPath("sqlcipher-null");
-    const SqlCipherDb::Bytes key = randomKey32();
+    const Bytes key = randomKey32();
     SqlCipherDb db;
     ASSERT_TRUE(db.open(path, key)) << db.lastError();
 
@@ -290,7 +290,7 @@ TEST(SqlCipherDb, IsNullReportsNullColumn) {
 
 TEST(SqlCipherDb, BadSqlPopulatesLastError) {
     const std::string path = makeTempDbPath("sqlcipher-badsql");
-    const SqlCipherDb::Bytes key = randomKey32();
+    const Bytes key = randomKey32();
     SqlCipherDb db;
     ASSERT_TRUE(db.open(path, key)) << db.lastError();
 
@@ -316,7 +316,7 @@ TEST(SqlCipherDb, BadSqlPopulatesLastError) {
 
 TEST(SqlCipherDb, PreparedStatementBindAndRead) {
     const std::string path = makeTempDbPath("sqlcipher-prep");
-    const SqlCipherDb::Bytes key = randomKey32();
+    const Bytes key = randomKey32();
     SqlCipherDb db;
     ASSERT_TRUE(db.open(path, key)) << db.lastError();
 
@@ -329,7 +329,7 @@ TEST(SqlCipherDb, PreparedStatementBindAndRead) {
     ASSERT_TRUE(ins.prepare("INSERT INTO t (i, s, b) VALUES (:i, :s, :b);"));
     ins.bindValue(":i", int64_t(42));
     ins.bindValue(":s", std::string("forty-two"));
-    const SqlCipherQuery::Bytes blob = {0xDE, 0xAD, 0xBE, 0xEF};
+    const Bytes blob = {0xDE, 0xAD, 0xBE, 0xEF};
     ins.bindValue(":b", blob);
     ASSERT_TRUE(ins.exec()) << ins.lastError();
 

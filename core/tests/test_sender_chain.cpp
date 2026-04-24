@@ -32,7 +32,7 @@
 
 namespace {
 
-using Bytes = SenderChain::Bytes;
+using Bytes = Bytes;
 
 // Helper: two chains share deterministic output if given the same seed.
 // Returns the key at idx from a fresh inbound chain rooted at `seed`.
@@ -225,12 +225,12 @@ TEST(SenderChain, CacheNeverExceedsMaxSkippedViaSuccessiveCalls) {
     EXPECT_EQ(c.messageKeyFor(1).size(), 32U);  // next-oldest still cached
 }
 
-// Audit #3 M3: forgetSeed() drops the ability to re-derive message
-// keys from idx 0 without breaking ongoing decryption.  The chain
-// remains valid (isValid() still true) and messageKeyFor continues
-// to work for forward messages — only the seed fan-out material is
-// gone.  A serialize+deserialize round-trip preserves the forgotten
-// state so a restart doesn't resurrect the seed.
+// forgetSeed() drops the ability to re-derive message keys from
+// idx 0 without breaking ongoing decryption.  The chain remains
+// valid (isValid() still true) and messageKeyFor continues to work
+// for forward messages — only the seed fan-out material is gone.
+// A serialize+deserialize round-trip preserves the forgotten state
+// so a restart doesn't resurrect the seed.
 TEST(SenderChain, ForgetSeedRetainsDecryptButDropsSeedAccess) {
     SenderChain c = SenderChain::fromSeed(Bytes(32, 0x55));
     const Bytes seedBefore = c.seed();
@@ -270,10 +270,10 @@ TEST(SenderChain, ForgetSeedIdempotent) {
     EXPECT_TRUE(c.isValid());
 }
 
-// Audit #3 H3: explicit single-index erase (caller-driven forward
-// secrecy).  GroupProtocol calls this after a successful AEAD verify
-// at idx so the message key for an already-delivered envelope can't
-// be recovered from a later in-memory or on-disk compromise.
+// Explicit single-index erase (caller-driven forward secrecy).
+// GroupProtocol calls this after a successful AEAD verify at idx so
+// the message key for an already-delivered envelope can't be
+// recovered from a later in-memory or on-disk compromise.
 TEST(SenderChain, EraseSkippedRemovesOnlyTheNamedIdx) {
     SenderChain c = SenderChain::fromSeed(Bytes(32, 0x77));
     // messageKeyFor(5) caches 0..5 then advances chain to nextIdx=6.

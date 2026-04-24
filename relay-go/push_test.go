@@ -27,8 +27,8 @@ func newTestPushStore(t *testing.T) *PushStore {
 	}
 	t.Cleanup(func() { m.Close() })
 	// Deterministic per-test key — production derives this from the
-	// relay's persistent X25519 priv via HKDF (Audit #3 C2).  Tests
-	// don't need real key isolation, just a valid 32-byte key so
+	// relay's persistent X25519 priv via HKDF.  Tests don't need real
+	// key isolation, just a valid 32-byte key so
 	// chacha20poly1305.NewX accepts it.
 	key := make([]byte, 32)
 	for i := range key {
@@ -154,11 +154,11 @@ func TestPushStore_RejectsEmptyInputs(t *testing.T) {
 	}
 }
 
-// Audit #3 C2: tokens MUST be sealed with XChaCha20-Poly1305 before
-// they touch SQLite.  Read the raw token column out from under the
-// store and assert (a) it carries the v1: prefix and (b) the cleartext
-// token doesn't appear anywhere in the stored bytes.  A regression
-// that reverted Upsert to plaintext would trip this test immediately.
+// Tokens MUST be sealed with XChaCha20-Poly1305 before they touch
+// SQLite.  Read the raw token column out from under the store and
+// assert (a) it carries the v1: prefix and (b) the cleartext token
+// doesn't appear anywhere in the stored bytes.  A regression that
+// reverted Upsert to plaintext would trip this test immediately.
 func TestPushStore_TokensEncryptedAtRest(t *testing.T) {
 	s := newTestPushStore(t)
 	const plain = "apns-token-deadbeefcafef00d"
@@ -192,7 +192,7 @@ func TestPushStore_TokensEncryptedAtRest(t *testing.T) {
 // hostile relay operator copies the encrypted token from alice/ios into
 // bob/ios, the AEAD tag verification must fail — otherwise we'd be
 // vulnerable to row-swap attacks even with encryption on.  Models the
-// "DBA can edit SQLite directly" threat that motivated C2.
+// "DBA can edit SQLite directly" threat.
 func TestPushStore_RejectsRowSwap(t *testing.T) {
 	s := newTestPushStore(t)
 	if err := s.Upsert("alice", "ios", "alice-token"); err != nil {
@@ -223,7 +223,7 @@ func TestPushStore_RejectsRowSwap(t *testing.T) {
 
 // NewPushStore must reject keys of the wrong size — fail-closed
 // behaviour so a misconfigured caller can't silently disable the
-// encryption Audit #3 C2 added.
+// at-rest token encryption.
 func TestNewPushStore_RejectsBadKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "push.db")
 	m, _ := NewMailbox(path)

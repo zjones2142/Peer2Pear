@@ -118,7 +118,7 @@ bool migratePlaintextDbToSqlCipher(const QString &dbPath, const QByteArray &dbKe
     }
 
     SqlCipherDb encDb;
-    AppDataStore::Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
+    Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
                                     reinterpret_cast<const uint8_t*>(dbKey.constData()) + dbKey.size());
     if (!encDb.open(encPath.toStdString(), dbKeyBytes)) {
         qWarning() << "Migration: failed to create encrypted DB";
@@ -189,7 +189,7 @@ bool openAppDataDb(SqlCipherDb &db, const QByteArray &dbKey)
         if (marker.open(QIODevice::WriteOnly)) marker.close();
     }
 
-    AppDataStore::Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
+    Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
                                     reinterpret_cast<const uint8_t*>(dbKey.constData()) + dbKey.size());
     return db.open(dbPath.toStdString(), dbKeyBytes);
 }
@@ -357,8 +357,8 @@ MainWindow::MainWindow(QWidget *parent)
                 bytesConcat(m_controller.myIdB64u(), "peer2pear-dbkey")));
             QByteArray legacyGen2 = p2p::bridge::toQByteArray(ChatController::blake2b256(
                 bytesConcat(pass.toStdString(), "peer2pear-dbkey")));
-            auto qbaToBytes = [](const QByteArray& b) -> AppDataStore::Bytes {
-                return AppDataStore::Bytes(
+            auto qbaToBytes = [](const QByteArray& b) -> Bytes {
+                return Bytes(
                     reinterpret_cast<const uint8_t*>(b.constData()),
                     reinterpret_cast<const uint8_t*>(b.constData()) + b.size());
             };
@@ -600,7 +600,7 @@ MainWindow::MainWindow(QWidget *parent)
     m_notifier->setEnabled(m_settingsPanel->notificationsEnabled());
     m_notifier->setContentMode(m_settingsPanel->notificationMode());
 
-    // Phase 2: file transfer consent settings → ChatController
+    // File transfer consent settings → ChatController
     // ChatController isn't a QObject anymore, so route the SettingsPanel
     // signals through small lambdas that invoke the regular methods.
     connect(m_settingsPanel, &SettingsPanel::fileAutoAcceptMaxChanged,
@@ -647,7 +647,7 @@ MainWindow::MainWindow(QWidget *parent)
         if (m_chatView) m_chatView->refreshAfterKeyChange();
     };
 
-    // Phase 2: file accept/decline prompt + cancel notifications → ChatView
+    // File accept/decline prompt + cancel notifications → ChatView
     m_controller.onFileAcceptRequested =
         [cv = m_chatView, toQ](const std::string& from, const std::string& tid,
                                 const std::string& fn, int64_t size) {
@@ -658,7 +658,7 @@ MainWindow::MainWindow(QWidget *parent)
             cv->onFileTransferCanceled(toQ(tid), byReceiver);
         };
 
-    // Phase 3: delivery confirmation + transport-policy block
+    // Delivery confirmation + transport-policy block
     m_controller.onFileTransferDelivered =
         [cv = m_chatView, toQ](const std::string& tid) {
             cv->onFileTransferDelivered(toQ(tid));
@@ -703,23 +703,7 @@ void MainWindow::onExportContacts()
         "JSON Files (*.json)");
     if (path.isEmpty()) return;
 
-    std::vector<AppDataStore::Contact> contacts;
-    m_store.loadAllContacts([&contacts](const AppDataStore::Contact &c) {
-        contacts.push_back(c);
-    });
-
-    QJsonArray arr;
-    for (const auto &c : contacts) {
-        if (c.isBlocked) continue; // never export blocked contacts
-        QJsonObject obj;
-        obj["name"] = qtbridge::qstr(c.name);
-        obj["keys"] = QJsonArray::fromStringList(qtbridge::qstrList(c.keys));
-        arr.append(obj);
-    }
-
-    QJsonObject root;
-    root["version"]  = 1;
-    root["contacts"] = arr;
+    const std::string json = m_store.exportContactsJson();
 
     QFile file(path);
     if (!file.open(QIODevice::WriteOnly)) {
@@ -727,11 +711,10 @@ void MainWindow::onExportContacts()
                              "Could not write to:\n" + path);
         return;
     }
-    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    file.write(QByteArray::fromStdString(json));
     file.close();
 
-    QMessageBox::information(this, "Export Complete",
-                             QString("Exported %1 contact(s).").arg(arr.size()));
+    QMessageBox::information(this, "Export Complete", "Contacts exported.");
 }
 
 void MainWindow::onImportContacts()
@@ -747,68 +730,14 @@ void MainWindow::onImportContacts()
                              "Could not read:\n" + path);
         return;
     }
-
-    QJsonParseError err;
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+    const QByteArray bytes = file.readAll();
     file.close();
 
-    if (doc.isNull()) {
-        QMessageBox::warning(this, "Import Failed",
-                             "Invalid JSON:\n" + err.errorString());
+    const int imported = m_store.importContactsJson(
+        std::string(bytes.constData(), static_cast<size_t>(bytes.size())));
+    if (imported < 0) {
+        QMessageBox::warning(this, "Import Failed", "Invalid JSON.");
         return;
-    }
-
-    const QJsonObject root = doc.object();
-    const QJsonArray  arr  = root["contacts"].toArray();
-    if (arr.isEmpty()) {
-        QMessageBox::information(this, "Import", "No contacts found in file.");
-        return;
-    }
-
-    // Build a set of existing contact identifiers so we never overwrite them.
-    // Contacts with a real peer ID use that; name-only contacts use "name:<name>".
-    QSet<QString> existingIds;
-    m_store.loadAllContacts([&existingIds](const AppDataStore::Contact &e) {
-        if (!e.peerIdB64u.empty())
-            existingIds.insert(qtbridge::qstr(e.peerIdB64u));
-        else if (!e.name.empty())
-            existingIds.insert(QLatin1String("name:") + qtbridge::qstr(e.name));
-    });
-
-    int imported = 0;
-    for (const QJsonValue &v : arr) {
-        const QJsonObject obj = v.toObject();
-
-        AppDataStore::Contact chat;
-        chat.name = obj["name"].toString().trimmed().toStdString();
-        const QJsonArray keysArr = obj["keys"].toArray();
-        for (const QJsonValue &k : keysArr)
-            chat.keys.push_back(k.toString().toStdString());
-
-        // Derive peerIdB64u from the first key when available.
-        // In this app the first public key doubles as the peer identifier.
-        if (!chat.keys.empty())
-            chat.peerIdB64u = chat.keys.front();
-
-        // Skip entries with no name and no keys
-        if (chat.name.empty() && chat.keys.empty())
-            continue;
-
-        // Determine the effective storage key — for unnamed groups
-        // we fall back to "name:Foo" so the row has SOMETHING to key
-        // off; named contacts always use peerIdB64u.
-        const QString effectiveKey = chat.peerIdB64u.empty()
-            ? QLatin1String("name:") + qtbridge::qstr(chat.name)
-            : qtbridge::qstr(chat.peerIdB64u);
-
-        // Skip if the contact already exists — never overwrite
-        if (existingIds.contains(effectiveKey))
-            continue;
-
-        chat.subtitle = "Secure chat";
-        m_store.saveContact(chat);
-        existingIds.insert(effectiveKey); // prevent duplicates within the file
-        ++imported;
     }
 
     // Reload the chat list so newly imported contacts appear

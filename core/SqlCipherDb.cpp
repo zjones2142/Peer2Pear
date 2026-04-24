@@ -283,7 +283,7 @@ double SqlCipherQuery::valueDouble(int column) const
     return m_stmt ? sqlite3_column_double(m_stmt, column) : 0.0;
 }
 
-SqlCipherQuery::Bytes SqlCipherQuery::valueBlob(int column) const
+Bytes SqlCipherQuery::valueBlob(int column) const
 {
     if (!m_stmt) return {};
     const void* data = sqlite3_column_blob(m_stmt, column);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -31,7 +33,6 @@
  * for byte blobs.
  */
 
-using Bytes = std::vector<uint8_t>;
 
 class SessionManager {
 public:

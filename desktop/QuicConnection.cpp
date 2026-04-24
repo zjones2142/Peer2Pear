@@ -113,7 +113,7 @@ uint16_t findEphemeralUdpPort() {
 }
 
 // Replaces QByteArray::startsWith for Bytes.
-inline bool bytesStartsWith(const QuicConnection::Bytes& data, const char* prefix) {
+inline bool bytesStartsWith(const Bytes& data, const char* prefix) {
     const size_t n = std::strlen(prefix);
     if (data.size() < n) return false;
     return std::memcmp(data.data(), prefix, n) == 0;
