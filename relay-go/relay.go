@@ -63,6 +63,16 @@ const (
 	presenceQueryWindow     = 60 // seconds
 	maxPresenceQueriesPerWin = 60
 
+	// Per-connection presence_subscribe rate limit (Audit #3 H4).  The
+	// subscription-size cap (maxPresenceSubs = 200) bounds the watched
+	// set per call; the per-call frequency cap below prevents an
+	// authenticated peer from churning the watched set ("subscribe 200
+	// IDs, replace, repeat") to enumerate the social graph at WebSocket
+	// speed.  6/min ≈ one every 10 s — comfortable for legitimate
+	// contact-list edits, hostile to enumeration.
+	presenceSubWindow         = 60 // seconds
+	maxPresenceSubsPerWin     = 6
+
 	// Global max envelopes stored in mailbox.
 	maxGlobalEnvelopes = 500_000
 
@@ -83,19 +93,38 @@ type ipRateEntry struct {
 type rateLimiter struct {
 	mu      sync.Mutex
 	entries map[string]*ipRateEntry
+	// Audit #3 L5: signal channel so the background purge goroutine
+	// terminates when the Hub shuts down.  Without this the goroutine
+	// outlives the test fixture and accumulates across the suite.
+	stop chan struct{}
 }
 
 func newRateLimiter() *rateLimiter {
-	rl := &rateLimiter{entries: make(map[string]*ipRateEntry)}
-	// Purge stale entries every 5 minutes
+	rl := &rateLimiter{
+		entries: make(map[string]*ipRateEntry),
+		stop:    make(chan struct{}),
+	}
+	// Purge stale entries every 5 minutes; exit on stop.
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			rl.purge()
+		for {
+			select {
+			case <-ticker.C:
+				rl.purge()
+			case <-rl.stop:
+				return
+			}
 		}
 	}()
 	return rl
+}
+
+// Stop signals the purge goroutine to exit.  Safe to call once;
+// subsequent calls panic on the closed channel, matching the rest of
+// the relay's "lifecycle objects close exactly once" convention.
+func (rl *rateLimiter) Stop() {
+	close(rl.stop)
 }
 
 // allow returns true if the IP is within its rate limit.
@@ -145,6 +174,11 @@ type Peer struct {
 	// silently.
 	presenceQueryCount   int
 	presenceQueryResetAt int64 // unix seconds
+
+	// Per-connection presence_subscribe rate limit.  Same shape as the
+	// query counter above — see Audit #3 H4 / `maxPresenceSubsPerWin`.
+	presenceSubCount   int
+	presenceSubResetAt int64 // unix seconds
 }
 
 // ── Hub: manages all connected peers ─────────────────────────────────────────
@@ -167,6 +201,18 @@ type Hub struct {
 	relayX25519Pub  *[32]byte
 	relayX25519Priv *[32]byte
 
+	// Mobile push-notification integration.  Tokens are stored per
+	// (peer_id, platform) and consulted when an envelope lands for
+	// an offline recipient — the sender stub logs today; swapping in
+	// a real APNs client is a one-file change.
+	push       *PushStore
+	pushSender *PushSender
+
+	// Audit #3 L5: signal channel that terminates the auth-nonce purge
+	// goroutine when the Hub shuts down.  Closed exactly once by
+	// CloseAll.  rateLimiter has its own equivalent.
+	stopAuthPurge chan struct{}
+
 	upgrader websocket.Upgrader
 }
 
@@ -183,18 +229,62 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 			WriteBufferSize: maxEnvelopeBytes,
 			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
+		pushSender:    NewPushSender(false), // stub until APNs key configured
+		stopAuthPurge: make(chan struct{}),
 	}
+	// PushStore is intentionally NOT initialised here — it needs the
+	// AEAD key derived from the relay's persistent X25519 private key
+	// for at-rest token encryption (Audit #3 C2), and that key is
+	// loaded after NewHub returns.  Caller must invoke InitPush(priv)
+	// once the relay key is available; until then h.push stays nil
+	// and push registration is silently dropped (NotifyOffline is a
+	// no-op without h.push, which is acceptable for the brief window
+	// before main wires it up).
 	// Periodically purge expired auth nonces from the persistent table.
 	// RegisterAuthNonce() also cleans up opportunistically; this just
-	// bounds table size in steady state.
+	// bounds table size in steady state.  Exits on stop so the goroutine
+	// doesn't outlive the Hub (Audit #3 L5).  Capture the channel
+	// locally — CloseAll mutates h.stopAuthPurge and the goroutine must
+	// not read that field concurrently.
+	stop := h.stopAuthPurge
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			mbox.PurgeExpiredAuthNonces()
+		for {
+			select {
+			case <-ticker.C:
+				mbox.PurgeExpiredAuthNonces()
+			case <-stop:
+				return
+			}
 		}
 	}()
 	return h
+}
+
+// InitPush wires up the at-rest-encrypted push token store using the
+// relay's persistent X25519 private key as HKDF input.  Idempotent —
+// safe to call multiple times if the relay key is rotated.  Also
+// installs the global peer-ID hasher (Arch-review #8) so subsequent
+// Mailbox / PushStore writes land with HMAC-hashed row keys rather
+// than raw base64url peer IDs.
+func (h *Hub) InitPush(relayPriv *[32]byte) {
+	if h.mbox == nil || h.mbox.db == nil || relayPriv == nil {
+		return
+	}
+	// Install the hasher first so the PushStore's CREATE TABLE path
+	// doesn't transiently write raw peer IDs — the table itself is
+	// schema-only, but any migration logic that runs under NewPushStore
+	// already sees the hashed form.
+	setGlobalPeerHasher(derivePeerHasher(relayPriv))
+
+	key := derivePushTokenKey(relayPriv)
+	store, err := NewPushStore(h.mbox.db, key)
+	if err != nil {
+		log.Printf("push: failed to init store: %v (push disabled)", err)
+		return
+	}
+	h.push = store
 }
 
 func (h *Hub) CloseAll() {
@@ -206,6 +296,25 @@ func (h *Hub) CloseAll() {
 	}
 	h.peers = make(map[string]*Peer)
 	h.subs = make(map[string]map[string]bool)
+
+	// Audit #3 L5: terminate the background purge goroutines so Hub
+	// shutdown actually releases all worker resources (matters for the
+	// test fixture, which spins up a fresh Hub per case).  Don't nil
+	// the limiters — late HTTP handlers from a not-yet-closed listener
+	// still call allow().  The stop channels only end the purger; the
+	// allow() path is unaffected.
+	if h.rl != nil {
+		h.rl.Stop()
+	}
+	if h.rlRecip != nil {
+		h.rlRecip.Stop()
+	}
+	if h.stopAuthPurge != nil {
+		// The goroutine captured the channel locally at startup, so
+		// closing here signals it to exit without racing on the field.
+		close(h.stopAuthPurge)
+		h.stopAuthPurge = nil
+	}
 }
 
 // register adds a peer to the hub, closing any existing connection for the same ID.
@@ -273,8 +382,19 @@ func (h *Hub) deliverOrStore(recipientID string, envelope []byte) (delivered boo
 		}
 	}
 
-	// Offline or buffer full — store in mailbox
-	return false, h.mbox.Store(recipientID, envelope)
+	// Offline or buffer full — store in mailbox + wake the peer's
+	// device via push.  Push is best-effort and cooldown-gated
+	// inside PushSender so a burst of queued envelopes fires only
+	// one wake-up, not one per envelope.
+	if err := h.mbox.Store(recipientID, envelope); err != nil {
+		return false, err
+	}
+	if h.push != nil && h.pushSender != nil {
+		if records, perr := h.push.GetForPeer(recipientID); perr == nil {
+			h.pushSender.NotifyOffline(recipientID, records)
+		}
+	}
+	return false, nil
 }
 
 // notifyPresence pushes online/offline events to subscribers.
@@ -591,9 +711,32 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 				"type":  "presence_result",
 				"peers": results,
 			})
-			peer.Send <- resp
+			// Non-blocking send (Audit #3 M8): a slow consumer must not
+			// stall the read goroutine.  Buffer-full → drop the reply;
+			// the client can re-query.
+			select {
+			case peer.Send <- resp:
+			default:
+			}
 
 		case "presence_subscribe":
+			// Cap subscribe frequency per connection (Audit #3 H4).
+			// Without this, an authenticated peer could replace the
+			// 200-id watched set repeatedly to enumerate the social
+			// graph at WebSocket speed.
+			now := time.Now().Unix()
+			if now >= peer.presenceSubResetAt {
+				peer.presenceSubCount = 0
+				peer.presenceSubResetAt = now + presenceSubWindow
+			}
+			peer.presenceSubCount++
+			if peer.presenceSubCount > maxPresenceSubsPerWin {
+				if peer.presenceSubCount == maxPresenceSubsPerWin+1 {
+					log.Printf("presence subscribe rate limit hit for %s…",
+						truncID(peer.ID))
+				}
+				continue
+			}
 			peerIDs := toStringSlice(msg["peer_ids"])
 			// Cap subscription size to prevent social graph enumeration.
 			if len(peerIDs) > maxPresenceSubs {
@@ -618,11 +761,36 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 				"type":  "presence_result",
 				"peers": results,
 			})
-			peer.Send <- resp
+			select {
+			case peer.Send <- resp:
+			default:
+			}
 
 		case "ping":
 			resp, _ := json.Marshal(map[string]string{"type": "pong"})
-			peer.Send <- resp
+			select {
+			case peer.Send <- resp:
+			default:
+			}
+
+		case "push_register":
+			// Mobile client tells us "wake me via this APNs/FCM token
+			// when envelopes land while I'm offline."  Authenticated
+			// WS already identifies peer.ID, so we just upsert
+			// (peer.ID, platform, token).  An empty token acts as
+			// unregister.
+			if h.push == nil {
+				continue
+			}
+			platform, _ := msg["platform"].(string)
+			token, _ := msg["token"].(string)
+			if platform == "" {
+				continue
+			}
+			if err := h.push.Upsert(peer.ID, platform, token); err != nil {
+				log.Printf("push: upsert failed for %s…: %v",
+					truncID(peer.ID), err)
+			}
 		}
 	}
 }

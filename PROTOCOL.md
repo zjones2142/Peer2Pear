@@ -222,6 +222,21 @@ A conforming relay MUST expose these endpoints over HTTPS:
 
 No other endpoints are defined at the protocol level.
 
+Operator configuration (environment variables; not part of the wire
+protocol but required for a conforming deployment):
+
+| Variable | Purpose |
+|---|---|
+| `RELAY_KEY_PATH` | File path for the persistent X25519 onion keypair. |
+| `RELAY_KEY_KEK` | Base64url 32-byte key that wraps the on-disk onion private key (audit #3 C3).  Without this the key is persisted in plaintext with file-perm 0o600 only; a container / shared-host deploy SHOULD set this. |
+| `RELAY_KEY_KEK_FILE` | Alternative to `RELAY_KEY_KEK`: path to a file containing the raw 32-byte KEK. |
+| `DB_PATH` | SQLite file for mailbox + push-token storage. |
+| `RELAY_DB_KEY` | Base64url 32-byte SQLCipher page key (arch-review #8).  When set, the mailbox SQLite file is encrypted at rest — timing metadata, schema, and HMAC-hashed peer routing keys are all opaque to anyone with filesystem access.  When unset, the file stays plaintext SQLite (current default), but peer IDs in routing columns are still HMAC-hashed via HKDF from the onion priv so a snapshot alone can't reveal the social graph.  Peer ID HMAC + SQLCipher compose (both layers apply when both are configured). |
+| `RELAY_DB_KEY_FILE` | Alternative to `RELAY_DB_KEY`: path to a file containing the raw 32-byte SQLCipher key. |
+| `PORT` | TCP port to listen on (default 8443). |
+| `TLS_CERT`, `TLS_KEY` | PEM cert + key for native TLS termination. |
+| `TRUST_PROXY` | When set, trust `X-Forwarded-For` for rate-limit bucketing. |
+
 ### 4.2 POST /v1/send
 
 Request body: raw routing envelope bytes (see §3.1).
@@ -299,8 +314,11 @@ Note the two shapes: `presence_result` is the aggregated reply to a
 query, `presence` is an individual push notification.  Subscription
 sizes are capped at 200 peer IDs per connection (audit H4).
 
-No other client-originated frames are defined. Servers MUST reject
-unknown `type`s or garbage frames.
+No other client-originated frames are defined.  Servers MUST NOT
+act on unknown `type`s or garbage frames: silently dropping the frame
+is conforming; closing the connection or replying with an error is
+not required.  Clients MUST be prepared to receive no response to
+an unknown frame they sent.
 
 ### 4.4 POST /v1/forward
 
@@ -429,6 +447,19 @@ envelopes:
   unseal at the receiver and be dropped)
 - SHOULD follow bursty timing (not uniform intervals) to mimic real
   conversation patterns
+- SHOULD distribute cover envelopes across **all three padding buckets**
+  (§3.1.1), not only the small or only the large bucket.  A cover
+  generator that only ever hits one bucket leaks a fingerprint: the
+  relay can identify users whose real-traffic bucket histogram differs
+  from the cover distribution.  Reference distributions that the
+  Peer2Pear clients implement:
+  - Bandwidth-biased mode (privacy level 1 default): 60 % small / 30 %
+    medium / 10 % large.  Covers every bucket but keeps average cover
+    packet size close to typical user traffic.
+  - Uniform mode (privacy level 2 default): 1/3 / 1/3 / 1/3 across the
+    buckets.  Every user's observed cover-bucket histogram is
+    identical regardless of their real sends; costs roughly 3× the
+    bandwidth of biased mode.
 
 ### 5.4 Onion routing
 
@@ -454,6 +485,134 @@ Mitigations clients can apply:
 - Connect through Tor/VPN for network-layer anonymity
 - Use multiple relays for send (round-robin) to split knowledge
 - Use onion routing when privacy matters
+
+### 5.6 Traffic-analysis model and its limits
+
+This section documents what the combination of §5.1-§5.5 actually
+guarantees against a passive or operator-level adversary, and what it
+does **not**.  It is deliberately conservative: we prefer an honest
+"we do not claim X" over an aspirational "X is probably fine."
+
+**Observer capabilities assumed.**  A single honest-but-curious relay
+operator sees every envelope's wire-padded size, its arrival time,
+the (IP-level) source of each POST /v1/send, and the TLS-level
+metadata of every WebSocket connection.  The operator does **not**
+see the sender pubkey (sealed sender) nor the envelope payload
+(authenticated end-to-end encryption).
+
+**Claims we make.**
+
+1. *Size uniformity at bucket granularity.*  Every envelope on the
+   wire is one of exactly three sizes (§3.1.1).  A single envelope's
+   byte count reveals at most which bucket it fell into, not the
+   real inner length.
+2. *Sender unlinkability within a bucket.*  For envelopes in the
+   same bucket at approximately the same time, the operator cannot
+   distinguish "Alice sent to Bob" from "Carol sent to Bob" — the
+   sealed-sender construction leaves no sender identifier in the
+   routing header.
+3. *Per-send timing decoupling (with jitter enabled).*  With jitter
+   at privacy level ≥ 1, the operator cannot pinpoint which user
+   action produced which envelope within the jitter window (50-
+   500 ms depending on level).
+4. *Cover-traffic bucket indistinguishability (with uniform mode).*
+   At privacy level 2 the cover generator emits each padding bucket
+   with equal probability, so the operator's observed bucket
+   histogram for a user becomes statistically independent of that
+   user's actual send distribution.
+
+**Claims we deliberately DO NOT make.**
+
+1. We do not claim the operator cannot link a user's sending times
+   to an off-relay event.  Jitter is bounded; an operator with a
+   side-channel (e.g., "Alice tweeted, then an envelope arrived 200
+   ms later") can narrow causation.
+2. We do not claim the operator cannot separate cover from real
+   traffic by aggregate rate.  If a user closes their app, cover
+   stops; the operator sees "offline" vs "cover-rate" as distinct
+   regimes.  The self-addressed fallback (§5.3) covers short peer-
+   offline windows but not a genuine app-closed state.
+3. We do not claim resistance to a *colluding pair* of relays on
+   the single-hop path.  Multi-hop onion routing (§5.4) plus
+   privacy level 2 raise the bar but do not eliminate it.
+4. We do not make a formal indistinguishability claim of the form
+   "the operator's advantage in identifying a specific envelope is
+   at most ε."  Such a claim would require an end-to-end traffic-
+   analysis proof (Poisson rate matching, bucket-histogram chi-
+   square analysis, etc.) that is outside the scope of this spec.
+   The protocol gives operators a toolbox of well-known defences;
+   their concrete composition is tuned empirically.
+
+**Interaction between the three defences.**  Padding (always on) is
+independent of both jitter and cover traffic and composes trivially:
+every envelope is bucketed regardless of its origin.  Jitter and
+cover traffic operate on different timing distributions by design
+(jitter is a per-send uniform delay, cover is a bursty Poisson-ish
+process).  This means a timing-correlation adversary can in
+principle separate the two streams; the mitigation is (a) bucket-
+uniform cover so each stream's sizes look the same, and (b) using
+onion routing and multi-hop forwarding for traffic whose
+observability must be minimised.
+
+### 5.7 P2P (ICE/QUIC) path: security properties
+
+The P2P transport is an OPTIONAL direct path between two peers,
+negotiated via ICE candidates exchanged over the relay and carried
+over QUIC.  When active, file chunks flow directly peer-to-peer
+instead of through the relay's mailbox.  Its security properties
+are deliberately different from the relay path:
+
+**What the P2P path DOES claim (parity with the relay path):**
+
+1. *End-to-end confidentiality.*  File chunks are AEAD-encrypted
+   under a per-file key derived from the ratchet (§7.3.1).  The
+   direct transport never sees plaintext.
+2. *Authenticated bucket sizes.*  The sender wraps every chunk
+   with `SealedEnvelope::padForP2P` before it touches the QUIC
+   stream.  Wire layout is `innerLen(4 BE) || chunk || random
+   pad`, padded to the same 2 / 16 / 256 KiB buckets §3.1.1
+   defines.  A passive network observer between the peers (ISP,
+   Wi-Fi sniffer, corporate DLP) sees only the bucket class, not
+   the real chunk length.
+3. *Hard-block-on-key-change policy.*  If a user enabled
+   hard-block and the peer's safety number flipped, the P2P
+   file-send refuses the direct path and falls the chunk back
+   to the relay path, which runs the same check and drops
+   authoritatively.  Pre-audit-#10 builds bypassed this check
+   entirely on the QUIC path — every remaining chunk of an
+   in-flight transfer streamed to a potentially-compromised
+   peer.
+
+**What the P2P path does NOT claim (intrinsic to the transport):**
+
+1. *Sender anonymity.*  A P2P connection is direct IP-to-IP.
+   The peer sees your IP address by construction.  No crypto
+   trick reclaims this — it is the defining difference between
+   the P2P path and the sealed-sender relay path.  Users who
+   need sender anonymity MUST use privacy level ≤ 1 (no P2P).
+2. *Relay-observer timing defences.*  Jitter (§5.2) and cover
+   traffic (§5.3) exist to defeat a relay operator correlating
+   user actions with wire timing.  The P2P peer is not the
+   relay — they already see the app-level event that triggered
+   the send.  Applying jitter / cover to P2P would waste
+   bandwidth between two peers who chose direct transport *for*
+   throughput, without gaining a defence the threat model needs.
+   If a user wants those defences, dropping to privacy level 1
+   disables P2P and routes everything through the relay.
+3. *Persistent replay dedup.*  The P2P chunk handler dedups on
+   `(transferId, chunkIndex)` via a non-persistent in-memory
+   cache.  ICE sessions don't survive process restart — a new
+   connection must renegotiate — so persistent dedup would
+   protect a scenario that can't actually occur.
+
+**User-visible policy.**  A client SHOULD make the P2P-vs-relay
+choice explicit to the user — either a global "no direct
+connections" toggle (a user who wants IP-level anonymity flips it
+once) or a per-contact preference.  Silently preferring P2P when
+the user has chosen a max-privacy mode is user-hostile.  The
+reference implementation exposes the `requireP2P` flag on file
+transfers plus a sender-side "require direct connection" setting;
+either end can force the relay path for a given transfer.
 
 ---
 
@@ -608,12 +767,13 @@ dropped (never processed, never ack'd).
 | `file_ack` | receiver→sender | File fully received and integrity-verified |
 | `file_request` | receiver→sender | Resume: re-send these chunks |
 | `file_chunk` | sender→receiver | Encrypted chunk (uses SEALEDFC: prefix) |
-| `group_text` | member→members | Text in a group chat |
+| `group_msg` | member→members | Text in a group chat (sender-chain-encrypted) |
+| `group_skey_announce` | member→member | Distribute a sender-chain seed (via 1:1 ratchet) |
 | `group_invite` | member→members | New-member invite |
 | `group_leave` | member→members | Member-left notification |
-| `group_rename` | member→members | Rename a group |
-| `group_avatar` | member→members | Update group avatar |
-| `group_member_update` | member→members | Member list changed |
+| `group_rename` | member→members | Rename a group (sender-chain-encrypted) |
+| `group_avatar` | member→members | Update group avatar (sender-chain-encrypted) |
+| `group_member_update` | member→members | Member list changed (sender-chain-encrypted) |
 | `ice_offer`, `ice_answer` | peer↔peer | P2P signaling (optional) |
 
 ### 7.2 Text messages
@@ -622,24 +782,168 @@ dropped (never processed, never ack'd).
 { "type": "text", "text": "hello", "from": "...", "ts": 1712956800, "msgId": "..." }
 ```
 
-For group messages:
+#### 7.2.1 Group messaging — sender keys
+
+Group chats use **sender keys**: each member maintains one outbound
+symmetric chain per group that every other member installs a copy of.
+User content (`group_msg` body, `group_rename` new name, `group_avatar`
+image, `group_member_update` roster) is AEAD-encrypted once per send
+under a chain-derived message key, not re-encrypted per recipient.
+
+The outer envelope still rides the 1:1 sealed ratchet between sender
+and each receiver — sealed-sender metadata hiding and per-peer
+forward-secrecy still apply.  Sender-chain encryption adds a second,
+group-level confidentiality layer and cuts the per-send CPU cost from
+O(N) plaintext encrypts to one encrypt + N envelope wraps.
+
+**Chain ratchet** — both sides derive the same sequence of message
+keys from a shared 32-byte `seed`:
+
+```
+chain_key_0 = seed
+msg_key_n   = BLAKE2b-256(key=chain_key_n, input=0x02)
+chain_key_{n+1} = BLAKE2b-256(key=chain_key_n, input=0x01)
+```
+
+**AEAD of inner payload** (same primitive everywhere: XChaCha20-Poly1305):
+
+```
+plaintext  = <JSON object — shape depends on wire type>
+AAD        = msgType || '\n' || from || '\n' || gid
+           || epoch(LE u64) || idx(LE u32)
+ciphertext = AEAD_encrypt(msg_key_idx, plaintext, AAD)
+```
+
+AAD binds the wire `type`, so a ciphertext produced for `group_msg`
+cannot be relabelled as `group_rename` (or any other type) without
+failing AEAD authentication.
+
+#### 7.2.2 `group_msg`
 
 ```json
 {
-  "type": "group_text",
-  "groupId":   "<UUID>",
-  "groupName": "...",
-  "members":   ["<id1>", "<id2>", ...],
-  "seq":       <monotonic uint64>,
-  "text":      "...",
-  "from":      "...",
-  "ts":        ...,
-  "msgId":     "..."
+  "type":       "group_msg",
+  "groupId":    "<UUID>",
+  "groupName":  "...",
+  "members":    ["<id1>", "<id2>", ...],
+  "skey_epoch": <uint64>,
+  "skey_idx":   <uint32>,
+  "ciphertext": "<base64url(AEAD_encrypt(msg_key, {\"text\":\"...\"}))>",
+  "from":       "...",
+  "ts":         ...,
+  "msgId":      "..."
 }
 ```
 
-`seq` is a per-(group, sender) monotonic counter detected by each member
-for gap detection.
+The inner plaintext is a JSON object `{"text": "<string>"}`.
+
+#### 7.2.3 `group_skey_announce`
+
+Distributes the sender's current chain seed to a recipient via the
+1:1 sealed ratchet between them.  Emitted on first group send (lazy
+chain creation), on add of a new member (current seed to the joiner
+only), and on rekey-on-leave (new seed to every remaining member).
+
+```json
+{
+  "type":    "group_skey_announce",
+  "groupId": "<UUID>",
+  "epoch":   <uint64>,
+  "seed":    "<base64url 32 bytes>",
+  "from":    "...",
+  "ts":      ...,
+  "msgId":   "..."
+}
+```
+
+The receiver installs the seed as `SenderChain::fromSeed(seed)`
+under (gid, from, epoch).  If an earlier chain existed at a lower
+epoch, it moves to a prev slot retained for ~5 minutes of grace so
+in-flight messages at the old epoch still decrypt.
+
+#### 7.2.4 `group_rename`, `group_avatar`, `group_member_update`
+
+Same sender-chain envelope shape as `group_msg`, with different
+inner plaintext JSON per type:
+
+| Wire type | Inner plaintext JSON |
+|---|---|
+| `group_rename` | `{"newName": "<string>"}` |
+| `group_avatar` | `{"avatar": "<base64-encoded image>"}` |
+| `group_member_update` | `{"groupName": "<string>", "members": [...]}` |
+
+Outer envelope fields are the same as `group_msg` except `groupName`
+and `members` are NOT duplicated in plaintext on `group_member_update`
+(they live inside the ciphertext).  `group_rename` and `group_avatar`
+have never had those fields and continue to carry only routing
+metadata (`from`, `groupId`, `ts`, `msgId`, `skey_epoch`, `skey_idx`,
+`ciphertext`).
+
+#### 7.2.5 `group_leave`
+
+Sender-chain encrypted — the `groupName` and full member roster go
+inside the `ciphertext`, not the outer envelope, matching every
+other `group_*` control message (audit #3 H2).  Only routing fields
+are plaintext; a relay operator can no longer harvest "Alice left
+group X, whose members are B, C, D" as metadata.
+
+Outer envelope:
+
+```json
+{
+  "type":       "group_leave",
+  "groupId":    "<UUID>",
+  "skey_epoch": <uint64>,
+  "skey_idx":   <uint32>,
+  "ciphertext": "<base64url(AEAD_encrypt(msg_key, inner))>",
+  "from":       "...",
+  "ts":         ...,
+  "msgId":      "..."
+}
+```
+
+Inner plaintext (JSON, AEAD-decrypted with the sender chain's
+`msg_key` for `(epoch, idx)`):
+
+```json
+{
+  "groupName": "...",
+  "members":   [<full roster, including the leaver's own id>]
+}
+```
+
+#### 7.2.6 Rekey-on-leave
+
+When a member is removed from a group via `group_member_update`:
+
+1. The initiator bumps their chain's `epoch`, generates a fresh
+   `seed`, and writes the rotated chain to disk.
+2. A `group_skey_announce` at the new epoch is fanned out to every
+   **remaining** member (not the removed peer).
+3. The `group_member_update` message then fans out to the same
+   remaining members; inside its ciphertext is the new roster.
+4. Receivers install the new chain, moving the previous-epoch chain
+   to a grace slot with a ~5-minute expiry for in-flight decryption.
+   Receivers retain TWO previous-epoch slots (audit #3 L4), so a
+   rapid 0→1→2 sequence still lets stragglers from epoch 0 decrypt
+   within the grace window.
+5. After a successful AEAD verify the receiver drops the consumed
+   skipped-key entry from the chain's cache (audit #3 H3), so a
+   later compromise of the chain state cannot recover message keys
+   for messages already delivered.
+6. Inbound chains forget their originating `seed` right after
+   construction (audit #3 M3).  The chain key evolves independently
+   of the seed, so inbound decrypts do not need it; dropping it
+   limits what an attacker with a heap dump can recover.
+
+The removed peer keeps their copy of the pre-rekey seed in memory,
+but it is useless against any future outbound message from the
+initiator: the new epoch's AAD mismatches, so AEAD authentication
+fails regardless of which seed the removed peer tries.  Other
+remaining members do NOT auto-rotate their own chains — the removed
+peer is cryptographically blinded to their future sends by not being
+a recipient of the outer 1:1 sealed envelope, not by a sender-chain
+rotation.
 
 ### 7.3 File transfer (1:1)
 
@@ -930,12 +1234,42 @@ alignment.
 
 ---
 
-## 11. Future extensions
+## 11. Known limitations and future extensions
 
-The following are under consideration for a future protocol version and
-are deliberately NOT part of v2.0:
+### 11.1 Known limitations
 
-- **Sender Keys / MLS** for groups > 20 members.
+**Group-membership authority is not cryptographically enforced.**
+Sender keys bound the impact of a compromised group member (they
+cannot decrypt messages from others whose sender-chain seeds they
+never received) and the impact of a removed member (rekey-on-leave
+invalidates their old copy of the initiator's chain for new
+messages).  They do NOT prevent a group member from publishing a
+forged roster claim to a peer that lacks an independent view of the
+group.  Specifically:
+
+- An attacker who is a group member can send a `group_member_update`
+  to other members naming whichever roster they want.  Recipients
+  merge the sender into their local view (bootstrap case) but do
+  not blindly accept full roster replacements from peers who are
+  already known members.
+- An attacker who knows a `groupId` but is NOT a member cannot inject
+  a forged roster: the outer sealed envelope is authenticated to a
+  specific sender, and `isAuthorizedSender` drops control messages
+  from non-members.
+- An attacker cannot decrypt sender-chain-encrypted payloads (group
+  messages, renames, avatars, roster updates) without receiving the
+  relevant chain seed via a legitimate `group_skey_announce`.
+
+Full membership authority (creator-signed invite chains with
+verifiable epoch transitions, MLS-style) remains future work.
+
+### 11.2 Future extensions
+
+The following are under consideration for a future protocol version:
+
+- **MLS (Messaging Layer Security)** for larger groups and
+  cryptographic membership authority.  Would replace or augment the
+  current sender-keys group path.
 - **Multi-device identity** with cross-device key sync and per-device
   message fanout.
 - **QR-code and invite-link contact exchange** (UX; no wire change).
@@ -1080,7 +1414,42 @@ function unseal(recipient_curve_priv, recipient_ed_pub,
 
 ## Appendix C: Changelog
 
-- **v2.0.0 (current)** — Recipient AAD binding, envelope-id replay
+- **v2.1.1 (current)** — Audit #3 hardening.  Wire changes:
+  `group_leave` joins the sender-keys family — `groupName` and
+  `members` move inside `ciphertext` with `skey_epoch` / `skey_idx`
+  on the outer envelope (§7.2.5).  Non-wire hardening that clients
+  and relays MUST apply:
+  - SenderChain drops the consumed skipped-key cache entry after
+    each successful AEAD verify (forward secrecy on the skipped
+    window).
+  - Inbound SenderChain forgets its originating seed after
+    construction (in-memory defense-in-depth).
+  - Receivers retain two previous-epoch slots, not one, so a rapid
+    0→1→2 rekey still decrypts stragglers from epoch 0.
+  - `installRemoteChain` rejects lower-epoch offers from the same
+    sender (epoch downgrade).
+  - Relay persists push tokens wrapped in XChaCha20-Poly1305 keyed
+    by HKDF of the onion priv; operator-supplied `RELAY_KEY_KEK`
+    wraps the onion priv itself (§4.1).
+  - `presence_subscribe` is rate-limited per connection (6 per
+    minute by default); unknown-type frames are silently dropped.
+  - C FFI hardening: `p2p_ws_on_binary`, `p2p_http_response`, and
+    `p2p_check_presence` / `_subscribe_presence` reject null / bad-
+    length inputs instead of UB-ing.  `p2p_app_load_contacts`
+    snapshots rows before firing the user callback so a reentrant
+    callback can't deadlock on the non-recursive ctrl mutex.
+- **v2.1.0** — Sender keys for group messaging: `group_msg`,
+  `group_rename`, `group_avatar`, and `group_member_update` all
+  encrypt their user-content fields inside a sender-chain-derived
+  AEAD ciphertext with AAD binding
+  `type || from || gid || epoch || idx`.  New `group_skey_announce`
+  control message distributes chain seeds via the 1:1 sealed ratchet.
+  Rekey-on-leave: removing a member bumps the initiator's epoch +
+  fans a fresh seed to remaining peers.  Breaking change from v2.0
+  for all group control messages (plaintext `text` / `newName` /
+  `avatar` / `members` fields replaced by `ciphertext` + `skey_epoch`
+  + `skey_idx`).
+- **v2.0.0** — Recipient AAD binding, envelope-id replay
   protection, onion routing, file transfer with resumption, PQ-hybrid
   at every layer.
 - **v1.x (deprecated)** — Initial design. Removed: `/mbox/enqueue`,

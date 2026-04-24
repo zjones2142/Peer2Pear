@@ -182,6 +182,14 @@ void p2p_unverify_peer(p2p_context* ctx, const char* peer_id);
  */
 void p2p_set_hard_block_on_key_change(p2p_context* ctx, int enabled);
 
+/**
+ * Wipe the ratchet session with peer_id so the next outbound message
+ * performs a fresh handshake.  Useful when a peer reports decryption
+ * errors on their end (desync) or after a device swap.  Does not touch
+ * trust state, message history, or safety numbers.
+ */
+void p2p_reset_session(p2p_context* ctx, const char* peer_id);
+
 /* ── Relay ─────────────────────────────────────────────────────────────── */
 
 /** Set the relay server URL (e.g., "https://relay.peer2pear.org:8443"). */
@@ -203,6 +211,33 @@ void p2p_add_send_relay(p2p_context* ctx, const char* url);
  *   2 = Maximum:   + multi-hop forwarding + high-frequency cover traffic
  */
 void p2p_set_privacy_level(p2p_context* ctx, int level);
+
+/**
+ * Register a push-notification token with the relay.  Called by
+ * mobile clients after they receive a device token from APNs (iOS)
+ * or FCM (Android).  The relay stores (peer_id, platform, token) so
+ * it can fire a silent wake-up push when a new envelope arrives for
+ * an offline recipient.
+ *
+ * `platform` is a short identifier like "ios" or "android".  Pass an
+ * empty token to unregister (e.g., on sign-out).
+ *
+ * Safe to call any time after p2p_connect — the call is forwarded
+ * to the relay over the authenticated WebSocket.
+ */
+void p2p_set_push_token(p2p_context* ctx,
+                         const char* token,
+                         const char* platform);
+
+/**
+ * Wake-up hook for background push arrivals.  Mobile silent-push
+ * handlers invoke this from their background-task entry point;
+ * internally it nudges the relay connection to drain any queued
+ * envelopes that were waiting on this device.  Returns immediately;
+ * completion signalling is via the usual on_message / on_group_message
+ * callbacks.
+ */
+void p2p_wake_for_push(p2p_context* ctx);
 
 /* ── Messaging ─────────────────────────────────────────────────────────── */
 
@@ -552,6 +587,125 @@ void p2p_set_on_peer_key_changed(p2p_context* ctx,
                const uint8_t* new_fingerprint, int new_len,
                void* ud),
     void* ud);
+
+/* ── App-data store (contacts / messages / settings / file_transfers) ───
+ *
+ * Persistent app-data layer on the same SQLCipher DB the core uses for
+ * ratchet state.  Replaces the legacy iOS JSON snapshot and the desktop
+ * Qt DBM for app-state storage.  Per-field XChaCha20-Poly1305 layered on
+ * top of SQLCipher page encryption — same key derivation as the ratchet
+ * store, no separate passphrase.
+ *
+ * All functions return 0 on success / -1 on failure unless documented
+ * otherwise.  Pointer arguments may not be NULL except where stated.
+ *
+ * Strings handed to the *_cb callbacks live only for the duration of the
+ * call — copy if you need them past the callback's return.
+ */
+
+/** Save (insert or update) a contact row.  `keys` is a NULL-terminated
+ *  array of base64url public keys (one per peer for groups, one for
+ *  1:1 contacts).  `last_active_secs` is unix time; pass 0 for "never".
+ *  `in_address_book` toggles the iOS chats-vs-contacts split — pass 1
+ *  for explicit user-added contacts, 0 for stranger-message stub rows. */
+int p2p_app_save_contact(p2p_context* ctx,
+                          const char* peer_id,
+                          const char* name,
+                          const char* subtitle,
+                          const char* const* keys,
+                          int is_blocked,
+                          int is_group,
+                          const char* group_id,
+                          const char* avatar_b64,
+                          int64_t last_active_secs,
+                          int in_address_book);
+
+/** Delete a contact (and CASCADE its messages). */
+int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id);
+
+/** Stream every contact via callback (last_active DESC). */
+typedef void (*p2p_contact_cb)(const char* peer_id,
+                                const char* name,
+                                const char* subtitle,
+                                const char* const* keys,
+                                int is_blocked,
+                                int is_group,
+                                const char* group_id,
+                                const char* avatar_b64,
+                                int64_t last_active_secs,
+                                int in_address_book,
+                                void* ud);
+void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud);
+
+/** Update just the avatar field on an existing contact. */
+int p2p_app_save_contact_avatar(p2p_context* ctx,
+                                 const char* peer_id,
+                                 const char* avatar_b64);
+
+/** Insert a 1:1 or group message.  For groups, `peer_id` is the group_id
+ *  and `sender_name` carries the sender's display name (1:1 leaves it ""). */
+int p2p_app_save_message(p2p_context* ctx,
+                          const char* peer_id,
+                          int sent,
+                          const char* text,
+                          int64_t timestamp_secs,
+                          const char* msg_id,
+                          const char* sender_name);
+
+/** Stream messages for `peer_id` in chronological order. */
+typedef void (*p2p_message_cb)(int sent,
+                                const char* text,
+                                int64_t timestamp_secs,
+                                const char* msg_id,
+                                const char* sender_name,
+                                void* ud);
+void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
+                            p2p_message_cb cb, void* ud);
+
+/** Wipe all messages for `peer_id`.  Doesn't touch the contact row. */
+int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id);
+
+/** Settings key/value store.  load returns the static-storage scratch
+ *  buffer in `ctx`; treat it as valid only until the next p2p_* call. */
+int         p2p_app_save_setting(p2p_context* ctx, const char* key, const char* value);
+const char* p2p_app_load_setting(p2p_context* ctx, const char* key,
+                                  const char* default_value);
+
+/** File transfer record persistence — mirrors FileTransferRecord. */
+int p2p_app_save_file_record(p2p_context* ctx,
+                              const char* transfer_id,
+                              const char* chat_key,
+                              const char* file_name,
+                              int64_t file_size,
+                              const char* peer_id,
+                              const char* peer_name,
+                              int64_t timestamp_secs,
+                              int sent,
+                              int status,
+                              int chunks_total,
+                              int chunks_complete,
+                              const char* saved_path);
+int p2p_app_delete_file_record(p2p_context* ctx, const char* transfer_id);
+
+/** Wipe every file_transfers row for a chat (peer or group ID).  Used
+ *  by "delete chat" flows so transfer cards disappear alongside the
+ *  message bubbles.  Does NOT touch the actual files at savedPath. */
+int p2p_app_delete_file_records_for_chat(p2p_context* ctx, const char* chat_key);
+
+typedef void (*p2p_file_record_cb)(const char* transfer_id,
+                                    const char* file_name,
+                                    int64_t file_size,
+                                    const char* peer_id,
+                                    const char* peer_name,
+                                    int64_t timestamp_secs,
+                                    int sent,
+                                    int status,
+                                    int chunks_total,
+                                    int chunks_complete,
+                                    const char* saved_path,
+                                    void* ud);
+void p2p_app_load_file_records(p2p_context* ctx, const char* chat_key,
+                                p2p_file_record_cb cb, void* ud);
 
 #ifdef __cplusplus
 }

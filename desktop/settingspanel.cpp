@@ -1,5 +1,8 @@
 #include "settingspanel.h"
-#include "databasemanager.h"
+#include "AppDataStore.hpp"
+#include "qt_str_helpers.hpp"
+#include "theme.h"
+#include "theme_styles.h"
 
 #include <QLabel>
 #include <QVBoxLayout>
@@ -17,6 +20,13 @@ SettingsPanel::SettingsPanel(QWidget *parent)
     : QWidget(parent)
 {
     buildUI();
+    // Re-style on theme change.  Cheap (single findChildren walk) and
+    // also refreshes the appearance-picker button highlights.
+    connect(&ThemeManager::instance(), &ThemeManager::themeChanged,
+            this, [this](const Theme&) {
+                applyThemeStyles();
+                applyThemeButtonStyles();
+            });
 }
 
 void SettingsPanel::buildUI()
@@ -30,7 +40,10 @@ void SettingsPanel::buildUI()
 
     // ── Top bar ───────────────────────────────────────────────────────────────
     QWidget *settingsHeader = new QWidget();
+    // settingsHeader objectName drives the inline #settingsHeader sheet
+    // below; p2pRole is what applyThemeStyles keys on for re-styling.
     settingsHeader->setObjectName("settingsHeader");
+    settingsHeader->setProperty("p2pRole", "headerBar");
     settingsHeader->setFixedHeight(72);
     settingsHeader->setStyleSheet(
         "QWidget#settingsHeader { background-color: #0d0d0d; border-bottom: 1px solid #1e1e1e; }"
@@ -43,19 +56,11 @@ void SettingsPanel::buildUI()
     QPushButton *backBtn = new QPushButton("← Back");
     backBtn->setObjectName("settingsBackBtn");
     backBtn->setFixedSize(80, 32);
-    backBtn->setStyleSheet(
-        "QPushButton#settingsBackBtn {"
-        "  background-color: transparent;"
-        "  color: #888888;"
-        "  border: 1px solid #333333;"
-        "  border-radius: 8px;"
-        "  font-size: 13px;"
-        "  padding: 4px 10px;"
-        "}"
-        "QPushButton#settingsBackBtn:hover { color: #ffffff; border-color: #555555; }"
-        );
+    themeStyles::applyRole(backBtn, "backBtn",
+        themeStyles::backBtnCss(ThemeManager::instance().current()));
 
     QLabel *titleLabel = new QLabel("Settings");
+    titleLabel->setProperty("p2pRole", "headerTitle");
     titleLabel->setStyleSheet("color: #ffffff; font-size: 16px; font-weight: bold;");
 
     headerLayout->addWidget(backBtn);
@@ -66,12 +71,14 @@ void SettingsPanel::buildUI()
 
     // ── Scrollable body ───────────────────────────────────────────────────────
     QScrollArea *scroll = new QScrollArea();
+    scroll->setProperty("p2pRole", "scroll");
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setWidgetResizable(true);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scroll->setStyleSheet("background-color: #0d0d0d; border: none;");
 
     QWidget *body = new QWidget();
+    body->setProperty("p2pRole", "body");
     body->setStyleSheet("background-color: #0d0d0d;");
     QVBoxLayout *bodyLayout = new QVBoxLayout(body);
     bodyLayout->setContentsMargins(32, 24, 32, 24);
@@ -95,6 +102,9 @@ void SettingsPanel::buildUI()
     // ── Privacy level ───────────────────────────────────────────────────────
     bodyLayout->addWidget(makePrivacySection());
 
+    // ── Appearance (theme) ─────────────────────────────────────────────────
+    bodyLayout->addWidget(makeAppearanceSection());
+
     // ── About section ─────────────────────────────────────────────────────────
     // Version    = app version (matches project(Peer2Pear VERSION ...) in CMakeLists.txt)
     // Protocol   = wire-protocol version (matches the relay's /healthz "version" field
@@ -112,6 +122,12 @@ void SettingsPanel::buildUI()
 
     outerLayout->addWidget(settingsHeader);
     outerLayout->addWidget(scroll);
+
+    // Final pass: every widget tagged with a p2pRole property gets its
+    // stylesheet rewritten from the active Theme.  Inline stylesheets
+    // set above are still emitted but get overwritten by this call,
+    // which becomes important the first time the user flips Light mode.
+    applyThemeStyles();
 }
 
 // Builds the Profile section card with display name and public key + copy button
@@ -178,17 +194,13 @@ QWidget *SettingsPanel::makeProfileSection()
         );
     m_publicKeyLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     QPushButton *copyBtn = new QPushButton("Copy");
-    copyBtn->setFixedSize(52, 24);
-    copyBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #1a1a2e;"
-        "  color: #5588dd;"
-        "  border: 1px solid #2e2e5e;"
-        "  border-radius: 5px;"
-        "  font-size: 11px;"
-        "}"
-        "QPushButton:hover { background-color: #22223a; }"
-        );
+    // Pin the width so the row layout doesn't reflow when the label
+    // toggles to "Copied!", but let the height size to the content +
+    // dialogAccentBtnCss's vertical padding.  The previous 24px hard
+    // cap clipped the descenders on "py" / "Copied!".
+    copyBtn->setFixedWidth(76);
+    themeStyles::applyRole(copyBtn, "dialogAccentBtn",
+        themeStyles::dialogAccentBtnCss(ThemeManager::instance().current()));
     connect(copyBtn, &QPushButton::clicked, this, [this, copyBtn]() {
         QApplication::clipboard()->setText(m_fullPublicKey);
         copyBtn->setText("Copied!");
@@ -218,19 +230,41 @@ void SettingsPanel::setProfileInfo(const QString &displayName, const QString &pu
     }
 }
 
-void SettingsPanel::setDatabase(DatabaseManager *db)
+void SettingsPanel::setAppDataStore(AppDataStore *store)
 {
-    m_db = db;
-    if (!m_db) return;
+    m_store = store;
+    if (!m_store) return;
     // Load persisted notification state
-    const QString saved = m_db->loadSetting("notificationsEnabled", "true");
+    const std::string saved = m_store->loadSetting("notificationsEnabled", "true");
     m_notificationsEnabled = (saved == "true");
     applyNotificationState();
+    // DND has no persisted value today (session-only); paint the
+    // default-off state with theme-correct colors on first show.
+    applyDndState();
+
+    // Load notification content-privacy mode.  Default is Hidden —
+    // generic "New message" banners keep plaintext out of the OS-
+    // level notification store.  Users can opt up in the UI.
+    {
+        const std::string raw = m_store->loadSetting("notificationMode", "hidden");
+        if (raw == "full")         m_notifMode = NotificationMode::Full;
+        else if (raw == "sender")  m_notifMode = NotificationMode::SenderOnly;
+        else                        m_notifMode = NotificationMode::Hidden;
+        if (m_notifModeCombo) {
+            QSignalBlocker blocker(m_notifModeCombo);
+            m_notifModeCombo->setCurrentIndex(static_cast<int>(m_notifMode));
+        }
+        emit notificationModeChanged(m_notifMode);
+    }
 
     // Load file-transfer consent settings.  Defaults: everything ≤100 MB
     // accepts, no relay requirement.
-    const int softMB = m_db->loadSetting("fileAutoAcceptMaxMB", "100").toInt();
-    const int hardMB = m_db->loadSetting("fileHardMaxMB",       "100").toInt();
+    auto parseIntSetting = [this](const std::string& key, int defaultValue) {
+        try { return std::stoi(m_store->loadSetting(key, std::to_string(defaultValue))); }
+        catch (...) { return defaultValue; }
+    };
+    const int softMB = parseIntSetting("fileAutoAcceptMaxMB", 100);
+    const int hardMB = parseIntSetting("fileHardMaxMB",       100);
     if (m_fileAutoAcceptSpin) {
         QSignalBlocker blocker(m_fileAutoAcceptSpin);
         m_fileAutoAcceptSpin->setValue(softMB);
@@ -240,17 +274,21 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
         m_fileHardMaxSpin->setValue(hardMB);
     }
 
-    m_requireP2PEnabled = (m_db->loadSetting("fileRequireP2P", "false") == "true");
+    m_requireP2PEnabled = (m_store->loadSetting("fileRequireP2P", "false") == "true");
+    m_requireVerifiedFilesEnabled =
+        (m_store->loadSetting("fileRequireVerified", "false") == "true");
     applyRequireP2PState();
+    applyRequireVerifiedFilesState();
 
     m_hardBlockKeyChangeEnabled =
-        (m_db->loadSetting("hardBlockOnKeyChange", "false") == "true");
+        (m_store->loadSetting("hardBlockOnKeyChange", "false") == "true");
     applyHardBlockKeyChangeState();
 
     // Emit initial values so MainWindow/ChatController sync up.
     emit fileAutoAcceptMaxChanged(softMB);
     emit fileHardMaxChanged(hardMB);
     emit fileRequireP2PToggled(m_requireP2PEnabled);
+    emit fileRequireVerifiedToggled(m_requireVerifiedFilesEnabled);
     emit hardBlockOnKeyChangeToggled(m_hardBlockKeyChangeEnabled);
 
     // Relay URL — load whatever's stored (the mainwindow startup path is
@@ -258,7 +296,7 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
     // actually in the DB so what the user sees matches what the client
     // is connected to).
     if (m_relayUrlEdit) {
-        const QString url = m_db->loadSetting("relayUrl", "https://peer2pear.com");
+        const QString url = qtbridge::qstr(m_store->loadSetting("relayUrl", "https://peer2pear.com"));
         QSignalBlocker blocker(m_relayUrlEdit);
         m_relayUrlEdit->setText(url);
         m_lastAppliedRelayUrl = url;
@@ -267,34 +305,38 @@ void SettingsPanel::setDatabase(DatabaseManager *db)
 
     // Privacy level — 0 (Standard), 1 (Enhanced), 2 (Maximum).
     {
-        const int lvl = m_db->loadSetting("privacyLevel", "0").toInt();
+        int lvl = 0;
+        try { lvl = std::stoi(m_store->loadSetting("privacyLevel", "0")); }
+        catch (...) { lvl = 0; }
         // Triggers the slot which updates the visual + persists again +
         // emits privacyLevelChanged so MainWindow syncs RelayClient on load.
         onPrivacyLevelChanged(lvl);
+    }
+
+    // Appearance — default Dark matches the hardcoded dark palette.
+    // setPreference cascades through reapply() → themeChanged signal →
+    // applyThemeStyles + applyThemeButtonStyles via the connection in
+    // our constructor.
+    {
+        const std::string raw = m_store->loadSetting("themePreference", "dark");
+        const auto pref = raw == "light"  ? ThemeManager::Preference::Light
+                        : raw == "system" ? ThemeManager::Preference::System
+                        :                    ThemeManager::Preference::Dark;
+        ThemeManager::instance().setPreference(pref);
     }
 }
 
 void SettingsPanel::applyNotificationState()
 {
+    const Theme& t = ThemeManager::instance().current();
     if (m_notificationsEnabled) {
         if (m_notifStatusLabel) {
             m_notifStatusLabel->setText("Enabled");
-            m_notifStatusLabel->setStyleSheet(
-                "color: #4caf50; font-size: 13px; background: transparent; border: none;"
-                );
+            m_notifStatusLabel->setStyleSheet(themeStyles::statusAccentCss(t));
         }
         if (m_notifToggleBtn) {
             m_notifToggleBtn->setText("Disable");
-            m_notifToggleBtn->setStyleSheet(
-                "QPushButton {"
-                "  background-color: #2e1a1a;"
-                "  color: #cc5555;"
-                "  border: 1px solid #5e2e2e;"
-                "  border-radius: 6px;"
-                "  font-size: 12px;"
-                "}"
-                "QPushButton:hover { background-color: #3a2020; }"
-                );
+            m_notifToggleBtn->setStyleSheet(themeStyles::toggleDangerCss(t));
         }
         // Sub-labels reflect effective state: suppressed when DND is active
         const bool effective = !m_dndEnabled;
@@ -303,22 +345,11 @@ void SettingsPanel::applyNotificationState()
     } else {
         if (m_notifStatusLabel) {
             m_notifStatusLabel->setText("Disabled");
-            m_notifStatusLabel->setStyleSheet(
-                "color: #555555; font-size: 13px; background: transparent; border: none;"
-                );
+            m_notifStatusLabel->setStyleSheet(themeStyles::statusMutedCss(t));
         }
         if (m_notifToggleBtn) {
             m_notifToggleBtn->setText("Enable");
-            m_notifToggleBtn->setStyleSheet(
-                "QPushButton {"
-                "  background-color: #1a2e1c;"
-                "  color: #5dd868;"
-                "  border: 1px solid #2e5e30;"
-                "  border-radius: 6px;"
-                "  font-size: 12px;"
-                "}"
-                "QPushButton:hover { background-color: #223a24; }"
-                );
+            m_notifToggleBtn->setStyleSheet(themeStyles::toggleAccentCss(t));
         }
         if (m_messageAlertsLabel) m_messageAlertsLabel->setText("Off");
         if (m_soundLabel)         m_soundLabel->setText("Off");
@@ -487,6 +518,88 @@ QWidget *SettingsPanel::makeNotificationsSection()
     al->addWidget(m_messageAlertsLabel);
     cardLayout->addWidget(alertsRow);
 
+    // ── Notification content (privacy) row ────────────────────────────────────
+    //
+    // Content-level control of what the OS notification store sees.
+    // Default is "Hidden" because the macOS/Windows/Linux notification
+    // history is outside the app's sandbox — once plaintext enters it,
+    // our SQLCipher-at-rest posture is defeated.  Mirrors the iOS
+    // setting so a user who opts up on one platform sees the same
+    // label on the other.
+    addDivider();
+
+    QWidget *contentRow = new QWidget();
+    contentRow->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *contentCol = new QVBoxLayout(contentRow);
+    contentCol->setContentsMargins(16, 10, 16, 10);
+    contentCol->setSpacing(4);
+
+    QHBoxLayout *contentTop = new QHBoxLayout();
+    contentTop->setSpacing(8);
+    QLabel *contentKey = new QLabel("Show in banner");
+    contentKey->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+    m_notifModeCombo = new QComboBox();
+    m_notifModeCombo->addItems({"Hidden", "Sender only", "Full content"});
+    m_notifModeCombo->setCurrentIndex(0);
+    m_notifModeCombo->setFixedWidth(160);
+    themeStyles::applyRole(m_notifModeCombo, "themedCombo",
+        themeStyles::comboCss(ThemeManager::instance().current(), 12));
+    contentTop->addWidget(contentKey);
+    contentTop->addStretch();
+    contentTop->addWidget(m_notifModeCombo);
+    contentCol->addLayout(contentTop);
+
+    m_notifModeHelp = new QLabel(
+        "Banners show only \"New message\".  Contents stay inside the "
+        "app's encrypted store — the OS notification history sees nothing."
+        );
+    m_notifModeHelp->setWordWrap(true);
+    m_notifModeHelp->setStyleSheet(
+        "color: #777777; font-size: 11px; background: transparent; border: none;"
+        );
+    contentCol->addWidget(m_notifModeHelp);
+
+    cardLayout->addWidget(contentRow);
+
+    connect(m_notifModeCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int idx) {
+                m_notifMode = static_cast<NotificationMode>(
+                    std::clamp(idx, 0, 2));
+                if (m_store) {
+                    const char* raw =
+                        m_notifMode == NotificationMode::Full       ? "full"
+                      : m_notifMode == NotificationMode::SenderOnly ? "sender"
+                      :                                                "hidden";
+                    m_store->saveSetting("notificationMode", raw);
+                }
+                if (m_notifModeHelp) {
+                    switch (m_notifMode) {
+                    case NotificationMode::Hidden:
+                        m_notifModeHelp->setText(
+                            "Banners show only \"New message\".  Contents "
+                            "stay inside the app's encrypted store — the "
+                            "OS notification history sees nothing.");
+                        break;
+                    case NotificationMode::SenderOnly:
+                        m_notifModeHelp->setText(
+                            "Banners name the sender.  The OS stores that "
+                            "identifier; message text stays private.");
+                        break;
+                    case NotificationMode::Full:
+                        m_notifModeHelp->setText(
+                            "Banners include the message text.  Convenient, "
+                            "but the OS retains the plaintext in its "
+                            "notification history — readable by forensic "
+                            "tools even after the message is deleted.");
+                        break;
+                    }
+                }
+                emit notificationModeChanged(m_notifMode);
+            });
+
     // ── Sound row ─────────────────────────────────────────────────────────────
     addDivider();
 
@@ -593,16 +706,8 @@ QWidget *SettingsPanel::makeDataSection()
     QPushButton *exportBtn = new QPushButton("Export");
     exportBtn->setObjectName("exportContactsBtn");
     exportBtn->setFixedSize(76, 28);
-    exportBtn->setStyleSheet(
-        "QPushButton#exportContactsBtn {"
-        "  background-color: #1a2e1c;"
-        "  color: #5dd868;"
-        "  border: 1px solid #2e5e30;"
-        "  border-radius: 6px;"
-        "  font-size: 12px;"
-        "}"
-        "QPushButton#exportContactsBtn:hover { background-color: #223a24; }"
-        );
+    themeStyles::applyRole(exportBtn, "dialogAccentBtn",
+        themeStyles::dialogAccentBtnCss(ThemeManager::instance().current()));
     connect(exportBtn, &QPushButton::clicked,
             this, &SettingsPanel::exportContactsClicked);
 
@@ -634,16 +739,12 @@ QWidget *SettingsPanel::makeDataSection()
     QPushButton *importBtn = new QPushButton("Import");
     importBtn->setObjectName("importContactsBtn");
     importBtn->setFixedSize(76, 28);
-    importBtn->setStyleSheet(
-        "QPushButton#importContactsBtn {"
-        "  background-color: #1a1a2e;"
-        "  color: #5588dd;"
-        "  border: 1px solid #2e2e5e;"
-        "  border-radius: 6px;"
-        "  font-size: 12px;"
-        "}"
-        "QPushButton#importContactsBtn:hover { background-color: #22223a; }"
-        );
+    // Both Export + Import use the same accent pill — the previous
+    // green/blue distinction is dropped for now so light-mode doesn't
+    // ship a hardcoded blue button (no info-color token in Theme).
+    // Action affordance is still clear from the labels.
+    themeStyles::applyRole(importBtn, "dialogAccentBtn",
+        themeStyles::dialogAccentBtnCss(ThemeManager::instance().current()));
     connect(importBtn, &QPushButton::clicked,
             this, &SettingsPanel::importContactsClicked);
 
@@ -661,9 +762,9 @@ void SettingsPanel::onToggleNotifications()
     applyNotificationState();
 
     // Persist to DB
-    if (m_db)
-        m_db->saveSetting("notificationsEnabled",
-                          m_notificationsEnabled ? "true" : "false");
+    if (m_store)
+        m_store->saveSetting("notificationsEnabled",
+                             m_notificationsEnabled ? "true" : "false");
 
     // DND overrides: if DND is on, keep notifications suppressed regardless
     emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
@@ -672,46 +773,32 @@ void SettingsPanel::onToggleNotifications()
 void SettingsPanel::onToggleDnd()
 {
     m_dndEnabled = !m_dndEnabled;
+    applyDndState();
+    applyNotificationState();  // sub-labels reflect effective state
+    emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
+}
 
+void SettingsPanel::applyDndState()
+{
+    if (!m_dndStatusLabel || !m_dndToggleBtn) return;
+    const Theme& t = ThemeManager::instance().current();
+    // DND is special: "On" reads in DANGER red because it suppresses
+    // notifications (opposite polarity from the other toggles, where
+    // "On" = good).  Both button variants still match the standard
+    // toggle palette.
     if (m_dndEnabled) {
         m_dndStatusLabel->setText("On");
-        m_dndStatusLabel->setStyleSheet(
-            "color: #cc5555; font-size: 13px; background: transparent; border: none;"
-            );
+        m_dndStatusLabel->setStyleSheet(QStringLiteral(
+            "color: %1; font-size: 13px; background: transparent; border: none;"
+        ).arg(t.dangerText.name()));
         m_dndToggleBtn->setText("Disable");
-        m_dndToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #2e1a1a;"
-            "  color: #cc5555;"
-            "  border: 1px solid #5e2e2e;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #3a2020; }"
-            );
+        m_dndToggleBtn->setStyleSheet(themeStyles::toggleDangerCss(t));
     } else {
         m_dndStatusLabel->setText("Off");
-        m_dndStatusLabel->setStyleSheet(
-            "color: #555555; font-size: 13px; background: transparent; border: none;"
-            );
+        m_dndStatusLabel->setStyleSheet(themeStyles::statusMutedCss(t));
         m_dndToggleBtn->setText("Enable");
-        m_dndToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #1a2e1a;"
-            "  color: #55cc55;"
-            "  border: 1px solid #2e5e2e;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #203a20; }"
-            );
+        m_dndToggleBtn->setStyleSheet(themeStyles::toggleAccentCss(t));
     }
-
-    // Sync Notifications UI (Message Alerts/Sound) to reflect effective state
-    applyNotificationState();
-
-    // DND suppresses notifications; restores them when turned off if global toggle is on
-    emit notificationsToggled(m_notificationsEnabled && !m_dndEnabled);
 }
 
 // ── About & Help section ─────────────────────────────────────────────────────
@@ -857,16 +944,8 @@ QWidget *SettingsPanel::makeFileTransferSection()
         spin->setValue(defaultMB);
         spin->setSuffix(" MB");
         spin->setFixedWidth(110);
-        spin->setStyleSheet(
-            "QSpinBox {"
-            "  background-color: #1a1a1a;"
-            "  color: #e0e0e0;"
-            "  border: 1px solid #2a2a2a;"
-            "  border-radius: 6px;"
-            "  padding: 3px 6px;"
-            "  font-size: 13px;"
-            "}"
-            );
+        themeStyles::applyRole(spin, "themedSpin",
+            themeStyles::spinBoxCss(ThemeManager::instance().current(), 13));
 
         top->addWidget(mainLbl);
         top->addStretch();
@@ -963,26 +1042,87 @@ QWidget *SettingsPanel::makeFileTransferSection()
 
     cardLayout->addWidget(p2pRow);
 
+    // ── Verified-contacts gate ─────────────────────────────────────────
+    // UI mirrors the Require-P2P row above.  Lives entirely in ChatView
+    // (see onFileAcceptRequested) — when on, files from peers whose
+    // safety number isn't verified are silently declined before the
+    // consent QMessageBox is raised.
+    QFrame *verRow = new QFrame(card);
+    verRow->setObjectName("p2pSubrow");
+    verRow->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *vv = new QVBoxLayout(verRow);
+    vv->setContentsMargins(16, 10, 16, 10);
+    vv->setSpacing(4);
+
+    QHBoxLayout *verTop = new QHBoxLayout();
+    verTop->setContentsMargins(0, 0, 0, 0);
+    verTop->setSpacing(8);
+
+    QLabel *verLabel = new QLabel("Only accept files from verified contacts");
+    verLabel->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+
+    m_requireVerifiedFilesStatusLbl = new QLabel("Off");
+    m_requireVerifiedFilesStatusLbl->setStyleSheet(
+        "color: #888888; font-size: 13px; background: transparent; border: none;"
+        );
+    m_requireVerifiedFilesStatusLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    m_requireVerifiedFilesToggleBtn = new QPushButton("Enable");
+    m_requireVerifiedFilesToggleBtn->setFixedSize(76, 28);
+    m_requireVerifiedFilesToggleBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #1a2a1a;"
+        "  color: #77cc77;"
+        "  border: 1px solid #2e5e2e;"
+        "  border-radius: 6px;"
+        "  font-size: 12px;"
+        "}"
+        "QPushButton:hover { background-color: #203020; }"
+        );
+    connect(m_requireVerifiedFilesToggleBtn, &QPushButton::clicked,
+            this, &SettingsPanel::onToggleRequireVerifiedFiles);
+
+    verTop->addWidget(verLabel);
+    verTop->addStretch();
+    verTop->addWidget(m_requireVerifiedFilesStatusLbl);
+    verTop->addSpacing(8);
+    verTop->addWidget(m_requireVerifiedFilesToggleBtn);
+    vv->addLayout(verTop);
+
+    QLabel *verSub = new QLabel(
+        "Files from peers whose safety number you haven't confirmed are "
+        "silently declined.  Use Contact Info to verify."
+        );
+    verSub->setStyleSheet(
+        "color: #777777; font-size: 11px; background: transparent; border: none;"
+        );
+    verSub->setWordWrap(true);
+    vv->addWidget(verSub);
+
+    cardLayout->addWidget(verRow);
+
     return card;
 }
 
 void SettingsPanel::onFileAutoAcceptSpin(int mb)
 {
-    if (m_db) m_db->saveSetting("fileAutoAcceptMaxMB", QString::number(mb));
+    if (m_store) m_store->saveSetting("fileAutoAcceptMaxMB", std::to_string(mb));
     emit fileAutoAcceptMaxChanged(mb);
 }
 
 void SettingsPanel::onFileHardMaxSpin(int mb)
 {
-    if (m_db) m_db->saveSetting("fileHardMaxMB", QString::number(mb));
+    if (m_store) m_store->saveSetting("fileHardMaxMB", std::to_string(mb));
     emit fileHardMaxChanged(mb);
 }
 
 void SettingsPanel::onToggleRequireP2P()
 {
     m_requireP2PEnabled = !m_requireP2PEnabled;
-    if (m_db) m_db->saveSetting("fileRequireP2P",
-                                 m_requireP2PEnabled ? "true" : "false");
+    if (m_store) m_store->saveSetting("fileRequireP2P",
+                                      m_requireP2PEnabled ? "true" : "false");
     applyRequireP2PState();
     emit fileRequireP2PToggled(m_requireP2PEnabled);
 }
@@ -990,38 +1130,43 @@ void SettingsPanel::onToggleRequireP2P()
 void SettingsPanel::applyRequireP2PState()
 {
     if (!m_requireP2PStatusLbl || !m_requireP2PToggleBtn) return;
+    const Theme& t = ThemeManager::instance().current();
     if (m_requireP2PEnabled) {
         m_requireP2PStatusLbl->setText("On");
-        m_requireP2PStatusLbl->setStyleSheet(
-            "color: #4caf50; font-size: 13px; background: transparent; border: none;"
-            );
+        m_requireP2PStatusLbl->setStyleSheet(themeStyles::statusAccentCss(t));
         m_requireP2PToggleBtn->setText("Disable");
-        m_requireP2PToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #2e1a1a;"
-            "  color: #cc5555;"
-            "  border: 1px solid #5e2e2e;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #3a2020; }"
-            );
+        m_requireP2PToggleBtn->setStyleSheet(themeStyles::toggleDangerCss(t));
     } else {
         m_requireP2PStatusLbl->setText("Off");
-        m_requireP2PStatusLbl->setStyleSheet(
-            "color: #888888; font-size: 13px; background: transparent; border: none;"
-            );
+        m_requireP2PStatusLbl->setStyleSheet(themeStyles::statusMutedCss(t));
         m_requireP2PToggleBtn->setText("Enable");
-        m_requireP2PToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #1a2a1a;"
-            "  color: #77cc77;"
-            "  border: 1px solid #2e5e2e;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #203020; }"
-            );
+        m_requireP2PToggleBtn->setStyleSheet(themeStyles::toggleAccentCss(t));
+    }
+}
+
+void SettingsPanel::onToggleRequireVerifiedFiles()
+{
+    m_requireVerifiedFilesEnabled = !m_requireVerifiedFilesEnabled;
+    if (m_store) m_store->saveSetting("fileRequireVerified",
+                                      m_requireVerifiedFilesEnabled ? "true" : "false");
+    applyRequireVerifiedFilesState();
+    emit fileRequireVerifiedToggled(m_requireVerifiedFilesEnabled);
+}
+
+void SettingsPanel::applyRequireVerifiedFilesState()
+{
+    if (!m_requireVerifiedFilesStatusLbl || !m_requireVerifiedFilesToggleBtn) return;
+    const Theme& t = ThemeManager::instance().current();
+    if (m_requireVerifiedFilesEnabled) {
+        m_requireVerifiedFilesStatusLbl->setText("On");
+        m_requireVerifiedFilesStatusLbl->setStyleSheet(themeStyles::statusAccentCss(t));
+        m_requireVerifiedFilesToggleBtn->setText("Disable");
+        m_requireVerifiedFilesToggleBtn->setStyleSheet(themeStyles::toggleDangerCss(t));
+    } else {
+        m_requireVerifiedFilesStatusLbl->setText("Off");
+        m_requireVerifiedFilesStatusLbl->setStyleSheet(themeStyles::statusMutedCss(t));
+        m_requireVerifiedFilesToggleBtn->setText("Enable");
+        m_requireVerifiedFilesToggleBtn->setStyleSheet(themeStyles::toggleAccentCss(t));
     }
 }
 
@@ -1080,35 +1225,14 @@ QWidget *SettingsPanel::makeRelaySection()
     m_relayUrlEdit = new QLineEdit();
     m_relayUrlEdit->setText("https://peer2pear.com");
     m_relayUrlEdit->setPlaceholderText("https://your-relay.example.com");
-    m_relayUrlEdit->setStyleSheet(
-        "QLineEdit {"
-        "  background-color: #1a1a1a;"
-        "  color: #e0e0e0;"
-        "  border: 1px solid #2a2a2a;"
-        "  border-radius: 6px;"
-        "  padding: 5px 8px;"
-        "  font-size: 13px;"
-        "}"
-        "QLineEdit:focus { border: 1px solid #4caf50; }"
-        );
+    themeStyles::applyRole(m_relayUrlEdit, "themedLineEdit",
+        themeStyles::lineEditCss(ThemeManager::instance().current(), 13));
 
     m_relayApplyBtn = new QPushButton("Apply");
     m_relayApplyBtn->setEnabled(false);
     m_relayApplyBtn->setFixedWidth(78);
-    m_relayApplyBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #1e2e1e;"
-        "  color: #cccccc;"
-        "  border: 1px solid #2e4e2e;"
-        "  border-radius: 6px;"
-        "  padding: 5px 12px;"
-        "  font-size: 12px;"
-        "}"
-        "QPushButton:hover:enabled { background-color: #203020; color: #4caf50; }"
-        "QPushButton:disabled {"
-        "  background-color: #151515; color: #555555; border-color: #222222;"
-        "}"
-        );
+    themeStyles::applyRole(m_relayApplyBtn, "applyBtn",
+        themeStyles::applyBtnCss(ThemeManager::instance().current()));
 
     inputRow->addWidget(m_relayUrlEdit, 1);
     inputRow->addWidget(m_relayApplyBtn);
@@ -1178,7 +1302,7 @@ void SettingsPanel::onApplyRelayUrl()
     const QString url = m_relayUrlEdit->text().trimmed();
     if (url.isEmpty()) return;
 
-    if (m_db) m_db->saveSetting("relayUrl", url);
+    if (m_store) m_store->saveSetting("relayUrl", url.toStdString());
     m_lastAppliedRelayUrl = url;
     if (m_relayApplyBtn) m_relayApplyBtn->setEnabled(false);
 
@@ -1246,23 +1370,8 @@ QWidget *SettingsPanel::makePrivacySection()
         QPushButton *btn = new QPushButton(text);
         btn->setCheckable(true);
         btn->setCursor(Qt::PointingHandCursor);
-        btn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #1a1a1a;"
-            "  color: #999999;"
-            "  border: 1px solid #2a2a2a;"
-            "  border-radius: 6px;"
-            "  padding: 8px 14px;"
-            "  font-size: 13px;"
-            "}"
-            "QPushButton:hover { background-color: #1e1e1e; color: #cccccc; }"
-            "QPushButton:checked {"
-            "  background-color: #1f2e1f;"
-            "  color: #4caf50;"
-            "  border: 1px solid #4caf50;"
-            "  font-weight: bold;"
-            "}"
-            );
+        themeStyles::applyRole(btn, "segmentBtn",
+            themeStyles::segmentButtonCss(ThemeManager::instance().current()));
         return btn;
     };
 
@@ -1359,8 +1468,8 @@ QWidget *SettingsPanel::makePrivacySection()
 void SettingsPanel::onToggleHardBlockOnKeyChange()
 {
     m_hardBlockKeyChangeEnabled = !m_hardBlockKeyChangeEnabled;
-    if (m_db) m_db->saveSetting("hardBlockOnKeyChange",
-                                 m_hardBlockKeyChangeEnabled ? "true" : "false");
+    if (m_store) m_store->saveSetting("hardBlockOnKeyChange",
+                                      m_hardBlockKeyChangeEnabled ? "true" : "false");
     applyHardBlockKeyChangeState();
     emit hardBlockOnKeyChangeToggled(m_hardBlockKeyChangeEnabled);
 }
@@ -1368,34 +1477,17 @@ void SettingsPanel::onToggleHardBlockOnKeyChange()
 void SettingsPanel::applyHardBlockKeyChangeState()
 {
     if (!m_hardBlockKeyChangeStatusLbl || !m_hardBlockKeyChangeToggleBtn) return;
+    const Theme& t = ThemeManager::instance().current();
     if (m_hardBlockKeyChangeEnabled) {
         m_hardBlockKeyChangeStatusLbl->setText("On");
-        m_hardBlockKeyChangeStatusLbl->setStyleSheet(
-            "color: #4caf50; font-size: 13px; background: transparent; border: none;");
+        m_hardBlockKeyChangeStatusLbl->setStyleSheet(themeStyles::statusAccentCss(t));
         m_hardBlockKeyChangeToggleBtn->setText("Disable");
-        m_hardBlockKeyChangeToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #2e1a1a;"
-            "  color: #cc5555;"
-            "  border: 1px solid #5e2e2e;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #3a2020; }");
+        m_hardBlockKeyChangeToggleBtn->setStyleSheet(themeStyles::toggleDangerCss(t));
     } else {
         m_hardBlockKeyChangeStatusLbl->setText("Off");
-        m_hardBlockKeyChangeStatusLbl->setStyleSheet(
-            "color: #888888; font-size: 13px; background: transparent; border: none;");
+        m_hardBlockKeyChangeStatusLbl->setStyleSheet(themeStyles::statusMutedCss(t));
         m_hardBlockKeyChangeToggleBtn->setText("Enable");
-        m_hardBlockKeyChangeToggleBtn->setStyleSheet(
-            "QPushButton {"
-            "  background-color: #1a2a1a;"
-            "  color: #77cc77;"
-            "  border: 1px solid #2e5e2e;"
-            "  border-radius: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPushButton:hover { background-color: #203020; }");
+        m_hardBlockKeyChangeToggleBtn->setStyleSheet(themeStyles::toggleAccentCss(t));
     }
 }
 
@@ -1455,6 +1547,169 @@ void SettingsPanel::onPrivacyLevelChanged(int level)
     }
 
     // Persist and notify.
-    if (m_db) m_db->saveSetting("privacyLevel", QString::number(level));
+    if (m_store) m_store->saveSetting("privacyLevel", std::to_string(level));
     emit privacyLevelChanged(level);
+}
+
+QWidget *SettingsPanel::makeAppearanceSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    QLabel *heading = new QLabel("APPEARANCE");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    QWidget *segRow = new QWidget();
+    segRow->setStyleSheet("background: transparent; border: none;");
+    QHBoxLayout *segLayout = new QHBoxLayout(segRow);
+    segLayout->setContentsMargins(16, 8, 16, 4);
+    segLayout->setSpacing(8);
+
+    auto makeThemeButton = [](const QString &text) -> QPushButton * {
+        QPushButton *btn = new QPushButton(text);
+        btn->setCheckable(true);
+        btn->setCursor(Qt::PointingHandCursor);
+        themeStyles::applyRole(btn, "segmentBtn",
+            themeStyles::segmentButtonCss(ThemeManager::instance().current()));
+        return btn;
+    };
+
+    m_themeBtnDark   = makeThemeButton("Dark");
+    m_themeBtnLight  = makeThemeButton("Light");
+    m_themeBtnSystem = makeThemeButton("System");
+
+    segLayout->addWidget(m_themeBtnDark,   1);
+    segLayout->addWidget(m_themeBtnLight,  1);
+    segLayout->addWidget(m_themeBtnSystem, 1);
+    cardLayout->addWidget(segRow);
+
+    // Caption — honest about current scope.  The dark palette is
+    // hardcoded in per-widget stylesheets throughout the app; Light
+    // currently swaps the app-level Fusion palette so system widgets
+    // (menus, dialogs, scrollbars) respect it but per-widget
+    // stylesheets still paint dark.
+    QLabel *caption = new QLabel(
+        "Light theme is a work in progress — app-level chrome switches, "
+        "but per-widget colors still follow the dark palette.  Full "
+        "coverage is tracked as follow-up work."
+        );
+    caption->setWordWrap(true);
+    caption->setStyleSheet(
+        "color: #777777; font-size: 11px;"
+        "padding: 6px 16px 14px 16px;"
+        "background: transparent; border: none;"
+        );
+    cardLayout->addWidget(caption);
+
+    auto pickTheme = [this](ThemeManager::Preference pref) {
+        if (m_store) {
+            const char* raw = pref == ThemeManager::Preference::Light  ? "light"
+                             : pref == ThemeManager::Preference::System ? "system"
+                                                                          : "dark";
+            m_store->saveSetting("themePreference", raw);
+        }
+        // Single source of truth — ThemeManager fires themeChanged
+        // which our constructor's connection routes to applyThemeStyles
+        // + applyThemeButtonStyles, so the buttons re-highlight too.
+        ThemeManager::instance().setPreference(pref);
+    };
+    connect(m_themeBtnDark,   &QPushButton::clicked, this,
+            [pickTheme]() { pickTheme(ThemeManager::Preference::Dark); });
+    connect(m_themeBtnLight,  &QPushButton::clicked, this,
+            [pickTheme]() { pickTheme(ThemeManager::Preference::Light); });
+    connect(m_themeBtnSystem, &QPushButton::clicked, this,
+            [pickTheme]() { pickTheme(ThemeManager::Preference::System); });
+
+    return card;
+}
+
+void SettingsPanel::applyThemeButtonStyles()
+{
+    if (!m_themeBtnDark || !m_themeBtnLight || !m_themeBtnSystem) return;
+    const auto pref = ThemeManager::instance().preference();
+    QSignalBlocker b0(m_themeBtnDark);
+    QSignalBlocker b1(m_themeBtnLight);
+    QSignalBlocker b2(m_themeBtnSystem);
+    m_themeBtnDark  ->setChecked(pref == ThemeManager::Preference::Dark);
+    m_themeBtnLight ->setChecked(pref == ThemeManager::Preference::Light);
+    m_themeBtnSystem->setChecked(pref == ThemeManager::Preference::System);
+}
+
+// ── Theme application ───────────────────────────────────────────────────────
+//
+// Strategy: every section maker above has already emitted hardcoded dark
+// stylesheets via setStyleSheet().  applyThemeStyles auto-classifies each
+// child widget by inspecting that stylesheet (e.g. "background-color:
+// #111111" + "border-radius: 10px" → card) and overwrites with a theme-
+// driven sheet.  Auto-classification keeps the section makers simple
+// (no per-widget tagging boilerplate) and the override-then-overwrite
+// flow is harmless: in dark mode the rewritten sheet matches the
+// original byte-for-byte; in light mode it actually flips colors.
+//
+// Roles handled:
+//   • card        — section background + border + 10px radius
+//   • heading     — green ALL-CAPS section label
+//   • key         — left-side row label (e.g. "Display Name")
+//   • value       — right-side dim row value (e.g. truncated key)
+//   • divider     — 1px horizontal rule between rows
+//   • outerChrome — settingsPanel / settingsHeader / scroll / body
+//
+// Buttons + segmented pickers are intentionally NOT covered yet —
+// they have state-dependent stylesheets (enabled/disabled, checked/
+// hover) that the existing apply*State() methods recompute on every
+// toggle.  Migrating those is a follow-up.
+
+void SettingsPanel::applyThemeStyles()
+{
+    const Theme& t = ThemeManager::instance().current();
+
+    // Outer chrome — settingsPanel itself + the named header bar.
+    // Scroll area + body widget are tagged via p2pRole so the
+    // shared classifier doesn't have to know about the layout.
+    setStyleSheet(QStringLiteral(
+        "QWidget#settingsPanel { background-color: %1; }"
+    ).arg(t.bg.name()));
+    if (auto* header = findChild<QWidget*>("settingsHeader")) {
+        header->setStyleSheet(QStringLiteral(
+            "QWidget#settingsHeader {"
+            "  background-color: %1;"
+            "  border-bottom: 1px solid %2;"
+            "}"
+        ).arg(t.bg.name(), t.border.name()));
+    }
+    for (auto* w : findChildren<QWidget*>()) {
+        const QString role = w->property("p2pRole").toString();
+        if (role == "scroll" || role == "body") {
+            w->setStyleSheet(QStringLiteral(
+                "background-color: %1; border: none;"
+            ).arg(t.bg.name()));
+        }
+    }
+
+    // Cards / headings / key+value labels / dividers — shared with ChatView.
+    themeStyles::reapplyForChildren(this, t);
+
+    // State-dependent toggles (Notifications, DND, Require-P2P,
+    // Safety-number hard-block) own their stylesheets per state — re-
+    // invoke the apply*State methods so they pick up the new palette.
+    applyNotificationState();
+    applyDndState();
+    applyRequireP2PState();
+    applyHardBlockKeyChangeState();
 }

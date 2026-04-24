@@ -53,12 +53,15 @@ func main() {
 	hub := NewHub(mbox, *trustProxy)
 
 	// Load or generate the relay's X25519 keypair for onion routing.
+	// The same key seeds HKDF for the push-token AEAD (Audit #3 C2),
+	// so the push store can only be initialised after this load.
 	pub, priv, err := loadOrCreateRelayKey()
 	if err != nil {
 		log.Fatalf("init relay onion key: %v", err)
 	}
 	hub.relayX25519Pub = pub
 	hub.relayX25519Priv = priv
+	hub.InitPush(priv)
 
 	// Background purge of expired envelopes
 	go func() {

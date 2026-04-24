@@ -77,6 +77,20 @@ public:
     static Bytes unwrapFromRelay(const Bytes& relayEnvelope,
                                  Bytes* recipientEdPub = nullptr);
 
+    // Pad a P2P QUIC-stream payload to the next fixed bucket so an
+    // external network observer can't distinguish file chunks from
+    // control frames by size alone (arch-review #10).  Wire layout:
+    //   innerLen(4 BE) || payload || randomPadding
+    // Buckets are the same 2 / 16 / 256 KiB set used by wrapForRelay.
+    // Unlike wrapForRelay, there's no routing header (P2P is already
+    // addressed by the QUIC connection itself).
+    static Bytes padForP2P(const Bytes& payload);
+
+    // Strip the length header + padding added by padForP2P.  Returns
+    // empty if the header is malformed or claims more bytes than the
+    // framed buffer can hold.
+    static Bytes unpadFromP2P(const Bytes& padded);
+
     // Unseal an envelope using the recipient's keys.
     //
     // recipientCurvePriv: recipient's X25519 private key (32)

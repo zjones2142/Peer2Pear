@@ -9,28 +9,46 @@
 #include <QHBoxLayout>
 #include <QFrame>
 #include <QSpinBox>
+#include <QComboBox>
 
-class DatabaseManager;
+class AppDataStore;
 
 class SettingsPanel : public QWidget
 {
     Q_OBJECT
 
 public:
+    // Notification-content privacy mode.  Controls how much plaintext
+    // reaches the OS-level notification store (macOS NotificationCenter
+    // DB, Windows Action Center, Linux notification daemons) where
+    // forensic tools can read it even after the app wipes its own
+    // state.  Default is Hidden — generic banner only.  See the
+    // matching enum on iOS (Peer2PearClient.NotificationContentMode).
+    enum class NotificationMode {
+        Hidden     = 0,   // "Peer2Pear — new message"
+        SenderOnly = 1,   // "<senderName> sent a new message"
+        Full       = 2    // "<senderName>: <message text>"
+    };
+
     explicit SettingsPanel(QWidget *parent = nullptr);
 
     // Returns whether notifications are currently enabled
     bool notificationsEnabled() const { return m_notificationsEnabled; }
 
+    // Currently-selected notification content mode.  Defaults to
+    // Hidden (most private) until the user explicitly opts up.
+    NotificationMode notificationMode() const { return m_notifMode; }
+
     // Call after construction to populate profile fields
     void setProfileInfo(const QString &displayName, const QString &publicKey);
 
-    // Attach a DatabaseManager for persisting settings, then load saved state
-    void setDatabase(DatabaseManager *db);
+    // Attach the app-data store for persisting settings, then load saved state
+    void setAppDataStore(AppDataStore *store);
 
 signals:
     void backClicked();
     void notificationsToggled(bool enabled);
+    void notificationModeChanged(SettingsPanel::NotificationMode mode);
     void exportContactsClicked();
     void importContactsClicked();
 
@@ -38,6 +56,11 @@ signals:
     void fileAutoAcceptMaxChanged(int mb);
     void fileHardMaxChanged(int mb);
     void fileRequireP2PToggled(bool on);
+
+    // When on, files from peers whose safety number isn't verified are
+    // silently declined.  Pure UI-side filter — desktop ChatView's
+    // onFileAcceptRequested checks this before raising the QMessageBox.
+    void fileRequireVerifiedToggled(bool on);
 
     // Relay URL the client should connect to.  MainWindow hooks this and
     // drops the existing WS connection + reconnects with the new URL.
@@ -59,6 +82,7 @@ private slots:
     void onFileAutoAcceptSpin(int mb);
     void onFileHardMaxSpin(int mb);
     void onToggleRequireP2P();
+    void onToggleRequireVerifiedFiles();
     void onApplyRelayUrl();
     void onResetRelayUrl();
     void onPrivacyLevelChanged(int level);
@@ -67,7 +91,9 @@ private slots:
 private:
     void buildUI();
     void applyNotificationState();   // sync UI labels to m_notificationsEnabled
+    void applyDndState();            // sync UI labels to m_dndEnabled
     void applyRequireP2PState();
+    void applyRequireVerifiedFilesState();
     QWidget *makeProfileSection();
     QWidget *makeSection(const QString &sectionTitle,
                          const QList<QPair<QString, QString>> &rows);
@@ -84,10 +110,13 @@ private:
     QString      m_fullPublicKey;
 
     // Database (not owned)
-    DatabaseManager *m_db               = nullptr;
+    AppDataStore *m_store               = nullptr;
 
     // Notifications
-    bool         m_notificationsEnabled = true;
+    bool             m_notificationsEnabled = true;
+    NotificationMode m_notifMode            = NotificationMode::Hidden;
+    QComboBox       *m_notifModeCombo       = nullptr;
+    QLabel          *m_notifModeHelp        = nullptr;
     QPushButton *m_notifToggleBtn       = nullptr;
     QLabel      *m_notifStatusLabel     = nullptr;
     QLabel      *m_messageAlertsLabel   = nullptr;
@@ -103,6 +132,10 @@ private:
     bool         m_requireP2PEnabled    = false;
     QPushButton *m_requireP2PToggleBtn  = nullptr;
     QLabel      *m_requireP2PStatusLbl  = nullptr;
+
+    bool         m_requireVerifiedFilesEnabled    = false;
+    QPushButton *m_requireVerifiedFilesToggleBtn  = nullptr;
+    QLabel      *m_requireVerifiedFilesStatusLbl  = nullptr;
 
     // Relay URL
     QLineEdit   *m_relayUrlEdit         = nullptr;
@@ -122,6 +155,23 @@ private:
     QPushButton *m_hardBlockKeyChangeToggleBtn = nullptr;
     QLabel      *m_hardBlockKeyChangeStatusLbl = nullptr;
     void applyHardBlockKeyChangeState();
+
+    // Appearance — three buttons styled like the privacy level picker.
+    // The selected preference itself lives on ThemeManager (single
+    // source of truth); this class only owns the button pointers.
+    QPushButton    *m_themeBtnDark     = nullptr;
+    QPushButton    *m_themeBtnLight    = nullptr;
+    QPushButton    *m_themeBtnSystem   = nullptr;
+    QWidget *makeAppearanceSection();
+    void applyThemeButtonStyles();
+
+    // Walks every child widget tagged with one of our p2p* objectNames
+    // (p2pCard / p2pSectionHeading / p2pKeyLabel / p2pValueLabel /
+    // p2pDivider) and overwrites its stylesheet with one built from the
+    // currently-active Theme.  Called at end of buildUI() and again
+    // every time ThemeManager::themeChanged fires.  Cheap (single
+    // findChildren walk per tag); no widget-tree rebuild required.
+    void applyThemeStyles();
 };
 
 #endif // SETTINGSPANEL_H

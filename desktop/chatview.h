@@ -1,6 +1,9 @@
 #pragma once
 
 #include "ChatController.hpp"
+#include "AppDataStore.hpp"
+#include "qt_str_helpers.hpp"
+
 #include <QObject>
 #include <QVector>
 #include <QString>
@@ -8,13 +11,15 @@
 #include <QDateTime>
 #include <QMap>
 #include <QSet>
-#include <functional>
 #include <QLabel>
 #include <QFrame>
 
+#include <functional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "ChatNotifier.h"
-#include "chattypes.h"
-#include "databasemanager.h"
 #include "filetransfer.h"
 
 namespace Ui { class MainWindow; }
@@ -26,7 +31,7 @@ class ChatView : public QObject
 public:
     explicit ChatView(Ui::MainWindow *ui,
                       ChatController *controller,
-                      DatabaseManager *db,
+                      AppDataStore *store,
                       QObject *parent = nullptr);
 
     void reloadCurrentChat();
@@ -127,6 +132,11 @@ public:
     /// Safety-numbers: called when ChatController::onPeerKeyChanged
     /// fires, so the contact list re-renders its verification badges.
     void refreshAfterKeyChange() { rebuildChatList(); }
+    /// "Only accept files from verified contacts" UI policy.  Set
+    /// from MainWindow when SettingsPanel emits the toggle.  Pure
+    /// presentation-layer filter — onFileAcceptRequested checks this
+    /// + peerTrust before raising the consent QMessageBox.
+    void setRequireVerifiedFiles(bool on) { m_requireVerifiedFiles = on; }
 
 private:
     void rebuildChatList();
@@ -141,7 +151,7 @@ private:
 
     // File tab — buildFileCard returns an owned QFrame; rebuildFilesTab places it
     void    rebuildFilesTab();
-    QFrame *buildFileCard(const FileTransferRecord &rec, QWidget *parent);
+    QFrame *buildFileCard(const AppDataStore::FileRecord &rec, QWidget *parent);
 
     // Find the 1:1 chat index for a peer (-1 if none).  Skips group
     // chats — groups are matched by groupId via their own helpers.
@@ -150,16 +160,17 @@ private:
     // is found.  Used for inbound traffic from a peer we haven't
     // explicitly added yet.
     int findOrCreateChatForPeer(const QString &peerIdB64u);
-    static QString chatKey(const ChatData &c);
+    static QString chatKey(const AppDataStore::Contact &c);
 
     Ui::MainWindow  *m_ui         = nullptr;
     ChatController  *m_controller = nullptr;
     ChatNotifier    *m_notifier   = nullptr;
-    DatabaseManager *m_db         = nullptr;
+    AppDataStore    *m_store      = nullptr;
 
     std::function<bool()> m_shouldToastFn;
 
-    QVector<ChatData> m_chats;
+    std::vector<AppDataStore::Contact> m_chats;
+    bool              m_requireVerifiedFiles = false;
     int               m_currentChat = -1;
 
     QVector<int> m_unread;
@@ -168,8 +179,13 @@ private:
     // Per-member online status (peerIdB64u → online); shared across DM and group chats
     QMap<QString, bool> m_memberOnline;
 
+    // Messages keyed by peerIdB64u (DMs) or groupId (groups) — kept
+    // in-memory alongside m_chats since AppDataStore::Contact no
+    // longer carries an embedded message list.
+    std::unordered_map<std::string, std::vector<AppDataStore::Message>> m_messagesByPeer;
+
     // File records keyed by stable chatKey() — never needs index remapping
-    QMap<QString, QVector<FileTransferRecord>> m_filesByKey;
+    QMap<QString, std::vector<AppDataStore::FileRecord>> m_filesByKey;
 
     int  totalUnread() const;
     void ensureUnreadSize();

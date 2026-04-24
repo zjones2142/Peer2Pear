@@ -303,7 +303,14 @@ TEST_F(FileTransferRoundTrip, FileRoundTripInOrderReassembles) {
     auto markSeen = [](const std::string&) { return true; };
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
     for (const auto& w : wire) {
-        EXPECT_TRUE(receiver->handleFileEnvelope(w.peerId, w.payload, markSeen, fileKeys));
+        // fromId is who the receiver believes sent the chunk — in
+        // production this comes from the sealed envelope's sender
+        // pub.  Past versions of this test passed `w.peerId` (which
+        // is actually the recipient that the sender targeted), and
+        // handleFileEnvelope's trial-decrypt loop masked the
+        // mismatch; Audit #3 M4's peer-scoped filter now requires
+        // the arg to match a key in fileKeys.
+        EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
     EXPECT_TRUE(transferCompletedFired);
@@ -336,7 +343,14 @@ TEST_F(FileTransferRoundTrip, FileRoundTripOutOfOrderReassembles) {
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
     std::reverse(wire.begin(), wire.end());
     for (const auto& w : wire) {
-        EXPECT_TRUE(receiver->handleFileEnvelope(w.peerId, w.payload, markSeen, fileKeys));
+        // fromId is who the receiver believes sent the chunk — in
+        // production this comes from the sealed envelope's sender
+        // pub.  Past versions of this test passed `w.peerId` (which
+        // is actually the recipient that the sender targeted), and
+        // handleFileEnvelope's trial-decrypt loop masked the
+        // mismatch; Audit #3 M4's peer-scoped filter now requires
+        // the arg to match a key in fileKeys.
+        EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
     EXPECT_TRUE(transferCompletedFired);
@@ -379,7 +393,14 @@ TEST_F(FileTransferRoundTrip, HashMismatchDiscardsFile) {
     auto markSeen = [](const std::string&) { return true; };
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
     for (const auto& w : wire) {
-        EXPECT_TRUE(receiver->handleFileEnvelope(w.peerId, w.payload, markSeen, fileKeys));
+        // fromId is who the receiver believes sent the chunk — in
+        // production this comes from the sealed envelope's sender
+        // pub.  Past versions of this test passed `w.peerId` (which
+        // is actually the recipient that the sender targeted), and
+        // handleFileEnvelope's trial-decrypt loop masked the
+        // mismatch; Audit #3 M4's peer-scoped filter now requires
+        // the arg to match a key in fileKeys.
+        EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
     EXPECT_TRUE(transferCompletedFired) << "transfer should still fire 'completed' to clean up";
@@ -420,8 +441,9 @@ TEST_F(FileTransferRoundTrip, ResumptionListsMissingChunksAfterRestart) {
     // Deliver only chunks 0 and 2 — leave 1 missing.
     auto markSeen = [](const std::string&) { return true; };
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
-    EXPECT_TRUE(receiver->handleFileEnvelope(wire[0].peerId, wire[0].payload, markSeen, fileKeys));
-    EXPECT_TRUE(receiver->handleFileEnvelope(wire[2].peerId, wire[2].payload, markSeen, fileKeys));
+    // fromId is the sender's ID — see M4 note above.
+    EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, wire[0].payload, markSeen, fileKeys));
+    EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, wire[2].payload, markSeen, fileKeys));
     EXPECT_FALSE(transferCompletedFired);  // still waiting on chunk 1
 
     // Simulate a restart: throw away the receiver, build a new one on the

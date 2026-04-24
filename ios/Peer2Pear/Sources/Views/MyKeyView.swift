@@ -13,6 +13,10 @@ import UIKit
 //      are interchangeable.
 //
 // Surfaced from ChatListView's toolbar (person.circle icon) as a sheet.
+// Per-device preferences (appearance, biometric unlock, notification
+// privacy, relay URL) live in SettingsView — they used to sit here
+// but were confusing under the "My Key" title since they have
+// nothing to do with identity-sharing.
 struct MyKeyView: View {
     @ObservedObject var client: Peer2PearClient
     @Environment(\.dismiss) private var dismiss
@@ -75,6 +79,7 @@ struct MyKeyView: View {
                 }
             }
         }
+        .p2pColorScheme(client.colorScheme)
     }
 }
 

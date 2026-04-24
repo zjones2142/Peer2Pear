@@ -11,7 +11,14 @@ struct ConversationView: View {
     @State private var activeFileRequest: P2PFileRequest?
 
     private var peerMessages: [P2PMessage] {
-        client.messages.filter { $0.from == peerId }
+        // Both directions: inbound (from == peerId) + outbound echoes
+        // (from == myPeerId && to == peerId).  Without the echo side
+        // the sender's own bubbles would never render — tapping Send
+        // would just clear the text field with no visible feedback.
+        client.messages.filter { msg in
+            msg.from == peerId
+                || (msg.from == client.myPeerId && msg.to == peerId)
+        }
     }
 
     /// Transfers with this peer — inbound or outbound, in-flight or
@@ -40,7 +47,7 @@ struct ConversationView: View {
             Divider()
             inputBar
         }
-        .navigationTitle(peerId.prefix(8) + "...")
+        .navigationTitle(client.displayName(for: peerId))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .fileImporter(isPresented: $showFilePicker,
@@ -226,6 +233,23 @@ struct GroupConversationView: View {
         var g = group
         g.lastActivity = Date()
         client.groups[group.id] = g
+        // Persist: bump the group's contact row + insert the echo
+        // message.  senderName carries our peerId so the row maps back
+        // to "you" on a future restart.
+        client.dbSaveContact(Peer2PearClient.DBContact(
+            peerId:        g.id,
+            name:          g.name,
+            keys:          g.memberIds,
+            isGroup:       true,
+            groupId:       g.id,
+            avatarB64:     client.groupAvatars[g.id] ?? "",
+            lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
+        client.dbSaveMessage(peerId: g.id, message: Peer2PearClient.DBMessage(
+            sent:          true,
+            text:          echo.text,
+            timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
+            msgId:         echo.id,
+            senderName:    client.myPeerId))
         messageText = ""
     }
 }
@@ -723,6 +747,7 @@ struct ChatInputBar: View {
 struct FileTransferRow: View {
     @ObservedObject var client: Peer2PearClient
     let transfer: P2PTransferRecord
+    @State private var confirmRemove = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -747,6 +772,33 @@ struct FileTransferRow: View {
         .padding(8)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        // Long-press → "Remove from List" on terminal rows.  Hides the
+        // chat-strip card and drops the file_transfers row but never
+        // touches the file on disk — same semantics as desktop's
+        // chatview "Delete" button.  In-flight transfers offer the
+        // inline xmark.circle cancel button instead, so this menu is
+        // strictly for cleaning up history.
+        .contextMenu {
+            if transfer.isTerminal {
+                Button(role: .destructive) {
+                    confirmRemove = true
+                } label: {
+                    Label("Remove from List", systemImage: "trash")
+                }
+            }
+        }
+        // Confirm before removing — the user's mental model is "delete",
+        // so reassure them their saved file stays in the iOS Files app.
+        .confirmationDialog("Remove from List?",
+                            isPresented: $confirmRemove,
+                            titleVisibility: .visible) {
+            Button("Remove", role: .destructive) {
+                client.removeTransferRecord(transferId: transfer.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This file will remain in Files — only the entry in this chat is removed.")
+        }
     }
 
     @ViewBuilder private var subtitle: some View {

@@ -1,52 +1,8 @@
 import Foundation
 import Combine
-
-// MARK: - Persistent UI-state snapshot
-// Groups, group avatars, and message history live here across app
-// launches.  The core's own SQLCipher DB covers identity + ratchet
-// sessions separately; this snapshot is just the iOS-side @Published
-// surface so the user doesn't see an empty chat list on every restart.
-//
-// Storage: JSON file at <docs>/peer2pear-ui-state.json.  Written with
-// .completeFileProtection so iOS encrypts it at rest while the device
-// is locked (matches the at-rest posture of identity.json + the
-// SQLCipher DB).
-//
-// Not persisted (intentional): peerPresence (transient), keyChanges
-// (session-scoped warnings), pendingFileRequests (re-arrive on
-// reconnect), transfers (FileTransferManager owns ground truth and
-// re-emits progress on resume), statusMessage / isConnected /
-// myPeerId (derived).
-final class Peer2PearStore {
-    private let url: URL
-
-    struct Snapshot: Codable {
-        var groups:        [String: P2PGroup]
-        var groupAvatars:  [String: String]
-        var groupMessages: [P2PGroupMessage]
-        var messages:      [P2PMessage]
-    }
-
-    init(documentDir: String) {
-        url = URL(fileURLWithPath: documentDir)
-            .appendingPathComponent("peer2pear-ui-state.json")
-    }
-
-    func load() -> Snapshot? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        let dec = JSONDecoder()
-        dec.dateDecodingStrategy = .iso8601
-        return try? dec.decode(Snapshot.self, from: data)
-    }
-
-    func save(_ snap: Snapshot) {
-        let enc = JSONEncoder()
-        enc.dateEncodingStrategy = .iso8601
-        guard let data = try? enc.encode(snap) else { return }
-        // Atomic write so a crash mid-save doesn't truncate the file.
-        try? data.write(to: url, options: [.atomic, .completeFileProtection])
-    }
-}
+import Network
+import UIKit
+import UserNotifications
 
 // MARK: - Event data models
 
@@ -56,6 +12,11 @@ struct P2PMessage: Identifiable, Codable {
     let from: String     // peer ID (base64url)
     let text: String
     let timestamp: Date
+    // Set only for locally-originated (outgoing) messages so the UI
+    // knows which conversation the echo belongs to.  Nil for inbound
+    // — the sender is the conversation key in that case.  Optional so
+    // older on-disk snapshots that predate this field load cleanly.
+    var to: String?
 }
 
 /// Group message — carries groupId + member list alongside the text.
@@ -169,6 +130,114 @@ struct P2PKeyChange: Identifiable {
 /// High-level Swift wrapper around the peer2pear C API.
 /// Owns the p2p_context and bridges C callbacks → Combine publishers.
 final class Peer2PearClient: ObservableObject {
+    // MARK: - Relay URL (shared by Onboarding + Settings)
+
+    // UserDefaults survives app launches and passcode unlock but is
+    // wiped on uninstall (iOS sandbox).  Cross-reinstall persistence
+    // would need iCloud Keychain, which we deliberately avoid to keep
+    // the relay URL from leaving the device.
+    static let kDefaultsRelayUrlKey = "p2p.lastRelayUrl"
+    static let kDefaultRelayUrl     = "https://peer2pear.com"
+
+    /// Last-entered (or default) relay URL.  Reads UserDefaults each
+    /// time so a Settings-screen change is visible without needing a
+    /// notification to propagate.
+    static var storedRelayUrl: String {
+        UserDefaults.standard.string(forKey: kDefaultsRelayUrlKey)
+            ?? kDefaultRelayUrl
+    }
+
+    // MARK: - Backup relays (send pool for multi-hop)
+
+    // Stored as a JSON-encoded [String] in UserDefaults.  Multi-hop
+    // forwarding in RelayClient gates on `m_sendRelays.size() >= 2`,
+    // so a user on Privacy=Maximum with fewer than two backup relays
+    // silently falls back to Enhanced-tier behavior.  The SettingsView
+    // explainer reflects that honestly.
+    static let kBackupRelayUrlsKey = "p2p.backupRelayUrls"
+
+    @Published var backupRelayUrls: [String] = {
+        guard let data = UserDefaults.standard
+                .data(forKey: Peer2PearClient.kBackupRelayUrlsKey),
+              let arr = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return arr
+    }() {
+        didSet {
+            if let data = try? JSONEncoder().encode(backupRelayUrls) {
+                UserDefaults.standard.set(data, forKey: Self.kBackupRelayUrlsKey)
+            }
+        }
+    }
+
+    /// Validate + append a backup relay URL.  Returns false when the URL
+    /// is empty, malformed, uses a non-TLS scheme, or duplicates one
+    /// already in the list.  On success, also pushes the new relay to
+    /// the live send pool so multi-hop can pick it up without waiting
+    /// for a relaunch — the core deduplicates, so the next start() call
+    /// replaying the persisted list is a no-op.
+    @discardableResult
+    func addBackupRelay(_ url: String) -> Bool {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lowered = trimmed.lowercased()
+        guard lowered.hasPrefix("https://") || lowered.hasPrefix("wss://")
+        else { return false }
+        guard URL(string: trimmed) != nil else { return false }
+        guard !backupRelayUrls.contains(trimmed) else { return false }
+        backupRelayUrls.append(trimmed)
+        addSendRelay(url: trimmed)
+        return true
+    }
+
+    /// Remove a backup relay from the persisted list.  The live send
+    /// pool is not mutated — the core has no remove-send-relay entry
+    /// point, so the deletion takes effect on the next start().
+    func removeBackupRelay(_ url: String) {
+        backupRelayUrls.removeAll { $0 == url }
+    }
+
+    /// True when a passphrase-unlockable identity already lives on disk.
+    /// Drives the Onboarding "Unlock" vs. "Create" branching — mirrors
+    /// what `p2p_set_passphrase_v2` in the core checks (the salt file is
+    /// created on first run and persists for the life of the install).
+    static func identityExists(documentDir: String) -> Bool {
+        let salt = URL(fileURLWithPath: documentDir)
+            .appendingPathComponent("keys/db_salt.bin")
+        return FileManager.default.fileExists(atPath: salt.path)
+    }
+
+    static var documentsPath: String {
+        FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0].path
+    }
+
+    // MARK: - Appearance preference
+
+    /// Three-way color scheme preference.  `.system` follows the OS
+    /// dark/light toggle; `.dark` / `.light` pin regardless.  Default
+    /// is `.dark` because the desktop app is dark-only and we want
+    /// per-user identity posture to feel consistent across platforms.
+    enum ColorSchemePreference: String, CaseIterable, Identifiable {
+        case dark   = "dark"
+        case light  = "light"
+        case system = "system"
+        var id: String { rawValue }
+    }
+
+    private static let kColorSchemeKey = "p2p.colorScheme"
+
+    @Published var colorScheme: ColorSchemePreference = {
+        let raw = UserDefaults.standard.string(forKey: kColorSchemeKey)
+               ?? ColorSchemePreference.dark.rawValue
+        return ColorSchemePreference(rawValue: raw) ?? .dark
+    }() {
+        didSet {
+            UserDefaults.standard.set(colorScheme.rawValue,
+                                       forKey: Self.kColorSchemeKey)
+        }
+    }
+
     // MARK: - Published state (drives SwiftUI)
 
     @Published var isConnected = false
@@ -211,6 +280,273 @@ final class Peer2PearClient: ObservableObject {
     /// the user re-verifies via `markPeerVerified`.
     @Published var keyChanges: [String: P2PKeyChange] = [:]
 
+    /// Peers the user added via "New Chat" before any messages flowed.
+    /// ChatListView unions this with the message-derived peer set so a
+    /// freshly-added contact shows up immediately.  Persisted as
+    /// in_address_book=1 contact rows in the AppDataStore so restarts
+    /// don't lose contacts that haven't yet exchanged a message.
+    @Published var knownPeerContacts: Set<String> = []
+
+    /// Register a peer as a known contact.  Safe to call on an already-
+    /// known peer (idempotent), and skips self (the core filters self
+    /// out everywhere else, keep the invariant here too).  Upserts the
+    /// matching contacts row with in_address_book=1 so a future restart
+    /// reloads the peer as an explicit contact.
+    func addContact(peerId: String) {
+        let trimmed = peerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != myPeerId else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.knownPeerContacts.insert(trimmed)
+            self.dbSaveContact(DBContact(
+                peerId:        trimmed,
+                name:          self.contactNicknames[trimmed] ?? "",
+                keys:          [trimmed],
+                isBlocked:     self.blockedPeerIds.contains(trimmed),
+                inAddressBook: true))
+        }
+    }
+
+    /// Remove a peer from the address book and clear their nickname.
+    /// Leaves message history intact — the key pair still identifies
+    /// the peer, so if they message again the chat row stays attached
+    /// to the same cryptographic identity.  Use `deleteChat(peerId:)`
+    /// to wipe the transcript separately.  In the DB the row stays
+    /// (so messages.peer_id FK is satisfied) but in_address_book flips
+    /// to 0 and name resets to empty.
+    func removeContact(peerId: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.knownPeerContacts.remove(peerId)
+            self.contactNicknames.removeValue(forKey: peerId)
+            self.dbSaveContact(DBContact(
+                peerId:        peerId,
+                name:          "",
+                keys:          [peerId],
+                isBlocked:     self.blockedPeerIds.contains(peerId),
+                inAddressBook: false))
+        }
+    }
+
+    /// Wipe 1:1 message history with a peer without touching the
+    /// contacts roster.  Used by the ChatListView trailing swipe so
+    /// the user can dismiss a chat row (e.g. from a stranger who
+    /// messaged first) without also deleting the contact.  Also wipes
+    /// the file_transfers rows for this chat so the strip cards
+    /// disappear — the actual files at savedPath stay on disk.
+    func deleteChat(peerId: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.messages.removeAll { $0.from == peerId || $0.to == peerId }
+            // In-memory transfer cards for this peer also go away.
+            // (We don't touch the on-disk files at savedPath — only
+            // the bookkeeping row + UI card.)
+            let toRemove = self.transfers.filter { $0.value.peerId == peerId }.keys
+            for tid in toRemove {
+                self.transfers.removeValue(forKey: tid)
+            }
+            self.dbDeleteMessages(peerId: peerId)
+            self.dbDeleteFileRecordsForChat(chatKey: peerId)
+        }
+    }
+
+    /// Peers the user has blocked.  Inbound 1:1 messages and file
+    /// requests from these peers are dropped on arrival; outbound
+    /// sends are refused by `sendText` / `sendFile`.  Purely a
+    /// client-side filter (the relay still delivers the envelope —
+    /// we just never surface it).  Mirrors the desktop's
+    /// `ChatData.isBlocked` bit.
+    @Published var blockedPeerIds: Set<String> = []
+
+    /// Toggle block state for a peer.  `blocked == true` adds to the
+    /// set; `blocked == false` removes.  Persisted via the snapshot
+    /// so blocks survive relaunch.
+    func setBlocked(peerId: String, blocked: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if blocked { self.blockedPeerIds.insert(peerId) }
+            else       { self.blockedPeerIds.remove(peerId) }
+            self.dbSaveContact(DBContact(
+                peerId:        peerId,
+                name:          self.contactNicknames[peerId] ?? "",
+                keys:          [peerId],
+                isBlocked:     blocked,
+                inAddressBook: self.knownPeerContacts.contains(peerId)))
+        }
+    }
+
+    func isBlocked(peerId: String) -> Bool {
+        blockedPeerIds.contains(peerId)
+    }
+
+    /// Tear down the Double Ratchet session with this peer so the next
+    /// outbound message performs a fresh X3DH-style handshake.  Useful
+    /// after a device swap or when the peer reports decryption errors.
+    /// Does not touch trust state, message history, or safety numbers.
+    func resetSession(peerId: String) {
+        guard let ctx = rawContext else { return }
+        p2p_reset_session(ctx, peerId)
+    }
+
+    /// User-chosen friendly names for contacts, keyed by peer ID.
+    /// Editable in ContactDetailView + via the swipe-rename in
+    /// ContactsListView.  Falls back through `displayName(for:)` to
+    /// the peer's published `peerAvatars` name and then to the key
+    /// prefix when no nickname is set.
+    @Published var contactNicknames: [String: String] = [:]
+
+    /// Set or clear the user's nickname for a peer.  Empty / whitespace
+    /// strings clear the entry so future renders fall back to the
+    /// peer-published display name (or, if none, the key prefix).
+    func setNickname(peerId: String, nickname: String) {
+        let trimmed = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if trimmed.isEmpty {
+                self.contactNicknames.removeValue(forKey: peerId)
+            } else {
+                self.contactNicknames[peerId] = trimmed
+                // Setting a nickname is a strong "this person is now
+                // in my address book" signal — promote stranger-stub
+                // rows so the peer also surfaces in ContactsListView,
+                // not just the chat thread they came from.
+                self.knownPeerContacts.insert(peerId)
+            }
+            self.dbSaveContact(DBContact(
+                peerId:        peerId,
+                name:          trimmed,
+                keys:          [peerId],
+                isBlocked:     self.blockedPeerIds.contains(peerId),
+                inAddressBook: !trimmed.isEmpty
+                                || self.knownPeerContacts.contains(peerId)))
+        }
+    }
+
+    // MARK: - Contacts export / import
+    //
+    // Wire format matches the desktop's `peer2pear_contacts.json`
+    // schema (see desktop/mainwindow.cpp onExportContacts + onImportContacts)
+    // so an exported file from either platform imports cleanly into the
+    // other.  Version 1 is: `{ "version": 1, "contacts": [{name, keys[]}] }`.
+
+    struct ContactsExport: Codable {
+        let version: Int
+        let contacts: [Entry]
+        struct Entry: Codable {
+            let name: String
+            let keys: [String]
+        }
+    }
+
+    /// Build a desktop-compatible JSON blob of the address book.  Only
+    /// explicit contacts are exported — strangers we've merely exchanged
+    /// messages with stay out, matching the ContactsListView roster.
+    /// Each entry uses `displayName(for:)` so nicknames survive the
+    /// round-trip; when no nickname is set, falls back to the peer's
+    /// published display name or the key prefix.
+    func exportContactsJSON() -> Data {
+        let entries = contactPeerIds.sorted().map { peerId in
+            ContactsExport.Entry(
+                name: displayName(for: peerId),
+                keys: [peerId])
+        }
+        let payload = ContactsExport(version: 1, contacts: entries)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return (try? enc.encode(payload)) ?? Data()
+    }
+
+    /// Merge contacts from an exported JSON blob into our local state.
+    /// Returns the count successfully imported (skipping malformed
+    /// entries, self, and entries whose first key isn't a 43-char
+    /// base64url peer ID).  Existing nicknames are overwritten by the
+    /// incoming name — treating the import as authoritative matches
+    /// the desktop's "imported name stored as-is" behavior.
+    @discardableResult
+    func importContacts(from data: Data) -> Int {
+        guard let payload = try? JSONDecoder()
+            .decode(ContactsExport.self, from: data) else { return 0 }
+        var imported = 0
+        for entry in payload.contacts {
+            guard let key = entry.keys.first else { continue }
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.count == 43, trimmed != myPeerId else { continue }
+            addContact(peerId: trimmed)
+            let name = entry.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty {
+                setNickname(peerId: trimmed, nickname: name)
+            }
+            imported += 1
+        }
+        return imported
+    }
+
+    /// Best-available display name for a peer ID.  Priority:
+    ///   1. user-chosen nickname (contactNicknames),
+    ///   2. peer-published display name (peerAvatars),
+    ///   3. truncated key prefix `"abcdefgh…"`.
+    /// Single source of truth used by every chat row, conversation
+    /// header, and contact detail view so a rename in one place
+    /// propagates everywhere.
+    func displayName(for peerId: String) -> String {
+        if let nick = contactNicknames[peerId],
+           !nick.isEmpty { return nick }
+        if let pub = peerAvatars[peerId]?.displayName,
+           !pub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return pub
+        }
+        return String(peerId.prefix(8)) + "…"
+    }
+
+    /// Active 1:1 conversations — peers with at least one message in
+    /// either direction.  Address-book entries with no message history
+    /// do NOT appear here (they live only in ContactsListView until the
+    /// user actually starts a chat from the "Send Message" link in
+    /// ContactDetailView).  Decoupling chats from contacts is what lets
+    /// `deleteChat` remove a row without also removing the contact —
+    /// the chat list listens to message presence, the contact list
+    /// listens to in_address_book.
+    var chatPeerIds: Set<String> {
+        var ids = Set<String>()
+        for m in messages {
+            ids.insert(m.from)
+            if let to = m.to { ids.insert(to) }
+        }
+        ids.remove(myPeerId)
+        return ids
+    }
+
+    /// Address-book peers: only those the user explicitly added via
+    /// New Chat paste / QR scan / Import.  Narrower than
+    /// `chatPeerIds` — drives ContactsListView so strangers who
+    /// messaged us don't auto-populate the roster.
+    var contactPeerIds: Set<String> {
+        var ids = knownPeerContacts
+        ids.remove(myPeerId)
+        return ids
+    }
+
+    // Plaintext passphrase from the most recent unlock, held only so
+    // the Settings → "Enable Face ID" toggle can install it into the
+    // Keychain without re-prompting.  Wiped on app background and on
+    // first read via `consumeUnlockPassphrase()` — whichever comes
+    // first.  Not @Published: we don't want the value flowing through
+    // SwiftUI re-renders or driving persistSnapshot.
+    private var lastUnlockPassphrase: String = ""
+
+    func setLastUnlockPassphrase(_ pass: String) {
+        lastUnlockPassphrase = pass
+    }
+
+    /// One-time read.  Returns the cached passphrase and clears it.
+    /// Returns nil if nothing's cached (e.g. user came back to Settings
+    /// after backgrounding the app, or already enabled Face ID once).
+    func consumeUnlockPassphrase() -> String? {
+        let pass = lastUnlockPassphrase
+        lastUnlockPassphrase = ""
+        return pass.isEmpty ? nil : pass
+    }
+
     // MARK: - Internal
 
     /// Raw C context pointer — accessed by platform adapters
@@ -219,21 +555,123 @@ final class Peer2PearClient: ObservableObject {
     private var ws: WebSocketAdapter!
     private var http: HttpAdapter!
 
-    // Persistent UI-state — bound after `start()` once we know the
-    // data dir.  See Peer2PearStore for what gets persisted vs. not.
-    private var store: Peer2PearStore?
-    private var saveCancellable: AnyCancellable?
-
     // MARK: - Lifecycle
 
     init() {
         ws = WebSocketAdapter(client: self)
         http = HttpAdapter(client: self)
+        // Wipe any cached unlock passphrase as soon as the app
+        // backgrounds — UIKit posts this synchronously before the
+        // process can be jetsam'd or memory-imaged.  Also stamp the
+        // background time so the foreground observer can decide
+        // whether to auto-lock.  Kept tokens here so the observers
+        // don't outlive `self`.
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            _ = self?.consumeUnlockPassphrase()
+            self?.backgroundedAt = Date()
+        }
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.maybeAutoLock()
+        }
+    }
+
+    deinit {
+        if let backgroundObserver {
+            NotificationCenter.default.removeObserver(backgroundObserver)
+        }
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
+        stop()
+    }
+
+    private var backgroundObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
+
+    /// Wall-clock instant the app most recently entered background.
+    /// Cleared once the auto-lock decision is made on foreground.
+    private var backgroundedAt: Date?
+
+    /// Foreground hook: if the unlocked session has been backgrounded
+    /// longer than `autoLockMinutes`, fire `lock()` so the user has to
+    /// re-authenticate.  -1 = never, 0 = lock on every backgrounding,
+    /// otherwise a minute threshold.  No-op when locked already.
+    private func maybeAutoLock() {
+        guard let bgAt = backgroundedAt else { return }
+        backgroundedAt = nil
+        // Only relevant when we have a live unlocked session.
+        guard rawContext != nil else { return }
+        let mins = autoLockMinutes
+        if mins < 0 { return }              // "Never"
+        if mins == 0 { lock(); return }     // "Immediately"
+        let elapsed = Date().timeIntervalSince(bgAt)
+        if elapsed >= TimeInterval(mins) * 60 { lock() }
+    }
+
+    // MARK: - Failed unlock counter + panic wipe
+
+    /// Bump the failed-attempt counter.  When the wipe-on-failure
+    /// setting is on AND the counter crosses the threshold, nuke the
+    /// entire app sandbox via `wipeAllData(documentDir:)`.  Returns
+    /// true if a wipe fired so the caller (OnboardingView) can show
+    /// the notice.
+    @discardableResult
+    func recordFailedUnlock(documentDir: String) -> Bool {
+        let next = failedUnlockAttempts + 1
+        UserDefaults.standard.set(next, forKey: Self.kFailedUnlockAttemptsKey)
+        if wipeOnFailedAttempts, next >= Self.kFailedUnlockAttemptsThreshold {
+            wipeAllData(documentDir: documentDir)
+            return true
+        }
+        return false
+    }
+
+    /// Reset the failed-attempt counter — called after a successful
+    /// unlock so a sequence like "wrong, wrong, right" doesn't keep
+    /// the counter primed for a wipe on the next typo session.
+    func resetFailedUnlockCounter() {
+        UserDefaults.standard.set(0, forKey: Self.kFailedUnlockAttemptsKey)
+    }
+
+    /// Panic wipe: nuke every file in the app's documents directory
+    /// (identity, SQLCipher DB, salt, message snapshot if any) and
+    /// remove the biometric passphrase from the Keychain.  Mirrors
+    /// what `simctl uninstall + install` does, without an actual
+    /// reinstall.  After this returns the app is in the "fresh
+    /// install" state and OnboardingView's next render will show the
+    /// "Get Started" branch instead of "Unlock".
+    func wipeAllData(documentDir: String) {
+        stop()
+        BiometricUnlock.remove()
+        UserDefaults.standard.set(0, forKey: Self.kFailedUnlockAttemptsKey)
+        let fm = FileManager.default
+        if let contents = try? fm.contentsOfDirectory(atPath: documentDir) {
+            for item in contents {
+                try? fm.removeItem(atPath: documentDir + "/" + item)
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.myPeerId        = ""
+            self.statusMessage   = ""
+            self.dataWipedNotice = true
+        }
     }
 
     /// Initialize the protocol engine with a data directory and passphrase.
     func start(dataDir: String, passphrase: String, relayUrl: String) {
         guard rawContext == nil else { return }
+        // Wipe any stale error from a prior failed unlock so the new
+        // attempt starts clean.  Without this, a successful retry
+        // shows the previous "Identity unlock failed" string until
+        // the next on_status callback overwrites it.
+        statusMessage = ""
 
         // Build the platform callbacks struct
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -298,43 +736,40 @@ final class Peer2PearClient: ObservableObject {
         }
         myPeerId = String(cString: p2p_my_id(rawContext))
 
-        // Restore persisted UI state.  Do this BEFORE connectToRelay so
-        // setKnownGroupMembers replays the H2 roster gate before any
-        // inbound control messages arrive on the new socket.
-        store = Peer2PearStore(documentDir: dataDir)
-        if let snap = store?.load() {
-            groups        = snap.groups
-            groupAvatars  = snap.groupAvatars
-            groupMessages = snap.groupMessages
-            messages      = snap.messages
-            // Replay every known group's roster to the core so inbound
-            // group_rename / group_avatar / group_leave / group_member_update
-            // from existing members are admitted.  Without this, all
-            // control messages drop after restart until a fresh group_msg
-            // bootstraps the roster.
-            for group in snap.groups.values {
-                setKnownGroupMembers(groupId: group.id,
-                                      memberPeerIds: group.memberIds)
-            }
-        }
+        // Hydrate the @Published surface from the SQLCipher AppDataStore.
+        // Done BEFORE p2p_connect so setKnownGroupMembers replays the
+        // H2 roster gate before any inbound control messages arrive on
+        // the new socket.
+        loadStateFromDb()
 
-        // Auto-save on any persisted-state change, debounced so a burst
-        // of message arrivals coalesces into one write.
-        saveCancellable = objectWillChange
-            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in self?.persistSnapshot() }
+        // Re-apply file-policy preferences each unlock so a setting the
+        // user changed in a prior session takes effect now.  Network
+        // monitor decides the effective auto-accept value (0 on
+        // cellular when wifi-only is on).
+        startNetworkMonitor()
+        setFileHardMaxMB(fileHardMaxMB)
+        setFileRequireP2P(fileRequireP2P)
+        setHardBlockOnKeyChange(hardBlockOnKeyChange)
+        setPrivacyLevel(privacyLevel.rawValue)
+        applyEffectiveAutoAcceptThreshold()
 
         p2p_set_relay_url(rawContext, relayUrl)
+        // Replay the persisted backup-relay list into the core's send
+        // pool so Privacy=Maximum's multi-hop path (gated on
+        // m_sendRelays.size() >= 2) has forwarders to choose from.
+        // Order is stable (primary via set_relay_url, then backups in
+        // insertion order) so the pool composition matches across
+        // relaunches — keeps forwarder selection consistent.
+        for backup in backupRelayUrls {
+            addSendRelay(url: backup)
+        }
         p2p_connect(rawContext)
-    }
 
-    private func persistSnapshot() {
-        guard let store else { return }
-        store.save(.init(
-            groups:        groups,
-            groupAvatars:  groupAvatars,
-            groupMessages: groupMessages,
-            messages:      messages))
+        // If APNs registered before start() completed, the AppDelegate
+        // will have stashed the token in `pendingPushToken`.  Forward
+        // it now so the relay sees us as reachable via push from the
+        // very first connection.
+        forwardPushTokenIfConnected()
     }
 
     func stop() {
@@ -345,12 +780,396 @@ final class Peer2PearClient: ObservableObject {
         isConnected = false
     }
 
-    deinit { stop() }
+    /// Tear down the unlocked session and bounce back to OnboardingView.
+    /// Drops the rawContext (which evicts the dbKey + ratchet state from
+    /// memory), wipes the cached passphrase, and clears the @Published
+    /// surface so SwiftUI swaps to the unlock screen via the
+    /// `client.myPeerId.isEmpty` state-machine guard at the app root.
+    /// On the next unlock, `loadStateFromDb()` repopulates from the
+    /// SQLCipher AppDataStore so contacts/messages/etc. survive the lock.
+    func lock() {
+        _ = consumeUnlockPassphrase()  // belt-and-braces — also wiped on background
+        stop()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.myPeerId          = ""
+            self.statusMessage     = ""
+            self.messages          = []
+            self.groupMessages     = []
+            self.groups            = [:]
+            self.groupAvatars      = [:]
+            self.knownPeerContacts = []
+            self.contactNicknames  = [:]
+            self.blockedPeerIds    = []
+            self.peerPresence      = [:]
+            self.peerAvatars       = [:]
+            self.pendingFileRequests = []
+            self.transfers         = [:]
+            self.keyChanges        = [:]
+        }
+    }
+
+    // MARK: - Push notifications
+
+    /// Hand the APNs device token to the core, which forwards it to
+    /// the relay over the authenticated WebSocket.  Safe to call
+    /// before `start()` — the token is stashed and replayed once the
+    /// core is live.  `token` is the hex-encoded bytes; empty
+    /// unregisters the device.
+    func setPushToken(_ token: String, platform: String) {
+        pendingPushToken = (token, platform)
+        forwardPushTokenIfConnected()
+    }
+
+    /// Invoked by the AppDelegate when a silent push arrives while the
+    /// app is backgrounded.  iOS gives us ~30 s to fetch queued
+    /// envelopes before freezing the app again.  Completion is called
+    /// with `true` if we observed any new data during the wake.
+    func handleBackgroundPush(completion: @escaping (Bool) -> Void) {
+        guard let ctx = rawContext else {
+            completion(false)
+            return
+        }
+        let baseline = messages.count + groupMessages.count
+        p2p_wake_for_push(ctx)
+
+        // Poll for ~5 s: if a new message has landed by then, we
+        // report newData.  Longer-running delivery after completion
+        // still fires normal callbacks + local notifications — the
+        // completion here just tells iOS whether the wake was useful
+        // for background-refresh scheduling heuristics.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self else { completion(false); return }
+            let now = self.messages.count + self.groupMessages.count
+            completion(now > baseline)
+        }
+    }
+
+    private var pendingPushToken: (token: String, platform: String)?
+
+    private func forwardPushTokenIfConnected() {
+        guard let ctx = rawContext, let p = pendingPushToken else { return }
+        p2p_set_push_token(ctx, p.token, p.platform)
+        // Leave `pendingPushToken` set — RelayClient replays it on
+        // every reconnect already, and re-sending on a warm WS is
+        // idempotent at the relay level (upsert).
+    }
+
+    /// How much content to reveal in the OS notification banner.
+    /// Default is `.hidden` because iOS persists notification
+    /// payloads in a system-level store (`backboardd` / NotificationCenter
+    /// DB) that forensic tools can extract even after the app "forgets"
+    /// a message.  Once plaintext enters that store, our SQLCipher-
+    /// at-rest posture is defeated.  Users who value UX over this
+    /// residual leak can opt up to `.senderOnly` or `.full`.
+    enum NotificationContentMode: String {
+        case hidden     = "hidden"      // "New message"
+        case senderOnly = "sender"      // "New message from <fingerprint>"
+        case full       = "full"        // "Alice: hello"
+    }
+
+    // MARK: - Auto-lock + wipe-on-failure preferences
+
+    /// Minutes of background time before the app auto-locks on
+    /// foreground.  0 = lock immediately on every background, -1 = never,
+    /// otherwise a positive minute count.  Default 5 minutes.
+    static let kAutoLockMinutesKey = "p2p.autoLockMinutes"
+    static let kDefaultAutoLockMinutes = 5
+
+    @Published var autoLockMinutes: Int = {
+        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kAutoLockMinutesKey) as? Int
+        return v ?? Peer2PearClient.kDefaultAutoLockMinutes
+    }() {
+        didSet { UserDefaults.standard.set(autoLockMinutes,
+                                            forKey: Peer2PearClient.kAutoLockMinutesKey) }
+    }
+
+    /// When enabled, 12 consecutive failed unlock attempts wipe every
+    /// byte in the app sandbox (identity files, SQLCipher DB, Keychain
+    /// passphrase if any) — panic-wipe mirrors the iOS native passcode
+    /// "Erase Data" option.  Off by default: destructive setting that
+    /// users must opt into knowingly.
+    static let kWipeOnFailedAttemptsKey = "p2p.wipeOnFailedAttempts"
+    static let kFailedUnlockAttemptsKey = "p2p.failedUnlockAttempts"
+    /// After N consecutive failures, wipe.  Matches iOS native default.
+    static let kFailedUnlockAttemptsThreshold = 12
+
+    @Published var wipeOnFailedAttempts: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kWipeOnFailedAttemptsKey) {
+        didSet { UserDefaults.standard.set(wipeOnFailedAttempts,
+                                            forKey: Peer2PearClient.kWipeOnFailedAttemptsKey) }
+    }
+
+    /// Flipped to true by `wipeAllData` so the onboarding view can show
+    /// a one-shot "Data Erased" notice.  Consumer should reset after read.
+    @Published var dataWipedNotice: Bool = false
+
+    // MARK: - File-transfer policy preferences
+    //
+    // Core ships defaults of 100 MB auto-accept / 100 MB hard cap.  We
+    // mirror that here, persist user changes to UserDefaults, and re-
+    // apply on every start() so the policy survives lock + relaunch.
+    // The verified-contacts gate is iOS-side because it's a UX policy
+    // (silently decline) rather than a protocol invariant.
+
+    static let kFileAutoAcceptMBKey   = "p2p.file.autoAcceptMB"
+    static let kFileHardMaxMBKey      = "p2p.file.hardMaxMB"
+    static let kFileRequireP2PKey     = "p2p.file.requireP2P"
+    static let kFileVerifiedOnlyKey   = "p2p.file.verifiedOnly"
+
+    static let kDefaultFileAutoAcceptMB = 100
+    static let kDefaultFileHardMaxMB    = 100
+
+    @Published var fileAutoAcceptMB: Int = {
+        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kFileAutoAcceptMBKey) as? Int
+        return v ?? Peer2PearClient.kDefaultFileAutoAcceptMB
+    }() {
+        didSet {
+            UserDefaults.standard.set(fileAutoAcceptMB, forKey: Self.kFileAutoAcceptMBKey)
+            setFileAutoAcceptMB(fileAutoAcceptMB)
+        }
+    }
+
+    @Published var fileHardMaxMB: Int = {
+        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kFileHardMaxMBKey) as? Int
+        return v ?? Peer2PearClient.kDefaultFileHardMaxMB
+    }() {
+        didSet {
+            UserDefaults.standard.set(fileHardMaxMB, forKey: Self.kFileHardMaxMBKey)
+            setFileHardMaxMB(fileHardMaxMB)
+        }
+    }
+
+    @Published var fileRequireP2P: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kFileRequireP2PKey) {
+        didSet {
+            UserDefaults.standard.set(fileRequireP2P, forKey: Self.kFileRequireP2PKey)
+            setFileRequireP2P(fileRequireP2P)
+        }
+    }
+
+    /// Silently decline file requests from peers whose safety number
+    /// hasn't been confirmed.  Pure iOS-side filter (the core still
+    /// receives the envelope; we just send back a decline before the
+    /// user is even prompted).
+    @Published var fileRequireVerifiedContact: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kFileVerifiedOnlyKey) {
+        didSet {
+            UserDefaults.standard.set(fileRequireVerifiedContact,
+                                       forKey: Self.kFileVerifiedOnlyKey)
+        }
+    }
+
+    /// Three-tier privacy posture for the relay protocol.  Mirrors the
+    /// desktop "Privacy" picker — every level subsumes the previous.
+    /// Stored as the int the C API expects (0/1/2).
+    enum PrivacyLevel: Int, CaseIterable, Identifiable {
+        case standard = 0   // envelope padding + sealed sender + E2EE
+        case enhanced = 1   // + send jitter + cover traffic + multi-relay rotation
+        case maximum  = 2   // + multi-hop forwarding + high-frequency cover traffic
+        var id: Int { rawValue }
+    }
+
+    static let kPrivacyLevelKey = "p2p.privacyLevel"
+
+    @Published var privacyLevel: PrivacyLevel = {
+        let raw = UserDefaults.standard.object(forKey: Peer2PearClient.kPrivacyLevelKey) as? Int
+        return PrivacyLevel(rawValue: raw ?? 0) ?? .standard
+    }() {
+        didSet {
+            UserDefaults.standard.set(privacyLevel.rawValue,
+                                       forKey: Self.kPrivacyLevelKey)
+            setPrivacyLevel(privacyLevel.rawValue)
+        }
+    }
+
+    /// Hard-block messages and files to/from a contact whose safety
+    /// number no longer matches what we previously verified.  Off by
+    /// default — a mismatch surfaces a banner in ChatRow and the user
+    /// chooses whether to continue.  When on, the core enforces the
+    /// block at seal/unseal time so the UI never has to render the
+    /// warning state, mirroring desktop's policy of the same name.
+    static let kHardBlockOnKeyChangeKey = "p2p.hardBlockOnKeyChange"
+    @Published var hardBlockOnKeyChange: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kHardBlockOnKeyChangeKey) {
+        didSet {
+            UserDefaults.standard.set(hardBlockOnKeyChange,
+                                       forKey: Self.kHardBlockOnKeyChangeKey)
+            setHardBlockOnKeyChange(hardBlockOnKeyChange)
+        }
+    }
+
+    /// Cellular-data hygiene: when on, the auto-accept threshold is
+    /// silently overridden to 0 whenever the device is NOT on Wi-Fi
+    /// (LTE / 5G / hotspot tethering).  The user gets an explicit
+    /// prompt for every file on cellular and saves both bytes and
+    /// battery.  Default ON because surprise data charges are worse
+    /// than an extra tap.  Doesn't affect the hard cap or any other
+    /// policy — only auto-accept.
+    static let kFileAutoAcceptWifiOnlyKey = "p2p.file.autoAcceptWifiOnly"
+    @Published var fileAutoAcceptWifiOnly: Bool = {
+        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kFileAutoAcceptWifiOnlyKey) as? Bool
+        return v ?? true
+    }() {
+        didSet {
+            UserDefaults.standard.set(fileAutoAcceptWifiOnly,
+                                       forKey: Self.kFileAutoAcceptWifiOnlyKey)
+            applyEffectiveAutoAcceptThreshold()
+        }
+    }
+
+    /// True whenever the most-recent NWPathMonitor update saw Wi-Fi
+    /// (or a wired connection on iPad with USB-C ethernet).  False on
+    /// cellular / hotspot / unknown.  Drives both
+    /// `applyEffectiveAutoAcceptThreshold` and a small UI label that
+    /// surfaces "Cellular — auto-accept paused" when relevant.
+    @Published var onWifi: Bool = true
+
+    private var pathMonitor: NWPathMonitor?
+
+    /// Compute and push the effective auto-accept MB to the core based
+    /// on the user's setting + current network type.  Called on every
+    /// network change AND every time the user flips the toggle / changes
+    /// the threshold, so the core's rule is always current.
+    private func applyEffectiveAutoAcceptThreshold() {
+        let effective: Int = (fileAutoAcceptWifiOnly && !onWifi)
+            ? 0
+            : fileAutoAcceptMB
+        setFileAutoAcceptMB(effective)
+    }
+
+    private func startNetworkMonitor() {
+        guard pathMonitor == nil else { return }
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { [weak self] path in
+            // usesInterfaceType(.wifi) is true for both 802.11 and a
+            // wired ethernet adapter.  Treat both as "not cellular".
+            let onWifi = path.usesInterfaceType(.wifi)
+                      || path.usesInterfaceType(.wiredEthernet)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.onWifi != onWifi {
+                    self.onWifi = onWifi
+                    self.applyEffectiveAutoAcceptThreshold()
+                }
+            }
+        }
+        m.start(queue: DispatchQueue.global(qos: .utility))
+        pathMonitor = m
+    }
+
+    /// Current consecutive-failure counter.  Exposed so the settings UI
+    /// can surface "X of 12 attempts used" to give users a heads-up.
+    var failedUnlockAttempts: Int {
+        UserDefaults.standard.integer(forKey: Self.kFailedUnlockAttemptsKey)
+    }
+
+    private static let kNotificationModeKey = "p2p.notificationContentMode"
+
+    @Published var notificationContentMode: NotificationContentMode = {
+        let raw = UserDefaults.standard.string(forKey: kNotificationModeKey)
+               ?? NotificationContentMode.hidden.rawValue
+        return NotificationContentMode(rawValue: raw) ?? .hidden
+    }() {
+        didSet {
+            UserDefaults.standard.set(notificationContentMode.rawValue,
+                                       forKey: Self.kNotificationModeKey)
+        }
+    }
+
+    /// Fire a local UNUserNotificationCenter banner for an inbound
+    /// message, applying the user's content-privacy mode.  The OS
+    /// decides whether to actually surface it — foreground banners
+    /// go through Peer2PearAppDelegate's willPresent delegate method;
+    /// backgrounded banners surface directly.
+    ///
+    /// The sender ID / message text passed here are always the
+    /// decrypted, plaintext values; this function decides what
+    /// fraction (if any) to hand to the OS notification store.
+    /// Own-message check prevents double-notify when the sender
+    /// receives their own fan-out on group sends.
+    fileprivate func fireLocalNotification(
+        fromPeerId: String,
+        senderDisplay: String,   // e.g., first-8-chars fingerprint, or "Alice"
+        groupName: String?,      // non-nil for group messages
+        messageText: String,
+        threadId: String
+    ) {
+        if fromPeerId == myPeerId { return }
+
+        let content = UNMutableNotificationContent()
+        content.sound = .default
+        content.threadIdentifier = threadId
+
+        switch notificationContentMode {
+        case .hidden:
+            // Generic wake-up only — the OS notification DB learns
+            // nothing about who or what.  User opens the app to see
+            // the actual message, which lives only in our encrypted
+            // SQLCipher AppDataStore.
+            content.title = "Peer2Pear"
+            content.body  = "New message"
+
+        case .senderOnly:
+            content.title = "Peer2Pear"
+            if let group = groupName, !group.isEmpty {
+                content.body = "New message in \(group)"
+            } else {
+                content.body = "New message from \(senderDisplay)"
+            }
+
+        case .full:
+            if let group = groupName, !group.isEmpty {
+                content.title = group
+                content.subtitle = senderDisplay
+            } else {
+                content.title = senderDisplay
+            }
+            content.body = messageText.count > 140
+                ? String(messageText.prefix(137)) + "…"
+                : messageText
+        }
+
+        let req = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil)
+        UNUserNotificationCenter.current().add(req) { _ in }
+    }
 
     // MARK: - Messaging actions
 
     func sendText(to peerId: String, text: String) {
         guard let ctx = rawContext else { return }
+        // Refuse to send to a blocked peer — mirrors desktop's
+        // isBlocked guard.  Silent no-op so the UI doesn't accidentally
+        // reach someone the user chose to ignore.
+        if isBlocked(peerId: peerId) { return }
+        // Local echo: the core doesn't fire on_message for our own
+        // outbound sends, so the sender's ConversationView would stay
+        // empty even after a successful send.  Append to `messages`
+        // with from == myPeerId so MessageBubble renders it on the
+        // right side.  Mirrors the group send path which already echoes
+        // via `client.groupMessages.append(...)` in ConversationView.
+        let echo = P2PMessage(
+            id: UUID().uuidString,
+            from: myPeerId,
+            text: text,
+            timestamp: Date(),
+            to: peerId)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.messages.append(echo)
+            // saveMessage internally INSERT-OR-IGNOREs a contacts stub
+            // row to satisfy the FK, so callers don't have to worry
+            // about ordering vs. addContact.
+            self.dbSaveMessage(peerId: peerId, message: DBMessage(
+                sent:          true,
+                text:          echo.text,
+                timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
+                msgId:         echo.id,
+                senderName:    ""))
+        }
         p2p_send_text(ctx, peerId, text)
     }
 
@@ -373,7 +1192,15 @@ final class Peer2PearClient: ObservableObject {
                              memberIds: memberPeerIds,
                              lastActivity: Date())
         DispatchQueue.main.async { [weak self] in
-            self?.groups[gid] = group
+            guard let self else { return }
+            self.groups[gid] = group
+            self.dbSaveContact(DBContact(
+                peerId:        gid,
+                name:          name,
+                keys:          memberPeerIds,
+                isGroup:       true,
+                groupId:       gid,
+                lastActiveSecs: Int64(group.lastActivity.timeIntervalSince1970)))
         }
         // Seed the core's roster with self + members so we'll accept
         // inbound rename/avatar/leave from any of them.
@@ -440,11 +1267,18 @@ final class Peer2PearClient: ObservableObject {
         }
         if rc == 0 {
             DispatchQueue.main.async { [weak self] in
-                if var g = self?.groups[groupId] {
-                    g.name = newName
-                    g.lastActivity = Date()
-                    self?.groups[groupId] = g
-                }
+                guard let self, var g = self.groups[groupId] else { return }
+                g.name = newName
+                g.lastActivity = Date()
+                self.groups[groupId] = g
+                self.dbSaveContact(DBContact(
+                    peerId:        groupId,
+                    name:          newName,
+                    keys:          g.memberIds,
+                    isGroup:       true,
+                    groupId:       groupId,
+                    avatarB64:     self.groupAvatars[groupId] ?? "",
+                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
             }
         }
         return rc == 0
@@ -462,9 +1296,12 @@ final class Peer2PearClient: ObservableObject {
         }
         if rc == 0 {
             DispatchQueue.main.async { [weak self] in
-                self?.groups.removeValue(forKey: groupId)
-                self?.groupMessages.removeAll { $0.groupId == groupId }
-                self?.groupAvatars.removeValue(forKey: groupId)
+                guard let self else { return }
+                self.groups.removeValue(forKey: groupId)
+                self.groupMessages.removeAll { $0.groupId == groupId }
+                self.groupAvatars.removeValue(forKey: groupId)
+                // CASCADE wipes the group's messages via the FK.
+                self.dbDeleteContact(peerId: groupId)
             }
         }
         return rc == 0
@@ -480,7 +1317,9 @@ final class Peer2PearClient: ObservableObject {
         }
         if rc == 0 {
             DispatchQueue.main.async { [weak self] in
-                self?.groupAvatars[groupId] = avatarB64
+                guard let self else { return }
+                self.groupAvatars[groupId] = avatarB64
+                self.dbSaveContactAvatar(peerId: groupId, avatarB64: avatarB64)
             }
         }
         return rc == 0
@@ -497,11 +1336,18 @@ final class Peer2PearClient: ObservableObject {
         }
         if rc == 0 {
             DispatchQueue.main.async { [weak self] in
-                if var g = self?.groups[groupId] {
-                    g.memberIds = memberPeerIds
-                    g.lastActivity = Date()
-                    self?.groups[groupId] = g
-                }
+                guard let self, var g = self.groups[groupId] else { return }
+                g.memberIds = memberPeerIds
+                g.lastActivity = Date()
+                self.groups[groupId] = g
+                self.dbSaveContact(DBContact(
+                    peerId:        groupId,
+                    name:          g.name,
+                    keys:          memberPeerIds,
+                    isGroup:       true,
+                    groupId:       groupId,
+                    avatarB64:     self.groupAvatars[groupId] ?? "",
+                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
             }
         }
         return rc == 0
@@ -566,6 +1412,7 @@ final class Peer2PearClient: ObservableObject {
                 chunksDone: chunksDone, chunksTotal: chunksTotal,
                 savedPath: savedPath, status: status, timestamp: timestamp)
         }
+        if let r = transfers[id] { persistTransfer(r) }
     }
 
     /// Flip the status on an existing record (delivered / canceled /
@@ -577,6 +1424,28 @@ final class Peer2PearClient: ObservableObject {
         existing.status = status
         existing.timestamp = Date()
         transfers[id] = existing
+        persistTransfer(existing)
+    }
+
+    /// Mirror a P2PTransferRecord into the file_transfers table so the
+    /// row survives lock/unlock + relaunch.  Cheap UPSERT — every status
+    /// change calls this; SQLite handles it in <1 ms.  The chat key is
+    /// the counter-party's peer ID for 1:1 (groups TBD when iOS sends
+    /// group files).
+    private func persistTransfer(_ r: P2PTransferRecord) {
+        dbSaveFileRecord(DBFileRecord(
+            transferId:     r.id,
+            chatKey:        r.peerId,
+            fileName:       r.fileName,
+            fileSize:       r.fileSize,
+            peerId:         r.peerId,
+            peerName:       contactNicknames[r.peerId] ?? "",
+            timestampSecs:  Int64(r.timestamp.timeIntervalSince1970),
+            sent:           r.direction == .outbound,
+            status:         Self.encodeStatus(r.status),
+            chunksTotal:    r.chunksTotal,
+            chunksComplete: r.chunksDone,
+            savedPath:      r.savedPath ?? ""))
     }
 
     // MARK: - File transfer actions
@@ -587,6 +1456,7 @@ final class Peer2PearClient: ObservableObject {
     @discardableResult
     func sendFile(to peerId: String, fileName: String, filePath: String) -> String? {
         guard let ctx = rawContext else { return nil }
+        if isBlocked(peerId: peerId) { return nil }
         guard let c = p2p_send_file(ctx, peerId, fileName, filePath) else { return nil }
         return String(cString: c)
     }
@@ -609,6 +1479,19 @@ final class Peer2PearClient: ObservableObject {
     func cancelTransfer(transferId: String) {
         guard let ctx = rawContext else { return }
         p2p_cancel_transfer(ctx, transferId)
+    }
+
+    /// Drop a terminal transfer record from the chat strip and the
+    /// SQLCipher file_transfers table.  Mirrors desktop's "Remove this
+    /// file from your file list" action — the saved file (if any) stays
+    /// on disk untouched; only the bookkeeping row goes away.  No-op
+    /// for in-flight transfers (use `cancelTransfer` for those).
+    func removeTransferRecord(transferId: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.transfers.removeValue(forKey: transferId)
+            self.dbDeleteFileRecord(transferId: transferId)
+        }
     }
 
     /// Global consent thresholds (match core defaults — 100 MB / 100 MB).
@@ -645,6 +1528,15 @@ final class Peer2PearClient: ObservableObject {
     func setPrivacyLevel(_ level: Int) {
         guard let ctx = rawContext else { return }
         p2p_set_privacy_level(ctx, Int32(level))
+    }
+
+    /// Append a relay URL to the core's send pool for multi-hop
+    /// forwarding.  Safe to call before start() — becomes a no-op when
+    /// rawContext is nil, and the persisted list is replayed on every
+    /// start() anyway.  Deduplication happens in the core.
+    func addSendRelay(url: String) {
+        guard let ctx = rawContext else { return }
+        p2p_add_send_relay(ctx, url)
     }
 
     // MARK: - Safety numbers (key verification)
@@ -716,7 +1608,32 @@ final class Peer2PearClient: ObservableObject {
                 text: String(cString: text),
                 timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
             )
-            DispatchQueue.main.async { client.messages.append(msg) }
+            DispatchQueue.main.async {
+                // Drop messages from blocked peers.  Mirrors desktop
+                // chatview `if (chat.isBlocked) return`.  Silent — no
+                // notification, no list entry.
+                if client.isBlocked(peerId: msg.from) { return }
+                client.messages.append(msg)
+                // Persist: saveMessage internally INSERT-OR-IGNOREs a
+                // stub contacts row for the FK, leaving the sender
+                // out of the address book (in_address_book=0) until
+                // the user explicitly adds them via "+ New Chat".
+                client.dbSaveMessage(peerId: msg.from, message: DBMessage(
+                    sent:          false,
+                    text:          msg.text,
+                    timestampSecs: Int64(msg.timestamp.timeIntervalSince1970),
+                    msgId:         msg.id,
+                    senderName:    ""))
+                // threadId = sender so iOS groups banners per-conversation.
+                // The content-privacy mode decides how much actually
+                // enters the OS notification store.
+                client.fireLocalNotification(
+                    fromPeerId: msg.from,
+                    senderDisplay: String(msg.from.prefix(8)) + "…",
+                    groupName: nil,
+                    messageText: msg.text,
+                    threadId: "dm:" + msg.from)
+            }
         }, selfPtr)
 
         // ── Incoming group text ────────────────────────────────────────
@@ -762,6 +1679,30 @@ final class Peer2PearClient: ObservableObject {
                 // from this group's members are admitted.
                 client.setKnownGroupMembers(groupId: gm.groupId,
                                              memberPeerIds: roster)
+                // Persist: upsert the group's contact row + insert the
+                // message.  senderName carries the sender's peer ID so
+                // a later restart can reconstruct who sent what.
+                client.dbSaveContact(DBContact(
+                    peerId:        gm.groupId,
+                    name:          g.name,
+                    keys:          roster,
+                    isGroup:       true,
+                    groupId:       gm.groupId,
+                    avatarB64:     client.groupAvatars[gm.groupId] ?? "",
+                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
+                client.dbSaveMessage(peerId: gm.groupId, message: DBMessage(
+                    sent:          gm.from == client.myPeerId,
+                    text:          gm.text,
+                    timestampSecs: Int64(gm.timestamp.timeIntervalSince1970),
+                    msgId:         gm.id,
+                    senderName:    gm.from))
+
+                client.fireLocalNotification(
+                    fromPeerId: gm.from,
+                    senderDisplay: String(gm.from.prefix(8)) + "…",
+                    groupName: gm.groupName.isEmpty ? "Group" : gm.groupName,
+                    messageText: gm.text,
+                    threadId: "group:" + gm.groupId)
             }
         }, selfPtr)
 
@@ -801,6 +1742,23 @@ final class Peer2PearClient: ObservableObject {
                         : "\(fromStr.prefix(8))… left the group",
                     timestamp: Date())
                 client.groupMessages.append(marker)
+                // Persist roster change + marker.
+                if let g = client.groups[gidStr] {
+                    client.dbSaveContact(DBContact(
+                        peerId:        gidStr,
+                        name:          g.name,
+                        keys:          g.memberIds,
+                        isGroup:       true,
+                        groupId:       gidStr,
+                        avatarB64:     client.groupAvatars[gidStr] ?? "",
+                        lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
+                }
+                client.dbSaveMessage(peerId: gidStr, message: DBMessage(
+                    sent:          fromStr == client.myPeerId,
+                    text:          marker.text,
+                    timestampSecs: Int64(marker.timestamp.timeIntervalSince1970),
+                    msgId:         marker.id,
+                    senderName:    fromStr))
             }
         }, selfPtr)
 
@@ -811,11 +1769,18 @@ final class Peer2PearClient: ObservableObject {
             let gidStr = String(cString: gid)
             let nameStr = String(cString: newName)
             DispatchQueue.main.async {
-                if var g = client.groups[gidStr] {
-                    g.name = nameStr
-                    g.lastActivity = Date()
-                    client.groups[gidStr] = g
-                }
+                guard var g = client.groups[gidStr] else { return }
+                g.name = nameStr
+                g.lastActivity = Date()
+                client.groups[gidStr] = g
+                client.dbSaveContact(DBContact(
+                    peerId:        gidStr,
+                    name:          nameStr,
+                    keys:          g.memberIds,
+                    isGroup:       true,
+                    groupId:       gidStr,
+                    avatarB64:     client.groupAvatars[gidStr] ?? "",
+                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
             }
         }, selfPtr)
 
@@ -828,6 +1793,7 @@ final class Peer2PearClient: ObservableObject {
             DispatchQueue.main.async {
                 if client.groupAvatars[gidStr] != avatarStr {
                     client.groupAvatars[gidStr] = avatarStr
+                    client.dbSaveContactAvatar(peerId: gidStr, avatarB64: avatarStr)
                 }
             }
         }, selfPtr)
@@ -936,6 +1902,23 @@ final class Peer2PearClient: ObservableObject {
                 fileSize: fileSize
             )
             DispatchQueue.main.async {
+                // Silently decline files from blocked peers — the core
+                // still expects a response, so we explicitly reject
+                // rather than let the sender sit in "awaiting consent".
+                if client.isBlocked(peerId: req.from) {
+                    client.respondToFileRequest(transferId: req.id, accept: false)
+                    return
+                }
+                // Verified-contacts gate: when on, files from peers
+                // whose safety number hasn't been confirmed are
+                // declined without prompting.  iOS-side policy — the
+                // core has already accepted the envelope; we just
+                // refuse before the user is bothered.
+                if client.fileRequireVerifiedContact
+                   && client.peerTrust(for: req.from) != .verified {
+                    client.respondToFileRequest(transferId: req.id, accept: false)
+                    return
+                }
                 // Avoid duplicates if the relay re-delivers the envelope.
                 if !client.pendingFileRequests.contains(where: { $0.id == req.id }) {
                     client.pendingFileRequests.append(req)

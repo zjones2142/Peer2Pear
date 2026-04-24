@@ -117,6 +117,40 @@ public:
     Bytes aeadDecrypt(const Bytes& key32, const Bytes& nonceAndCiphertext,
                       const Bytes& aad = {}) const;
 
+    // Derive the per-file AEAD key from the ratchet message key used
+    // to encrypt the file_key announcement (Arch-review #4).  Before
+    // this helper existed, FileProtocol captured the message key via
+    // SessionManager::lastMessageKey() — a stateful getter whose
+    // value was whatever seal/decrypt ran last.  The derivation was
+    // implicit and race-prone.  `deriveFileKey(ratchetMsgKey, tid)`
+    // is pure, binds the transferId into the HKDF info string, and
+    // both sender + receiver compute it the same way.  Returns an
+    // empty vector on bad inputs (wrong msg-key size / empty tid).
+    //
+    // Wire impact: the per-file AEAD key under v2.1.2+ is
+    //   HKDF-BLAKE2b(ikm=ratchetMsgKey,
+    //                info="peer2pear:file-key-v1:" || transferId)
+    // rather than the raw ratchet key — a flag-day break from
+    // earlier builds that used the raw key.  PROTOCOL.md §7.3.1
+    // documents it.
+    static Bytes deriveFileKey(const Bytes& ratchetMsgKey,
+                                const std::string& transferId);
+
+    // Wrap / unwrap a 32-byte file-transfer AEAD key for at-rest
+    // storage in file_transfers_{in,out} (Audit #3 M1).  SQLCipher's
+    // page key already encrypts the row, but a compromise of that
+    // page key alone would expose the raw file key and let the
+    // attacker decrypt past chunks.  Wrapping with a key derived
+    // from m_identityKey (which sits behind Argon2-gated master key)
+    // means even a page-key leak doesn't surface usable file keys.
+    // transferId binds into the AAD so a swapped row fails to
+    // unwrap.  Returns {} if the derived key is unavailable (e.g.,
+    // pre-unlock).
+    Bytes wrapFileKey(const std::string& transferId,
+                      const Bytes& fileKey) const;
+    Bytes unwrapFileKey(const std::string& transferId,
+                        const Bytes& wrapped) const;
+
     // Ed25519 signature verification (static — any key, not just ours)
     static bool verifySignature(const Bytes& sig, const Bytes& message,
                                 const Bytes& edPub);

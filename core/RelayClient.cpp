@@ -195,6 +195,11 @@ void RelayClient::onWsDisconnected()
     m_coverTimer->stop();
     m_onlinePeers.clear();
 
+    // Queue a push-token replay if we had one registered — the relay
+    // may have lost per-connection state, and the next reconnect
+    // should re-establish us as reachable via push.
+    if (!m_pushPlatform.empty()) m_pushPending = true;
+
     P2P_LOG("[Relay] WebSocket disconnected");
 
     if (onDisconnected) onDisconnected();
@@ -237,6 +242,21 @@ void RelayClient::onWsTextMessage(const std::string& message)
         P2P_LOG("[Relay] Authenticated as " << peerPrefix(obj.value("peer_id", std::string())));
         if (m_coverIntervalSec > 0) scheduleCoverTimer();
         refreshRelayInfo();
+
+        // Replay any pending push-token registration on this fresh
+        // authenticated WS.  The cached (platform, token) pair is
+        // whatever the app last told us — includes the "unregister"
+        // case (empty token) so the relay drops stale rows if the
+        // user signed out offline.
+        if (m_pushPending && !m_pushPlatform.empty()) {
+            json msg;
+            msg["type"]     = "push_register";
+            msg["platform"] = m_pushPlatform;
+            msg["token"]    = m_pushToken;
+            m_ws.sendTextMessage(msg.dump());
+            m_pushPending = false;
+        }
+
         if (onConnected) onConnected();
         return;
     }
@@ -342,6 +362,27 @@ void RelayClient::queryPresence(const std::vector<std::string>& peerIds)
     msg["type"]     = "presence_query";
     msg["peer_ids"] = std::move(ids);
     m_ws.sendTextMessage(msg.dump());
+}
+
+void RelayClient::registerPushToken(const std::string& platform,
+                                       const std::string& token)
+{
+    // Cache so we can replay on reconnect.  The WS auth already
+    // identifies which peer_id this is for, so the relay stores
+    // under (connected_peer_id, platform).  Token may be empty to
+    // signal "unregister" — the relay treats that as a delete.
+    m_pushPlatform = platform;
+    m_pushToken    = token;
+    m_pushPending  = true;
+
+    if (!isConnected()) return;
+
+    json msg;
+    msg["type"]     = "push_register";
+    msg["platform"] = platform;
+    msg["token"]    = token;
+    m_ws.sendTextMessage(msg.dump());
+    m_pushPending = false;
 }
 
 // ── Retry queue ──────────────────────────────────────────────────────────────
@@ -478,11 +519,52 @@ void RelayClient::sendCoverEnvelope()
         ? (1 + 32 + 1088 + 24 + 16)
         : (1 + 32 + 24 + 16);
 
-    size_t innerSize;
-    if (randombytes_uniform(20) == 0) {
-        innerSize = baseMin + 244000 + size_t(randombytes_uniform(8000));
+    // Arch-review #9: pick a padding bucket first, then fill the
+    // inner body so it lands *inside* that bucket after wrapForRelay
+    // pads it up.  SealedEnvelope buckets are {2 KiB, 16 KiB, 256
+    // KiB}; the 37-byte routing header means the raw inner max per
+    // bucket is (bucket - 37).
+    //
+    //   BandwidthBiased : 60 / 30 / 10  — covers the medium bucket
+    //                     (previously 0%) so text-only users can't be
+    //                     fingerprinted by "never sends a 16 KB body."
+    //
+    //   UniformBuckets  : 34 / 33 / 33 — every user's cover histogram
+    //                     is identical regardless of real-send shape.
+    //                     Roughly 3x the bandwidth of the biased mode.
+    constexpr size_t kSmallMax  =   2 * 1024 - 37;  //  2011
+    constexpr size_t kMediumMax =  16 * 1024 - 37;  // 16347
+    constexpr size_t kLargeMax  = 256 * 1024 - 37;  // 262107
+
+    const uint32_t roll = randombytes_uniform(100);
+    uint32_t bucketProb[3];  // small / medium / large cutpoints in 0..99
+    if (m_coverSizeMode == CoverSizeMode::UniformBuckets) {
+        bucketProb[0] = 34;  // 0..33  → small
+        bucketProb[1] = 67;  // 34..66 → medium
+        bucketProb[2] = 100; // 67..99 → large
     } else {
-        innerSize = baseMin + size_t(randombytes_uniform(1400));
+        bucketProb[0] = 60;  // 0..59  → small
+        bucketProb[1] = 90;  // 60..89 → medium
+        bucketProb[2] = 100; // 90..99 → large
+    }
+
+    size_t innerSize;
+    if (roll < bucketProb[0]) {
+        const size_t span = (kSmallMax > size_t(baseMin))
+            ? kSmallMax - size_t(baseMin) : 0;
+        innerSize = size_t(baseMin) +
+                    (span ? size_t(randombytes_uniform(uint32_t(span))) : 0);
+    } else if (roll < bucketProb[1]) {
+        // Span: (2 KiB .. 16 KiB) — skip the small bucket entirely.
+        const size_t lo   = kSmallMax + 1;
+        const size_t span = kMediumMax - lo;
+        innerSize = lo + size_t(randombytes_uniform(uint32_t(span)));
+    } else {
+        // Span: (16 KiB .. 256 KiB).  Bounded below kLargeMax so the
+        // envelope doesn't exceed the large bucket.
+        const size_t lo   = kMediumMax + 1;
+        const size_t span = kLargeMax - lo;
+        innerSize = lo + size_t(randombytes_uniform(uint32_t(span)));
     }
     Bytes body(innerSize);
     randombytes_buf(body.data(), innerSize);
@@ -641,16 +723,22 @@ void RelayClient::setPrivacyLevel(int level)
         setCoverTrafficInterval(0);
         m_sendRelays.clear();
         setMultiHopEnabled(false);
+        m_coverSizeMode = CoverSizeMode::BandwidthBiased;
         break;
     case 1:
         setJitterRange(50, 300);
         setCoverTrafficInterval(30);
         setMultiHopEnabled(false);
+        m_coverSizeMode = CoverSizeMode::BandwidthBiased;
         break;
     case 2:
         setJitterRange(100, 500);
         setCoverTrafficInterval(10);
         setMultiHopEnabled(true);
+        // Arch-review #9: Maximum privacy pays the ~3x bandwidth cost
+        // for uniform cover distribution so the relay can't correlate
+        // the user's observed bucket histogram with their actual sends.
+        m_coverSizeMode = CoverSizeMode::UniformBuckets;
         break;
     }
 }

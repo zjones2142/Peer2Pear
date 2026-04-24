@@ -269,6 +269,57 @@ Bytes SealedEnvelope::wrapForRelay(const Bytes& recipientEdPub,
     return out;
 }
 
+// ── P2P QUIC-stream padding ──────────────────────────────────────────────────
+//
+// Arch-review #10: file chunks riding a direct QUIC stream between two
+// peers are visible to any network middlebox between them — ISP, Wi-Fi
+// sniffer, corporate DLP.  The relay path pads every envelope to one
+// of three fixed buckets so those middleboxes can't distinguish chunk-
+// sized traffic from control-sized traffic on the wire.  The P2P path
+// is not subject to relay-operator surveillance, but the external-
+// network observer threat is identical.  `padForP2P` / `unpadFromP2P`
+// give the direct transport the same size-uniformity property:
+//
+//   wire:  [innerLen u32 BE][payload][random pad to bucket]
+//
+// Buckets are the same 2 / 16 / 256 KiB set (§3.1.1).  There's no
+// routing header because the QUIC connection itself is already
+// peer-addressed.  No routing version byte either — if we ever need
+// a second P2P framing version we can add one; the current format is
+// unambiguous because the innerLen is the very first field.
+
+static constexpr size_t kP2PLenHeaderSize = 4;
+
+Bytes SealedEnvelope::padForP2P(const Bytes& payload)
+{
+    if (payload.empty()) return {};
+    const size_t raw       = kP2PLenHeaderSize + payload.size();
+    const size_t padded    = paddedSize(raw);
+    const size_t padLen    = padded - raw;
+
+    Bytes out;
+    out.reserve(padded);
+    uint8_t lenBE[4];
+    write_u32_be(lenBE, static_cast<uint32_t>(payload.size()));
+    append(out, lenBE, 4);
+    append(out, payload);
+    if (padLen > 0) {
+        const size_t head = out.size();
+        out.resize(head + padLen);
+        randombytes_buf(out.data() + head, padLen);
+    }
+    return out;
+}
+
+Bytes SealedEnvelope::unpadFromP2P(const Bytes& padded)
+{
+    if (padded.size() < kP2PLenHeaderSize + 1) return {};
+    const uint32_t innerLen = read_u32_be(padded.data());
+    if (innerLen == 0 || innerLen > padded.size() - kP2PLenHeaderSize) return {};
+    return Bytes(padded.begin() + kP2PLenHeaderSize,
+                 padded.begin() + kP2PLenHeaderSize + innerLen);
+}
+
 Bytes SealedEnvelope::unwrapFromRelay(const Bytes& relayEnvelope,
                                        Bytes* recipientEdPub)
 {

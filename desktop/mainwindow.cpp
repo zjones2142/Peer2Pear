@@ -3,15 +3,25 @@
 #include "onboardingdialog.h"
 #include "qt_interop.hpp"  // Qt↔std boundary helpers for CryptoEngine calls
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
+#include "peer2pear.h"     // P2P_MIN_PASSPHRASE_BYTES — single source of truth
+#include "theme.h"         // ThemeManager — dark/light palette + global stylesheet
+#include "theme_styles.h"  // tagChromeWidgets + reapplyForChildren
+                            // with the C API; desktop uses ChatController
+                            // directly, not the C API, but the constant is
+                            // shared policy so we mirror it from here.
 
 #include <QPixmap>
 #include <QHBoxLayout>
 #include <QSet>
 #include <QStackedWidget>
 #include <QTimer>
+#include <QApplication>
 #include <QDateTime>
 #include <QTimeZone>
+#include <QDir>
+#include <QFile>
 #include <QInputDialog>
+#include <QIODevice>
 #include <QMessageBox>
 #include <QLineEdit>
 #include <QToolButton>
@@ -22,12 +32,190 @@
 #include <QJsonObject>
 #include <QStandardPaths>
 
+#include <sodium.h>
+#include <sqlite3.h>
+
+namespace {
+
+// Best-effort secure delete: overwrite + unlink.  Used by the legacy
+// plaintext-DB migration to scrub the WAL/SHM and original .db before
+// the encrypted copy takes its place.  On copy-on-write filesystems
+// (APFS, btrfs) the overwrite isn't guaranteed to land on the same
+// physical blocks, but the attempt is still worth more than nothing.
+void secureRemoveFile(const QString &filePath)
+{
+    QFile f(filePath);
+    if (!f.exists()) return;
+    const qint64 sz = f.size();
+    if (sz > 0 && f.open(QIODevice::WriteOnly)) {
+        QByteArray noise(static_cast<int>(qMin(sz, qint64(1 << 20))), 0);
+        qint64 remaining = sz;
+        while (remaining > 0) {
+            int chunk = static_cast<int>(qMin(remaining, qint64(noise.size())));
+            randombytes_buf(reinterpret_cast<unsigned char*>(noise.data()),
+                            static_cast<size_t>(chunk));
+            f.write(noise.constData(), chunk);
+            remaining -= chunk;
+        }
+        f.flush();
+        f.close();
+    }
+    QFile::remove(filePath);
+}
+
+// One-shot legacy-plaintext → SQLCipher migration.  Returns true if the
+// upgrade ran (or was unnecessary because the DB was already empty);
+// false on failure or "DB is already encrypted" — both of which the
+// caller treats as "fine, just open it normally."  Marker-file gated
+// upstream so we don't probe the DB on every launch.
+bool migratePlaintextDbToSqlCipher(const QString &dbPath, const QByteArray &dbKey)
+{
+    const QString encPath    = dbPath + ".encrypted";
+    const QString backupPath = dbPath + ".backup";
+
+    QFile::remove(encPath);
+    QFile::remove(encPath + "-wal");
+    QFile::remove(encPath + "-shm");
+    if (QFile::exists(backupPath) && !QFile::exists(dbPath)) {
+        qWarning() << "Migration: found orphaned .backup — restoring original DB";
+        QFile::rename(backupPath, dbPath);
+    }
+    QFile::remove(backupPath);
+
+    sqlite3* plainDb = nullptr;
+    int rc = sqlite3_open_v2(dbPath.toUtf8().constData(), &plainDb,
+                             SQLITE_OPEN_READWRITE, nullptr);
+    if (rc != SQLITE_OK) {
+        if (plainDb) sqlite3_close_v2(plainDb);
+        return false;
+    }
+    sqlite3_exec(plainDb, "PRAGMA locking_mode=EXCLUSIVE;", nullptr, nullptr, nullptr);
+
+    rc = sqlite3_exec(plainDb, "SELECT count(*) FROM sqlite_master;",
+                      nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        sqlite3_close_v2(plainDb);
+        return false;  // Already encrypted (or corrupt) — nothing to migrate.
+    }
+
+    int tableCount = 0;
+    sqlite3_stmt* countStmt = nullptr;
+    if (sqlite3_prepare_v2(plainDb,
+                           "SELECT count(*) FROM sqlite_master WHERE type='table';",
+                           -1, &countStmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(countStmt) == SQLITE_ROW)
+            tableCount = sqlite3_column_int(countStmt, 0);
+        sqlite3_finalize(countStmt);
+    }
+    sqlite3_exec(plainDb, "PRAGMA wal_checkpoint(TRUNCATE);", nullptr, nullptr, nullptr);
+    sqlite3_close_v2(plainDb);
+
+    if (tableCount == 0) {
+        QFile::remove(dbPath);
+        QFile::remove(dbPath + "-wal");
+        QFile::remove(dbPath + "-shm");
+        return true;
+    }
+
+    SqlCipherDb encDb;
+    AppDataStore::Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
+                                    reinterpret_cast<const uint8_t*>(dbKey.constData()) + dbKey.size());
+    if (!encDb.open(encPath.toStdString(), dbKeyBytes)) {
+        qWarning() << "Migration: failed to create encrypted DB";
+        QFile::remove(encPath);
+        return false;
+    }
+
+    QString escapedPlain = dbPath;
+    escapedPlain.replace(QLatin1Char('\''), QLatin1String("''"));
+    const QString attachSql = QStringLiteral(
+        "ATTACH DATABASE '%1' AS plaintext KEY '';").arg(escapedPlain);
+
+    char* err = nullptr;
+    rc = sqlite3_exec(encDb.handle(), attachSql.toUtf8().constData(),
+                      nullptr, nullptr, &err);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(err);
+        encDb.close();
+        QFile::remove(encPath);
+        return false;
+    }
+
+    err = nullptr;
+    rc = sqlite3_exec(encDb.handle(),
+                      "SELECT sqlcipher_export('main', 'plaintext');",
+                      nullptr, nullptr, &err);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(err);
+        sqlite3_exec(encDb.handle(), "DETACH DATABASE plaintext;",
+                     nullptr, nullptr, nullptr);
+        encDb.close();
+        QFile::remove(encPath);
+        return false;
+    }
+    sqlite3_exec(encDb.handle(), "DETACH DATABASE plaintext;",
+                 nullptr, nullptr, nullptr);
+    encDb.close();
+
+    if (!QFile::rename(dbPath, backupPath)) {
+        QFile::remove(encPath);
+        return false;
+    }
+    if (!QFile::rename(encPath, dbPath)) {
+        QFile::rename(backupPath, dbPath);
+        return false;
+    }
+    secureRemoveFile(dbPath + "-wal");
+    secureRemoveFile(dbPath + "-shm");
+    secureRemoveFile(backupPath);
+    return true;
+}
+
+// Centralises the desktop's per-user app-data DB path + the legacy-
+// plaintext migration check.  Caller (MainWindow::ctor) opens the
+// SqlCipherDb after this returns, then binds an AppDataStore to it.
+bool openAppDataDb(SqlCipherDb &db, const QByteArray &dbKey)
+{
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(base);
+    const QString dbPath = base + "/peer2PearUser.db";
+    const QString migratedMarker = base + "/.sqlcipher_migrated";
+
+    if (!dbKey.isEmpty() && QFile::exists(dbPath) && !QFile::exists(migratedMarker)) {
+        migratePlaintextDbToSqlCipher(dbPath, dbKey);
+        // Always write the marker after probing — success or "already
+        // encrypted" both mean "don't probe again on next launch."
+        QFile marker(migratedMarker);
+        if (marker.open(QIODevice::WriteOnly)) marker.close();
+    }
+
+    AppDataStore::Bytes dbKeyBytes(reinterpret_cast<const uint8_t*>(dbKey.constData()),
+                                    reinterpret_cast<const uint8_t*>(dbKey.constData()) + dbKey.size());
+    return db.open(dbPath.toStdString(), dbKeyBytes);
+}
+
+}  // namespace
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
     , m_controller(m_webSocket, m_httpClient, m_timerFactory)
 {
     ui->setupUi(this);
+
+    // Tag the .ui-defined chrome widgets with p2pRole properties so
+    // subsequent theme flips can live-update them through the
+    // theme_styles classifier.  applyTheme (wired via SettingsPanel's
+    // themeChanged signal further below) then reapplies the palette +
+    // walks centralwidget's children on every flip.
+    themeStyles::tagChromeWidgets(this, ThemeManager::instance().current());
+    connect(&ThemeManager::instance(), &ThemeManager::themeChanged,
+            this, [this](const Theme& t) {
+        themeStyles::tagChromeWidgets(this, t);
+        if (centralWidget()) {
+            themeStyles::reapplyForChildren(centralWidget(), t);
+        }
+    });
 
     // ── Identity unlock ───────────────────────────────────────────────────────
     // Passphrase must be obtained BEFORE opening the DB so we can derive the
@@ -62,6 +250,19 @@ MainWindow::MainWindow(QWidget *parent)
         if (!ok) { QTimer::singleShot(0, qApp, &QCoreApplication::quit); return; }
         if (pass.isEmpty()) {
             QMessageBox::warning(this, "Passphrase Required", "Passphrase cannot be empty.");
+            continue;
+        }
+        // Enforce the same byte-length floor the core does in
+        // p2p_set_passphrase_v2.  Surface the reason inline instead of
+        // letting the core silently reject it a few lines down.  The
+        // gate runs on both create + unlock so UX is consistent —
+        // anyone with a shorter legacy passphrase would already be
+        // unable to unlock via the core.
+        if (pass.toUtf8().size() < P2P_MIN_PASSPHRASE_BYTES) {
+            QMessageBox::warning(this, "Passphrase Too Short",
+                QString("Passphrase must be at least %1 characters.")
+                    .arg(P2P_MIN_PASSPHRASE_BYTES));
+            p2p::bridge::secureZeroQ(pass);
             continue;
         }
 
@@ -125,7 +326,7 @@ MainWindow::MainWindow(QWidget *parent)
             p2p::bridge::secureZeroQ(identityKey);
 
             // ── Open DB with SQLCipher encryption ────────────────────────────
-            if (!m_db.open(dbKey)) {
+            if (!openAppDataDb(m_db, dbKey)) {
                 QMessageBox::critical(this, "Database Error",
                                       "Could not open the local chat database.\n"
                                       "The passphrase may be incorrect.");
@@ -135,6 +336,11 @@ MainWindow::MainWindow(QWidget *parent)
                 continue;
             }
             p2p::bridge::secureZeroQ(dbKey);
+
+            // Bind the app-data table layer to the handle.  Creates
+            // contacts/messages/settings/file_transfers/group_seq_counters
+            // tables on first run, idempotent on upgrade.
+            m_store.bind(m_db);
 
             // Set per-field encryption key (backward compat with ENC: fields).
             // Legacy keys cover previous key derivation generations:
@@ -151,23 +357,24 @@ MainWindow::MainWindow(QWidget *parent)
                 bytesConcat(m_controller.myIdB64u(), "peer2pear-dbkey")));
             QByteArray legacyGen2 = p2p::bridge::toQByteArray(ChatController::blake2b256(
                 bytesConcat(pass.toStdString(), "peer2pear-dbkey")));
-            m_db.setEncryptionKey(fieldKey, {legacyGen2, legacyGen1});
+            auto qbaToBytes = [](const QByteArray& b) -> AppDataStore::Bytes {
+                return AppDataStore::Bytes(
+                    reinterpret_cast<const uint8_t*>(b.constData()),
+                    reinterpret_cast<const uint8_t*>(b.constData()) + b.size());
+            };
+            m_store.setEncryptionKey(qbaToBytes(fieldKey),
+                                      {qbaToBytes(legacyGen2), qbaToBytes(legacyGen1)});
             p2p::bridge::secureZeroQ(fieldKey);
             p2p::bridge::secureZeroQ(legacyGen1);
             p2p::bridge::secureZeroQ(legacyGen2);
 
             // Wire DB to ChatController for Noise/Ratchet session persistence
-            m_controller.setDatabase(m_db.database());
+            m_controller.setDatabase(m_db);
 
-            // Restore persisted group sequence counters.
-            auto qMapToStd = [](const QMap<QString, qint64>& qm) {
-                std::map<std::string, int64_t> out;
-                for (auto it = qm.cbegin(); it != qm.cend(); ++it)
-                    out.emplace(it.key().toStdString(), int64_t(it.value()));
-                return out;
-            };
-            m_controller.setGroupSeqCounters(qMapToStd(m_db.loadGroupSeqOut()),
-                                              qMapToStd(m_db.loadGroupSeqIn()));
+            // Restore persisted group sequence counters — AppDataStore
+            // returns std::map directly so no Qt-bridge conversion needed.
+            m_controller.setGroupSeqCounters(m_store.loadGroupSeqOut(),
+                                              m_store.loadGroupSeqIn());
 
             p2p::bridge::secureZeroQ(pass);
             break;
@@ -177,16 +384,17 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // ── First-time onboarding ─────────────────────────────────────────────────
-    if (m_db.loadSetting("displayName").isEmpty()) {
+    if (m_store.loadSetting("displayName").empty()) {
         OnboardingDialog dlg(this);
         if (dlg.exec() != QDialog::Accepted) {
             QTimer::singleShot(0, qApp, &QCoreApplication::quit);
             return;
         }
-        m_db.saveSetting("displayName", dlg.displayName());
+        m_store.saveSetting("displayName", dlg.displayName().toStdString());
         if (!dlg.avatarData().isEmpty()) {
-            m_db.saveSetting("avatarData", dlg.avatarData());
-            m_db.saveSetting("avatarIsPhoto", dlg.isPhotoAvatar() ? "true" : "false");
+            m_store.saveSetting("avatarData", dlg.avatarData().toStdString());
+            m_store.saveSetting("avatarIsPhoto",
+                                 dlg.isPhotoAvatar() ? "true" : "false");
         }
 
         // ── Welcome guide (shown once after first onboarding) ────────────────
@@ -219,33 +427,34 @@ MainWindow::MainWindow(QWidget *parent)
     // obsolete endpoints so they land on the current production relay without
     // having to wipe their local DB.
     {
-        const QString old = m_db.loadSetting("relayUrl",
-                                m_db.loadSetting("serverUrl")); // fallback to old key
+        const std::string old = m_store.loadSetting("relayUrl",
+                                m_store.loadSetting("serverUrl")); // fallback to old key
         const bool staleIp      = (old == "http://3.141.14.234" ||
                                    old == "http://3.141.14.234/");
         const bool staleLocal   = (old == "http://localhost:8443" ||
                                    old == "http://localhost:8443/");
         if (staleIp || staleLocal) {
-            m_db.saveSetting("relayUrl", "https://peer2pear.com");
+            m_store.saveSetting("relayUrl", "https://peer2pear.com");
         }
     }
     // Default for a fresh install: the production relay on peer2pear.com.
     // Users who self-host can override this via the settings table (no UI
     // yet — edit `SELECT value FROM settings WHERE key='relayUrl';` via
     // SQLCipher, or plumb in a Settings field).
-    const QString relayUrl = m_db.loadSetting("relayUrl", "https://peer2pear.com");
-    m_controller.setRelayUrl(relayUrl.toStdString());
+    const std::string relayUrl = m_store.loadSetting("relayUrl", "https://peer2pear.com");
+    m_controller.setRelayUrl(relayUrl);
 
 #ifdef PEER2PEAR_P2P
     // TURN relay for symmetric NAT fallback — only meaningful when P2P is
     // compiled in.  setTurnServer() itself is declared behind the same flag.
-    const QString turnHost = m_db.loadSetting("turnHost", "peer2pear.com");
-    const int     turnPort = m_db.loadSetting("turnPort", "3478").toInt();
-    const QString turnUser = m_db.loadSetting("turnUser", "peer2pear");
-    const QString turnPass = m_db.loadSetting("turnPass", "peer2pear");
-    if (!turnHost.isEmpty())
-        m_controller.setTurnServer(turnHost.toStdString(), turnPort,
-                                    turnUser.toStdString(), turnPass.toStdString());
+    const std::string turnHost = m_store.loadSetting("turnHost", "peer2pear.com");
+    int turnPort = 3478;
+    try { turnPort = std::stoi(m_store.loadSetting("turnPort", "3478")); }
+    catch (...) { turnPort = 3478; }
+    const std::string turnUser = m_store.loadSetting("turnUser", "peer2pear");
+    const std::string turnPass = m_store.loadSetting("turnPass", "peer2pear");
+    if (!turnHost.empty())
+        m_controller.setTurnServer(turnHost, turnPort, turnUser, turnPass);
 #endif
 
     m_controller.connectToRelay();
@@ -273,15 +482,15 @@ MainWindow::MainWindow(QWidget *parent)
     m_mainStack->addWidget(ui->contentWidget);  // index 0 – chat
 
     m_settingsPanel = new SettingsPanel(ui->rootWidget);
-    m_settingsPanel->setProfileInfo(m_db.loadSetting("displayName"),
+    m_settingsPanel->setProfileInfo(qtbridge::qstr(m_store.loadSetting("displayName")),
                                     QString::fromStdString(m_controller.myIdB64u()));
-    m_settingsPanel->setDatabase(&m_db);
+    m_settingsPanel->setAppDataStore(&m_store);
     m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
 
     rootLayout->addWidget(m_mainStack);
 
     // ── ChatView ──────────────────────────────────────────────────────────────
-    m_chatView = new ChatView(ui, &m_controller, &m_db, this);
+    m_chatView = new ChatView(ui, &m_controller, &m_store, this);
 
     m_chatView->setShouldToastFn([this]() -> bool {
         return isMinimized() || !isVisible() || !isActiveWindow();
@@ -376,13 +585,20 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onSettingsBackClicked);
     connect(m_settingsPanel, &SettingsPanel::notificationsToggled,
             m_notifier,      &ChatNotifier::setEnabled);
+    connect(m_settingsPanel, &SettingsPanel::notificationModeChanged,
+            m_notifier,      &ChatNotifier::setContentMode);
+
     connect(m_settingsPanel, &SettingsPanel::exportContactsClicked,
             this, &MainWindow::onExportContacts);
     connect(m_settingsPanel, &SettingsPanel::importContactsClicked,
             this, &MainWindow::onImportContacts);
 
-    // Apply persisted notification state to the notifier
+    // Apply persisted notification state to the notifier.  Both the
+    // global on/off and the content-privacy mode are mirrored from
+    // whatever the DB restored — avoids a window between construction
+    // and the first user toggle where banners could leak plaintext.
     m_notifier->setEnabled(m_settingsPanel->notificationsEnabled());
+    m_notifier->setContentMode(m_settingsPanel->notificationMode());
 
     // Phase 2: file transfer consent settings → ChatController
     // ChatController isn't a QObject anymore, so route the SettingsPanel
@@ -393,6 +609,8 @@ MainWindow::MainWindow(QWidget *parent)
             this, [this](int mb) { m_controller.setFileHardMaxMB(mb); });
     connect(m_settingsPanel, &SettingsPanel::fileRequireP2PToggled,
             this, [this](bool on) { m_controller.setFileRequireP2P(on); });
+    connect(m_settingsPanel, &SettingsPanel::fileRequireVerifiedToggled,
+            this, [this](bool on) { m_chatView->setRequireVerifiedFiles(on); });
 
     // Relay URL — settings UI can live-switch which relay we're connected
     // to.  Drop the existing WS, point the RelayClient at the new URL, and
@@ -461,15 +679,10 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow() {
     m_controller.disconnectFromRelay();
 
-    // Persist group sequence counters before shutdown.
-    auto stdToQ = [](const std::map<std::string, int64_t>& m) {
-        QMap<QString, qint64> out;
-        for (const auto& kv : m)
-            out.insert(QString::fromStdString(kv.first), qint64(kv.second));
-        return out;
-    };
-    m_db.saveGroupSeqOut(stdToQ(m_controller.groupSeqOut()));
-    m_db.saveGroupSeqIn(stdToQ(m_controller.groupSeqIn()));
+    // Persist group sequence counters before shutdown.  AppDataStore
+    // takes std::map natively so no Qt-bridge round-trip required.
+    m_store.saveGroupSeqOut(m_controller.groupSeqOut());
+    m_store.saveGroupSeqIn(m_controller.groupSeqIn());
 
     delete ui;
 }
@@ -490,14 +703,17 @@ void MainWindow::onExportContacts()
         "JSON Files (*.json)");
     if (path.isEmpty()) return;
 
-    const QVector<ChatData> contacts = m_db.loadAllContacts();
+    std::vector<AppDataStore::Contact> contacts;
+    m_store.loadAllContacts([&contacts](const AppDataStore::Contact &c) {
+        contacts.push_back(c);
+    });
 
     QJsonArray arr;
     for (const auto &c : contacts) {
         if (c.isBlocked) continue; // never export blocked contacts
         QJsonObject obj;
-        obj["name"] = c.name;
-        obj["keys"] = QJsonArray::fromStringList(c.keys);
+        obj["name"] = qtbridge::qstr(c.name);
+        obj["keys"] = QJsonArray::fromStringList(qtbridge::qstrList(c.keys));
         arr.append(obj);
     }
 
@@ -551,45 +767,46 @@ void MainWindow::onImportContacts()
 
     // Build a set of existing contact identifiers so we never overwrite them.
     // Contacts with a real peer ID use that; name-only contacts use "name:<name>".
-    const QVector<ChatData> existing = m_db.loadAllContacts();
     QSet<QString> existingIds;
-    for (const auto &e : existing) {
-        if (!e.peerIdB64u.isEmpty())
-            existingIds.insert(e.peerIdB64u);
-        else if (!e.name.isEmpty())
-            existingIds.insert(QLatin1String("name:") + e.name);
-    }
+    m_store.loadAllContacts([&existingIds](const AppDataStore::Contact &e) {
+        if (!e.peerIdB64u.empty())
+            existingIds.insert(qtbridge::qstr(e.peerIdB64u));
+        else if (!e.name.empty())
+            existingIds.insert(QLatin1String("name:") + qtbridge::qstr(e.name));
+    });
 
     int imported = 0;
     for (const QJsonValue &v : arr) {
         const QJsonObject obj = v.toObject();
 
-        ChatData chat;
-        chat.name = obj["name"].toString().trimmed();
+        AppDataStore::Contact chat;
+        chat.name = obj["name"].toString().trimmed().toStdString();
         const QJsonArray keysArr = obj["keys"].toArray();
         for (const QJsonValue &k : keysArr)
-            chat.keys.append(k.toString());
+            chat.keys.push_back(k.toString().toStdString());
 
         // Derive peerIdB64u from the first key when available.
         // In this app the first public key doubles as the peer identifier.
-        if (!chat.keys.isEmpty())
-            chat.peerIdB64u = chat.keys.first();
+        if (!chat.keys.empty())
+            chat.peerIdB64u = chat.keys.front();
 
         // Skip entries with no name and no keys
-        if (chat.name.isEmpty() && chat.keys.isEmpty())
+        if (chat.name.empty() && chat.keys.empty())
             continue;
 
-        // Determine the effective storage key (mirrors DatabaseManager::contactKey)
-        const QString effectiveKey = chat.peerIdB64u.isEmpty()
-            ? QLatin1String("name:") + chat.name
-            : chat.peerIdB64u;
+        // Determine the effective storage key — for unnamed groups
+        // we fall back to "name:Foo" so the row has SOMETHING to key
+        // off; named contacts always use peerIdB64u.
+        const QString effectiveKey = chat.peerIdB64u.empty()
+            ? QLatin1String("name:") + qtbridge::qstr(chat.name)
+            : qtbridge::qstr(chat.peerIdB64u);
 
         // Skip if the contact already exists — never overwrite
         if (existingIds.contains(effectiveKey))
             continue;
 
         chat.subtitle = "Secure chat";
-        m_db.saveContact(chat);
+        m_store.saveContact(chat);
         existingIds.insert(effectiveKey); // prevent duplicates within the file
         ++imported;
     }

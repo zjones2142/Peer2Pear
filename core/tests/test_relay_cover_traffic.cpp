@@ -129,6 +129,7 @@ public:
 class SimpleWebSocket : public IWebSocket {
 public:
     std::string lastOpenUrl;
+    std::vector<std::string> sentTexts;  // captures outbound text frames
 
     void open(const std::string& url) override {
         lastOpenUrl = url;
@@ -144,7 +145,12 @@ public:
     bool isConnected() const override { return m_connected; }
     bool isIdle() const override { return !m_connected; }
 
-    void sendTextMessage(const std::string& /*message*/) override {
+    void sendTextMessage(const std::string& message) override {
+        sentTexts.push_back(message);
+        // Only the first text frame is auth — subsequent frames
+        // (push_register, presence_query, etc.) don't need a reply.
+        if (m_authReplied) return;
+        m_authReplied = true;
         nlohmann::json r;
         r["type"] = "auth_ok";
         if (onTextMessage) onTextMessage(r.dump());
@@ -152,6 +158,7 @@ public:
 
 private:
     bool m_connected = false;
+    bool m_authReplied = false;
 };
 
 }  // namespace
@@ -208,6 +215,65 @@ TEST(RelayCoverTraffic, SelfAddressedFallbackWhenNoPeersOnline) {
     // Stop the cover timer so teardown doesn't leave callbacks pending.
     relay.setCoverTrafficInterval(0);
     fs::remove_all(dataDir);
+}
+
+// Arch-review #9: cover traffic must cover all three padding buckets.
+// Pre-fix cover only hit 2 KiB and 256 KiB, which meant a relay
+// observing "this client never emits 16 KiB envelopes" could
+// fingerprint a user who never sends medium-sized real traffic.
+// This test runs enough cover fires to see every bucket, then
+// verifies each one showed up at least once at privacy level 2
+// (uniform mode) and each one showed up at privacy level 1
+// (bandwidth-biased mode still allocates the medium bucket 30%).
+TEST(RelayCoverTraffic, CoverHitsAllThreePaddingBucketsAtBothLevels) {
+    ASSERT_GE(sodium_init(), 0);
+
+    constexpr size_t kBucketSmall  =   2 * 1024;
+    constexpr size_t kBucketMedium =  16 * 1024;
+    constexpr size_t kBucketLarge  = 256 * 1024;
+
+    auto runLevel = [&](int level) {
+        const std::string dataDir = makeTempDir("p2p-cover-dist");
+        CryptoEngine crypto;
+        crypto.setDataDir(dataDir);
+        crypto.setPassphrase("cover-dist-passphrase");
+        ASSERT_NO_THROW(crypto.ensureIdentity());
+
+        FireableTimerFactory timers;
+        CapturingHttpClient  http;
+        SimpleWebSocket      ws;
+        RelayClient          relay(ws, http, timers, &crypto);
+        relay.setRelayUrl("wss://mock-relay.test");
+        relay.connectToRelay();
+        ASSERT_TRUE(relay.isConnected());
+        http.posts.clear();
+        relay.setPrivacyLevel(level);
+
+        // Fire ~300 cover events; with either mode, probabilities
+        // make a missed bucket vanishingly unlikely (biased mode has
+        // 10% large → P(miss) ≈ 0.9^300 ≈ 10^-14).
+        size_t smallCount = 0, mediumCount = 0, largeCount = 0;
+        for (int i = 0; i < 300; ++i) {
+            if (!timers.fireNext()) break;
+        }
+        for (const auto& p : http.posts) {
+            switch (p.body.size()) {
+                case kBucketSmall:  ++smallCount; break;
+                case kBucketMedium: ++mediumCount; break;
+                case kBucketLarge:  ++largeCount; break;
+                default: break;  // retry queue / other — ignore
+            }
+        }
+        EXPECT_GT(smallCount,  0u) << "level " << level << ": small bucket never hit";
+        EXPECT_GT(mediumCount, 0u) << "level " << level << ": medium bucket never hit";
+        EXPECT_GT(largeCount,  0u) << "level " << level << ": large bucket never hit";
+
+        relay.setPrivacyLevel(0);  // stops the cover timer
+        fs::remove_all(dataDir);
+    };
+
+    runLevel(1);
+    runLevel(2);
 }
 
 // ── setRelayUrl refuses non-TLS URLs ─────────────────────────────────────
@@ -274,4 +340,55 @@ TEST(RelayUrlScheme, RejectsNonTlsUrls) {
                 << "\" leaked through to ws.open(\"" << ws.lastOpenUrl << "\")";
         }
     }
+}
+
+// Audit #3 test gap: push token registration E2E.  A call to
+// RelayClient::registerPushToken on a connected relay must produce
+// exactly one push_register text frame with the right shape.  An
+// unconnected client should cache the token and replay it on the
+// next auth_ok (separate concern — tested inside RelayClient's
+// auth path; this test only pins the connected path).
+TEST(PushRegistration, SendsPushRegisterFrameOnConnectedRelay) {
+    ASSERT_GE(sodium_init(), 0);
+
+    const std::string dataDir = makeTempDir("p2p-push-e2e");
+    CryptoEngine crypto;
+    crypto.setDataDir(dataDir);
+    crypto.setPassphrase("push-test-passphrase");
+    ASSERT_NO_THROW(crypto.ensureIdentity());
+
+    FireableTimerFactory timers;
+    CapturingHttpClient  http;
+    SimpleWebSocket      ws;
+    RelayClient          relay(ws, http, timers, &crypto);
+
+    relay.setRelayUrl("wss://mock-relay.test");
+    relay.connectToRelay();
+    ASSERT_TRUE(relay.isConnected());
+
+    // Clear the auth frame so we can find the push_register frame alone.
+    const size_t framesBeforePush = ws.sentTexts.size();
+
+    relay.registerPushToken("ios", "deadbeefcafef00d");
+
+    ASSERT_GT(ws.sentTexts.size(), framesBeforePush)
+        << "registerPushToken did not send a frame while connected";
+
+    // The newest frame must be the push_register payload with the
+    // right platform + token.
+    const std::string& pushFrame = ws.sentTexts.back();
+    auto j = nlohmann::json::parse(pushFrame);
+    EXPECT_EQ(j.value("type",     std::string()), "push_register");
+    EXPECT_EQ(j.value("platform", std::string()), "ios");
+    EXPECT_EQ(j.value("token",    std::string()), "deadbeefcafef00d");
+
+    // Empty token → unregister.  Also goes on the wire as push_register
+    // with empty token (relay interprets empty as delete).
+    relay.registerPushToken("ios", "");
+    const std::string& unregFrame = ws.sentTexts.back();
+    auto jEmpty = nlohmann::json::parse(unregFrame);
+    EXPECT_EQ(jEmpty.value("type",     std::string()), "push_register");
+    EXPECT_EQ(jEmpty.value("token",    std::string()), "");
+
+    fs::remove_all(dataDir);
 }
