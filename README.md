@@ -1,4 +1,4 @@
-# Peer2Pear
+# Peer2Pear 🍐
 
 A peer-to-peer encrypted messaging and file-sharing **protocol**. Open source, relay-first, post-quantum cryptography, no phone numbers, no accounts.
 

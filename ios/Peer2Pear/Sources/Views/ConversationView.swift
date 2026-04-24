@@ -74,6 +74,18 @@ struct ConversationView: View {
     @ViewBuilder private var messagesScroll: some View {
         ChatMessagesScroll(messages: peerMessages) { msg in
             MessageBubble(message: msg, isMine: msg.from == client.myPeerId)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = msg.text
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    Button(role: .destructive) {
+                        client.deleteMessage(chatKey: peerId, msgId: msg.id)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
         }
     }
 
@@ -101,17 +113,23 @@ struct ConversationView: View {
     }
 
     @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
+        // Trust marker lives beside the display name; the trailing
+        // slot is the always-visible info button so the user can get
+        // to contact details regardless of verification state.
+        ToolbarItem(placement: .principal) {
+            HStack(spacing: 6) {
+                Text(client.displayName(for: peerId))
+                    .font(.headline)
+                TrustBadge(trust: client.peerTrust(for: peerId))
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             NavigationLink {
-                ContactDetailView(client: client, peerId: peerId)
+                ContactDetailView(client: client, peerId: peerId,
+                                   dismissOnSendMessage: true)
             } label: {
-                let trust = client.peerTrust(for: peerId)
-                if trust == .unverified {
-                    Image(systemName: "info.circle")
-                        .foregroundStyle(.blue)
-                } else {
-                    TrustBadge(trust: trust)
-                }
+                Image(systemName: "info.circle")
+                    .foregroundStyle(.blue)
             }
         }
     }
@@ -187,6 +205,18 @@ struct GroupConversationView: View {
         ChatMessagesScroll(messages: groupMessages) { msg in
             GroupMessageBubble(message: msg,
                                isMine: msg.from == client.myPeerId)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = msg.text
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    Button(role: .destructive) {
+                        client.deleteMessage(chatKey: groupId, msgId: msg.id)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
         }
     }
 

@@ -79,6 +79,22 @@ struct ProfileOutput {
 // Returns true when the user accepted (Save); out is populated only then.
 bool openProfileEditor(QWidget *parent, const ProfileInput &in, ProfileOutput &out);
 
+// ── Contacts picker ──────────────────────────────────────────────────────────
+//
+// Modal list of explicit address-book contacts (in_address_book=1,
+// not a group, not self).  Mirrors iOS's ContactsListView: a place
+// to surface fresh peers that haven't yet produced a chat, and to
+// reopen chats hidden by Delete Conversation.  The caller passes in
+// the already-loaded contact snapshot so the dialog doesn't need
+// database access.
+//
+// Returns the peerIdB64u of the chosen contact, or an empty string if
+// the user cancelled.
+
+QString openContactsPicker(QWidget *parent,
+                           const std::vector<AppDataStore::Contact> &contacts,
+                           const QString &myPeerId);
+
 // ── File card ────────────────────────────────────────────────────────────────
 //
 // Grid tile for a single transferred file.  Emits deleteRequested /

@@ -112,6 +112,12 @@ extension Peer2PearClient {
     }
 
     @discardableResult
+    func dbDeleteMessage(peerId: String, msgId: String) -> Bool {
+        guard let ctx = rawContext else { return false }
+        return p2p_app_delete_message(ctx, peerId, msgId) == 0
+    }
+
+    @discardableResult
     func dbSaveSetting(_ key: String, _ value: String) -> Bool {
         guard let ctx = rawContext else { return false }
         return p2p_app_save_setting(ctx, key, value) == 0

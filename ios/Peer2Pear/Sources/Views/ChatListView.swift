@@ -11,6 +11,13 @@ struct ChatListView: View {
     @State private var showConnectivityInfo = false
     @State private var newContactId = ""
 
+    /// Set by ContactsListView → ContactDetailView's Send Message
+    /// handler when the user wants to land in a specific peer's chat
+    /// after dismissing the contacts sheet.  Populating this binding
+    /// triggers `navigationDestination(item:)` below, pushing the
+    /// ConversationView on the main stack.
+    @State private var pendingDirectChatPeerId: String?
+
     /// 1:1 conversations keyed by the OTHER peer's ID (not always the
     /// `from` — for outgoing messages `from == myPeerId` and we key off
     /// `to` instead).  Used to render the last-message preview per chat.
@@ -43,6 +50,19 @@ struct ChatListView: View {
                                 GroupConversationView(client: client, groupId: group.id)
                             } label: {
                                 GroupRow(client: client, group: group)
+                            }
+                            // Trailing swipe: wipe the group transcript.
+                            // Leaves the group's roster / avatar intact on
+                            // the sending side; the user can still rejoin
+                            // if someone re-messages them.  "Leave Group"
+                            // (separate action) handles the network-side
+                            // departure signal.
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button(role: .destructive) {
+                                    client.deleteChat(peerId: group.id)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
                             }
                         }
                     }
@@ -160,7 +180,19 @@ struct ChatListView: View {
                 SettingsView(client: client)
             }
             .sheet(isPresented: $showContacts) {
-                ContactsListView(client: client)
+                ContactsListView(client: client, onOpenChat: { peerId in
+                    // Dismiss the contacts sheet, then push the peer's
+                    // chat onto the main stack.  The small delay gives
+                    // the sheet dismissal time to settle so the nav
+                    // animation isn't stomped on by the sheet slide.
+                    showContacts = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        pendingDirectChatPeerId = peerId
+                    }
+                })
+            }
+            .navigationDestination(item: $pendingDirectChatPeerId) { peerId in
+                ConversationView(client: client, peerId: peerId)
             }
             .overlay {
                 if isEmpty {
@@ -469,16 +501,40 @@ struct TrustBadge: View {
 struct ContactDetailView: View {
     @ObservedObject var client: Peer2PearClient
     let peerId: String
+
+    /// Provided when this view is reached from inside a sheet (e.g.
+    /// ContactsListView).  Calling it lets the parent dismiss the
+    /// sheet and push ConversationView on the main navigation stack
+    /// instead of trapping the user inside the sheet's own stack.
+    /// When nil, "Send Message" falls back to a local NavigationLink
+    /// push — correct for non-sheet call sites.
+    var onOpenChat: ((String) -> Void)? = nil
+
+    /// Set by the ConversationView toolbar's (i) entry point.  The
+    /// chat we'd want to "open" is the one we came from, so Send
+    /// Message just pops this view instead of pushing a duplicate
+    /// ConversationView three levels deep.
+    var dismissOnSendMessage: Bool = false
+
     @Environment(\.dismiss) private var dismiss
     @State private var confirmUnverify = false
     @State private var confirmRemove = false
     @State private var confirmBlock = false
     @State private var confirmReset = false
     @State private var nicknameDraft = ""
+    @State private var showComposeSheet = false
 
     private var trust: P2PPeerTrust { client.peerTrust(for: peerId) }
     private var keyChanged: Bool   { client.keyChanges[peerId] != nil }
     private var isBlocked: Bool    { client.isBlocked(peerId: peerId) }
+
+    /// True when any 1:1 message with this peer lives in the local
+    /// transcript — either side of the echo counts.  Drives whether
+    /// "Send Message" jumps straight to the existing thread or opens
+    /// a compose sheet to start a fresh one.
+    private var hasChat: Bool {
+        client.messages.contains { $0.from == peerId || $0.to == peerId }
+    }
 
     var body: some View {
         Form {
@@ -521,12 +577,40 @@ struct ContactDetailView: View {
             // Chats are now message-history-only (no longer auto-include
             // address-book contacts), so without this link an explicit
             // contact with no prior chat would be unreachable from the
-            // contacts list.
+            // contacts list.  Two shapes:
+            //   • In the contacts-sheet context (onOpenChat != nil):
+            //     existing chat → dismiss-and-push via the callback;
+            //     no chat → open a compose sheet to author the first
+            //     message, then dismiss-and-push.
+            //   • Otherwise (opened from the chat list's own stack):
+            //     a plain NavigationLink is correct — we're already in
+            //     the main stack.
             Section {
-                NavigationLink {
-                    ConversationView(client: client, peerId: peerId)
-                } label: {
-                    Label("Send Message", systemImage: "bubble.left")
+                if let onOpenChat = onOpenChat {
+                    Button {
+                        if hasChat {
+                            onOpenChat(peerId)
+                        } else {
+                            showComposeSheet = true
+                        }
+                    } label: {
+                        Label("Send Message", systemImage: "bubble.left")
+                    }
+                } else if dismissOnSendMessage {
+                    // Reached via the toolbar (i) from ConversationView
+                    // — the chat we'd push is already one level below
+                    // in the stack.  Pop ourselves to return there.
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label("Send Message", systemImage: "bubble.left")
+                    }
+                } else {
+                    NavigationLink {
+                        ConversationView(client: client, peerId: peerId)
+                    } label: {
+                        Label("Send Message", systemImage: "bubble.left")
+                    }
                 }
             }
 
@@ -669,6 +753,21 @@ struct ContactDetailView: View {
         } message: {
             Text("The next message either of you sends will start a fresh handshake. Use this if the peer reports undecryptable messages or after a device swap.")
         }
+        .sheet(isPresented: $showComposeSheet) {
+            ComposeFirstMessageSheet(
+                peerName: client.displayName(for: peerId),
+                onSend: { text in
+                    client.sendText(to: peerId, text: text)
+                    showComposeSheet = false
+                    // Let the compose sheet finish dismissing, then
+                    // route to the freshly-created conversation in the
+                    // main stack (callback is only nil from non-sheet
+                    // call sites, which don't need compose anyway).
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        onOpenChat?(peerId)
+                    }
+                })
+        }
     }
 
     private var trustLabel: String {
@@ -710,6 +809,55 @@ struct ContactDetailView: View {
     }
 }
 
+// MARK: - Compose first message
+//
+// Presented over ContactDetailView when the user taps Send Message on
+// a contact they've never chatted with.  After Send, the parent
+// dismisses the contacts sheet and pushes ConversationView on the main
+// navigation stack so the user lands on their new chat instead of
+// being stuck inside the modal.
+
+private struct ComposeFirstMessageSheet: View {
+    let peerName: String
+    let onSend: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var text: String = ""
+
+    private var trimmed: String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Type your message…", text: $text, axis: .vertical)
+                        .lineLimit(3...8)
+                } header: {
+                    Text("First message to \(peerName)")
+                } footer: {
+                    Text("This starts the conversation. After sending, you'll jump into the chat.")
+                }
+            }
+            .navigationTitle("New Message")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send") {
+                        guard !trimmed.isEmpty else { return }
+                        onSend(trimmed)
+                    }
+                    .disabled(trimmed.isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
 // MARK: - Contacts list (address book)
 //
 // Surfaced from ChatListView's leading toolbar button.  Backed by
@@ -724,6 +872,11 @@ struct ContactDetailView: View {
 
 struct ContactsListView: View {
     @ObservedObject var client: Peer2PearClient
+    /// Fired when the user picks "Send Message" on a contact with an
+    /// existing chat (or after composing the first message of a new
+    /// one).  ChatListView dismisses the contacts sheet and routes to
+    /// the appropriate ConversationView on its own navigation stack.
+    var onOpenChat: ((String) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var showExport = false
     @State private var showImport = false
@@ -749,7 +902,9 @@ struct ContactsListView: View {
                     List {
                         ForEach(peerIds, id: \.self) { peerId in
                             NavigationLink {
-                                ContactDetailView(client: client, peerId: peerId)
+                                ContactDetailView(client: client,
+                                                   peerId: peerId,
+                                                   onOpenChat: onOpenChat)
                             } label: {
                                 ChatRow(client: client, peerId: peerId,
                                         preview: client.peerTrust(for: peerId) == .verified

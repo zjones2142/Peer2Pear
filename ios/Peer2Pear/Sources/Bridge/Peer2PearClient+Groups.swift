@@ -121,25 +121,16 @@ extension Peer2PearClient {
         return rc == 0
     }
 
-    /// Leave a group — broadcasts a `group_leave` notification and drops
-    /// the group from our local state.  Peers will remove us from their
-    /// rosters via their on_group_member_left callback.
+    /// Leave a group — broadcasts a `group_leave` notification.
+    /// iMessage-parity: local transcript + group entry stay.  Members
+    /// get the leave marker; the user keeps their history and can wipe
+    /// it separately via swipe-to-delete → `deleteChat(peerId:)`.
     @discardableResult
     func leaveGroup(groupId: String, groupName: String,
                     memberPeerIds: [String]) -> Bool {
         guard let ctx = rawContext else { return false }
         let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
             p2p_leave_group(ctx, groupId, groupName, ptr)
-        }
-        if rc == 0 {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.groups.removeValue(forKey: groupId)
-                self.groupMessages.removeAll { $0.groupId == groupId }
-                self.groupAvatars.removeValue(forKey: groupId)
-                // CASCADE wipes the group's messages via the FK.
-                self.dbDeleteContact(peerId: groupId)
-            }
         }
         return rc == 0
     }

@@ -508,7 +508,10 @@ ContactEditorResult openContactEditor(
         QObject::connect(removeBtn, &QPushButton::clicked, [&]() {
             const QString msg = isGroup
                                     ? "Delete this group? This cannot be undone."
-                                    : "Remove this contact? This cannot be undone.";
+                                    : "Remove this contact from your address book?\n\n"
+                                      "Messages and file records stay — right-click "
+                                      "the chat and pick \"Delete Conversation\" to "
+                                      "wipe the transcript separately.";
             if (QMessageBox::question(&dlg, isGroup ? "Delete Group" : "Remove Contact",
                                       msg, QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
                 result = ContactEditorResult::Removed;
@@ -1153,6 +1156,79 @@ FileCard::FileCard(const AppDataStore::FileRecord &rec, QWidget *parent)
         bl->addWidget(cancelFileBtn);
         vl->addWidget(btnContainer);
     }
+}
+
+// ── Contacts picker ──────────────────────────────────────────────────────────
+
+QString openContactsPicker(QWidget *parent,
+                           const std::vector<AppDataStore::Contact> &contacts,
+                           const QString &myPeerId)
+{
+    QDialog dlg(parent);
+    dlg.setWindowTitle("Contacts");
+    applyStyle(&dlg);
+    dlg.setMinimumWidth(380);
+    dlg.setMinimumHeight(480);
+    dlg.setModal(true);
+
+    auto *root = new QVBoxLayout(&dlg);
+    root->setSpacing(12);
+    root->setContentsMargins(24, 24, 24, 24);
+
+    auto *title = new QLabel("Contacts", &dlg);
+    title->setObjectName("dlgTitle");
+    root->addWidget(title);
+
+    auto *sep = new QFrame(&dlg);
+    sep->setFrameShape(QFrame::HLine);
+    sep->setStyleSheet("color:#2a2a2a;");
+    root->addWidget(sep);
+
+    auto *list = new QListWidget(&dlg);
+    for (const auto &c : contacts) {
+        if (c.isGroup) continue;
+        if (!c.inAddressBook) continue;
+        if (!myPeerId.isEmpty() && c.peerIdB64u == myPeerId.toStdString()) continue;
+        const QString label = c.name.empty()
+            ? qtbridge::qstr(c.peerIdB64u).left(8) + "…"
+            : qtbridge::qstr(c.name);
+        auto *item = new QListWidgetItem(label, list);
+        item->setData(Qt::UserRole, qtbridge::qstr(c.peerIdB64u));
+        item->setToolTip(qtbridge::qstr(c.peerIdB64u));
+    }
+    root->addWidget(list, /*stretch=*/1);
+
+    QString selected;
+    // Double-click or Open button picks the highlighted contact.
+    QObject::connect(list, &QListWidget::itemDoubleClicked,
+        [&](QListWidgetItem *item) {
+            if (item) {
+                selected = item->data(Qt::UserRole).toString();
+                dlg.accept();
+            }
+        });
+
+    auto *btnRow = new QHBoxLayout;
+    auto *closeBtn = new QPushButton("Close", &dlg);
+    auto *openBtn  = new QPushButton("View Info", &dlg);
+    closeBtn->setObjectName("cancelBtn");
+    openBtn->setObjectName("saveBtn");
+    openBtn->setDefault(true);
+    btnRow->addStretch();
+    btnRow->addWidget(closeBtn);
+    btnRow->addWidget(openBtn);
+    root->addLayout(btnRow);
+
+    QObject::connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    QObject::connect(openBtn, &QPushButton::clicked, [&]() {
+        if (auto *item = list->currentItem()) {
+            selected = item->data(Qt::UserRole).toString();
+            dlg.accept();
+        }
+    });
+
+    dlg.exec();
+    return selected;
 }
 
 }  // namespace dialogs

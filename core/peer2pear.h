@@ -664,6 +664,11 @@ void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
 /** Wipe all messages for `peer_id`.  Doesn't touch the contact row. */
 int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id);
 
+/** Delete a single message identified by (peer_id, msg_id).  Used by
+ *  the long-press / right-click "Delete Message" UX.  Returns 0 on
+ *  success, -1 on invalid args or when no matching row exists. */
+int p2p_app_delete_message(p2p_context* ctx, const char* peer_id, const char* msg_id);
+
 /** Settings key/value store.  load returns the static-storage scratch
  *  buffer in `ctx`; treat it as valid only until the next p2p_* call. */
 int         p2p_app_save_setting(p2p_context* ctx, const char* key, const char* value);

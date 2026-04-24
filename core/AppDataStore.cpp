@@ -422,6 +422,35 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
     }
 }
 
+bool AppDataStore::loadContact(const std::string& peerIdB64u, Contact& out) const
+{
+    if (!m_db || peerIdB64u.empty()) return false;
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT peer_id,name,subtitle,keys,is_blocked,is_group,"
+        "       group_id,avatar,last_active,in_address_book"
+        " FROM contacts WHERE peer_id=:pid LIMIT 1;"
+    );
+    q.bindValue(":pid", peerIdB64u);
+    if (!q.exec() || !q.next()) return false;
+    out.peerIdB64u     = q.valueText(0);
+    out.name           = decryptField(q.valueText(1),
+                                        fieldAad("contacts", "name",     out.peerIdB64u));
+    out.subtitle       = decryptField(q.valueText(2),
+                                        fieldAad("contacts", "subtitle", out.peerIdB64u));
+    out.keys           = splitKeys(decryptField(q.valueText(3),
+                                        fieldAad("contacts", "keys",     out.peerIdB64u)));
+    out.isBlocked      = q.valueInt(4) == 1;
+    out.isGroup        = q.valueInt(5) == 1;
+    out.groupId        = decryptField(q.valueText(6),
+                                        fieldAad("contacts", "group_id", out.peerIdB64u));
+    out.avatarB64      = decryptField(q.valueText(7),
+                                        fieldAad("contacts", "avatar",   out.peerIdB64u));
+    out.lastActiveSecs = q.valueInt64(8);
+    out.inAddressBook  = q.valueInt(9) == 1;
+    return true;
+}
+
 std::string AppDataStore::exportContactsJson() const
 {
     nlohmann::json arr = nlohmann::json::array();
@@ -605,6 +634,17 @@ bool AppDataStore::deleteMessages(const std::string& peerIdB64u)
     SqlCipherQuery q(*m_db);
     q.prepare("DELETE FROM messages WHERE peer_id=:peer_id;");
     q.bindValue(":peer_id", peerIdB64u);
+    return q.exec();
+}
+
+bool AppDataStore::deleteMessage(const std::string& peerIdB64u,
+                                 const std::string& msgId)
+{
+    if (!m_db || peerIdB64u.empty() || msgId.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare("DELETE FROM messages WHERE peer_id=:peer_id AND msg_id=:msg_id;");
+    q.bindValue(":peer_id", peerIdB64u);
+    q.bindValue(":msg_id",  msgId);
     return q.exec();
 }
 

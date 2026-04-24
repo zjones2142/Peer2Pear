@@ -86,6 +86,13 @@ public:
     /// matches the C-API consumer pattern (one callback per row).
     void loadAllContacts(const std::function<void(const Contact&)>& cb) const;
 
+    /// Load a single contact by peer ID.  Returns true and populates
+    /// `out` when the row exists; false otherwise (leaves `out`
+    /// untouched).  Used when we need to repopulate in-memory state
+    /// from DB without an O(n) scan — e.g. a peer messaging after
+    /// their chat row was deleted but their contact row wasn't.
+    bool loadContact(const std::string& peerIdB64u, Contact& out) const;
+
     /// Serialize the address book to the v1 wire format used by
     /// desktop's "Export Contacts" + iOS's share sheet.  Blocked rows
     /// are omitted.  Format:
@@ -122,6 +129,11 @@ public:
     /// Wipe every message for `peerIdB64u`.  Doesn't touch the contacts
     /// row — caller decides whether the contact stays in the address book.
     bool deleteMessages(const std::string& peerIdB64u);
+
+    /// Delete a single message by (peerId, msgId).  Used by the
+    /// long-press / right-click "Delete Message" UX on both platforms.
+    /// Returns true when a row was deleted, false when nothing matched.
+    bool deleteMessage(const std::string& peerIdB64u, const std::string& msgId);
 
     // ── Settings ──────────────────────────────────────────────────────────
 

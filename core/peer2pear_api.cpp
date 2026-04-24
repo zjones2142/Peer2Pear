@@ -1287,6 +1287,13 @@ int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id)
     return ctx->appData->deleteMessages(peer_id) ? 0 : -1;
 }
 
+int p2p_app_delete_message(p2p_context* ctx, const char* peer_id, const char* msg_id)
+{
+    if (!ctx || !peer_id || !msg_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->deleteMessage(peer_id, msg_id) ? 0 : -1;
+}
+
 int p2p_app_save_setting(p2p_context* ctx, const char* key, const char* value)
 {
     if (!ctx || !key) return -1;

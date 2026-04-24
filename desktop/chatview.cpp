@@ -2,6 +2,7 @@
 #include "QrImage.hpp"
 #include "dialogs.h"
 #include "peer2pear.h"
+#include "shared.hpp"
 #include "theme.h"
 #include "theme_styles.h"
 #include "ui_mainwindow.h"
@@ -23,6 +24,8 @@
 #include <QPushButton>
 #include <QProgressBar>
 #include <QListWidget>
+#include <QMenu>
+#include <QAction>
 #include <QToolButton>
 #include <QMessageBox>
 #include <QDateTime>
@@ -165,6 +168,9 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
     ensureUnreadSize();
 
     connect(m_ui->chatList,      &QListWidget::currentRowChanged, this, &ChatView::onChatSelected);
+    m_ui->chatList->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_ui->chatList, &QListWidget::customContextMenuRequested,
+            this, &ChatView::onChatListContextMenu);
     connect(m_ui->sendBtn,       &QPushButton::clicked,           this, &ChatView::onSendMessage);
     connect(m_ui->messageInput,  &QLineEdit::returnPressed,       this, &ChatView::onSendMessage);
     connect(m_ui->searchEdit_12, &QLineEdit::textChanged,         this, &ChatView::onSearchChanged);
@@ -175,6 +181,24 @@ ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
     connect(m_ui->editProfileBtn,&QToolButton::clicked,           this, &ChatView::onEditProfile);
     connect(m_ui->addContactBtn, &QToolButton::clicked,           this, &ChatView::onAddContact);
     connect(m_ui->attachBtn,     &QToolButton::clicked,           this, &ChatView::onAttachFile);
+
+    // Inject a "Contacts" button into the sidebar footer alongside
+    // the existing + (add-contact) button.  Done programmatically to
+    // avoid a .ui roundtrip; style mirrors the + button.
+    if (auto *footerLayout = qobject_cast<QHBoxLayout*>(m_ui->sidebarFooter->layout())) {
+        auto *contactsBtn = new QToolButton(m_ui->sidebarFooter);
+        contactsBtn->setText("👥");
+        contactsBtn->setToolTip("Contacts");
+        contactsBtn->setFixedSize(36, 36);
+        contactsBtn->setCursor(Qt::PointingHandCursor);
+        contactsBtn->setStyleSheet(
+            "QToolButton { background-color: #1a2e1c; border: 1px solid #2e5e30;"
+            " color: #5dd868; font-size: 16px; border-radius: 18px; }"
+            "QToolButton:hover { background-color: #223a24; border-color: #3a9e48; }");
+        // Insert before the + button (which is the last widget in the row).
+        footerLayout->insertWidget(footerLayout->count() - 1, contactsBtn);
+        connect(contactsBtn, &QToolButton::clicked, this, &ChatView::onOpenContactsPicker);
+    }
 
     rebuildChatList();
     m_ui->chatList->setCurrentRow(0);
@@ -395,7 +419,8 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
 
         if (i == m_currentChat) {
             if (needsSep) addDateSeparator(timestamp);
-            addMessageBubble(text, false);
+            addMessageBubble(text, false, /*senderName=*/QString(),
+                              qtbridge::qstr(msgIdStd), chatKey(m_chats[i]));
             promoteChatToTop(i);
             rebuildChatList();
         } else {
@@ -408,13 +433,17 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
         return;
     }
 
-    // Unknown sender — auto-create chat
+    // Unknown sender — auto-create chat.  Stranger stubs stay out of
+    // the address book (inAddressBook=false) so they don't surface in
+    // the contacts picker; the user has to explicitly Add Contact to
+    // promote them.  Matches iOS's INSERT-OR-IGNORE stub path.
     AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, ""};
     AppDataStore::Contact nc;
     nc.name = "Unknown contact";
     nc.subtitle = "Secure chat";
     nc.peerIdB64u = fromStd;
     nc.keys.push_back(fromStd);
+    nc.inAddressBook = false;
     m_messagesByPeer[nc.peerIdB64u].push_back(msg);
     m_chats.insert(m_chats.begin(), nc);
     if (m_store) { m_store->saveContact(nc); m_store->saveMessage(fromStd, msg); }
@@ -520,7 +549,8 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
 
     if (idx == m_currentChat) {
         if (needsSep) addDateSeparator(ts);
-        addMessageBubble(text, false, senderName);
+        addMessageBubble(text, false, senderName,
+                          qtbridge::qstr(msgIdStd), chatKey(chat));
         promoteChatToTop(idx);
         rebuildChatList();
     } else {
@@ -847,6 +877,9 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
     nc.keys.push_back(peerIdStd);
     nc.avatarB64   = avatarStd;
     nc.lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+    // Stranger auto-stub: keeps the chat thread but stays out of the
+    // address book until the user explicitly adds them.
+    nc.inAddressBook = false;
 
     m_chats.insert(m_chats.begin(), nc);
     if (m_store) {
@@ -1082,7 +1115,7 @@ void ChatView::onSendMessage()
         m_store->saveMessage(dbKey, msg);
     }
 
-    addMessageBubble(text, true);
+    addMessageBubble(text, true, /*senderName=*/QString(), msgId, chatKey(cur));
     m_ui->messageInput->clear();
 
     if (cur.isGroup) {
@@ -1346,16 +1379,16 @@ void ChatView::onEditContact(int index)
                                                      m_chats[index].name, stdKeys);
         }
     } else if (result == ContactEditorResult::Removed) {
-        // Use the same key logic as saveContact
-        const std::string dbKey = m_chats[index].peerIdB64u.empty()
-                                  ? ("name:" + m_chats[index].name)
-                                  : m_chats[index].peerIdB64u;
-        if (m_store) m_store->deleteContact(dbKey);
-        m_chats.erase(m_chats.begin() + index);
-        m_unread.remove(index);
-        m_currentChat = -1;
+        // "Remove Contact" on desktop = forget the address-book entry.
+        // iMessage-style: clear the nickname, flip the in-address-book
+        // flag, but never CASCADE-wipe the transcript.  The chat row
+        // stays visible (the rebuildChatList fallback shows a key-prefix
+        // label when name is empty).  Use right-click → "Delete
+        // Conversation" to wipe history separately.
+        m_chats[index].inAddressBook = false;
+        m_chats[index].name.clear();
+        if (m_store) m_store->saveContact(m_chats[index]);
         rebuildChatList();
-        if (!m_chats.empty()) m_ui->chatList->setCurrentRow(0);
     } else if (result == ContactEditorResult::Blocked) {
         m_chats[index].isBlocked = !m_chats[index].isBlocked;
         if (m_store) m_store->saveContact(m_chats[index]);
@@ -1369,22 +1402,18 @@ void ChatView::onEditContact(int index)
         if (m_store) m_store->saveContact(m_chats[index]);
         rebuildChatList();
     } else if (result == ContactEditorResult::Left) {
-        // Notify all members you're leaving
+        // iMessage-parity: "Leave Group" is a network-side signal only.
+        // Members see a leave marker; the user keeps their local
+        // transcript and can still scroll the history.  Wiping the
+        // messages is a separate action (right-click → Delete
+        // Conversation).  The in-address-book flag flips so the row
+        // can be filtered from a future contacts view if we add one.
         const std::string groupId = m_chats[index].groupId;
         m_controller->sendGroupLeaveNotification(
             groupId, m_chats[index].name, m_chats[index].keys);
-
-        // Remove group locally
-        const std::string dbKey = m_chats[index].peerIdB64u.empty()
-                                  ? ("name:" + m_chats[index].name)
-                                  : m_chats[index].peerIdB64u;
-        if (m_store) m_store->deleteContact(dbKey);
-        m_chats.erase(m_chats.begin() + index);
-        m_unread.remove(index);
-        m_currentChat = -1;
+        m_chats[index].inAddressBook = false;
+        if (m_store) m_store->saveContact(m_chats[index]);
         rebuildChatList();
-        if (!m_chats.empty())
-            m_ui->chatList->setCurrentRow(0);
     }
 
 }
@@ -1544,6 +1573,111 @@ void ChatView::onAddContact()
     m_ui->chatList->setCurrentRow(static_cast<int>(m_chats.size())-1);
 }
 
+void ChatView::onOpenContactsPicker()
+{
+    if (!m_store) return;
+
+    // Load the full contact roster from the DB — the in-memory
+    // m_chats is message-filtered so it won't include fresh contacts
+    // the user hasn't started chatting with yet.
+    std::vector<AppDataStore::Contact> all;
+    m_store->loadAllContacts([&](const AppDataStore::Contact &c) {
+        all.push_back(c);
+    });
+
+    const QString myId = QString::fromStdString(m_controller
+                                                    ? m_controller->myIdB64u()
+                                                    : std::string());
+    const QString picked = dialogs::openContactsPicker(m_ui->centralwidget,
+                                                        all, myId);
+    if (picked.isEmpty()) return;
+
+    // Mirror iOS's ContactsListView → ContactDetailView flow: selecting
+    // a contact opens their info (nickname, keys, safety number,
+    // block/verify actions), not a chat.  findOrCreateChatForPeer
+    // rehydrates the row into m_chats from the DB snapshot so
+    // onEditContact can operate on a real index — this may resurface
+    // the row in the chat list until the next relaunch filters it.
+    const int idx = findOrCreateChatForPeer(picked);
+    if (idx >= 0) onEditContact(idx);
+}
+
+void ChatView::onDeleteSingleMessage(const QString &chatKey, const QString &msgId)
+{
+    const std::string chatKeyStd = chatKey.toStdString();
+    const std::string msgIdStd   = msgId.toStdString();
+    if (m_store) m_store->deleteMessage(chatKeyStd, msgIdStd);
+
+    // Drop from the in-memory cache then re-render the current chat.
+    auto &msgs = m_messagesByPeer[chatKeyStd];
+    msgs.erase(std::remove_if(msgs.begin(), msgs.end(),
+        [&](const AppDataStore::Message &m) { return m.msgId == msgIdStd; }),
+        msgs.end());
+    if (m_currentChat >= 0) loadChat(m_currentChat);
+}
+
+void ChatView::onChatListContextMenu(const QPoint &pos)
+{
+    QListWidgetItem *item = m_ui->chatList->itemAt(pos);
+    if (!item) return;
+    const int index = m_ui->chatList->row(item);
+    if (index < 0 || index >= static_cast<int>(m_chats.size())) return;
+
+    QMenu menu(m_ui->chatList);
+    QAction *del = menu.addAction("Delete Conversation");
+    QAction *chosen = menu.exec(m_ui->chatList->viewport()->mapToGlobal(pos));
+    if (chosen == del) onDeleteConversation(index);
+}
+
+void ChatView::onDeleteConversation(int index)
+{
+    if (index < 0 || index >= static_cast<int>(m_chats.size())) return;
+
+    const QString label = qtbridge::qstr(m_chats[index].name);
+    const QString prompt = label.isEmpty()
+        ? QString("Delete this conversation?\n\nMessages and file records "
+                  "are wiped; the contact stays in your address book.")
+        : QString("Delete the conversation with \"%1\"?\n\nMessages and file "
+                  "records are wiped; the contact stays in your address "
+                  "book.").arg(label);
+
+    if (QMessageBox::question(m_ui->centralwidget, "Delete Conversation",
+                              prompt, QMessageBox::Yes | QMessageBox::No,
+                              QMessageBox::No) != QMessageBox::Yes) return;
+
+    // Snapshot before we mutate m_chats.
+    AppDataStore::Contact c = m_chats[index];
+    const QString ck = chatKey(c);
+    const std::string ckStd = ck.toStdString();
+
+    if (m_store) {
+        m_store->deleteMessages(c.peerIdB64u);
+        m_store->deleteFileRecordsForChat(ckStd);
+        // Contact row is NOT touched.  "Delete Conversation" wipes
+        // history; "Remove Contact" is the separate address-book
+        // action.  The chat-list filter hides message-less non-group
+        // rows so an explicit contact still "disappears" from chats
+        // after delete, but remains findable via the contacts picker.
+    }
+
+    m_messagesByPeer.erase(c.peerIdB64u);
+    m_filesByKey.remove(ck);
+    m_chats.erase(m_chats.begin() + index);
+    m_unread.remove(index);
+
+    if (m_currentChat == index) {
+        m_currentChat = -1;
+        clearMessages();
+    } else if (m_currentChat > index) {
+        m_currentChat -= 1;
+    }
+
+    rebuildChatList();
+    if (!m_chats.empty() && m_currentChat < 0)
+        m_ui->chatList->setCurrentRow(0);
+    emit unreadChanged(totalUnread());
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 int ChatView::findChatForPeer(const QString &peerIdB64u) const
@@ -1569,14 +1703,23 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
     const int existing = findChatForPeer(peerIdB64u);
     if (existing >= 0) return existing;
 
-    // Unknown sender — auto-create at the top of the list.
+    // If the DB already has a row for this peer (e.g. an explicit
+    // contact whose chat was deleted earlier), re-hydrate from it so
+    // we don't clobber the nickname with "Unknown contact".  Only fall
+    // back to a fresh stub when the peer is genuinely unknown.
     AppDataStore::Contact nc;
-    nc.name = "Unknown contact";
-    nc.subtitle = "Secure chat";
-    nc.peerIdB64u = peerIdB64u.toStdString();
-    nc.keys.push_back(peerIdB64u.toStdString());
+    bool loaded = false;
+    if (m_store) loaded = m_store->loadContact(peerIdB64u.toStdString(), nc);
+    if (!loaded) {
+        nc.name = "Unknown contact";
+        nc.subtitle = "Secure chat";
+        nc.peerIdB64u = peerIdB64u.toStdString();
+        nc.keys.push_back(peerIdB64u.toStdString());
+        // Strangers stay out of the address book until explicit add.
+        nc.inAddressBook = false;
+        if (m_store) m_store->saveContact(nc);
+    }
     m_chats.insert(m_chats.begin(), nc);
-    if (m_store) m_store->saveContact(nc);
     ensureUnreadSize();
     m_unread.prepend(0);
     if (m_currentChat >= 0) m_currentChat += 1;
@@ -1629,6 +1772,24 @@ void ChatView::initChats()
             if (!records.empty())
                 m_filesByKey[ck] = std::move(records);
         }
+
+        // Chat list is message-derived: we only show rows that have a
+        // transcript the user is likely to want to open.  Groups stay
+        // visible even when empty (they carry roster state).  Fresh
+        // contacts (in-address-book, no messages yet) live in the
+        // contacts picker, not the chat list — click one there to
+        // start a conversation.  Rows stay in the DB for FK integrity
+        // and `findOrCreateChatForPeer` re-hydrates when traffic
+        // resumes.
+        for (size_t i = m_chats.size(); i-- > 0; ) {
+            const auto &c = m_chats[i];
+            const auto  it = m_messagesByPeer.find(c.peerIdB64u);
+            const bool  noMessages = (it == m_messagesByPeer.end() || it->second.empty());
+            if (!c.isGroup && noMessages) {
+                m_messagesByPeer.erase(c.peerIdB64u);
+                m_chats.erase(m_chats.begin() + i);
+            }
+        }
     }
 
     m_ui->chatList->clear();
@@ -1675,7 +1836,13 @@ void ChatView::rebuildChatList()
         auto *hl = new QHBoxLayout(row);
         hl->setContentsMargins(14,0,14,0); hl->setSpacing(6);
 
-        auto *nameLbl = new QLabel(qtbridge::qstr(m_chats[i].name), row);
+        // "Remove Contact" clears the nickname — fall back to the first
+        // 8 chars of the peer ID so the row isn't blank.  Groups are
+        // always created with a name so this branch rarely runs for them.
+        QString label = qtbridge::qstr(m_chats[i].name);
+        if (label.isEmpty() && !m_chats[i].peerIdB64u.empty())
+            label = qtbridge::qstr(p2p::peerPrefix(m_chats[i].peerIdB64u)) + "…";
+        auto *nameLbl = new QLabel(label, row);
         nameLbl->setStyleSheet("color:#d0d0d0;font-size:14px;background:transparent;");
         hl->addWidget(nameLbl, 1);
 
@@ -1860,7 +2027,8 @@ void ChatView::loadChat(int index)
         if (chat.isGroup && !msg.sent && !msg.senderName.empty()) {
             senderName = qtbridge::qstr(msg.senderName);
         }
-        addMessageBubble(qtbridge::qstr(msg.text), msg.sent, senderName);
+        addMessageBubble(qtbridge::qstr(msg.text), msg.sent, senderName,
+                          qtbridge::qstr(msg.msgId), chatKey(chat));
     }
     rebuildFilesTab();
 }
@@ -1910,7 +2078,10 @@ void ChatView::addDateSeparator(const QDateTime &dt)
     layout->insertWidget(layout->count()-1, row);
 }
 
-void ChatView::addMessageBubble(const QString &text, bool sent, const QString &senderName)
+void ChatView::addMessageBubble(const QString &text, bool sent,
+                                const QString &senderName,
+                                const QString &msgId,
+                                const QString &chatKey)
 {
     QFont f = QApplication::font(); f.setPixelSize(13);
     QFontMetrics fm(f);
@@ -1994,6 +2165,34 @@ void ChatView::addMessageBubble(const QString &text, bool sent, const QString &s
     // doesn't briefly flash dark before the next themeChanged.
     themeStyles::reapplyForChildren(row, ThemeManager::instance().current());
     outerLayout->addLayout(rl);
+
+    // Right-click → Copy / Delete.  Only wired for real messages
+    // (system-rendered bubbles pass empty msgId and stay static).
+    if (!msgId.isEmpty() && !chatKey.isEmpty()) {
+        bubble->setContextMenuPolicy(Qt::CustomContextMenu);
+        const QString capturedText    = text;
+        const QString capturedMsgId   = msgId;
+        const QString capturedChatKey = chatKey;
+        connect(bubble, &QWidget::customContextMenuRequested, this,
+                [this, bubble, capturedText, capturedMsgId, capturedChatKey](const QPoint &pos) {
+            QMenu menu(bubble);
+            QAction *copyAct = menu.addAction("Copy");
+            QAction *delAct  = menu.addAction("Delete Message");
+            QAction *chosen  = menu.exec(bubble->mapToGlobal(pos));
+            if (chosen == copyAct) {
+                QApplication::clipboard()->setText(capturedText);
+            } else if (chosen == delAct) {
+                // Defer one event-loop turn so the bubble's signal
+                // dispatch unwinds before clearMessages() deletes it.
+                // Calling loadChat() synchronously here destroys the
+                // QLabel whose customContextMenuRequested slot we're
+                // still inside, which crashes on return.
+                QTimer::singleShot(0, this, [this, capturedChatKey, capturedMsgId]() {
+                    onDeleteSingleMessage(capturedChatKey, capturedMsgId);
+                });
+            }
+        });
+    }
 
     auto *layout = qobject_cast<QVBoxLayout*>(m_ui->scrollAreaWidgetContents->layout());
     if (!layout) return;

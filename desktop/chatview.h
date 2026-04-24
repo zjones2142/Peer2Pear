@@ -126,6 +126,9 @@ private slots:
     void onEditProfile();
     void onEditContact(int index);
     void onAddContact();
+    void onChatListContextMenu(const QPoint &pos);
+    void onDeleteConversation(int index);
+    void onOpenContactsPicker();
 
 public:
     void initChats();
@@ -145,7 +148,16 @@ private:
     QLabel *m_emptyLabel = nullptr;
 
     void clearMessages();
-    void addMessageBubble(const QString &text, bool sent, const QString &senderName = QString());
+    /// Render one message bubble.  Pass `msgId` + `chatKey` (peerIdB64u
+    /// for 1:1s, groupId for groups) to make the bubble long-press /
+    /// right-click deletable; leaving them empty produces a static
+    /// system bubble (e.g. "No keys saved for this contact") with no
+    /// context menu.
+    void addMessageBubble(const QString &text, bool sent,
+                          const QString &senderName = QString(),
+                          const QString &msgId = QString(),
+                          const QString &chatKey = QString());
+    void onDeleteSingleMessage(const QString &chatKey, const QString &msgId);
     void addFileBubble(const QString &fileName, qint64 fileSize, bool sent);
     void addDateSeparator(const QDateTime &dt);
 

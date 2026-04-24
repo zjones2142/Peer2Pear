@@ -336,17 +336,49 @@ final class Peer2PearClient: ObservableObject {
         }
     }
 
-    /// Wipe 1:1 message history with a peer without touching the
-    /// contacts roster.  Used by the ChatListView trailing swipe so
-    /// the user can dismiss a chat row (e.g. from a stranger who
-    /// messaged first) without also deleting the contact.  Also wipes
-    /// the file_transfers rows for this chat so the strip cards
-    /// disappear — the actual files at savedPath stay on disk.
+    /// Delete a single 1:1 or group message by msgId.  Wipes the row
+    /// from the in-memory @Published arrays and from the SQLCipher
+    /// store; the chat itself is untouched.  Used by the long-press
+    /// "Delete Message" action on message bubbles.
+    ///
+    /// `chatKey` is the peer ID for 1:1s and the group ID for group
+    /// messages — matches the `peer_id` column in the messages table.
+    func deleteMessage(chatKey: String, msgId: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.messages.removeAll { $0.id == msgId }
+            self.groupMessages.removeAll { $0.id == msgId }
+            self.dbDeleteMessage(peerId: chatKey, msgId: msgId)
+        }
+    }
+
+    /// Wipe local message history for a chat without touching the
+    /// contacts roster.  Works for both 1:1 peers and groups — pass
+    /// the peerIdB64u for a direct chat or the groupId for a group.
+    /// Also wipes the file_transfers rows for this chat so the strip
+    /// cards disappear; the actual files at savedPath stay on disk.
+    ///
+    /// The contact row in the AppDataStore is untouched — nickname,
+    /// avatar, and (for groups) member roster all survive.  If the
+    /// peer or group messages again, the chat re-materializes with
+    /// its prior identity intact.  Use `removeContact` / `leaveGroup`
+    /// separately to drop the address-book / membership side.
     func deleteChat(peerId: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+
+            // 1:1 bucket.
             self.messages.removeAll { $0.from == peerId || $0.to == peerId }
-            // In-memory transfer cards for this peer also go away.
+
+            // Group bucket (the `peerId` arg doubles as a groupId for
+            // group-chat call sites).  Safe to run both branches: the
+            // keys don't overlap — groupIds are UUIDs, peer IDs are
+            // 43-char base64url.
+            self.groupMessages.removeAll { $0.groupId == peerId }
+            self.groups.removeValue(forKey: peerId)
+            self.groupAvatars.removeValue(forKey: peerId)
+
+            // In-memory transfer cards for this chat also go away.
             // (We don't touch the on-disk files at savedPath — only
             // the bookkeeping row + UI card.)
             let toRemove = self.transfers.filter { $0.value.peerId == peerId }.keys
