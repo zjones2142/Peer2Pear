@@ -49,7 +49,7 @@ struct P2PAvatar {
     let avatarB64: String
 }
 
-/// Incoming file transfer awaiting user consent (Phase 2).
+/// Incoming file transfer awaiting user consent.
 /// App UI surfaces a prompt and calls `respondToFileRequest`.
 struct P2PFileRequest: Identifiable {
     let id: String       // transferId
@@ -201,6 +201,14 @@ final class Peer2PearClient: ObservableObject {
     /// Drives the Onboarding "Unlock" vs. "Create" branching — mirrors
     /// what `p2p_set_passphrase_v2` in the core checks (the salt file is
     /// created on first run and persists for the life of the install).
+    /// 43-char base64url peer-ID validator — delegates to the shared C API
+    /// (`p2p_is_valid_peer_id`) so iOS, desktop, and any future clients all
+    /// accept/reject the same strings.  Nil or empty returns false.
+    static func isValidPeerId(_ key: String?) -> Bool {
+        guard let k = key else { return false }
+        return p2p_is_valid_peer_id(k) == 1
+    }
+
     static func identityExists(documentDir: String) -> Bool {
         let salt = URL(fileURLWithPath: documentDir)
             .appendingPathComponent("keys/db_salt.bin")
@@ -424,61 +432,41 @@ final class Peer2PearClient: ObservableObject {
 
     // MARK: - Contacts export / import
     //
-    // Wire format matches the desktop's `peer2pear_contacts.json`
-    // schema (see desktop/mainwindow.cpp onExportContacts + onImportContacts)
-    // so an exported file from either platform imports cleanly into the
-    // other.  Version 1 is: `{ "version": 1, "contacts": [{name, keys[]}] }`.
+    // Serializer lives in the shared C core (`p2p_export_contacts_json` /
+    // `p2p_import_contacts_json`) so desktop + iOS cannot drift on the
+    // v1 wire format: `{ "version": 1, "contacts": [{name, keys[]}] }`.
 
-    struct ContactsExport: Codable {
-        let version: Int
-        let contacts: [Entry]
-        struct Entry: Codable {
-            let name: String
-            let keys: [String]
-        }
-    }
-
-    /// Build a desktop-compatible JSON blob of the address book.  Only
-    /// explicit contacts are exported — strangers we've merely exchanged
-    /// messages with stay out, matching the ContactsListView roster.
-    /// Each entry uses `displayName(for:)` so nicknames survive the
-    /// round-trip; when no nickname is set, falls back to the peer's
-    /// published display name or the key prefix.
     func exportContactsJSON() -> Data {
-        let entries = contactPeerIds.sorted().map { peerId in
-            ContactsExport.Entry(
-                name: displayName(for: peerId),
-                keys: [peerId])
+        guard let ctx = rawContext else { return Data() }
+        var outPtr: UnsafeMutablePointer<CChar>? = nil
+        guard p2p_export_contacts_json(ctx, &outPtr) == 0, let c = outPtr else {
+            return Data()
         }
-        let payload = ContactsExport(version: 1, contacts: entries)
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return (try? enc.encode(payload)) ?? Data()
+        defer { free(c) }
+        return Data(String(cString: c).utf8)
     }
 
     /// Merge contacts from an exported JSON blob into our local state.
-    /// Returns the count successfully imported (skipping malformed
-    /// entries, self, and entries whose first key isn't a 43-char
-    /// base64url peer ID).  Existing nicknames are overwritten by the
-    /// incoming name — treating the import as authoritative matches
-    /// the desktop's "imported name stored as-is" behavior.
+    /// Core handles the AppDataStore write + duplicate skip; we refresh
+    /// the @Published contacts set so SwiftUI views pick up the changes.
     @discardableResult
     func importContacts(from data: Data) -> Int {
-        guard let payload = try? JSONDecoder()
-            .decode(ContactsExport.self, from: data) else { return 0 }
-        var imported = 0
-        for entry in payload.contacts {
-            guard let key = entry.keys.first else { continue }
-            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.count == 43, trimmed != myPeerId else { continue }
-            addContact(peerId: trimmed)
-            let name = entry.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !name.isEmpty {
-                setNickname(peerId: trimmed, nickname: name)
-            }
-            imported += 1
+        guard let ctx = rawContext else { return 0 }
+        let count: Int = data.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return -1 }
+            // Force NUL-termination — nlohmann::json::parse accepts any
+            // length-delimited input, but the C API takes `const char*`.
+            var buf = Array(UnsafeBufferPointer(start: base.assumingMemoryBound(to: CChar.self),
+                                                count: data.count))
+            buf.append(0)
+            return Int(p2p_import_contacts_json(ctx, buf))
         }
-        return imported
+        if count > 0 {
+            // Refresh the in-memory address book from disk so the newly
+            // inserted rows surface in ContactsListView immediately.
+            loadStateFromDb()
+        }
+        return max(count, 0)
     }
 
     /// Best-available display name for a peer ID.  Priority:
@@ -596,48 +584,9 @@ final class Peer2PearClient: ObservableObject {
 
     /// Wall-clock instant the app most recently entered background.
     /// Cleared once the auto-lock decision is made on foreground.
-    private var backgroundedAt: Date?
+    /// Read/written by `maybeAutoLock` in +Notifications.
+    var backgroundedAt: Date?
 
-    /// Foreground hook: if the unlocked session has been backgrounded
-    /// longer than `autoLockMinutes`, fire `lock()` so the user has to
-    /// re-authenticate.  -1 = never, 0 = lock on every backgrounding,
-    /// otherwise a minute threshold.  No-op when locked already.
-    private func maybeAutoLock() {
-        guard let bgAt = backgroundedAt else { return }
-        backgroundedAt = nil
-        // Only relevant when we have a live unlocked session.
-        guard rawContext != nil else { return }
-        let mins = autoLockMinutes
-        if mins < 0 { return }              // "Never"
-        if mins == 0 { lock(); return }     // "Immediately"
-        let elapsed = Date().timeIntervalSince(bgAt)
-        if elapsed >= TimeInterval(mins) * 60 { lock() }
-    }
-
-    // MARK: - Failed unlock counter + panic wipe
-
-    /// Bump the failed-attempt counter.  When the wipe-on-failure
-    /// setting is on AND the counter crosses the threshold, nuke the
-    /// entire app sandbox via `wipeAllData(documentDir:)`.  Returns
-    /// true if a wipe fired so the caller (OnboardingView) can show
-    /// the notice.
-    @discardableResult
-    func recordFailedUnlock(documentDir: String) -> Bool {
-        let next = failedUnlockAttempts + 1
-        UserDefaults.standard.set(next, forKey: Self.kFailedUnlockAttemptsKey)
-        if wipeOnFailedAttempts, next >= Self.kFailedUnlockAttemptsThreshold {
-            wipeAllData(documentDir: documentDir)
-            return true
-        }
-        return false
-    }
-
-    /// Reset the failed-attempt counter — called after a successful
-    /// unlock so a sequence like "wrong, wrong, right" doesn't keep
-    /// the counter primed for a wipe on the next typo session.
-    func resetFailedUnlockCounter() {
-        UserDefaults.standard.set(0, forKey: Self.kFailedUnlockAttemptsKey)
-    }
 
     /// Panic wipe: nuke every file in the app's documents directory
     /// (identity, SQLCipher DB, salt, message snapshot if any) and
@@ -738,8 +687,8 @@ final class Peer2PearClient: ObservableObject {
 
         // Hydrate the @Published surface from the SQLCipher AppDataStore.
         // Done BEFORE p2p_connect so setKnownGroupMembers replays the
-        // H2 roster gate before any inbound control messages arrive on
-        // the new socket.
+        // roster authorization gate before any inbound control
+        // messages arrive on the new socket.
         loadStateFromDb()
 
         // Re-apply file-policy preferences each unlock so a setting the
@@ -809,51 +758,9 @@ final class Peer2PearClient: ObservableObject {
         }
     }
 
-    // MARK: - Push notifications
-
-    /// Hand the APNs device token to the core, which forwards it to
-    /// the relay over the authenticated WebSocket.  Safe to call
-    /// before `start()` — the token is stashed and replayed once the
-    /// core is live.  `token` is the hex-encoded bytes; empty
-    /// unregisters the device.
-    func setPushToken(_ token: String, platform: String) {
-        pendingPushToken = (token, platform)
-        forwardPushTokenIfConnected()
-    }
-
-    /// Invoked by the AppDelegate when a silent push arrives while the
-    /// app is backgrounded.  iOS gives us ~30 s to fetch queued
-    /// envelopes before freezing the app again.  Completion is called
-    /// with `true` if we observed any new data during the wake.
-    func handleBackgroundPush(completion: @escaping (Bool) -> Void) {
-        guard let ctx = rawContext else {
-            completion(false)
-            return
-        }
-        let baseline = messages.count + groupMessages.count
-        p2p_wake_for_push(ctx)
-
-        // Poll for ~5 s: if a new message has landed by then, we
-        // report newData.  Longer-running delivery after completion
-        // still fires normal callbacks + local notifications — the
-        // completion here just tells iOS whether the wake was useful
-        // for background-refresh scheduling heuristics.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
-            guard let self else { completion(false); return }
-            let now = self.messages.count + self.groupMessages.count
-            completion(now > baseline)
-        }
-    }
-
-    private var pendingPushToken: (token: String, platform: String)?
-
-    private func forwardPushTokenIfConnected() {
-        guard let ctx = rawContext, let p = pendingPushToken else { return }
-        p2p_set_push_token(ctx, p.token, p.platform)
-        // Leave `pendingPushToken` set — RelayClient replays it on
-        // every reconnect already, and re-sending on a warm WS is
-        // idempotent at the relay level (upsert).
-    }
+    /// Stashed APNs token waiting to be forwarded once `rawContext` is live.
+    /// Accessed by +Notifications' push-token methods.
+    var pendingPushToken: (token: String, platform: String)?
 
     /// How much content to reveal in the OS notification banner.
     /// Default is `.hidden` because iOS persists notification
@@ -1025,38 +932,10 @@ final class Peer2PearClient: ObservableObject {
     /// surfaces "Cellular — auto-accept paused" when relevant.
     @Published var onWifi: Bool = true
 
-    private var pathMonitor: NWPathMonitor?
+    /// Owned by +FileTransfer's `startNetworkMonitor`; held here since
+    /// extensions can't hold stored state.
+    var pathMonitor: NWPathMonitor?
 
-    /// Compute and push the effective auto-accept MB to the core based
-    /// on the user's setting + current network type.  Called on every
-    /// network change AND every time the user flips the toggle / changes
-    /// the threshold, so the core's rule is always current.
-    private func applyEffectiveAutoAcceptThreshold() {
-        let effective: Int = (fileAutoAcceptWifiOnly && !onWifi)
-            ? 0
-            : fileAutoAcceptMB
-        setFileAutoAcceptMB(effective)
-    }
-
-    private func startNetworkMonitor() {
-        guard pathMonitor == nil else { return }
-        let m = NWPathMonitor()
-        m.pathUpdateHandler = { [weak self] path in
-            // usesInterfaceType(.wifi) is true for both 802.11 and a
-            // wired ethernet adapter.  Treat both as "not cellular".
-            let onWifi = path.usesInterfaceType(.wifi)
-                      || path.usesInterfaceType(.wiredEthernet)
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if self.onWifi != onWifi {
-                    self.onWifi = onWifi
-                    self.applyEffectiveAutoAcceptThreshold()
-                }
-            }
-        }
-        m.start(queue: DispatchQueue.global(qos: .utility))
-        pathMonitor = m
-    }
 
     /// Current consecutive-failure counter.  Exposed so the settings UI
     /// can surface "X of 12 attempts used" to give users a heads-up.
@@ -1075,66 +954,6 @@ final class Peer2PearClient: ObservableObject {
             UserDefaults.standard.set(notificationContentMode.rawValue,
                                        forKey: Self.kNotificationModeKey)
         }
-    }
-
-    /// Fire a local UNUserNotificationCenter banner for an inbound
-    /// message, applying the user's content-privacy mode.  The OS
-    /// decides whether to actually surface it — foreground banners
-    /// go through Peer2PearAppDelegate's willPresent delegate method;
-    /// backgrounded banners surface directly.
-    ///
-    /// The sender ID / message text passed here are always the
-    /// decrypted, plaintext values; this function decides what
-    /// fraction (if any) to hand to the OS notification store.
-    /// Own-message check prevents double-notify when the sender
-    /// receives their own fan-out on group sends.
-    fileprivate func fireLocalNotification(
-        fromPeerId: String,
-        senderDisplay: String,   // e.g., first-8-chars fingerprint, or "Alice"
-        groupName: String?,      // non-nil for group messages
-        messageText: String,
-        threadId: String
-    ) {
-        if fromPeerId == myPeerId { return }
-
-        let content = UNMutableNotificationContent()
-        content.sound = .default
-        content.threadIdentifier = threadId
-
-        switch notificationContentMode {
-        case .hidden:
-            // Generic wake-up only — the OS notification DB learns
-            // nothing about who or what.  User opens the app to see
-            // the actual message, which lives only in our encrypted
-            // SQLCipher AppDataStore.
-            content.title = "Peer2Pear"
-            content.body  = "New message"
-
-        case .senderOnly:
-            content.title = "Peer2Pear"
-            if let group = groupName, !group.isEmpty {
-                content.body = "New message in \(group)"
-            } else {
-                content.body = "New message from \(senderDisplay)"
-            }
-
-        case .full:
-            if let group = groupName, !group.isEmpty {
-                content.title = group
-                content.subtitle = senderDisplay
-            } else {
-                content.title = senderDisplay
-            }
-            content.body = messageText.count > 140
-                ? String(messageText.prefix(137)) + "…"
-                : messageText
-        }
-
-        let req = UNNotificationRequest(
-            identifier: UUID().uuidString,
-            content: content,
-            trigger: nil)
-        UNUserNotificationCenter.current().add(req) { _ in }
     }
 
     // MARK: - Messaging actions
@@ -1172,342 +991,6 @@ final class Peer2PearClient: ObservableObject {
         }
         p2p_send_text(ctx, peerId, text)
     }
-
-    /// Create a new group locally.  `memberPeerIds` is the roster you
-    /// want to invite (self is NOT included — the core filters self
-    /// out when fanning out sends).  The returned `groupId` is a fresh
-    /// UUID the app keeps and passes to every subsequent sendGroupText.
-    ///
-    /// There's no network round-trip here — groups exist only in the
-    /// client.  Members learn about the group the first time they
-    /// receive a message tagged with this groupId.
-    ///
-    /// Also seeds the core's in-memory roster for this group so
-    /// subsequent control messages (rename / avatar / leave) from
-    /// other members pass the authorization check.
-    @discardableResult
-    func createGroup(name: String, memberPeerIds: [String]) -> String {
-        let gid = UUID().uuidString.lowercased()
-        let group = P2PGroup(id: gid, name: name,
-                             memberIds: memberPeerIds,
-                             lastActivity: Date())
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.groups[gid] = group
-            self.dbSaveContact(DBContact(
-                peerId:        gid,
-                name:          name,
-                keys:          memberPeerIds,
-                isGroup:       true,
-                groupId:       gid,
-                lastActiveSecs: Int64(group.lastActivity.timeIntervalSince1970)))
-        }
-        // Seed the core's roster with self + members so we'll accept
-        // inbound rename/avatar/leave from any of them.
-        if let ctx = rawContext {
-            var roster = memberPeerIds
-            if !roster.contains(myPeerId) {
-                roster.append(myPeerId)
-            }
-            withCStringArray(roster) { ptr in
-                p2p_set_known_group_members(ctx, gid, ptr)
-            }
-        }
-        return gid
-    }
-
-    /// Seed the core's roster for a group that was either (a) loaded
-    /// from local persistence on startup or (b) learned about via an
-    /// inbound message.  Call on every known group after start() so
-    /// the authorization check admits control messages from other members.
-    func setKnownGroupMembers(groupId: String, memberPeerIds: [String]) {
-        guard let ctx = rawContext else { return }
-        withCStringArray(memberPeerIds) { ptr in
-            p2p_set_known_group_members(ctx, groupId, ptr)
-        }
-    }
-
-    /// Send a text message to every member of a group.  `memberPeerIds`
-    /// must include the recipients (self is filtered out internally).
-    func sendGroupText(groupId: String,
-                       groupName: String,
-                       memberPeerIds: [String],
-                       text: String) {
-        guard let ctx = rawContext else { return }
-        withCStringArray(memberPeerIds) { ptr in
-            _ = p2p_send_group_text(ctx, groupId, groupName, ptr, text)
-        }
-    }
-
-    /// Send a file to every member of a group.  Mirrors `sendFile` for
-    /// 1:1 — chunks stream after each recipient's file_accept.
-    @discardableResult
-    func sendGroupFile(groupId: String,
-                       groupName: String,
-                       memberPeerIds: [String],
-                       fileName: String,
-                       filePath: String) -> String? {
-        guard let ctx = rawContext else { return nil }
-        return withCStringArray(memberPeerIds) { ptr -> String? in
-            guard let c = p2p_send_group_file(ctx, groupId, groupName,
-                                              ptr, fileName, filePath) else {
-                return nil
-            }
-            return String(cString: c)
-        }
-    }
-
-    /// Rename a group — broadcasts a `group_rename` control message.
-    @discardableResult
-    func renameGroup(groupId: String, newName: String,
-                     memberPeerIds: [String]) -> Bool {
-        guard let ctx = rawContext else { return false }
-        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
-            p2p_rename_group(ctx, groupId, newName, ptr)
-        }
-        if rc == 0 {
-            DispatchQueue.main.async { [weak self] in
-                guard let self, var g = self.groups[groupId] else { return }
-                g.name = newName
-                g.lastActivity = Date()
-                self.groups[groupId] = g
-                self.dbSaveContact(DBContact(
-                    peerId:        groupId,
-                    name:          newName,
-                    keys:          g.memberIds,
-                    isGroup:       true,
-                    groupId:       groupId,
-                    avatarB64:     self.groupAvatars[groupId] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
-            }
-        }
-        return rc == 0
-    }
-
-    /// Leave a group — broadcasts a `group_leave` notification and drops
-    /// the group from our local state.  Peers will remove us from their
-    /// rosters via their on_group_member_left callback.
-    @discardableResult
-    func leaveGroup(groupId: String, groupName: String,
-                    memberPeerIds: [String]) -> Bool {
-        guard let ctx = rawContext else { return false }
-        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
-            p2p_leave_group(ctx, groupId, groupName, ptr)
-        }
-        if rc == 0 {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.groups.removeValue(forKey: groupId)
-                self.groupMessages.removeAll { $0.groupId == groupId }
-                self.groupAvatars.removeValue(forKey: groupId)
-                // CASCADE wipes the group's messages via the FK.
-                self.dbDeleteContact(peerId: groupId)
-            }
-        }
-        return rc == 0
-    }
-
-    /// Publish a new group avatar.
-    @discardableResult
-    func sendGroupAvatar(groupId: String, avatarB64: String,
-                         memberPeerIds: [String]) -> Bool {
-        guard let ctx = rawContext else { return false }
-        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
-            p2p_send_group_avatar(ctx, groupId, avatarB64, ptr)
-        }
-        if rc == 0 {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.groupAvatars[groupId] = avatarB64
-                self.dbSaveContactAvatar(peerId: groupId, avatarB64: avatarB64)
-            }
-        }
-        return rc == 0
-    }
-
-    /// Broadcast an updated member list — new members learn about the
-    /// group, dropped members see a left-marker.
-    @discardableResult
-    func updateGroupMembers(groupId: String, groupName: String,
-                            memberPeerIds: [String]) -> Bool {
-        guard let ctx = rawContext else { return false }
-        let rc = withCStringArray(memberPeerIds) { ptr -> Int32 in
-            p2p_update_group_members(ctx, groupId, groupName, ptr)
-        }
-        if rc == 0 {
-            DispatchQueue.main.async { [weak self] in
-                guard let self, var g = self.groups[groupId] else { return }
-                g.memberIds = memberPeerIds
-                g.lastActivity = Date()
-                self.groups[groupId] = g
-                self.dbSaveContact(DBContact(
-                    peerId:        groupId,
-                    name:          g.name,
-                    keys:          memberPeerIds,
-                    isGroup:       true,
-                    groupId:       groupId,
-                    avatarB64:     self.groupAvatars[groupId] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
-            }
-        }
-        return rc == 0
-    }
-
-    // Helper: marshal [String] into the `const char**` (NULL-terminated)
-    // shape the C API expects.  All five group-mutation wrappers above
-    // share the same prologue — consolidate here to keep them readable.
-    private func withCStringArray<R>(_ strings: [String],
-                                      _ body: (UnsafeMutablePointer<UnsafePointer<CChar>?>?) -> R) -> R {
-        let cStrings = strings.map { strdup($0) }
-        defer { cStrings.forEach { free($0) } }
-        var cArray: [UnsafePointer<CChar>?] =
-            cStrings.map { $0.map { UnsafePointer($0) } }
-        cArray.append(nil)
-        return cArray.withUnsafeMutableBufferPointer { buf in
-            body(buf.baseAddress)
-        }
-    }
-
-    /// Read a NULL-terminated C string array into a Swift `[String]`.
-    /// Used by every callback that receives a member list from the C API.
-    fileprivate static func stringsFromCArray(
-        _ ptr: UnsafePointer<UnsafePointer<CChar>?>?
-    ) -> [String] {
-        guard let ptr else { return [] }
-        var out: [String] = []
-        var i = 0
-        while let p = ptr[i] {
-            out.append(String(cString: p))
-            i += 1
-        }
-        return out
-    }
-
-    // MARK: - Transfer state mutators (called from callbacks on the main queue)
-
-    /// Upsert an in-progress transfer record.  Preserves existing
-    /// terminal status (.completed / .delivered / .canceled / .blocked)
-    /// — a late-arriving chunk event shouldn't flip a completed
-    /// transfer back to .inFlight.
-    fileprivate func upsertTransfer(id: String, peerId: String,
-                                     fileName: String, fileSize: Int64,
-                                     direction: P2PTransferDirection,
-                                     chunksDone: Int, chunksTotal: Int,
-                                     savedPath: String?,
-                                     status: P2PTransferStatus,
-                                     timestamp: Date) {
-        if var existing = transfers[id] {
-            existing.chunksDone  = max(existing.chunksDone, chunksDone)
-            existing.chunksTotal = chunksTotal > 0 ? chunksTotal : existing.chunksTotal
-            if let savedPath { existing.savedPath = savedPath }
-            if !existing.isTerminal {
-                existing.status = status
-            }
-            existing.timestamp = max(existing.timestamp, timestamp)
-            transfers[id] = existing
-        } else {
-            transfers[id] = P2PTransferRecord(
-                id: id, peerId: peerId, fileName: fileName, fileSize: fileSize,
-                direction: direction,
-                chunksDone: chunksDone, chunksTotal: chunksTotal,
-                savedPath: savedPath, status: status, timestamp: timestamp)
-        }
-        if let r = transfers[id] { persistTransfer(r) }
-    }
-
-    /// Flip the status on an existing record (delivered / canceled /
-    /// blocked events).  No-op if the transferId is unknown — not
-    /// every cancel / block necessarily has a prior progress event on
-    /// record (e.g. the transfer was blocked before the first chunk).
-    fileprivate func markTransferStatus(id: String, status: P2PTransferStatus) {
-        guard var existing = transfers[id] else { return }
-        existing.status = status
-        existing.timestamp = Date()
-        transfers[id] = existing
-        persistTransfer(existing)
-    }
-
-    /// Mirror a P2PTransferRecord into the file_transfers table so the
-    /// row survives lock/unlock + relaunch.  Cheap UPSERT — every status
-    /// change calls this; SQLite handles it in <1 ms.  The chat key is
-    /// the counter-party's peer ID for 1:1 (groups TBD when iOS sends
-    /// group files).
-    private func persistTransfer(_ r: P2PTransferRecord) {
-        dbSaveFileRecord(DBFileRecord(
-            transferId:     r.id,
-            chatKey:        r.peerId,
-            fileName:       r.fileName,
-            fileSize:       r.fileSize,
-            peerId:         r.peerId,
-            peerName:       contactNicknames[r.peerId] ?? "",
-            timestampSecs:  Int64(r.timestamp.timeIntervalSince1970),
-            sent:           r.direction == .outbound,
-            status:         Self.encodeStatus(r.status),
-            chunksTotal:    r.chunksTotal,
-            chunksComplete: r.chunksDone,
-            savedPath:      r.savedPath ?? ""))
-    }
-
-    // MARK: - File transfer actions
-
-    /// Start a file send.  Returns the transferId on success, nil otherwise.
-    /// The receiver will get an `on_file_request` callback and must accept
-    /// via `respondToFileRequest` before chunks flow.
-    @discardableResult
-    func sendFile(to peerId: String, fileName: String, filePath: String) -> String? {
-        guard let ctx = rawContext else { return nil }
-        if isBlocked(peerId: peerId) { return nil }
-        guard let c = p2p_send_file(ctx, peerId, fileName, filePath) else { return nil }
-        return String(cString: c)
-    }
-
-    /// Reply to an on_file_request prompt.  Accept=true installs the key
-    /// and tells the sender to start streaming chunks; accept=false
-    /// declines (zeroes the stashed key, no further state).
-    func respondToFileRequest(transferId: String,
-                              accept: Bool,
-                              requireP2P: Bool = false) {
-        guard let ctx = rawContext else { return }
-        p2p_respond_file_request(ctx, transferId, accept ? 1 : 0, requireP2P ? 1 : 0)
-        // Remove from pending list regardless of the choice.
-        DispatchQueue.main.async { [weak self] in
-            self?.pendingFileRequests.removeAll { $0.id == transferId }
-        }
-    }
-
-    /// Cancel an in-flight transfer (inbound or outbound).
-    func cancelTransfer(transferId: String) {
-        guard let ctx = rawContext else { return }
-        p2p_cancel_transfer(ctx, transferId)
-    }
-
-    /// Drop a terminal transfer record from the chat strip and the
-    /// SQLCipher file_transfers table.  Mirrors desktop's "Remove this
-    /// file from your file list" action — the saved file (if any) stays
-    /// on disk untouched; only the bookkeeping row goes away.  No-op
-    /// for in-flight transfers (use `cancelTransfer` for those).
-    func removeTransferRecord(transferId: String) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.transfers.removeValue(forKey: transferId)
-            self.dbDeleteFileRecord(transferId: transferId)
-        }
-    }
-
-    /// Global consent thresholds (match core defaults — 100 MB / 100 MB).
-    func setFileAutoAcceptMB(_ mb: Int) {
-        guard let ctx = rawContext else { return }
-        p2p_set_file_auto_accept_mb(ctx, Int32(mb))
-    }
-    func setFileHardMaxMB(_ mb: Int) {
-        guard let ctx = rawContext else { return }
-        p2p_set_file_hard_max_mb(ctx, Int32(mb))
-    }
-    func setFileRequireP2P(_ on: Bool) {
-        guard let ctx = rawContext else { return }
-        p2p_set_file_require_p2p(ctx, on ? 1 : 0)
-    }
-
     // MARK: - Presence
 
     func checkPresence(for peerIds: [String]) {
@@ -1580,405 +1063,4 @@ final class Peer2PearClient: ObservableObject {
         p2p_set_hard_block_on_key_change(ctx, on ? 1 : 0)
     }
 
-    // MARK: - Callback wiring
-
-    private func setupCallbacks() {
-        guard let ctx = rawContext else { return }
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-
-        // ── Connection / status ─────────────────────────────────────────
-        p2p_set_on_connected(ctx, { ud in
-            guard let client = Peer2PearClient.from(ud) else { return }
-            DispatchQueue.main.async { client.isConnected = true }
-        }, selfPtr)
-
-        p2p_set_on_status(ctx, { msg, ud in
-            guard let client = Peer2PearClient.from(ud), let msg else { return }
-            let str = String(cString: msg)
-            DispatchQueue.main.async { client.statusMessage = str }
-        }, selfPtr)
-
-        // ── Incoming 1:1 text ──────────────────────────────────────────
-        p2p_set_on_message(ctx, { from, text, ts, msgId, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let from, let text, let msgId else { return }
-            let msg = P2PMessage(
-                id: String(cString: msgId),
-                from: String(cString: from),
-                text: String(cString: text),
-                timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
-            )
-            DispatchQueue.main.async {
-                // Drop messages from blocked peers.  Mirrors desktop
-                // chatview `if (chat.isBlocked) return`.  Silent — no
-                // notification, no list entry.
-                if client.isBlocked(peerId: msg.from) { return }
-                client.messages.append(msg)
-                // Persist: saveMessage internally INSERT-OR-IGNOREs a
-                // stub contacts row for the FK, leaving the sender
-                // out of the address book (in_address_book=0) until
-                // the user explicitly adds them via "+ New Chat".
-                client.dbSaveMessage(peerId: msg.from, message: DBMessage(
-                    sent:          false,
-                    text:          msg.text,
-                    timestampSecs: Int64(msg.timestamp.timeIntervalSince1970),
-                    msgId:         msg.id,
-                    senderName:    ""))
-                // threadId = sender so iOS groups banners per-conversation.
-                // The content-privacy mode decides how much actually
-                // enters the OS notification store.
-                client.fireLocalNotification(
-                    fromPeerId: msg.from,
-                    senderDisplay: String(msg.from.prefix(8)) + "…",
-                    groupName: nil,
-                    messageText: msg.text,
-                    threadId: "dm:" + msg.from)
-            }
-        }, selfPtr)
-
-        // ── Incoming group text ────────────────────────────────────────
-        p2p_set_on_group_message(ctx, {
-            from, gid, gname, memberIds, text, ts, msgId, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let from, let gid, let gname, let text, let msgId else { return }
-            let members = Peer2PearClient.stringsFromCArray(memberIds)
-            let gm = P2PGroupMessage(
-                id: String(cString: msgId),
-                from: String(cString: from),
-                groupId: String(cString: gid),
-                groupName: String(cString: gname),
-                members: members,
-                text: String(cString: text),
-                timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
-            )
-            DispatchQueue.main.async {
-                client.groupMessages.append(gm)
-                // Upsert group roster.  Non-creator members learn about
-                // a group by receiving a message tagged with its ID.
-                // If the creator renames the group later, we also pick
-                // that up here (last-write-wins on name + members).
-                // Always add the SENDER to the roster (sendGroupText
-                // strips self from the declared members so members ==
-                // recipients) — otherwise subsequent control messages
-                // from the sender would fail the authorization check.
-                var roster = gm.members
-                if !roster.contains(client.myPeerId) {
-                    roster.append(client.myPeerId)
-                }
-                if !roster.contains(gm.from) {
-                    roster.append(gm.from)
-                }
-                var g = client.groups[gm.groupId]
-                    ?? P2PGroup(id: gm.groupId, name: gm.groupName,
-                                 memberIds: roster, lastActivity: gm.timestamp)
-                g.name = gm.groupName.isEmpty ? g.name : gm.groupName
-                g.memberIds = roster
-                g.lastActivity = max(g.lastActivity, gm.timestamp)
-                client.groups[gm.groupId] = g
-                // Seed core's roster too so inbound control messages
-                // from this group's members are admitted.
-                client.setKnownGroupMembers(groupId: gm.groupId,
-                                             memberPeerIds: roster)
-                // Persist: upsert the group's contact row + insert the
-                // message.  senderName carries the sender's peer ID so
-                // a later restart can reconstruct who sent what.
-                client.dbSaveContact(DBContact(
-                    peerId:        gm.groupId,
-                    name:          g.name,
-                    keys:          roster,
-                    isGroup:       true,
-                    groupId:       gm.groupId,
-                    avatarB64:     client.groupAvatars[gm.groupId] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
-                client.dbSaveMessage(peerId: gm.groupId, message: DBMessage(
-                    sent:          gm.from == client.myPeerId,
-                    text:          gm.text,
-                    timestampSecs: Int64(gm.timestamp.timeIntervalSince1970),
-                    msgId:         gm.id,
-                    senderName:    gm.from))
-
-                client.fireLocalNotification(
-                    fromPeerId: gm.from,
-                    senderDisplay: String(gm.from.prefix(8)) + "…",
-                    groupName: gm.groupName.isEmpty ? "Group" : gm.groupName,
-                    messageText: gm.text,
-                    threadId: "group:" + gm.groupId)
-            }
-        }, selfPtr)
-
-        // ── Group member left ──────────────────────────────────────────
-        // member_ids is the NEW roster as the sender saw it — replace
-        // our stored roster verbatim.  Removing self means we were
-        // removed; we leave our local state alone and let the user decide.
-        p2p_set_on_group_member_left(ctx, {
-            from, gid, gname, memberIds, _, _, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let from, let gid, let gname else { return }
-            let gidStr    = String(cString: gid)
-            let fromStr   = String(cString: from)
-            let gnameStr  = String(cString: gname)
-            let members   = Peer2PearClient.stringsFromCArray(memberIds)
-            DispatchQueue.main.async {
-                // Drop the departing peer from our stored roster.
-                if var g = client.groups[gidStr] {
-                    g.memberIds = members.filter { $0 != client.myPeerId }
-                    if !gnameStr.isEmpty { g.name = gnameStr }
-                    g.lastActivity = Date()
-                    client.groups[gidStr] = g
-                } else {
-                    // Unknown group — create a shell so the UI has something
-                    // to render if the user reconnects mid-departure.
-                    client.groups[gidStr] = P2PGroup(
-                        id: gidStr, name: gnameStr, memberIds: members,
-                        lastActivity: Date())
-                }
-                // Surface a transcript marker so the user sees what happened.
-                let marker = P2PGroupMessage(
-                    id: UUID().uuidString,
-                    from: fromStr, groupId: gidStr, groupName: gnameStr,
-                    members: members,
-                    text: fromStr == client.myPeerId
-                        ? "You left the group"
-                        : "\(fromStr.prefix(8))… left the group",
-                    timestamp: Date())
-                client.groupMessages.append(marker)
-                // Persist roster change + marker.
-                if let g = client.groups[gidStr] {
-                    client.dbSaveContact(DBContact(
-                        peerId:        gidStr,
-                        name:          g.name,
-                        keys:          g.memberIds,
-                        isGroup:       true,
-                        groupId:       gidStr,
-                        avatarB64:     client.groupAvatars[gidStr] ?? "",
-                        lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
-                }
-                client.dbSaveMessage(peerId: gidStr, message: DBMessage(
-                    sent:          fromStr == client.myPeerId,
-                    text:          marker.text,
-                    timestampSecs: Int64(marker.timestamp.timeIntervalSince1970),
-                    msgId:         marker.id,
-                    senderName:    fromStr))
-            }
-        }, selfPtr)
-
-        // ── Group renamed ──────────────────────────────────────────────
-        p2p_set_on_group_renamed(ctx, { gid, newName, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let gid, let newName else { return }
-            let gidStr = String(cString: gid)
-            let nameStr = String(cString: newName)
-            DispatchQueue.main.async {
-                guard var g = client.groups[gidStr] else { return }
-                g.name = nameStr
-                g.lastActivity = Date()
-                client.groups[gidStr] = g
-                client.dbSaveContact(DBContact(
-                    peerId:        gidStr,
-                    name:          nameStr,
-                    keys:          g.memberIds,
-                    isGroup:       true,
-                    groupId:       gidStr,
-                    avatarB64:     client.groupAvatars[gidStr] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
-            }
-        }, selfPtr)
-
-        // ── Group avatar updated ───────────────────────────────────────
-        p2p_set_on_group_avatar(ctx, { gid, avatarB64, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let gid, let avatarB64 else { return }
-            let gidStr = String(cString: gid)
-            let avatarStr = String(cString: avatarB64)
-            DispatchQueue.main.async {
-                if client.groupAvatars[gidStr] != avatarStr {
-                    client.groupAvatars[gidStr] = avatarStr
-                    client.dbSaveContactAvatar(peerId: gidStr, avatarB64: avatarStr)
-                }
-            }
-        }, selfPtr)
-
-        // ── Presence push ──────────────────────────────────────────────
-        // No-op guard: `peerPresence[pid] = isUp` always triggers
-        // objectWillChange, even when the value is unchanged.  Relay
-        // pushes are unconditional on subscribe/reconnect, so without
-        // the guard every reconnect rebuilds every view that reads
-        // peerPresence.
-        p2p_set_on_presence(ctx, { peerId, online, ud in
-            guard let client = Peer2PearClient.from(ud), let peerId else { return }
-            let pid = String(cString: peerId)
-            let isUp = online != 0
-            DispatchQueue.main.async {
-                if client.peerPresence[pid] != isUp {
-                    client.peerPresence[pid] = isUp
-                }
-            }
-        }, selfPtr)
-
-        // ── Avatar from a peer ─────────────────────────────────────────
-        p2p_set_on_avatar(ctx, { peerId, name, avatarB64, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let peerId, let name, let avatarB64 else { return }
-            let av = P2PAvatar(
-                from: String(cString: peerId),
-                displayName: String(cString: name),
-                avatarB64: String(cString: avatarB64)
-            )
-            DispatchQueue.main.async {
-                // Skip the write when the base64 payload is unchanged —
-                // avatars are re-pushed on every connect, so without
-                // this guard every reconnect re-renders every view
-                // reading peerAvatars.
-                if client.peerAvatars[av.from]?.avatarB64 != av.avatarB64 {
-                    client.peerAvatars[av.from] = av
-                }
-            }
-        }, selfPtr)
-
-        // ── File transfer: inbound progress + completion ──────────────
-        // Sets status = .completed once the core hands us a savedPath
-        // (receiver reassembled + hash-verified the file).
-        p2p_set_on_file_progress(ctx, {
-            from, tid, fileName, fileSize,
-            chunksReceived, chunksTotal, savedPath, ts, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let from, let tid, let fileName else { return }
-            let idStr   = String(cString: tid)
-            let fromStr = String(cString: from)
-            let nameStr = String(cString: fileName)
-            let saved   = savedPath.flatMap { String(cString: $0) }
-            let when    = Date(timeIntervalSince1970: TimeInterval(ts))
-            DispatchQueue.main.async {
-                client.upsertTransfer(
-                    id: idStr, peerId: fromStr, fileName: nameStr,
-                    fileSize: fileSize,
-                    direction: .inbound,
-                    chunksDone: Int(chunksReceived),
-                    chunksTotal: Int(chunksTotal),
-                    savedPath: saved,
-                    // Inbound reaches .completed only once the file has
-                    // been written to disk AND hash-verified — core
-                    // signals that by populating savedPath.
-                    status: (saved != nil && !saved!.isEmpty) ? .completed : .inFlight,
-                    timestamp: when)
-            }
-        }, selfPtr)
-
-        // ── File transfer: outbound (sender-side) progress ────────────
-        // Fires after every outbound chunk dispatches.  savedPath stays
-        // nil here — the sender already has the source file at the path
-        // they passed to p2p_send_file.  The .delivered status arrives
-        // later via on_file_delivered once the receiver acks.
-        p2p_set_on_file_sent_progress(ctx, {
-            to, tid, fileName, fileSize,
-            chunksSent, chunksTotal, ts, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let to, let tid, let fileName else { return }
-            let idStr   = String(cString: tid)
-            let toStr   = String(cString: to)
-            let nameStr = String(cString: fileName)
-            let when    = Date(timeIntervalSince1970: TimeInterval(ts))
-            DispatchQueue.main.async {
-                client.upsertTransfer(
-                    id: idStr, peerId: toStr, fileName: nameStr,
-                    fileSize: fileSize,
-                    direction: .outbound,
-                    chunksDone: Int(chunksSent),
-                    chunksTotal: Int(chunksTotal),
-                    savedPath: nil,
-                    status: .inFlight,
-                    timestamp: when)
-            }
-        }, selfPtr)
-
-        // ── File transfer: user-consent prompt (Phase 2) ───────────────
-        p2p_set_on_file_request(ctx, { from, tid, fileName, fileSize, ud in
-            guard let client = Peer2PearClient.from(ud),
-                  let from, let tid, let fileName else { return }
-            let req = P2PFileRequest(
-                id: String(cString: tid),
-                from: String(cString: from),
-                fileName: String(cString: fileName),
-                fileSize: fileSize
-            )
-            DispatchQueue.main.async {
-                // Silently decline files from blocked peers — the core
-                // still expects a response, so we explicitly reject
-                // rather than let the sender sit in "awaiting consent".
-                if client.isBlocked(peerId: req.from) {
-                    client.respondToFileRequest(transferId: req.id, accept: false)
-                    return
-                }
-                // Verified-contacts gate: when on, files from peers
-                // whose safety number hasn't been confirmed are
-                // declined without prompting.  iOS-side policy — the
-                // core has already accepted the envelope; we just
-                // refuse before the user is bothered.
-                if client.fileRequireVerifiedContact
-                   && client.peerTrust(for: req.from) != .verified {
-                    client.respondToFileRequest(transferId: req.id, accept: false)
-                    return
-                }
-                // Avoid duplicates if the relay re-delivers the envelope.
-                if !client.pendingFileRequests.contains(where: { $0.id == req.id }) {
-                    client.pendingFileRequests.append(req)
-                }
-            }
-        }, selfPtr)
-
-        // ── File transfer: cancellation ────────────────────────────────
-        // Flip status → .canceled and drop the pending-request entry if
-        // we never accepted.  We KEEP the transfer in the `transfers`
-        // dict (with terminal status) so the UI can show "Canceled" on
-        // the card instead of silently removing it.
-        p2p_set_on_file_canceled(ctx, { tid, byReceiver, ud in
-            guard let client = Peer2PearClient.from(ud), let tid else { return }
-            let id = String(cString: tid)
-            let byRcv = byReceiver != 0
-            DispatchQueue.main.async {
-                client.pendingFileRequests.removeAll { $0.id == id }
-                client.markTransferStatus(id: id, status: .canceled(byReceiver: byRcv))
-            }
-        }, selfPtr)
-
-        // ── File transfer: sender-side delivery confirmation ───────────
-        p2p_set_on_file_delivered(ctx, { tid, ud in
-            guard let client = Peer2PearClient.from(ud), let tid else { return }
-            let id = String(cString: tid)
-            DispatchQueue.main.async {
-                client.markTransferStatus(id: id, status: .delivered)
-            }
-        }, selfPtr)
-
-        // ── File transfer: blocked by transport policy ─────────────────
-        p2p_set_on_file_blocked(ctx, { tid, byReceiver, ud in
-            guard let client = Peer2PearClient.from(ud), let tid else { return }
-            let id = String(cString: tid)
-            let byRcv = byReceiver != 0
-            DispatchQueue.main.async {
-                client.markTransferStatus(id: id, status: .blocked(byReceiver: byRcv))
-            }
-        }, selfPtr)
-
-        // ── Safety numbers: peer's stored fingerprint no longer matches ─
-        p2p_set_on_peer_key_changed(ctx, {
-            peerId, oldFp, oldLen, newFp, newLen, ud in
-            guard let client = Peer2PearClient.from(ud), let peerId else { return }
-            let pid = String(cString: peerId)
-            let oldData = (oldFp != nil && oldLen > 0)
-                ? Data(bytes: oldFp!, count: Int(oldLen)) : Data()
-            let newData = (newFp != nil && newLen > 0)
-                ? Data(bytes: newFp!, count: Int(newLen)) : Data()
-            let change = P2PKeyChange(
-                id: pid, oldFingerprint: oldData, newFingerprint: newData)
-            DispatchQueue.main.async { client.keyChanges[pid] = change }
-        }, selfPtr)
-    }
-
-    // MARK: - Helpers
-
-    private static func from(_ ptr: UnsafeMutableRawPointer?) -> Peer2PearClient? {
-        guard let ptr else { return nil }
-        return Unmanaged<Peer2PearClient>.fromOpaque(ptr).takeUnretainedValue()
-    }
 }

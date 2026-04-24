@@ -23,6 +23,7 @@
 // directory — see cleanupSavedPath() below.  The transferId is random
 // per test so there's no collision with real user files.
 
+#include "types.hpp"
 #include "FileTransferManager.hpp"
 #include "CryptoEngine.hpp"
 #include "SqlCipherDb.hpp"
@@ -44,7 +45,6 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using Bytes = std::vector<uint8_t>;
 
 namespace {
 
@@ -308,8 +308,8 @@ TEST_F(FileTransferRoundTrip, FileRoundTripInOrderReassembles) {
         // pub.  Past versions of this test passed `w.peerId` (which
         // is actually the recipient that the sender targeted), and
         // handleFileEnvelope's trial-decrypt loop masked the
-        // mismatch; Audit #3 M4's peer-scoped filter now requires
-        // the arg to match a key in fileKeys.
+        // mismatch; the peer-scoped filter now requires the arg to
+        // match a key in fileKeys.
         EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
@@ -348,8 +348,8 @@ TEST_F(FileTransferRoundTrip, FileRoundTripOutOfOrderReassembles) {
         // pub.  Past versions of this test passed `w.peerId` (which
         // is actually the recipient that the sender targeted), and
         // handleFileEnvelope's trial-decrypt loop masked the
-        // mismatch; Audit #3 M4's peer-scoped filter now requires
-        // the arg to match a key in fileKeys.
+        // mismatch; the peer-scoped filter now requires the arg to
+        // match a key in fileKeys.
         EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
@@ -398,8 +398,8 @@ TEST_F(FileTransferRoundTrip, HashMismatchDiscardsFile) {
         // pub.  Past versions of this test passed `w.peerId` (which
         // is actually the recipient that the sender targeted), and
         // handleFileEnvelope's trial-decrypt loop masked the
-        // mismatch; Audit #3 M4's peer-scoped filter now requires
-        // the arg to match a key in fileKeys.
+        // mismatch; the peer-scoped filter now requires the arg to
+        // match a key in fileKeys.
         EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
@@ -426,7 +426,7 @@ TEST_F(FileTransferRoundTrip, ResumptionListsMissingChunksAfterRestart) {
     // Attach a fresh DB to the receiver so the partial transfer persists.
     const std::string dbPath = makeTempPath("p2p-ft-resume", ".db");
     SqlCipherDb db;
-    SqlCipherDb::Bytes dbKey(32);
+    Bytes dbKey(32);
     randombytes_buf(dbKey.data(), dbKey.size());
     ASSERT_TRUE(db.open(dbPath, dbKey)) << db.lastError();
     receiver->setDatabase(&db);
@@ -441,7 +441,7 @@ TEST_F(FileTransferRoundTrip, ResumptionListsMissingChunksAfterRestart) {
     // Deliver only chunks 0 and 2 — leave 1 missing.
     auto markSeen = [](const std::string&) { return true; };
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
-    // fromId is the sender's ID — see M4 note above.
+    // fromId is the sender's ID — see peer-scoped filter note above.
     EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, wire[0].payload, markSeen, fileKeys));
     EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, wire[2].payload, markSeen, fileKeys));
     EXPECT_FALSE(transferCompletedFired);  // still waiting on chunk 1

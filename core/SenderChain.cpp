@@ -16,10 +16,10 @@ constexpr uint8_t kTagMsg   = 0x02;
 
 // BLAKE2b-256 keyed hash → 32-byte output.  Thin wrapper so the KDF
 // sites below read as intent, not libsodium ceremony.
-SenderChain::Bytes blake2bKeyed32(uint8_t tag,
-                                    const SenderChain::Bytes& key)
+Bytes blake2bKeyed32(uint8_t tag,
+                                    const Bytes& key)
 {
-    SenderChain::Bytes out(32);
+    Bytes out(32);
     (void)crypto_generichash(out.data(), 32,
                              &tag, 1,
                              key.data(), key.size());
@@ -29,14 +29,14 @@ SenderChain::Bytes blake2bKeyed32(uint8_t tag,
 // Little-endian u32 read/write helpers.  Serialization format pins LE
 // explicitly so cross-platform restore is deterministic (BE hosts
 // would otherwise produce mismatched blobs).
-void writeU32LE(SenderChain::Bytes& out, uint32_t v) {
+void writeU32LE(Bytes& out, uint32_t v) {
     out.push_back(static_cast<uint8_t>(v & 0xFF));
     out.push_back(static_cast<uint8_t>((v >> 8)  & 0xFF));
     out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
     out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
 }
 
-bool readU32LE(const SenderChain::Bytes& in, size_t& pos, uint32_t& out) {
+bool readU32LE(const Bytes& in, size_t& pos, uint32_t& out) {
     if (pos + 4 > in.size()) return false;
     out = uint32_t(in[pos]) |
           (uint32_t(in[pos + 1]) << 8)  |
@@ -70,7 +70,7 @@ SenderChain SenderChain::fromSeed(const Bytes& seed)
 
 // ── Core advance step ─────────────────────────────────────────────────────
 
-SenderChain::Bytes SenderChain::advanceStep()
+Bytes SenderChain::advanceStep()
 {
     // msg_key       = BLAKE2b-256(key=chain_key, input=0x02)
     // next_chain_key= BLAKE2b-256(key=chain_key, input=0x01)
@@ -85,7 +85,7 @@ SenderChain::Bytes SenderChain::advanceStep()
 
 // ── Outbound ──────────────────────────────────────────────────────────────
 
-std::pair<uint32_t, SenderChain::Bytes> SenderChain::next()
+std::pair<uint32_t, Bytes> SenderChain::next()
 {
     const uint32_t idx = m_nextIdx;
     Bytes msgKey = advanceStep();
@@ -94,7 +94,7 @@ std::pair<uint32_t, SenderChain::Bytes> SenderChain::next()
 
 // ── Inbound ───────────────────────────────────────────────────────────────
 
-SenderChain::Bytes SenderChain::messageKeyFor(uint32_t idx)
+Bytes SenderChain::messageKeyFor(uint32_t idx)
 {
     // 1. Already-derived key — return cached copy without erasing.
     //    Replay defense lives at the envelope-id layer; here we only
@@ -174,7 +174,7 @@ void SenderChain::evictOldestIfOverCap()
 
 // ── Persistence ───────────────────────────────────────────────────────────
 
-SenderChain::Bytes SenderChain::serialize() const
+Bytes SenderChain::serialize() const
 {
     Bytes out;
     // Preallocate typical case to avoid repeated grows.
@@ -188,10 +188,10 @@ SenderChain::Bytes SenderChain::serialize() const
         return out;
     }
 
-    // Audit #3 M3: seed may be empty (forgotten post-distribution).
-    // In that case we emit 32 zero bytes so the layout is stable;
-    // deserialize recognises the all-zero pattern as "forgotten" and
-    // leaves m_seed empty rather than treating zeros as a real seed.
+    // Seed may be empty (forgotten post-distribution).  In that case
+    // we emit 32 zero bytes so the layout is stable; deserialize
+    // recognises the all-zero pattern as "forgotten" and leaves
+    // m_seed empty rather than treating zeros as a real seed.
     // Cryptographic collision with a real random seed is 2^-256.
     if (m_seed.size() == 32) {
         out.insert(out.end(), m_seed.begin(), m_seed.end());
@@ -222,10 +222,10 @@ SenderChain SenderChain::deserialize(const Bytes& blob)
     size_t pos = 1;
 
     SenderChain c;
-    // Audit #3 M3: an all-zero seed on disk means "forgotten post-
-    // distribution" — leave m_seed empty so callers can't re-distribute
-    // zeros as a key.  Cryptographic probability of a real random seed
-    // colliding with all-zero is 2^-256.
+    // An all-zero seed on disk means "forgotten post-distribution" —
+    // leave m_seed empty so callers can't re-distribute zeros as a
+    // key.  Cryptographic probability of a real random seed colliding
+    // with all-zero is 2^-256.
     bool seedIsZero = true;
     for (size_t i = 0; i < 32; ++i) {
         if (blob[pos + i] != 0) { seedIsZero = false; break; }

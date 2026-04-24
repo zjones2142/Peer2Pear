@@ -36,10 +36,10 @@ namespace {
 
 using p2p_test::makeTempDir;
 using p2p_test::makeTempPath;
-using Bytes = SessionSealer::Bytes;
+using Bytes = Bytes;
 
-SqlCipherDb::Bytes randomKey32() {
-    SqlCipherDb::Bytes k(32);
+Bytes randomKey32() {
+    Bytes k(32);
     randombytes_buf(k.data(), k.size());
     return k;
 }
@@ -486,12 +486,12 @@ TEST_F(SessionSealerSuite, SealPreEncrypted_RejectsTruncatedPeerIdAndEmpty) {
         s_peerIdB64u.substr(0, 10), chunk).empty());
 }
 
-// Audit #3 M7: peerIdB64u that decodes to anything other than 32 bytes
-// must be rejected up front.  Without this guard the libsodium
-// call crypto_sign_ed25519_pk_to_curve25519 reads past the end of the
+// peerIdB64u that decodes to anything other than 32 bytes must be
+// rejected up front.  Without this guard the libsodium call
+// crypto_sign_ed25519_pk_to_curve25519 reads past the end of the
 // underlying Bytes buffer (UB).  A no-session sealer is enough to
-// exercise the size check because the validation now runs before the
-// SessionManager wiring is touched.
+// exercise the size check because the validation now runs before
+// the SessionManager wiring is touched.
 TEST_F(SessionSealerSuite, SealForPeer_RejectsTruncatedPeerId) {
     Bytes pt = {1, 2, 3};
 

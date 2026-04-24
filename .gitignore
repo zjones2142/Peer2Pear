@@ -119,3 +119,4 @@ ios/Peer2Pear/Configs/Signing.local.xcconfig
 !third_party/sqlcipher/sqlite3.h
 !third_party/sqlcipher/LICENSE
 !third_party/sqlcipher/SQLCIPHER_VERSION.txt
+Testing/

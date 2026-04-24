@@ -33,9 +33,9 @@ const (
 	onionVersion        = 0x01
 	relayKeyPathDefault = "/data/peer2pear_relay_x25519.key"
 
-	// On-disk relay-key formats (Audit #3 C3):
+	// On-disk relay-key formats:
 	//   0x01 = legacy plaintext layout — 32 raw scalar bytes, file
-	//          perms only.  Pre-C3 deploys wrote this.
+	//          perms only.  Older deploys wrote this.
 	//   0x02 = KEK-wrapped:
 	//             [0x02][nonce(24)][ciphertext(32+16 MAC)]
 	//          Unwraps with XChaCha20-Poly1305 using the 32-byte KEK
@@ -202,7 +202,7 @@ func loadOrCreateRelayKey() (*[32]byte, *[32]byte, error) {
 			blob = wrapped
 		} else {
 			fmt.Fprintf(os.Stderr,
-				"warning: RELAY_KEY_KEK not set — persisting relay key in plaintext. Set it to enable KEK wrapping (Audit #3 C3).\n")
+				"warning: RELAY_KEY_KEK not set — persisting relay key in plaintext. Set it to enable KEK wrapping.\n")
 			blob = priv[:]
 		}
 		if err := os.WriteFile(path, blob, 0o600); err != nil {

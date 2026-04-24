@@ -7,6 +7,7 @@ set(DESKTOP_SOURCES
     main.cpp
     mainwindow.cpp      mainwindow.h        mainwindow.ui
     chatview.cpp         chatview.h
+    dialogs.cpp          dialogs.h
     filetransfer.h
     qt_str_helpers.hpp
     settingspanel.cpp    settingspanel.h

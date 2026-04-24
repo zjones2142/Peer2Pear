@@ -1,4 +1,6 @@
 #pragma once
+
+#include "types.hpp"
 //
 // QuicConnection — QUIC transport layered over ICE/libnice.
 //
@@ -40,7 +42,6 @@ class NiceConnection;
 
 class QuicConnection {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     explicit QuicConnection(ITimerFactory& timers);
     ~QuicConnection();

@@ -363,9 +363,9 @@ struct AddContactSheet: View {
     }
 
     private var isValid: Bool {
-        // The 43-char base64url check matches the desktop `isValidPublicKey`.
-        // A trimmed input is the canonical form the protocol accepts.
-        trimmed.count == 43
+        // Delegates to the shared C API so iOS and desktop never drift
+        // on what counts as a well-formed peer ID.
+        Peer2PearClient.isValidPeerId(trimmed)
     }
 
     var body: some View {
@@ -422,7 +422,7 @@ struct AddContactSheet: View {
                 QRScannerView(
                     onScan: { raw in
                         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if trimmed.count == 43 {
+                        if Peer2PearClient.isValidPeerId(trimmed) {
                             newContactId = trimmed
                             showScanner = false
                         } else {

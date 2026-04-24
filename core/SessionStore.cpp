@@ -74,7 +74,7 @@ void SessionStore::createTables() {
 // DB write access cannot swap encrypted blobs across tables or across
 // peers — the AAD mismatch trips the AEAD tag.
 
-SessionStore::Bytes SessionStore::encryptBlob(const Bytes& plaintext,
+Bytes SessionStore::encryptBlob(const Bytes& plaintext,
                                                const std::string& aad) const {
     if (m_storeKey.size() != 32) return {};  // no valid key — refuse to store plaintext
 
@@ -99,7 +99,7 @@ SessionStore::Bytes SessionStore::encryptBlob(const Bytes& plaintext,
     return out;
 }
 
-SessionStore::Bytes SessionStore::decryptBlob(const Bytes& ciphertext,
+Bytes SessionStore::decryptBlob(const Bytes& ciphertext,
                                                const std::string& aad) const {
     const size_t kMinSize = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
                             crypto_aead_xchacha20poly1305_ietf_ABYTES;
@@ -161,7 +161,7 @@ void SessionStore::saveSession(const std::string& peerId, const Bytes& stateBlob
         P2P_WARN("SessionStore::saveSession: " << q.lastError());
 }
 
-SessionStore::Bytes SessionStore::loadSession(const std::string& peerId) const {
+Bytes SessionStore::loadSession(const std::string& peerId) const {
     SqlCipherQuery q(m_db.handle());
     q.prepare("SELECT state_blob FROM ratchet_sessions WHERE peer_id=:pid;");
     q.bindValue(":pid", peerId);
@@ -211,7 +211,7 @@ void SessionStore::savePendingHandshake(const std::string& peerId, int role,
         P2P_WARN("SessionStore::savePendingHandshake: " << q.lastError());
 }
 
-SessionStore::Bytes SessionStore::loadPendingHandshake(const std::string& peerId,
+Bytes SessionStore::loadPendingHandshake(const std::string& peerId,
                                                        int& roleOut) const {
     SqlCipherQuery q(m_db.handle());
     q.prepare("SELECT role, handshake_blob FROM pending_handshakes WHERE peer_id=:pid;");

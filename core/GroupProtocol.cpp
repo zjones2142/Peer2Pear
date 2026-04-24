@@ -3,6 +3,7 @@
 #include "CryptoEngine.hpp"
 #include "SessionStore.hpp"
 #include "log.hpp"
+#include "shared.hpp"
 #include "uuid.hpp"
 
 #include <sodium.h>
@@ -13,24 +14,8 @@
 
 using json = nlohmann::json;
 
-namespace {
-
-int64_t nowSecs() {
-    using namespace std::chrono;
-    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-}
-
-// Strip surrounding whitespace.  Group sender-key strings sometimes
-// carry leading/trailing newlines from the UI's textarea copy-paste,
-// so every comparison trims first.
-std::string trimmed(const std::string& s) {
-    auto lb = s.find_first_not_of(" \t\r\n");
-    if (lb == std::string::npos) return {};
-    auto rb = s.find_last_not_of(" \t\r\n");
-    return s.substr(lb, rb - lb + 1);
-}
-
-}  // namespace
+using p2p::nowSecs;
+using p2p::trimmed;
 
 GroupProtocol::GroupProtocol(CryptoEngine& crypto) : m_crypto(crypto) {}
 
@@ -107,14 +92,13 @@ void GroupProtocol::sendLeave(const std::string& groupId,
     for (const std::string& key : memberPeerIds)
         membersArray.push_back(key);
 
-    // Audit #3 H2: encrypt groupName + members under the sender chain
-    // so the outer envelope leaks only the routing fields (groupId +
-    // type).  Previously sendLeave shipped these as plaintext JSON,
-    // unlike every other group_* sender, which would let a relay
-    // operator harvest "alice left group X containing B,C,D" as
-    // metadata.  encryptForGroup lazy-creates a chain if we never
-    // sent to this group — wasteful (we're leaving) but small, and
-    // it keeps the wire shape uniform with the rest of the family.
+    // Encrypt groupName + members under the sender chain so the outer
+    // envelope leaks only the routing fields (groupId + type).  If
+    // these shipped as plaintext JSON a relay operator could harvest
+    // "alice left group X containing B,C,D" as metadata.
+    // encryptForGroup lazy-creates a chain if we never sent to this
+    // group — wasteful (we're leaving) but small, and it keeps the
+    // wire shape uniform with the rest of the family.
     json plaintext = json::object();
     plaintext["groupName"] = groupName;
     plaintext["members"]   = membersArray;
@@ -358,10 +342,9 @@ void GroupProtocol::upsertMembersFromTrustedMessage(
     auto it = m_members.find(gid);
     if (it == m_members.end()) {
         // Bootstrap: accept only if sender includes themselves.  This
-        // is the H5 known-limitation first-mover race (an attacker who
-        // races a legit sender can seed a bogus roster); pairing with
-        // UI-persisted setKnownMembers at startup beats the bootstrap
-        // in practice.
+        // is a known first-mover race (an attacker who races a legit
+        // sender can seed a bogus roster); pairing with UI-persisted
+        // setKnownMembers at startup beats the bootstrap in practice.
         const bool senderInList =
             std::find(memberKeys.begin(), memberKeys.end(), senderId)
             != memberKeys.end();
@@ -433,7 +416,7 @@ void GroupProtocol::installRemoteChain(const std::string& gid,
     if (gid.empty() || senderId.empty()) return;
     if (seed.size() != 32) {
         P2P_WARN("[GROUP] installRemoteChain: invalid seed size "
-                 << seed.size() << " from " << senderId.substr(0, 8) << "...");
+                 << seed.size() << " from " << p2p::peerPrefix(senderId) << "...");
         return;
     }
 
@@ -447,11 +430,10 @@ void GroupProtocol::installRemoteChain(const std::string& gid,
         s.epoch = epoch;
         m_recvChains[key] = std::move(s);
         persistRemoteChain(gid, senderId);
-        // Audit #3 M3: after the seed is on disk, drop it from the
-        // in-memory chain.  Inbound chains only need m_chainKey to
-        // decrypt; retaining the seed would let a process-memory
-        // scrape re-derive every past and future message key back
-        // to idx 0.
+        // After the seed is on disk, drop it from the in-memory chain.
+        // Inbound chains only need m_chainKey to decrypt; retaining
+        // the seed would let a process-memory scrape re-derive every
+        // past and future message key back to idx 0.
         m_recvChains[key].chain.forgetSeed();
         return;
     }
@@ -464,21 +446,21 @@ void GroupProtocol::installRemoteChain(const std::string& gid,
     if (it->second.epoch == epoch) {
         it->second.chain = SenderChain::fromSeed(seed);
         persistRemoteChain(gid, senderId);
-        it->second.chain.forgetSeed();  // M3 — see note above
+        it->second.chain.forgetSeed();  // see note above
         return;
     }
 
-    // Epoch downgrade — REJECT (Audit #3 H1).  Without this guard, an
-    // attacker who captured a previous epoch's seed (e.g., from a
-    // compromised member's disk) could replay group_skey_announce at
-    // epoch N-1 after the group rotated to epoch N; the old code's
-    // fall-through would overwrite the current chain with the stale
-    // seed, downgrading the group back to a known-compromised epoch.
-    // Always reject lower epochs from the same sender.
+    // Epoch downgrade — REJECT.  Without this guard, an attacker who
+    // captured a previous epoch's seed (e.g., from a compromised
+    // member's disk) could replay group_skey_announce at epoch N-1
+    // after the group rotated to epoch N, overwriting the current
+    // chain with the stale seed and downgrading the group back to a
+    // known-compromised epoch.  Always reject lower epochs from the
+    // same sender.
     if (epoch < it->second.epoch) {
         P2P_WARN("[GROUP] reject epoch downgrade from "
-                 << senderId.substr(0, 8) << "... in "
-                 << gid.substr(0, 8) << "... current="
+                 << p2p::peerPrefix(senderId) << "... in "
+                 << p2p::peerPrefix(gid) << "... current="
                  << it->second.epoch << " offered=" << epoch);
         return;
     }
@@ -488,8 +470,8 @@ void GroupProtocol::installRemoteChain(const std::string& gid,
     // messages at the old epoch still decrypt while new-epoch traffic
     // ramps up.  Older slots shift toward the back; the oldest is
     // dropped (key material zeroed) so memory stays bounded across
-    // back-to-back rekeys.  L4: kPrevChainSlots > 1 means a rapid
-    // 0-1-2 sequence keeps epoch 0 reachable.
+    // back-to-back rekeys.  kPrevChainSlots > 1 means a rapid 0-1-2
+    // sequence keeps epoch 0 reachable.
     const uint64_t supersededEpoch = it->second.epoch;
     if (it->second.prevSlots.back().valid()) {
         it->second.prevSlots.back().clear();
@@ -504,13 +486,13 @@ void GroupProtocol::installRemoteChain(const std::string& gid,
     it->second.chain = SenderChain::fromSeed(seed);
     it->second.epoch = epoch;
 
-    P2P_LOG("[GROUP] rekey from " << senderId.substr(0, 8)
-            << "... in " << gid.substr(0, 8) << "... epoch "
+    P2P_LOG("[GROUP] rekey from " << p2p::peerPrefix(senderId)
+            << "... in " << p2p::peerPrefix(gid) << "... epoch "
             << supersededEpoch << " -> " << epoch
             << " (grace window " << m_graceWindowSecs << "s)");
 
     persistRemoteChain(gid, senderId);
-    it->second.chain.forgetSeed();  // M3 — see fast-path note above
+    it->second.chain.forgetSeed();  // see fast-path note above
 }
 
 void GroupProtocol::forgetRemoteChain(const std::string& gid,
@@ -554,7 +536,7 @@ void GroupProtocol::rotateMyChain(const std::string& gid,
     it->second.chain = SenderChain::freshOutbound();
     it->second.epoch = newEpoch;
 
-    P2P_LOG("[GROUP] rotated my chain for " << gid.substr(0, 8)
+    P2P_LOG("[GROUP] rotated my chain for " << p2p::peerPrefix(gid)
             << "... to epoch " << newEpoch);
 
     persistMyChain(gid);
@@ -609,8 +591,8 @@ GroupProtocol::decryptGroupMessage(const std::string& msgType,
                 // this epoch fall through to "epoch mismatch."
                 slot.clear();
                 P2P_WARN("[GROUP] grace window expired for "
-                         << senderId.substr(0, 8) << "... in "
-                         << gid.substr(0, 8) << "... epoch " << epoch);
+                         << p2p::peerPrefix(senderId) << "... in "
+                         << p2p::peerPrefix(gid) << "... epoch " << epoch);
             }
             break;
         }
@@ -618,8 +600,8 @@ GroupProtocol::decryptGroupMessage(const std::string& msgType,
 
     if (!chain) {
         P2P_WARN("[GROUP] decrypt: epoch mismatch for "
-                 << senderId.substr(0, 8) << "... in "
-                 << gid.substr(0, 8) << "... (chain @ "
+                 << p2p::peerPrefix(senderId) << "... in "
+                 << p2p::peerPrefix(gid) << "... (chain @ "
                  << it->second.epoch << ", msg @ " << epoch << ")");
         return {};
     }
@@ -634,12 +616,12 @@ GroupProtocol::decryptGroupMessage(const std::string& msgType,
     Bytes pt = m_crypto.aeadDecrypt(msgKey, ciphertext, aad);
     sodium_memzero(msgKey.data(), msgKey.size());
 
-    // Audit #3 H3 — forward secrecy on the skipped-key window.  After
-    // a successful AEAD verify we drop the cached key so a later
-    // compromise of this chain's in-memory or on-disk state cannot
-    // recover keys for messages already delivered.  We persist the
-    // mutation so the on-disk chain blob (re-loaded after restart)
-    // doesn't carry the now-erased key either.
+    // Forward secrecy on the skipped-key window.  After a successful
+    // AEAD verify we drop the cached key so a later compromise of
+    // this chain's in-memory or on-disk state cannot recover keys for
+    // messages already delivered.  We persist the mutation so the
+    // on-disk chain blob (re-loaded after restart) doesn't carry the
+    // now-erased key either.
     //
     // On AEAD failure we keep the key — a forged ciphertext shouldn't
     // burn a legitimate retransmit's chance to decrypt.  Replay of a
@@ -668,7 +650,7 @@ void GroupProtocol::restoreMyChain(const std::string& gid,
     SenderChain chain = SenderChain::deserialize(chainBlob);
     if (!chain.isValid()) {
         P2P_WARN("[GROUP] restoreMyChain: invalid blob for "
-                 << gid.substr(0, 8) << "...");
+                 << p2p::peerPrefix(gid) << "...");
         return;
     }
     OutboundGroupState s;
@@ -740,7 +722,7 @@ GroupProtocol::encryptForGroup(const std::string& msgType,
 
     if (ct.empty()) {
         P2P_WARN("[GROUP] aeadEncrypt failed for " << msgType << " in "
-                 << gid.substr(0, 8) << "...");
+                 << p2p::peerPrefix(gid) << "...");
         return out;
     }
 
@@ -765,8 +747,8 @@ void GroupProtocol::restorePersistedChains()
         SenderChain chain = SenderChain::deserialize(r.chainBlob);
         if (!chain.isValid()) {
             P2P_WARN("[GROUP] skipping invalid persisted chain for "
-                     << r.senderId.substr(0, 8) << "... in "
-                     << r.groupId.substr(0, 8) << "...");
+                     << p2p::peerPrefix(r.senderId) << "... in "
+                     << p2p::peerPrefix(r.groupId) << "...");
             continue;
         }
 
@@ -781,11 +763,11 @@ void GroupProtocol::restorePersistedChains()
             s.epoch = r.epoch;
             const auto key = std::make_pair(r.groupId, r.senderId);
             m_recvChains[key] = std::move(s);
-            // Audit #3 M3: on restart the deserialised chain may still
-            // carry a real seed if it was written under the legacy
-            // always-keep-seed scheme.  Drop it now so the in-memory
-            // image matches the post-install invariant; next persist
-            // writes the seedless blob back.
+            // On restart the deserialised chain may still carry a real
+            // seed if it was written under the legacy always-keep-seed
+            // scheme.  Drop it now so the in-memory image matches the
+            // current invariant; next persist writes the seedless blob
+            // back.
             m_recvChains[key].chain.forgetSeed();
         }
     }

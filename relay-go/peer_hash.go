@@ -1,4 +1,4 @@
-// peer_hash.go — HMAC-keyed peer-ID hashing for the relay (arch-review #8).
+// peer_hash.go — HMAC-keyed peer-ID hashing for the relay.
 //
 // The Go relay's SQLite file used to hold raw base64url peer IDs in
 // three places:
@@ -16,7 +16,7 @@
 //   * The HMAC key is per-process, derived from the relay's persistent
 //     X25519 private key via HKDF-SHA256 with a stable info string.
 //     The relay's disk footprint never carries the HMAC key in plain
-//     form; rotating the onion key (C3) rotates the hashes too, which
+//     form; rotating the onion key rotates the hashes too, which
 //     effectively nulls the old mailbox on next restart — acceptable
 //     because peers re-enqueue on reconnect and tokens re-register on
 //     auth_ok.

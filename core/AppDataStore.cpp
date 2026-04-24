@@ -1,10 +1,13 @@
 #include "AppDataStore.hpp"
+#include "shared.hpp"
 
 #include <sodium.h>
 #include <sqlite3.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 
 // Per-field encryption format: "ENC:" + base64(nonce || ciphertext || tag).
 // Anything without the prefix is treated as a legacy plaintext value and
@@ -13,8 +16,8 @@
 // written by either code path round-trip cleanly.
 namespace {
 // Per-field ciphertext prefixes.
-//   ENC:   — legacy (pre-arch-review #1b) format, no AAD.  Rows
-//            written by older builds decrypt through this path.
+//   ENC:   — legacy format, no AAD.  Rows written by older builds
+//            decrypt through this path.
 //   ENC2:  — current format, AAD binds `<table>|<column>|<row-key>`
 //            so an attacker with SQLCipher write access cannot swap
 //            a blob from e.g. contacts.name into contacts.subtitle
@@ -174,9 +177,9 @@ std::string AppDataStore::encryptField(const std::string& plaintext,
         m_encKey.data());
 
     buf.resize(nonceLen + ctLen);
-    // Always emit the v2 prefix post-arch-review #1b.  Legacy rows
-    // written under the v1 (no-AAD) path continue to decrypt via
-    // decryptField's fallback branch; new writes are AAD-bound.
+    // Always emit the v2 prefix.  Legacy rows written under the v1
+    // (no-AAD) path continue to decrypt via decryptField's fallback
+    // branch; new writes are AAD-bound.
     return std::string(kEnc2Prefix) + base64Encode(buf.data(), buf.size());
 }
 
@@ -366,10 +369,10 @@ bool AppDataStore::saveContact(const Contact& c)
                                   fieldAad("contacts", "keys", c.peerIdB64u)));
     q.bindValue(":is_blocked",  c.isBlocked ? 1 : 0);
     q.bindValue(":is_group",    c.isGroup   ? 1 : 0);
-    // Audit #3 L1: encrypt group_id alongside name/keys/avatar.  All
-    // other PII-shaped contact fields are field-encrypted; leaving
-    // group_id plaintext meant a SQLCipher-page-key compromise still
-    // leaked group membership topology.
+    // Encrypt group_id alongside name/keys/avatar.  All other
+    // PII-shaped contact fields are field-encrypted; leaving group_id
+    // plaintext would mean a SQLCipher-page-key compromise still leaks
+    // group membership topology.
     q.bindValue(":group_id",    encryptField(c.groupId,
                                   fieldAad("contacts", "group_id", c.peerIdB64u)));
     q.bindValue(":avatar",      encryptField(c.avatarB64,
@@ -419,6 +422,72 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
     }
 }
 
+std::string AppDataStore::exportContactsJson() const
+{
+    nlohmann::json arr = nlohmann::json::array();
+    loadAllContacts([&](const Contact& c) {
+        if (c.isBlocked) return;
+        nlohmann::json obj;
+        obj["name"] = c.name;
+        obj["keys"] = c.keys;
+        arr.push_back(std::move(obj));
+    });
+    nlohmann::json root;
+    root["version"]  = 1;
+    root["contacts"] = std::move(arr);
+    return root.dump(2);
+}
+
+int AppDataStore::importContactsJson(const std::string& json)
+{
+    nlohmann::json doc;
+    try {
+        doc = nlohmann::json::parse(json);
+    } catch (const std::exception&) {
+        return -1;
+    }
+    if (!doc.is_object() || !doc.contains("contacts") || !doc["contacts"].is_array()) {
+        return -1;
+    }
+
+    // Snapshot existing IDs once so the import never overwrites.  Matches
+    // desktop's prior behavior: row is keyed by peerIdB64u when present,
+    // or "name:<name>" for unnamed group-style rows.
+    std::unordered_set<std::string> existing;
+    loadAllContacts([&](const Contact& c) {
+        if (!c.peerIdB64u.empty())      existing.insert(c.peerIdB64u);
+        else if (!c.name.empty())       existing.insert("name:" + c.name);
+    });
+
+    int imported = 0;
+    for (const auto& entry : doc["contacts"]) {
+        if (!entry.is_object()) continue;
+        Contact c;
+        if (entry.contains("name") && entry["name"].is_string()) {
+            c.name = p2p::trimmed(entry["name"].get<std::string>());
+        }
+        if (entry.contains("keys") && entry["keys"].is_array()) {
+            for (const auto& k : entry["keys"]) {
+                if (k.is_string()) c.keys.push_back(k.get<std::string>());
+            }
+        }
+        if (c.name.empty() && c.keys.empty()) continue;
+
+        if (!c.keys.empty()) c.peerIdB64u = c.keys.front();
+        const std::string key = c.peerIdB64u.empty()
+            ? ("name:" + c.name)
+            : c.peerIdB64u;
+        if (existing.count(key)) continue;
+
+        c.subtitle = "Secure chat";
+        if (saveContact(c)) {
+            existing.insert(key);
+            ++imported;
+        }
+    }
+    return imported;
+}
+
 bool AppDataStore::saveContactAvatar(const std::string& peerIdB64u,
                                      const std::string& avatarB64)
 {
@@ -441,7 +510,7 @@ bool AppDataStore::saveContactKemPub(const std::string& peerIdB64u, const Bytes&
     return q.exec();
 }
 
-AppDataStore::Bytes AppDataStore::loadContactKemPub(const std::string& peerIdB64u) const
+Bytes AppDataStore::loadContactKemPub(const std::string& peerIdB64u) const
 {
     if (!m_db || peerIdB64u.empty()) return {};
     SqlCipherQuery q(m_db->handle());
@@ -547,13 +616,10 @@ bool AppDataStore::saveSetting(const std::string& key, const std::string& value)
     SqlCipherQuery q(*m_db);
     q.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES(:k,:v);");
     q.bindValue(":k", key);
-    // Audit #3 M5: encrypt every value at the storage layer so a
-    // page-key compromise can't harvest relay URLs / TURN creds /
-    // display name / similar.  The old comment "callers encrypt
-    // sensitive settings themselves" was a paper policy with zero
-    // enforcement — now the field is always wrapped.  Arch-review
-    // #1b: AAD binds the setting key so one setting's blob cannot
-    // be swapped into another.
+    // Encrypt every value at the storage layer so a page-key compromise
+    // can't harvest relay URLs / TURN creds / display name / similar.
+    // AAD binds the setting key so one setting's blob cannot be swapped
+    // into another.
     q.bindValue(":v", encryptField(value,
                         fieldAad("settings", "value", key)));
     return q.exec();

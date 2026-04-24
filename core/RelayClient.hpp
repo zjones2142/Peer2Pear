@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include "IHttpClient.hpp"
 #include "ITimer.hpp"
 #include "IWebSocket.hpp"
@@ -30,7 +32,6 @@ class CryptoEngine;
  */
 class RelayClient {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     RelayClient(IWebSocket& ws, IHttpClient& http,
                 ITimerFactory& timers, CryptoEngine* crypto);
@@ -153,13 +154,14 @@ private:
     int                     m_coverIntervalSec = 0;
     int                     m_burstRemaining   = 0;
 
-    // Cover-traffic size distribution (arch-review #9).  The inner
-    // body of a cover envelope picks a padding bucket first, then
-    // fills to land inside it, so the relay's view of cover bucket
-    // frequencies is independent of the user's real-traffic shape
-    // (before #9 cover was 95% small / 5% large / 0% medium — a
-    // trivial fingerprint for users who never send files).  The two
-    // modes trade bandwidth against indistinguishability:
+    // Cover-traffic size distribution.  The inner body of a cover
+    // envelope picks a padding bucket first, then fills to land
+    // inside it, so the relay's view of cover bucket frequencies is
+    // independent of the user's real-traffic shape.  Without bucket
+    // shuffling a text-only user would show a distinctive histogram
+    // (near-zero large-bucket rate), making them trivially separable
+    // from users who send files.  The two modes trade bandwidth
+    // against indistinguishability:
     //
     //   BandwidthBiased  — 60% small / 30% medium / 10% large.  Covers
     //                      every bucket at least some of the time so

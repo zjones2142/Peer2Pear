@@ -63,12 +63,12 @@ const (
 	presenceQueryWindow     = 60 // seconds
 	maxPresenceQueriesPerWin = 60
 
-	// Per-connection presence_subscribe rate limit (Audit #3 H4).  The
+	// Per-connection presence_subscribe rate limit.  The
 	// subscription-size cap (maxPresenceSubs = 200) bounds the watched
 	// set per call; the per-call frequency cap below prevents an
 	// authenticated peer from churning the watched set ("subscribe 200
 	// IDs, replace, repeat") to enumerate the social graph at WebSocket
-	// speed.  6/min ≈ one every 10 s — comfortable for legitimate
+	// speed.  6/min ~= one every 10 s — comfortable for legitimate
 	// contact-list edits, hostile to enumeration.
 	presenceSubWindow         = 60 // seconds
 	maxPresenceSubsPerWin     = 6
@@ -93,9 +93,9 @@ type ipRateEntry struct {
 type rateLimiter struct {
 	mu      sync.Mutex
 	entries map[string]*ipRateEntry
-	// Audit #3 L5: signal channel so the background purge goroutine
-	// terminates when the Hub shuts down.  Without this the goroutine
-	// outlives the test fixture and accumulates across the suite.
+	// Signal channel so the background purge goroutine terminates
+	// when the Hub shuts down.  Without this the goroutine outlives
+	// the test fixture and accumulates across the suite.
 	stop chan struct{}
 }
 
@@ -176,7 +176,7 @@ type Peer struct {
 	presenceQueryResetAt int64 // unix seconds
 
 	// Per-connection presence_subscribe rate limit.  Same shape as the
-	// query counter above — see Audit #3 H4 / `maxPresenceSubsPerWin`.
+	// query counter above — see `maxPresenceSubsPerWin`.
 	presenceSubCount   int
 	presenceSubResetAt int64 // unix seconds
 }
@@ -208,9 +208,9 @@ type Hub struct {
 	push       *PushStore
 	pushSender *PushSender
 
-	// Audit #3 L5: signal channel that terminates the auth-nonce purge
-	// goroutine when the Hub shuts down.  Closed exactly once by
-	// CloseAll.  rateLimiter has its own equivalent.
+	// Signal channel that terminates the auth-nonce purge goroutine
+	// when the Hub shuts down.  Closed exactly once by CloseAll.
+	// rateLimiter has its own equivalent.
 	stopAuthPurge chan struct{}
 
 	upgrader websocket.Upgrader
@@ -234,18 +234,18 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 	}
 	// PushStore is intentionally NOT initialised here — it needs the
 	// AEAD key derived from the relay's persistent X25519 private key
-	// for at-rest token encryption (Audit #3 C2), and that key is
-	// loaded after NewHub returns.  Caller must invoke InitPush(priv)
-	// once the relay key is available; until then h.push stays nil
-	// and push registration is silently dropped (NotifyOffline is a
-	// no-op without h.push, which is acceptable for the brief window
-	// before main wires it up).
+	// for at-rest token encryption, and that key is loaded after
+	// NewHub returns.  Caller must invoke InitPush(priv) once the
+	// relay key is available; until then h.push stays nil and push
+	// registration is silently dropped (NotifyOffline is a no-op
+	// without h.push, which is acceptable for the brief window before
+	// main wires it up).
 	// Periodically purge expired auth nonces from the persistent table.
 	// RegisterAuthNonce() also cleans up opportunistically; this just
-	// bounds table size in steady state.  Exits on stop so the goroutine
-	// doesn't outlive the Hub (Audit #3 L5).  Capture the channel
-	// locally — CloseAll mutates h.stopAuthPurge and the goroutine must
-	// not read that field concurrently.
+	// bounds table size in steady state.  Exits on stop so the
+	// goroutine doesn't outlive the Hub.  Capture the channel locally
+	// — CloseAll mutates h.stopAuthPurge and the goroutine must not
+	// read that field concurrently.
 	stop := h.stopAuthPurge
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
@@ -265,9 +265,9 @@ func NewHub(mbox *Mailbox, trustProxy bool) *Hub {
 // InitPush wires up the at-rest-encrypted push token store using the
 // relay's persistent X25519 private key as HKDF input.  Idempotent —
 // safe to call multiple times if the relay key is rotated.  Also
-// installs the global peer-ID hasher (Arch-review #8) so subsequent
-// Mailbox / PushStore writes land with HMAC-hashed row keys rather
-// than raw base64url peer IDs.
+// installs the global peer-ID hasher so subsequent Mailbox /
+// PushStore writes land with HMAC-hashed row keys rather than raw
+// base64url peer IDs.
 func (h *Hub) InitPush(relayPriv *[32]byte) {
 	if h.mbox == nil || h.mbox.db == nil || relayPriv == nil {
 		return
@@ -297,10 +297,10 @@ func (h *Hub) CloseAll() {
 	h.peers = make(map[string]*Peer)
 	h.subs = make(map[string]map[string]bool)
 
-	// Audit #3 L5: terminate the background purge goroutines so Hub
-	// shutdown actually releases all worker resources (matters for the
-	// test fixture, which spins up a fresh Hub per case).  Don't nil
-	// the limiters — late HTTP handlers from a not-yet-closed listener
+	// Terminate the background purge goroutines so Hub shutdown
+	// actually releases all worker resources (matters for the test
+	// fixture, which spins up a fresh Hub per case).  Don't nil the
+	// limiters — late HTTP handlers from a not-yet-closed listener
 	// still call allow().  The stop channels only end the purger; the
 	// allow() path is unaffected.
 	if h.rl != nil {
@@ -711,19 +711,19 @@ func (h *Hub) HandleReceive(w http.ResponseWriter, r *http.Request) {
 				"type":  "presence_result",
 				"peers": results,
 			})
-			// Non-blocking send (Audit #3 M8): a slow consumer must not
-			// stall the read goroutine.  Buffer-full → drop the reply;
-			// the client can re-query.
+			// Non-blocking send: a slow consumer must not stall the read
+			// goroutine.  Buffer-full → drop the reply; the client can
+			// re-query.
 			select {
 			case peer.Send <- resp:
 			default:
 			}
 
 		case "presence_subscribe":
-			// Cap subscribe frequency per connection (Audit #3 H4).
-			// Without this, an authenticated peer could replace the
-			// 200-id watched set repeatedly to enumerate the social
-			// graph at WebSocket speed.
+			// Cap subscribe frequency per connection.  Without this,
+			// an authenticated peer could replace the 200-id watched
+			// set repeatedly to enumerate the social graph at
+			// WebSocket speed.
 			now := time.Now().Unix()
 			if now >= peer.presenceSubResetAt {
 				peer.presenceSubCount = 0

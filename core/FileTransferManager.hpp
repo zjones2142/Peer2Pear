@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <deque>
 #include <fstream>
@@ -34,7 +36,6 @@ class SqlCipherDb;
  */
 class FileTransferManager {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     /// Return the sealed envelope to dispatch for a file chunk.  Empty = seal failed.
     using SealFn = std::function<Bytes(const std::string& peerIdB64u,
@@ -335,14 +336,14 @@ private:
     };
     std::map<std::string, OutboundTransfer> m_outboundPending;
 
-    // Audit #3 L2: bounded FIFO of cancelled / abandoned transfer IDs.
-    // The active-send loop checks membership before fanning out the
-    // next chunk; a long-lived process that's seen many cancels doesn't
-    // need to remember every one indefinitely.  kMaxAbortedTransfers is
-    // generous: a transfer that resumes after the ID has been evicted
-    // from this cache simply pays one extra encrypt+seal before the
-    // recipient drops it.  The deque carries insertion order so we can
-    // pop the oldest when the set is full.
+    // Bounded FIFO of cancelled / abandoned transfer IDs.  The
+    // active-send loop checks membership before fanning out the next
+    // chunk; a long-lived process that's seen many cancels doesn't
+    // need to remember every one indefinitely.  kMaxAbortedTransfers
+    // is generous: a transfer that resumes after the ID has been
+    // evicted from this cache simply pays one extra encrypt+seal
+    // before the recipient drops it.  The deque carries insertion
+    // order so we can pop the oldest when the set is full.
     static constexpr size_t kMaxAbortedTransfers = 256;
     std::unordered_set<std::string> m_abortedTransfers;
     std::deque<std::string>         m_abortedTransfersOrder;

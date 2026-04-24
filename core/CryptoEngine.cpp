@@ -1156,6 +1156,17 @@ Bytes CryptoEngine::deriveSubkey(const Bytes& masterKey,
     return hkdf(masterKey, {}, info, len);
 }
 
+Bytes CryptoEngine::edPubToCurvePub(const Bytes& edPub)
+{
+    if (edPub.size() != 32) return {};
+    unsigned char curvePub[32];
+    if (crypto_sign_ed25519_pk_to_curve25519(curvePub, edPub.data()) != 0)
+        return {};
+    Bytes out(curvePub, curvePub + 32);
+    sodium_memzero(curvePub, sizeof(curvePub));
+    return out;
+}
+
 Bytes CryptoEngine::deriveFileKey(const Bytes& ratchetMsgKey,
                                     const std::string& transferId)
 {
@@ -1166,8 +1177,8 @@ Bytes CryptoEngine::deriveFileKey(const Bytes& ratchetMsgKey,
     return hkdf(ratchetMsgKey, {}, info, 32);
 }
 
-// Audit #3 M1 — file-key wrap.  Both methods derive a 32-byte AEAD
-// key from m_identityKey on demand (stable across sessions because
+// File-key wrap.  Both methods derive a 32-byte AEAD key from
+// m_identityKey on demand (stable across sessions because
 // m_identityKey is stable post-unlock).  Wrapped blob layout is
 // exactly what aeadEncrypt returns (nonce||ct); transferId rides in
 // the AAD so a row swap fails verification.

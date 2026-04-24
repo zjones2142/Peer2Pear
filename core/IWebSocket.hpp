@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -21,7 +23,6 @@
  */
 class IWebSocket {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     virtual ~IWebSocket() = default;
 

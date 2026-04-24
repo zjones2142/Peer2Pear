@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <vector>
 
@@ -30,7 +32,6 @@
  * Types: std::vector<uint8_t> for all buffers.
  */
 
-using Bytes = std::vector<uint8_t>;
 
 struct CipherState {
     Bytes    key;    // 32 bytes — symmetric transport key

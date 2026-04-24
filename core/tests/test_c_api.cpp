@@ -270,7 +270,7 @@ TEST(CApi, SetPassphraseV2RejectsBadArguments) {
     fs::remove_all(dir);
 }
 
-// ── 5. FFI null/length guards (Audit #3 C1) ──────────────────────────────
+// ── 5. FFI null/length guards ─────────────────────────────────────────────
 // A buggy or hostile platform adapter could pass (NULL, anything),
 // (anything, negative), or (NULL, 0).  Constructing the inner Bytes
 // vector under those conditions would be UB even on (nullptr, 0)
@@ -296,12 +296,12 @@ TEST(CApi, WsOnBinaryRejectsMalformedInputs) {
     fs::remove_all(dir);
 }
 
-// Audit #3 test gap: p2p_app_load_contacts must not deadlock if its
-// callback re-enters another p2p_app_* function.  The fix snapshots
-// the rows under ctrlMu and releases before firing callbacks.  A
-// regression (moving the callback back inside the lock) deadlocks
-// here because std::mutex is non-recursive; we bound the call with
-// a watchdog future.
+// p2p_app_load_contacts must not deadlock if its callback re-enters
+// another p2p_app_* function.  The implementation snapshots the rows
+// under ctrlMu and releases before firing callbacks.  A regression
+// (moving the callback back inside the lock) deadlocks here because
+// std::mutex is non-recursive; we bound the call with a watchdog
+// future.
 struct ReentrancyState {
     p2p_context* ctx;
     int          count;
@@ -360,10 +360,9 @@ TEST(CApi, LoadContactsCallbackReentrancyDoesNotDeadlock) {
     fs::remove_all(dir);
 }
 
-// Audit #3 test gap: p2p_check_presence + p2p_subscribe_presence must
-// reject count<0 without hitting the reserve(size_t) underflow (which
-// would allocate ~SIZE_MAX bytes on a 64-bit host).  Also pins the
-// count=0 no-op.
+// p2p_check_presence + p2p_subscribe_presence must reject count<0
+// without hitting the reserve(size_t) underflow (which would allocate
+// ~SIZE_MAX bytes on a 64-bit host).  Also pins the count=0 no-op.
 TEST(CApi, PresenceRejectsNegativeAndZeroCount) {
     const std::string dir = makeTempDir("p2p-capi-presence");
     p2p_context* ctx = p2p_create(dir.c_str(), nullPlatform());

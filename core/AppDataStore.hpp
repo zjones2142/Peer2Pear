@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -36,7 +38,6 @@
  */
 class AppDataStore {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     AppDataStore() = default;
     ~AppDataStore();
@@ -84,6 +85,18 @@ public:
     /// Streaming (not batching) keeps memory flat for large rosters and
     /// matches the C-API consumer pattern (one callback per row).
     void loadAllContacts(const std::function<void(const Contact&)>& cb) const;
+
+    /// Serialize the address book to the v1 wire format used by
+    /// desktop's "Export Contacts" + iOS's share sheet.  Blocked rows
+    /// are omitted.  Format:
+    ///   { "version": 1, "contacts": [ { "name": "...", "keys": [...] } ] }
+    std::string exportContactsJson() const;
+
+    /// Merge contacts from a v1 JSON blob.  Existing rows (keyed by
+    /// peerIdB64u, or by "name:<name>" for unnamed rows) are never
+    /// overwritten.  Returns the number of rows inserted, or -1 on
+    /// parse error.
+    int importContactsJson(const std::string& json);
 
     bool  saveContactAvatar(const std::string& peerIdB64u, const std::string& avatarB64);
     bool  saveContactKemPub(const std::string& peerIdB64u, const Bytes& kemPub);

@@ -1,4 +1,4 @@
-// onion_wrap_test.go — unit tests for the relay-key KEK wrap (Audit #3 C3).
+// onion_wrap_test.go — unit tests for the relay-key KEK wrap.
 //
 // loadOrCreateRelayKey persists the onion X25519 private key under
 // either the legacy plaintext layout or the new wrapped layout.  The

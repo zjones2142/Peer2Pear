@@ -19,8 +19,7 @@ import (
 	// supplied in the DSN, so the default-plaintext behaviour is
 	// preserved.  When RELAY_DB_KEY is set, NewMailbox threads the
 	// key into the DSN and the file is SQLCipher-encrypted at rest
-	// (arch-review #8 + operator-opt-in, matching the RELAY_KEY_KEK
-	// pattern from C3).
+	// (operator-opt-in, matching the RELAY_KEY_KEK pattern).
 	_ "github.com/mutecomm/go-sqlcipher/v4"
 )
 
@@ -58,7 +57,7 @@ type Mailbox struct {
 //                          bytes (same file format as RELAY_KEY_KEK_FILE)
 // Returns (nil, nil) when neither is set — callers then open the DB
 // in plaintext mode with a stderr warning (mirrors the opt-in
-// pattern C3 uses for the onion key).
+// pattern the onion key uses).
 func loadRelayDbKey() ([]byte, error) {
 	if b64 := os.Getenv("RELAY_DB_KEY"); b64 != "" {
 		raw, err := base64.RawURLEncoding.DecodeString(b64)
@@ -139,7 +138,7 @@ func NewMailbox(dbPath string) (*Mailbox, error) {
 	if key == nil {
 		fmt.Fprintln(os.Stderr,
 			"warning: RELAY_DB_KEY not set — mailbox SQLite file stored "+
-				"in plaintext.  Set it to enable at-rest encryption (arch-review #8).")
+				"in plaintext.  Set it to enable at-rest encryption.")
 	}
 
 	db, err := sql.Open("sqlite3", buildMailboxDsn(dbPath, key))
@@ -477,9 +476,9 @@ func (m *Mailbox) PurgeExpired() (int, int) {
 }
 
 // Count returns the total number of stored envelopes.  The lock
-// matches every other Mailbox accessor (Audit #3 M6) so a concurrent
-// Store / FetchAll can't race the COUNT(*) read against an insert
-// or delete in flight.
+// matches every other Mailbox accessor so a concurrent Store /
+// FetchAll can't race the COUNT(*) read against an insert or delete
+// in flight.
 func (m *Mailbox) Count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

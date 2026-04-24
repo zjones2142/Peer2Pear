@@ -1,4 +1,4 @@
-// sqlcipher_test.go — opt-in at-rest encryption tests (arch-review #8).
+// sqlcipher_test.go — opt-in at-rest encryption tests.
 //
 // When RELAY_DB_KEY / RELAY_DB_KEY_FILE is set, NewMailbox opens the
 // SQLite file through the SQLCipher driver so every byte on disk is

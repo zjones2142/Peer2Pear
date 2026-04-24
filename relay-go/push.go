@@ -22,13 +22,13 @@ import (
 // envelope arrives.  Tokens are upserted by (peer_id, platform);
 // empty tokens act as "unregister" and delete the row.
 //
-// Tokens are encrypted at rest with XChaCha20-Poly1305 (Audit #3 C2).
-// The AEAD key is derived from the relay's persistent X25519 private
-// key via HKDF, so it lives only in memory and shares fate with the
-// relay binary — a snapshot of the SQLite file alone does NOT expose
-// any APNs/FCM tokens.  Stored format is `v1:` + base64(nonce||ct);
-// the prefix lets us migrate any pre-encryption rows on read without
-// a schema change.
+// Tokens are encrypted at rest with XChaCha20-Poly1305.  The AEAD
+// key is derived from the relay's persistent X25519 private key via
+// HKDF, so it lives only in memory and shares fate with the relay
+// binary — a snapshot of the SQLite file alone does NOT expose any
+// APNs/FCM tokens.  Stored format is `v1:` + base64(nonce||ct); the
+// prefix lets us migrate any pre-encryption rows on read without a
+// schema change.
 //
 // The store does NOT need to be durable across restarts for
 // correctness — if it empties, clients re-register on their next

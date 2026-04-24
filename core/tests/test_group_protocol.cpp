@@ -3,9 +3,9 @@
 // GroupProtocol owns:
 //   1. Outbound send methods (text / leave / rename / avatar / member_update)
 //      that fan out through a SendSealedFn callback per member.
-//   2. The roster authorization gate isAuthorizedSender — the H2 audit
-//      fix — with deny-by-default for unknown groups and bootstrap-on-
-//      first-trusted-message semantics via upsertMembersFromTrustedMessage.
+//   2. The roster authorization gate isAuthorizedSender — with
+//      deny-by-default for unknown groups and bootstrap-on-first-
+//      trusted-message semantics via upsertMembersFromTrustedMessage.
 //   3. Per-group outbound seq counters + per-(group, sender) inbound
 //      monotonic guard via recordInboundSeq.
 //
@@ -36,8 +36,8 @@ namespace {
 using p2p_test::makeTempDir;
 using p2p_test::makeTempPath;
 
-SqlCipherDb::Bytes randomKey32() {
-    SqlCipherDb::Bytes k(32);
+Bytes randomKey32() {
+    Bytes k(32);
     randombytes_buf(k.data(), k.size());
     return k;
 }
@@ -154,7 +154,7 @@ std::string                   GroupProtocolSuite::s_meId;
 std::string                   GroupProtocolSuite::s_aliceId;
 std::string                   GroupProtocolSuite::s_bobId;
 
-// ── 1. Roster authorization (H2 gate) ────────────────────────────────────────
+// ── 1. Roster authorization ──────────────────────────────────────────────────
 
 TEST_F(GroupProtocolSuite, IsAuthorizedSender_DenyByDefaultForUnknownGroup) {
     EXPECT_FALSE(m_gp->isAuthorizedSender("unknown-gid", s_aliceId));
@@ -185,8 +185,8 @@ TEST_F(GroupProtocolSuite, Upsert_BootstrapsWhenSenderIsInDeclaredList) {
 
 TEST_F(GroupProtocolSuite, Upsert_RejectsBootstrapWhenSenderOmitsSelf) {
     // Attacker tries to seed a bogus roster that excludes themselves — this
-    // is the H5 known-limitation first-mover race; we defend by only
-    // accepting a list that the claimed sender is actually in.
+    // is the known first-mover race; we defend by only accepting a list
+    // that the claimed sender is actually in.
     m_gp->upsertMembersFromTrustedMessage(
         "gid-x", s_aliceId, {s_meId, s_bobId});
     EXPECT_FALSE(m_gp->isAuthorizedSender("gid-x", s_aliceId));
@@ -351,10 +351,10 @@ TEST_F(GroupProtocolSuite, SendText_SkeyIdxIsPerGroup) {
 }
 
 TEST_F(GroupProtocolSuite, SendLeave_EncryptsGroupNameAndMembers) {
-    // Audit #3 H2: groupName + members must NOT ride on the outer
-    // envelope.  They live inside the sender-chain ciphertext so a
-    // relay operator can't harvest "alice left group X with members
-    // B,C,D" as plaintext metadata.
+    // groupName + members must NOT ride on the outer envelope.  They
+    // live inside the sender-chain ciphertext so a relay operator
+    // can't harvest "alice left group X with members B,C,D" as
+    // plaintext metadata.
     m_gp->sendLeave("gid", "My Group", {s_meId, s_aliceId, s_bobId});
 
     auto leaves = capturedOfType("group_leave");
@@ -643,13 +643,13 @@ TEST_F(GroupProtocolSuite, InstallRemoteChain_RejectsInvalidSeed) {
 }
 
 TEST_F(GroupProtocolSuite, InstallRemoteChain_RejectsEpochDowngrade) {
-    // Audit #3 H1: an attacker who captured a previous epoch's seed
-    // (e.g., from a compromised member's disk or a stale relay log)
-    // could replay group_skey_announce at epoch N-1 after the group
-    // rotated to epoch N.  Pre-fix, the receiver overwrote the
-    // current chain with the stale seed — downgrading the group
-    // back to a known-compromised epoch.  This test pins the
-    // rejection.
+    // An attacker who captured a previous epoch's seed (e.g., from a
+    // compromised member's disk or a stale relay log) could replay
+    // group_skey_announce at epoch N-1 after the group rotated to
+    // epoch N.  Without the downgrade guard, the receiver would
+    // overwrite the current chain with the stale seed — downgrading
+    // the group back to a known-compromised epoch.  This test pins
+    // the rejection.
 
     // 1. Sender (m_gp) emits a real epoch-0 skey + msg.
     m_gp->sendText("gid", "G", {s_meId, s_aliceId}, "hello-epoch0");
@@ -874,12 +874,12 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_WrongSenderIdBreaksAad) {
     EXPECT_TRUE(pt.empty());
 }
 
-// Audit #3 H3: forward secrecy on the skipped-key window.  After a
-// successful AEAD decrypt at idx=N the message key for N must be
-// dropped from the chain's cache so a later in-memory or on-disk
-// compromise cannot recover already-delivered keys.  Re-running the
-// same decrypt after success therefore returns empty — the second
-// call has nothing to look up.  AEAD failures don't trigger erasure
+// Forward secrecy on the skipped-key window.  After a successful
+// AEAD decrypt at idx=N the message key for N must be dropped from
+// the chain's cache so a later in-memory or on-disk compromise
+// cannot recover already-delivered keys.  Re-running the same
+// decrypt after success therefore returns empty — the second call
+// has nothing to look up.  AEAD failures don't trigger erasure
 // (covered by `_ForgedCiphertextLeavesKeyForLegitimateRetry` below).
 TEST_F(GroupProtocolSuite, DecryptGroupMessage_ErasesSkippedKeyAfterSuccess) {
     // Alice sends one message in a group containing me.
@@ -1278,11 +1278,11 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_PrevEpochAfterGraceExpiresFails) 
         << "prev-chain decrypt past grace window should fail";
 }
 
-// Audit #3 L4: with only one prev slot, a rapid 0→1→2 rekey dropped
-// epoch 0's chain when epoch 2 arrived.  In-flight messages from epoch
-// 0 within the grace window then became undecryptable.  With the slot
-// array bumped to two, both prior epochs stay reachable across a
-// double rotation.
+// With only one prev slot, a rapid 0->1->2 rekey would drop epoch
+// 0's chain when epoch 2 arrived.  In-flight messages from epoch 0
+// within the grace window then become undecryptable.  With the slot
+// array at two, both prior epochs stay reachable across a double
+// rotation.
 TEST_F(GroupProtocolSuite, DecryptGroupMessage_RapidDoubleRekeyKeepsBothPrevEpochs) {
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
@@ -1330,7 +1330,7 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_RapidDoubleRekeyKeepsBothPrevEpoc
             msg[i]["skey_idx"].get<uint32_t>(),
             CryptoEngine::fromBase64Url(msg[i]["ciphertext"].get<std::string>()));
         ASSERT_FALSE(pt.empty())
-            << "epoch " << i << " unreachable after double rekey (L4 regression)";
+            << "epoch " << i << " unreachable after double rekey";
         auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
         EXPECT_EQ(inner.value("text", std::string()),
                   std::string("msg @ ") + char('0' + i));
@@ -1431,8 +1431,8 @@ struct PersistenceFixture {
     std::unique_ptr<GroupProtocol> gp;
     std::vector<CapturedSend>      captured;
     std::string                    dbPath;
-    SqlCipherDb::Bytes             dbKey;
-    SqlCipherDb::Bytes             storeKey;
+    Bytes             dbKey;
+    Bytes             storeKey;
 };
 
 static PersistenceFixture makeFixture(CryptoEngine& crypto) {
@@ -1461,8 +1461,8 @@ static PersistenceFixture makeFixture(CryptoEngine& crypto) {
 // Callers hand in the dbPath / dbKey / storeKey from makeFixture.
 static PersistenceFixture reopenFixture(CryptoEngine& crypto,
                                           const std::string& dbPath,
-                                          const SqlCipherDb::Bytes& dbKey,
-                                          const SqlCipherDb::Bytes& storeKey) {
+                                          const Bytes& dbKey,
+                                          const Bytes& storeKey) {
     PersistenceFixture f;
     f.dbPath   = dbPath;
     f.dbKey    = dbKey;

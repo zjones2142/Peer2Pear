@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <set>
@@ -56,7 +58,6 @@ class SqlCipherDb;
  */
 class SessionSealer {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     enum class PeerTrust { Unverified, Verified, Mismatch };
 
@@ -90,6 +91,18 @@ public:
     // sealForPeer, plus hard-block rejection.
     Bytes sealPreEncryptedForPeer(const std::string& peerIdB64u,
                                     const Bytes& preEncryptedPayload);
+
+    // Wrap a Noise handshake-response blob (initiator has no ratchet
+    // session yet, so we can't call sealForPeer) into the standard
+    // `SEALED:` inner-wire form.  Unlike sealPreEncryptedForPeer this
+    // explicitly does NOT run the key-change / hard-block check — the
+    // handshake response is how the peer *proves* identity; denying
+    // it on a key-change policy would lock users out of their own
+    // re-keyed contacts.  Arch-review #3: ChatController used to
+    // open-code the envelope-framing here, duplicating logic that
+    // already lived in this class.
+    Bytes sealHandshakeResponseForPeer(const std::string& peerIdB64u,
+                                         const Bytes& handshakeBlob);
 
     // ── Safety numbers ────────────────────────────────────────────────
     // 60-digit display string for out-of-band verification, or empty
