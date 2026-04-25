@@ -1176,7 +1176,8 @@ int p2p_app_save_contact(p2p_context* ctx,
                           const char* group_id,
                           const char* avatar_b64,
                           int64_t last_active_secs,
-                          int in_address_book)
+                          int in_address_book,
+                          int muted)
 {
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
@@ -1191,6 +1192,7 @@ int p2p_app_save_contact(p2p_context* ctx,
     c.avatarB64      = avatar_b64 ? avatar_b64 : "";
     c.lastActiveSecs = last_active_secs;
     c.inAddressBook  = in_address_book != 0;
+    c.muted          = muted != 0;
     return ctx->appData->saveContact(c) ? 0 : -1;
 }
 
@@ -1199,6 +1201,13 @@ int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id)
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
     return ctx->appData->deleteContact(peer_id) ? 0 : -1;
+}
+
+int p2p_app_set_contact_muted(p2p_context* ctx, const char* peer_id, int muted)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->setContactMuted(peer_id, muted != 0) ? 0 : -1;
 }
 
 void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
@@ -1231,6 +1240,7 @@ void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
            c.avatarB64.c_str(),
            c.lastActiveSecs,
            c.inAddressBook ? 1 : 0,
+           c.muted ? 1 : 0,
            ud);
     }
 }

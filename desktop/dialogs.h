@@ -55,7 +55,8 @@ ContactEditorResult openContactEditor(
     const std::vector<AppDataStore::Contact> *allContacts = nullptr,
     std::function<void(const AppDataStore::Contact&)> onNewContact = nullptr,
     QString *avatarInOut = nullptr,
-    ChatController *controller = nullptr);
+    ChatController *controller = nullptr,
+    bool *isMutedInOut = nullptr);
 
 // ── Profile editor ───────────────────────────────────────────────────────────
 //

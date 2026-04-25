@@ -258,6 +258,7 @@ void AppDataStore::createTables()
         "  avatar           TEXT NOT NULL DEFAULT '',"
         "  last_active      INTEGER NOT NULL DEFAULT 0,"
         "  in_address_book  INTEGER NOT NULL DEFAULT 1,"
+        "  muted            INTEGER NOT NULL DEFAULT 0,"
         "  kem_pub          BLOB"
         ");"
     );
@@ -270,6 +271,7 @@ void AppDataStore::createTables()
     q.exec("ALTER TABLE contacts ADD COLUMN avatar           TEXT    NOT NULL DEFAULT '';");
     q.exec("ALTER TABLE contacts ADD COLUMN last_active      INTEGER NOT NULL DEFAULT 0;");
     q.exec("ALTER TABLE contacts ADD COLUMN in_address_book  INTEGER NOT NULL DEFAULT 1;");
+    q.exec("ALTER TABLE contacts ADD COLUMN muted            INTEGER NOT NULL DEFAULT 0;");
     q.exec("ALTER TABLE contacts ADD COLUMN kem_pub          BLOB;");
 
     // messages: FK to contacts so deleteContact cascades.  Index on
@@ -347,9 +349,9 @@ bool AppDataStore::saveContact(const Contact& c)
     q.prepare(
         "INSERT INTO contacts"
         " (peer_id,name,subtitle,keys,is_blocked,is_group,group_id,avatar,"
-        "  last_active,in_address_book)"
+        "  last_active,in_address_book,muted)"
         " VALUES (:peer_id,:name,:subtitle,:keys,:is_blocked,:is_group,"
-        "         :group_id,:avatar,:last_active,:in_ab)"
+        "         :group_id,:avatar,:last_active,:in_ab,:muted)"
         " ON CONFLICT(peer_id) DO UPDATE SET"
         "   name=excluded.name,"
         "   subtitle=excluded.subtitle,"
@@ -358,7 +360,8 @@ bool AppDataStore::saveContact(const Contact& c)
         "   is_group=excluded.is_group,"
         "   group_id=excluded.group_id,"
         "   avatar=excluded.avatar,"
-        "   in_address_book=excluded.in_address_book;"
+        "   in_address_book=excluded.in_address_book,"
+        "   muted=excluded.muted;"
     );
     q.bindValue(":peer_id",     c.peerIdB64u);
     q.bindValue(":name",        encryptField(c.name,
@@ -379,6 +382,7 @@ bool AppDataStore::saveContact(const Contact& c)
                                   fieldAad("contacts", "avatar", c.peerIdB64u)));
     q.bindValue(":last_active", c.lastActiveSecs);
     q.bindValue(":in_ab",       c.inAddressBook ? 1 : 0);
+    q.bindValue(":muted",       c.muted ? 1 : 0);
     return q.exec();
 }
 
@@ -397,7 +401,7 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
     SqlCipherQuery q(m_db->handle());
     q.prepare(
         "SELECT peer_id,name,subtitle,keys,is_blocked,is_group,"
-        "       group_id,avatar,last_active,in_address_book"
+        "       group_id,avatar,last_active,in_address_book,muted"
         " FROM contacts ORDER BY last_active DESC, rowid ASC;"
     );
     if (!q.exec()) return;
@@ -418,6 +422,7 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
                                           fieldAad("contacts", "avatar",   c.peerIdB64u));
         c.lastActiveSecs = q.valueInt64(8);
         c.inAddressBook  = q.valueInt(9) == 1;
+        c.muted          = q.valueInt(10) == 1;
         cb(c);
     }
 }
@@ -428,7 +433,7 @@ bool AppDataStore::loadContact(const std::string& peerIdB64u, Contact& out) cons
     SqlCipherQuery q(m_db->handle());
     q.prepare(
         "SELECT peer_id,name,subtitle,keys,is_blocked,is_group,"
-        "       group_id,avatar,last_active,in_address_book"
+        "       group_id,avatar,last_active,in_address_book,muted"
         " FROM contacts WHERE peer_id=:pid LIMIT 1;"
     );
     q.bindValue(":pid", peerIdB64u);
@@ -448,7 +453,18 @@ bool AppDataStore::loadContact(const std::string& peerIdB64u, Contact& out) cons
                                         fieldAad("contacts", "avatar",   out.peerIdB64u));
     out.lastActiveSecs = q.valueInt64(8);
     out.inAddressBook  = q.valueInt(9) == 1;
+    out.muted          = q.valueInt(10) == 1;
     return true;
+}
+
+bool AppDataStore::setContactMuted(const std::string& peerIdB64u, bool muted)
+{
+    if (!m_db || peerIdB64u.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare("UPDATE contacts SET muted=:muted WHERE peer_id=:pid;");
+    q.bindValue(":muted", muted ? 1 : 0);
+    q.bindValue(":pid",   peerIdB64u);
+    return q.exec() && q.numRowsAffected() > 0;
 }
 
 std::string AppDataStore::exportContactsJson() const
@@ -645,7 +661,9 @@ bool AppDataStore::deleteMessage(const std::string& peerIdB64u,
     q.prepare("DELETE FROM messages WHERE peer_id=:peer_id AND msg_id=:msg_id;");
     q.bindValue(":peer_id", peerIdB64u);
     q.bindValue(":msg_id",  msgId);
-    return q.exec();
+    // exec() returns true for SQLITE_DONE even when zero rows matched;
+    // honor the docstring's "returns false when nothing matched".
+    return q.exec() && q.numRowsAffected() > 0;
 }
 
 // ── Settings ────────────────────────────────────────────────────────────────

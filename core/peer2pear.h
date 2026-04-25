@@ -617,10 +617,17 @@ int p2p_app_save_contact(p2p_context* ctx,
                           const char* group_id,
                           const char* avatar_b64,
                           int64_t last_active_secs,
-                          int in_address_book);
+                          int in_address_book,
+                          int muted);
 
 /** Delete a contact (and CASCADE its messages). */
 int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id);
+
+/** Toggle the "hide alerts" / mute flag without rewriting other
+ *  fields.  When muted, clients suppress notifications for this chat
+ *  — messages still arrive and render in-app normally.  Returns 0 on
+ *  success, -1 on invalid args / no matching row. */
+int p2p_app_set_contact_muted(p2p_context* ctx, const char* peer_id, int muted);
 
 /** Stream every contact via callback (last_active DESC). */
 typedef void (*p2p_contact_cb)(const char* peer_id,
@@ -633,6 +640,7 @@ typedef void (*p2p_contact_cb)(const char* peer_id,
                                 const char* avatar_b64,
                                 int64_t last_active_secs,
                                 int in_address_book,
+                                int muted,
                                 void* ud);
 void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud);
 

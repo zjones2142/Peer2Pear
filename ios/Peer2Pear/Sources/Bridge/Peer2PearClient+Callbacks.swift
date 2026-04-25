@@ -26,7 +26,14 @@ extension Peer2PearClient {
         p2p_set_on_status(ctx, { msg, ud in
             guard let client = Peer2PearClient.from(ud), let msg else { return }
             let str = String(cString: msg)
-            DispatchQueue.main.async { client.statusMessage = str }
+            DispatchQueue.main.async {
+                client.statusMessage = str
+                // Also surface as a transient toast on the chat list so
+                // group-send failures / relay retries don't stay
+                // invisible.  OnboardingView keeps its own read of
+                // statusMessage for the unlock banner.
+                if !str.isEmpty { client.toastMessage = str }
+            }
         }, selfPtr)
 
         // ── Incoming 1:1 text ──────────────────────────────────────────
@@ -45,6 +52,9 @@ extension Peer2PearClient {
                 // notification, no list entry.
                 if client.isBlocked(peerId: msg.from) { return }
                 client.messages.append(msg)
+                // Blue-dot marker in ChatListView.  Cleared when the
+                // user opens the thread (ConversationView.onAppear).
+                client.unreadChatIds.insert(msg.from)
                 // Persist: saveMessage internally INSERT-OR-IGNOREs a
                 // stub contacts row for the FK, leaving the sender
                 // out of the address book (in_address_book=0) until
@@ -57,13 +67,16 @@ extension Peer2PearClient {
                     senderName:    ""))
                 // threadId = sender so iOS groups banners per-conversation.
                 // The content-privacy mode decides how much actually
-                // enters the OS notification store.
-                client.fireLocalNotification(
-                    fromPeerId: msg.from,
-                    senderDisplay: String(msg.from.prefix(8)) + "…",
-                    groupName: nil,
-                    messageText: msg.text,
-                    threadId: "dm:" + msg.from)
+                // enters the OS notification store.  Skip entirely if
+                // the user has muted this chat.
+                if !client.isMuted(peerId: msg.from) {
+                    client.fireLocalNotification(
+                        fromPeerId: msg.from,
+                        senderDisplay: String(msg.from.prefix(8)) + "…",
+                        groupName: nil,
+                        messageText: msg.text,
+                        threadId: "dm:" + msg.from)
+                }
             }
         }, selfPtr)
 
@@ -84,6 +97,13 @@ extension Peer2PearClient {
             )
             DispatchQueue.main.async {
                 client.groupMessages.append(gm)
+                // Skip the unread marker when it's our own echo — the
+                // sender sees their message immediately and doesn't
+                // need a "new" indicator.  Same behaviour as the
+                // notification-suppression guard below.
+                if gm.from != client.myPeerId {
+                    client.unreadChatIds.insert(gm.groupId)
+                }
                 // Upsert group roster.  Non-creator members learn about
                 // a group by receiving a message tagged with its ID.
                 // If the creator renames the group later, we also pick
@@ -128,12 +148,15 @@ extension Peer2PearClient {
                     msgId:         gm.id,
                     senderName:    gm.from))
 
-                client.fireLocalNotification(
-                    fromPeerId: gm.from,
-                    senderDisplay: String(gm.from.prefix(8)) + "…",
-                    groupName: gm.groupName.isEmpty ? "Group" : gm.groupName,
-                    messageText: gm.text,
-                    threadId: "group:" + gm.groupId)
+                // Suppress the banner if the user muted this group.
+                if !client.isMuted(peerId: gm.groupId) {
+                    client.fireLocalNotification(
+                        fromPeerId: gm.from,
+                        senderDisplay: String(gm.from.prefix(8)) + "…",
+                        groupName: gm.groupName.isEmpty ? "Group" : gm.groupName,
+                        messageText: gm.text,
+                        threadId: "group:" + gm.groupId)
+                }
             }
         }, selfPtr)
 

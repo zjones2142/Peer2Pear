@@ -252,6 +252,13 @@ final class Peer2PearClient: ObservableObject {
     @Published var myPeerId: String = ""
     @Published var statusMessage: String = ""
 
+    /// Transient status for the chat-list toast (group-send failures,
+    /// relay retry / give-up, session errors).  Set by the core's
+    /// on_status callback; the view clears it after displaying for a
+    /// few seconds.  Kept separate from `statusMessage`, which
+    /// OnboardingView uses for the persistent unlock banner.
+    @Published var toastMessage: String?
+
     /// Last-write-wins 1:1 message log.  Views may further partition by peer.
     @Published var messages: [P2PMessage] = []
 
@@ -373,7 +380,13 @@ final class Peer2PearClient: ObservableObject {
             // Group bucket (the `peerId` arg doubles as a groupId for
             // group-chat call sites).  Safe to run both branches: the
             // keys don't overlap — groupIds are UUIDs, peer IDs are
-            // 43-char base64url.
+            // 43-char base64url.  If this was a group, flip its
+            // contacts row to in_address_book=false so loadStateFromDb
+            // won't rematerialize it on next launch (it would come
+            // back empty otherwise because group entries aren't
+            // message-gated at load time).  A fresh inbound group
+            // message upserts the row back to true and revives the chat.
+            let wasGroup = self.groups[peerId] != nil
             self.groupMessages.removeAll { $0.groupId == peerId }
             self.groups.removeValue(forKey: peerId)
             self.groupAvatars.removeValue(forKey: peerId)
@@ -387,6 +400,15 @@ final class Peer2PearClient: ObservableObject {
             }
             self.dbDeleteMessages(peerId: peerId)
             self.dbDeleteFileRecordsForChat(chatKey: peerId)
+
+            if wasGroup {
+                self.dbSaveContact(DBContact(
+                    peerId:        peerId,
+                    keys:          [peerId],
+                    isGroup:       true,
+                    groupId:       peerId,
+                    inAddressBook: false))
+            }
         }
     }
 
@@ -397,6 +419,59 @@ final class Peer2PearClient: ObservableObject {
     /// we just never surface it).  Mirrors the desktop's
     /// `ChatData.isBlocked` bit.
     @Published var blockedPeerIds: Set<String> = []
+
+    /// "Hide Alerts" membership set — peers and groups whose inbound
+    /// messages should not fire a local notification.  Persisted as
+    /// the `muted` column on the contacts table; loaded on unlock.
+    @Published var mutedPeerIds: Set<String> = []
+
+    /// Set by any view that wants the root `ChatListView` nav stack to
+    /// open a specific 1:1 chat — e.g. "Send Message" on a contact
+    /// detail reached from the contacts sheet or a group member row.
+    /// ChatListView observes this via `.navigationDestination(item:)`
+    /// and pushes a `ConversationView` when it goes non-nil.  The
+    /// destination handler zeroes it out so the same peer can be
+    /// routed to again later.
+    @Published var pendingDirectChatPeerId: String?
+
+    /// Chats with at least one unread inbound message.  Keyed by the
+    /// same id a ConversationView is loaded with (peer ID for 1:1,
+    /// group ID for groups).  Session-only for now — cleared on
+    /// `lock()` and re-populated by inbound callbacks.  The chat list
+    /// renders a blue dot for any peer/group in this set.
+    @Published var unreadChatIds: Set<String> = []
+
+    /// Mark the chat (1:1 or group) as read.  Called from the
+    /// ConversationView / GroupConversationView `onAppear` so
+    /// opening a thread clears its unread dot.  Also used when the
+    /// user deletes / leaves the chat.
+    func markChatRead(chatKey: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.unreadChatIds.contains(chatKey) {
+                self.unreadChatIds.remove(chatKey)
+            }
+        }
+    }
+
+    /// True when `peerId` (either a 1:1 peer or a group) has alerts
+    /// silenced.  Reads the in-memory set so SwiftUI views re-render
+    /// reactively.
+    func isMuted(peerId: String) -> Bool {
+        mutedPeerIds.contains(peerId)
+    }
+
+    /// Flip the mute flag for a chat (1:1 peerId or groupId).  Writes
+    /// the single-column DB update immediately so the state survives
+    /// lock/unlock and relaunch.  Safe to call on the main thread.
+    func setMuted(peerId: String, muted: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if muted { self.mutedPeerIds.insert(peerId) }
+            else     { self.mutedPeerIds.remove(peerId) }
+            self.dbSetContactMuted(peerId: peerId, muted: muted)
+        }
+    }
 
     /// Toggle block state for a peer.  `blocked == true` adds to the
     /// set; `blocked == false` removes.  Persisted via the snapshot
@@ -782,6 +857,8 @@ final class Peer2PearClient: ObservableObject {
             self.knownPeerContacts = []
             self.contactNicknames  = [:]
             self.blockedPeerIds    = []
+            self.mutedPeerIds      = []
+            self.unreadChatIds     = []
             self.peerPresence      = [:]
             self.peerAvatars       = [:]
             self.pendingFileRequests = []

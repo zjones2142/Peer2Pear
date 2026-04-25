@@ -317,11 +317,12 @@ extern "C" void deadlockProbeCb(const char* peer_id,
                                  const char* avatar_b64,
                                  int64_t last_active_secs,
                                  int in_address_book,
+                                 int muted,
                                  void* ud)
 {
     (void)name; (void)subtitle; (void)keys; (void)is_blocked;
     (void)is_group; (void)group_id; (void)avatar_b64;
-    (void)last_active_secs; (void)in_address_book;
+    (void)last_active_secs; (void)in_address_book; (void)muted;
     auto* s = static_cast<ReentrancyState*>(ud);
     // Re-enter the C API from inside the callback.  A non-recursive
     // ctrlMu held across the callback would deadlock here.  Use
@@ -329,7 +330,7 @@ extern "C" void deadlockProbeCb(const char* peer_id,
     // that still grabs ctrlMu and exercises the reentrant path.
     const char* noKeys[] = {nullptr};
     (void)p2p_app_save_contact(s->ctx, peer_id, "Alice-updated", "",
-                                noKeys, 0, 0, "", "", 0, 1);
+                                noKeys, 0, 0, "", "", 0, 1, 0);
     s->count++;
 }
 
@@ -341,9 +342,9 @@ TEST(CApi, LoadContactsCallbackReentrancyDoesNotDeadlock) {
 
     // Seed three contacts so the callback fires multiple times.
     const char* keys[] = {nullptr};
-    p2p_app_save_contact(ctx, "peer1", "Alice", "", keys, 0, 0, "", "", 0, 1);
-    p2p_app_save_contact(ctx, "peer2", "Bob",   "", keys, 0, 0, "", "", 0, 1);
-    p2p_app_save_contact(ctx, "peer3", "Carol", "", keys, 0, 0, "", "", 0, 1);
+    p2p_app_save_contact(ctx, "peer1", "Alice", "", keys, 0, 0, "", "", 0, 1, 0);
+    p2p_app_save_contact(ctx, "peer2", "Bob",   "", keys, 0, 0, "", "", 0, 1, 0);
+    p2p_app_save_contact(ctx, "peer3", "Carol", "", keys, 0, 0, "", "", 0, 1, 0);
 
     ReentrancyState state{ctx, 0};
     auto fut = std::async(std::launch::async, [&]() {

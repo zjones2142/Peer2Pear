@@ -167,7 +167,7 @@ private:
     // Find the 1:1 chat index for a peer (-1 if none).  Skips group
     // chats — groups are matched by groupId via their own helpers.
     int findChatForPeer(const QString &peerIdB64u) const;
-    // As above but auto-creates an "Unknown contact" chat when no match
+    // As above but auto-creates a nameless stub chat (rendered by key
     // is found.  Used for inbound traffic from a peer we haven't
     // explicitly added yet.
     int findOrCreateChatForPeer(const QString &peerIdB64u);

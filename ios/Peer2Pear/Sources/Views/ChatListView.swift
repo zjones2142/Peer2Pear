@@ -11,13 +11,6 @@ struct ChatListView: View {
     @State private var showConnectivityInfo = false
     @State private var newContactId = ""
 
-    /// Set by ContactsListView → ContactDetailView's Send Message
-    /// handler when the user wants to land in a specific peer's chat
-    /// after dismissing the contacts sheet.  Populating this binding
-    /// triggers `navigationDestination(item:)` below, pushing the
-    /// ConversationView on the main stack.
-    @State private var pendingDirectChatPeerId: String?
-
     /// 1:1 conversations keyed by the OTHER peer's ID (not always the
     /// `from` — for outgoing messages `from == myPeerId` and we key off
     /// `to` instead).  Used to render the last-message preview per chat.
@@ -28,7 +21,16 @@ struct ChatListView: View {
     }
 
     private var directPeerIds: [String] {
-        client.chatPeerIds.subtracting([""]).sorted()
+        // Order chats by most recent activity (iMessage-style).
+        // `conversations` is already grouped by peer; take the last
+        // message's timestamp and sort descending.  Peers with no
+        // messages in the dict (shouldn't happen given chatPeerIds is
+        // message-derived) fall to the bottom in insertion order.
+        client.chatPeerIds.subtracting([""]).sorted { a, b in
+            let lastA = conversations[a]?.last?.timestamp ?? .distantPast
+            let lastB = conversations[b]?.last?.timestamp ?? .distantPast
+            return lastA > lastB
+        }
     }
 
     /// Groups sorted most-recently-active first.
@@ -99,6 +101,30 @@ struct ChatListView: View {
                     }
                 }
             }
+            .overlay(alignment: .bottom) {
+                // Transient toast for core status events — group-send
+                // failures, relay give-up, etc.  Styled close to the
+                // desktop toast; auto-dismisses on a timer.
+                if let msg = client.toastMessage, !msg.isEmpty {
+                    Text(msg)
+                        .font(.footnote)
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(.thickMaterial, in: Capsule())
+                        .overlay(Capsule().stroke(.quaternary, lineWidth: 1))
+                        .padding(.bottom, 24)
+                        .padding(.horizontal, 20)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .task(id: msg) {
+                            try? await Task.sleep(for: .seconds(3))
+                            if client.toastMessage == msg {
+                                client.toastMessage = nil
+                            }
+                        }
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: client.toastMessage)
             .navigationTitle("Chats")
             .toolbar {
                 // Leading slot: full contacts list (separate from the
@@ -168,7 +194,17 @@ struct ChatListView: View {
                 }
             }
             .sheet(isPresented: $showAddContact) {
-                AddContactSheet(client: client, newContactId: $newContactId)
+                AddContactSheet(client: client,
+                                newContactId: $newContactId,
+                                onOpenChat: { peerId in
+                                    // Sheet has already dismissed itself
+                                    // on Chat — defer a tick so the main
+                                    // stack push doesn't collide with the
+                                    // sheet slide animation.
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                        client.pendingDirectChatPeerId = peerId
+                                    }
+                                })
             }
             .sheet(isPresented: $showNewGroup) {
                 NewGroupSheet(client: client)
@@ -181,17 +217,25 @@ struct ChatListView: View {
             }
             .sheet(isPresented: $showContacts) {
                 ContactsListView(client: client, onOpenChat: { peerId in
-                    // Dismiss the contacts sheet, then push the peer's
-                    // chat onto the main stack.  The small delay gives
-                    // the sheet dismissal time to settle so the nav
-                    // animation isn't stomped on by the sheet slide.
+                    // Dismiss the contacts sheet, then ask the main
+                    // stack to push the peer's chat.  The small delay
+                    // gives the sheet dismissal time to settle so the
+                    // nav animation isn't stomped on by the slide.
                     showContacts = false
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        pendingDirectChatPeerId = peerId
+                        client.pendingDirectChatPeerId = peerId
                     }
                 })
             }
-            .navigationDestination(item: $pendingDirectChatPeerId) { peerId in
+            // Any view in the app can drop a peerId into
+            // `client.pendingDirectChatPeerId` to request a direct-chat
+            // push on the main stack.  We clear the binding when the
+            // destination is consumed so the same peer can be routed
+            // to again later.
+            .navigationDestination(item: Binding(
+                get: { client.pendingDirectChatPeerId },
+                set: { client.pendingDirectChatPeerId = $0 }
+            )) { peerId in
                 ConversationView(client: client, peerId: peerId)
             }
             .overlay {
@@ -240,6 +284,13 @@ struct GroupRow: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            Spacer()
+            if client.unreadChatIds.contains(group.id) {
+                Circle()
+                    .fill(.blue)
+                    .frame(width: 10, height: 10)
+                    .accessibilityLabel("Unread messages")
+            }
         }
     }
 }
@@ -284,6 +335,14 @@ struct ChatRow: View {
                 }
             }
             Spacer()
+            // Blue "unread" dot — iMessage-style.  Cleared when the
+            // user opens the thread (ConversationView.onAppear).
+            if client.unreadChatIds.contains(peerId) {
+                Circle()
+                    .fill(.blue)
+                    .frame(width: 10, height: 10)
+                    .accessibilityLabel("Unread messages")
+            }
             // Red warning dot if there's an outstanding key change for this peer.
             if client.keyChanges[peerId] != nil {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -386,6 +445,11 @@ struct NewGroupSheet: View {
 struct AddContactSheet: View {
     @ObservedObject var client: Peer2PearClient
     @Binding var newContactId: String
+    /// Invoked when the user taps Chat.  The parent dismisses this
+    /// sheet and pushes ConversationView on its own navigation stack,
+    /// matching the ContactsListView flow — otherwise the conversation
+    /// would render trapped inside the sheet.
+    var onOpenChat: ((String) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var showScanner = false
     @State private var scanError: String?
@@ -440,12 +504,14 @@ struct AddContactSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Chat") {
-                        // addContact lands the peer in knownPeerContacts
-                        // so they surface in the chat list before any
-                        // message round-trip happens.
-                        client.addContact(peerId: trimmed)
+                        // Jump straight into a conversation — no
+                        // address-book entry is created.  If the user
+                        // wants the peer in their contacts, they can
+                        // set a nickname from the chat's info view.
+                        let target = trimmed
                         newContactId = ""
                         dismiss()
+                        onOpenChat?(target)
                     }
                     .disabled(!isValid)
                 }
@@ -627,6 +693,21 @@ struct ContactDetailView: View {
                 Text("Nickname")
             } footer: {
                 Text("Only visible on this device. The peer can't see what you've named them.")
+            }
+
+            // ── Hide alerts ────────────────────────────────────────────
+            // Two-way binding drives `client.setMuted`, which writes the
+            // single-column DB update and updates `mutedPeerIds`.  The
+            // banner-suppression check lives in setupCallbacks.
+            Section {
+                Toggle(isOn: Binding(
+                    get: { client.isMuted(peerId: peerId) },
+                    set: { client.setMuted(peerId: peerId, muted: $0) }
+                )) {
+                    Label("Hide Alerts", systemImage: "bell.slash")
+                }
+            } footer: {
+                Text("Messages still arrive and appear in the chat. Only the notification banner is silenced.")
             }
 
             // ── Key-change warning, if any ─────────────────────────────

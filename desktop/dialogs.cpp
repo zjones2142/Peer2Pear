@@ -9,6 +9,7 @@
 
 #include <QApplication>
 #include <QBuffer>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QColorDialog>
 #include <QDesktopServices>
@@ -97,7 +98,8 @@ ContactEditorResult openContactEditor(
     const std::vector<AppDataStore::Contact> *allContacts,
     std::function<void(const AppDataStore::Contact&)> onNewContact,
     QString *avatarInOut,
-    ChatController *controller)
+    ChatController *controller,
+    bool *isMutedInOut)
 {
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
@@ -433,6 +435,24 @@ ContactEditorResult openContactEditor(
         }
     }
 
+    // ── Hide Alerts toggle ────────────────────────────────────────────────────
+    // Shown when the caller threaded an isMutedInOut pointer through.
+    // The checkbox drives a local bool; the caller reads it back on
+    // Save.  Messages still arrive; only the tray/toast is silenced.
+    QCheckBox *muteCheck = nullptr;
+    if (isMutedInOut) {
+        auto *muteSep = new QFrame(&dlg);
+        muteSep->setFrameShape(QFrame::HLine);
+        muteSep->setStyleSheet("color:#2a2a2a;");
+        root->addWidget(muteSep);
+
+        muteCheck = new QCheckBox("Hide Alerts", &dlg);
+        muteCheck->setChecked(*isMutedInOut);
+        muteCheck->setToolTip("Messages still arrive — only desktop notifications are silenced.");
+        muteCheck->setStyleSheet("color:#d0d0d0;font-size:13px;");
+        root->addWidget(muteCheck);
+    }
+
     root->addStretch();
     ContactEditorResult result = ContactEditorResult::Cancelled;
 
@@ -566,6 +586,9 @@ ContactEditorResult openContactEditor(
                 localAvatar = QString::fromLatin1(bytes.toBase64());
             }
             *avatarInOut = localAvatar;
+        }
+        if (isMutedInOut && muteCheck) {
+            *isMutedInOut = muteCheck->isChecked();
         }
     }
     return result;

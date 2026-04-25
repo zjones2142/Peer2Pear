@@ -428,35 +428,63 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
             emit unreadChanged(totalUnread());
             promoteChatToTop(i);
             rebuildChatList();
-            if (m_notifier && shouldToast()) m_notifier->notify(qtbridge::qstr(m_chats[0].name), text);
+            if (m_notifier && shouldToast() && !m_chats[0].muted)
+                m_notifier->notify(qtbridge::qstr(m_chats[0].name), text);
         }
         return;
     }
 
-    // Unknown sender — auto-create chat.  Stranger stubs stay out of
-    // the address book (inAddressBook=false) so they don't surface in
-    // the contacts picker; the user has to explicitly Add Contact to
-    // promote them.  Matches iOS's INSERT-OR-IGNORE stub path.
+    // No matching row in m_chats — either a true stranger or an
+    // explicit contact the chat-list filter evicted on startup.  Try
+    // the DB first so we don't clobber a real nickname / inAB bit
+    // with an "Unknown contact" stub (saveContact UPSERTs all fields).
     AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, ""};
     AppDataStore::Contact nc;
-    nc.name = "Unknown contact";
-    nc.subtitle = "Secure chat";
-    nc.peerIdB64u = fromStd;
-    nc.keys.push_back(fromStd);
-    nc.inAddressBook = false;
+    bool loadedFromDb = false;
+    if (m_store) loadedFromDb = m_store->loadContact(fromStd, nc);
+    if (!loadedFromDb) {
+        // Leave `nc.name` empty — identity for an un-added peer is
+        // their public key.  rebuildChatList falls back to an 8-char
+        // key prefix for empty names, and the "upgrade on avatar"
+        // path in onAvatarReceived fills the real display name when
+        // the peer broadcasts one.
+        nc.subtitle = "Secure chat";
+        nc.peerIdB64u = fromStd;
+        nc.keys.push_back(fromStd);
+        nc.inAddressBook = false;
+    }
     m_messagesByPeer[nc.peerIdB64u].push_back(msg);
     m_chats.insert(m_chats.begin(), nc);
-    if (m_store) { m_store->saveContact(nc); m_store->saveMessage(fromStd, msg); }
+    if (m_store) {
+        // Only persist the contact row when we minted a fresh stub;
+        // rehydrated rows already carry the correct nickname/inAB
+        // from the DB.
+        if (!loadedFromDb) m_store->saveContact(nc);
+        m_store->saveMessage(fromStd, msg);
+    }
     ensureUnreadSize();
     m_unread.prepend(0);
     if (m_currentChat >= 0) m_currentChat += 1;
     m_unread[0] += 1;
     emit unreadChanged(totalUnread());
-    if (m_notifier && shouldToast()) m_notifier->notify("Unknown contact", text);
+    if (m_notifier && shouldToast() && !nc.muted) {
+        const QString label = !nc.name.empty()
+            ? qtbridge::qstr(nc.name)
+            : qtbridge::qstr(p2p::peerPrefix(nc.peerIdB64u)) + "…";
+        m_notifier->notify(label, text);
+    }
     rebuildChatList();
 }
 
-void ChatView::onStatus(const QString &s) { qDebug() << "[status]" << s; }
+void ChatView::onStatus(const QString &s)
+{
+    // Status strings come from the core's onStatus channel — group-send
+    // failures, relay retry / give-up, encrypted-session unavailable,
+    // etc.  Surface them as a bottom-of-screen toast so the user sees
+    // when a message didn't land instead of silently losing it.
+    qDebug() << "[status]" << s;
+    if (!s.isEmpty()) showToast(s);
+}
 
 void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
                                       const QString &groupId,
@@ -533,11 +561,13 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     const bool needsSep = msgs.empty() ||
                           (tsSecs - msgs.back().timestampSecs) >= kDateSepSecs;
 
-    // Look up sender name from contacts
-    QString senderName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
+    // Look up sender name from contacts.  When the matching contact
+    // row exists but has no nickname (un-added peer), stick with the
+    // 8-char key-prefix fallback rather than rendering a blank label.
+    QString senderName = fromPeerIdB64u.left(8) + "...";
     for (const auto &c : m_chats) {
         if (!c.isGroup && std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
-            senderName = qtbridge::qstr(c.name);
+            if (!c.name.empty()) senderName = qtbridge::qstr(c.name);
             break;
         }
     }
@@ -560,7 +590,8 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         emit unreadChanged(totalUnread());
         promoteChatToTop(idx);
         rebuildChatList();
-        if (m_notifier) m_notifier->notifyGroup(senderName, chatName, text);
+        if (m_notifier && !chat.muted)
+            m_notifier->notifyGroup(senderName, chatName, text);
     }
 }
 
@@ -715,7 +746,7 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
                 ? QString("📎 %1 from %2").arg(fileName, senderName)
                 : QString("⚠ File from %1 failed: %2").arg(senderName, fileName);
             showToast(toastMsg);
-            if (m_notifier)
+            if (m_notifier && !m_chats[chatIndex].muted)
                 m_notifier->notify(senderName, toastMsg);
         }
 
@@ -812,9 +843,10 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
         // First genuine contact = had no avatar and now receiving one
         const bool firstTime = m_chats[i].avatarB64.empty() && !avatarStd.empty();
 
-        // If this was previously an auto-created "Unknown contact" (text
-        // arrived before any avatar), upgrade the name now that we know it.
-        if (!displayStd.empty() && m_chats[i].name == "Unknown contact") {
+        // If this was an auto-created stranger row (text arrived before
+        // any avatar, so the name was left empty / key-prefix-displayed),
+        // upgrade the name now that the peer has broadcast one.
+        if (!displayStd.empty() && m_chats[i].name.empty()) {
             m_chats[i].name = displayStd;
             if (m_store) m_store->saveContact(m_chats[i]);
         }
@@ -866,24 +898,36 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
 
     // ── First-contact avatar from unknown peer ──────────────────────────────
     //
-    // If we fall through, no matching contact exists.  Create the contact
-    // here using the peer's announced display name + avatar so the chat
-    // list shows them correctly from the first message (otherwise the
-    // follow-up text would create an "Unknown contact" row with no name).
+    // No matching row in m_chats.  Try the DB first so we don't clobber an
+    // explicit contact (the chat-list filter evicts message-less rows from
+    // m_chats on startup).  saveContact UPSERTs every column, so stubbing
+    // blindly would destroy a real nickname + flip in_address_book.
     AppDataStore::Contact nc;
-    nc.name        = displayStd.empty() ? std::string("Unknown contact") : displayStd;
-    nc.subtitle    = "Secure chat";
-    nc.peerIdB64u  = peerIdStd;
-    nc.keys.push_back(peerIdStd);
-    nc.avatarB64   = avatarStd;
+    bool loadedFromDb = false;
+    if (m_store) loadedFromDb = m_store->loadContact(peerIdStd, nc);
+    if (loadedFromDb) {
+        // Refresh only the peer-broadcast-controlled fields; preserve
+        // the user's nickname + address-book bit.
+        if (!avatarStd.empty()) nc.avatarB64 = avatarStd;
+    } else {
+        // Peer hasn't been added — identify them by public key.  Only
+        // take the broadcast display name when it's non-empty; the
+        // empty-name path lets rebuildChatList fall back to the key
+        // prefix so strangers never appear as "Unknown contact".
+        nc.name           = displayStd;
+        nc.subtitle       = "Secure chat";
+        nc.peerIdB64u     = peerIdStd;
+        nc.keys.push_back(peerIdStd);
+        nc.avatarB64      = avatarStd;
+        nc.inAddressBook  = false;
+    }
     nc.lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
-    // Stranger auto-stub: keeps the chat thread but stays out of the
-    // address book until the user explicitly adds them.
-    nc.inAddressBook = false;
 
     m_chats.insert(m_chats.begin(), nc);
     if (m_store) {
-        m_store->saveContact(nc);
+        if (!loadedFromDb) {
+            m_store->saveContact(nc);
+        }
         if (!avatarStd.empty()) m_store->saveContactAvatar(peerIdStd, avatarStd);
     }
 
@@ -1118,6 +1162,16 @@ void ChatView::onSendMessage()
     addMessageBubble(text, true, /*senderName=*/QString(), msgId, chatKey(cur));
     m_ui->messageInput->clear();
 
+    // Promote the current chat to the top of the list so outbound
+    // activity surfaces the thread the same way inbound does.
+    cur.lastActiveSecs = nowSecs;
+    if (m_store) m_store->saveContact(cur);
+    if (m_currentChat > 0) {
+        promoteChatToTop(m_currentChat);
+        rebuildChatList();
+        m_ui->chatList->setCurrentRow(0);
+    }
+
     if (cur.isGroup) {
         const std::string gid = cur.groupId.empty() ? cur.name : cur.groupId;
         m_controller->sendGroupMessageViaMailbox(
@@ -1305,6 +1359,8 @@ void ChatView::onEditContact(int index)
     const QString oldName  = name;
     const QString oldAvatar = avatar;
     const QStringList oldKeys = keys;
+    bool        muted      = m_chats[index].muted;
+    const bool  oldMuted   = muted;
 
     const ContactEditorResult result =
         openContactEditor(m_ui->centralwidget,
@@ -1319,7 +1375,8 @@ void ChatView::onEditContact(int index)
                               rebuildChatList();
                           },
                           wasGroup ? &avatar : nullptr,
-                          m_controller);
+                          m_controller,
+                          &muted);
 
     if (result == ContactEditorResult::Saved && !name.isEmpty()) {
         // Validate key format and prevent duplicate keys — 1:1 contacts only
@@ -1355,6 +1412,7 @@ void ChatView::onEditContact(int index)
 
         m_chats[index].name = name.toStdString();
         m_chats[index].keys = qtbridge::stdstrList(keys);
+        m_chats[index].muted = muted;
         if (wasGroup) m_chats[index].avatarB64 = avatar.toStdString();
         if (m_chats[index].peerIdB64u.empty() && !keys.isEmpty())
             m_chats[index].peerIdB64u = keys.first().toStdString();
@@ -1379,16 +1437,37 @@ void ChatView::onEditContact(int index)
                                                      m_chats[index].name, stdKeys);
         }
     } else if (result == ContactEditorResult::Removed) {
-        // "Remove Contact" on desktop = forget the address-book entry.
-        // iMessage-style: clear the nickname, flip the in-address-book
-        // flag, but never CASCADE-wipe the transcript.  The chat row
-        // stays visible (the rebuildChatList fallback shows a key-prefix
-        // label when name is empty).  Use right-click → "Delete
-        // Conversation" to wipe history separately.
-        m_chats[index].inAddressBook = false;
-        m_chats[index].name.clear();
-        if (m_store) m_store->saveContact(m_chats[index]);
-        rebuildChatList();
+        if (m_chats[index].isGroup) {
+            // "Delete Group" — the confirmation promised irreversible
+            // deletion.  Broadcast a group_leave so peers drop us from
+            // their rosters, then hard-delete the contacts row (the FK
+            // CASCADE wipes any residual messages/file_transfers).
+            const std::string groupId = m_chats[index].groupId;
+            m_controller->sendGroupLeaveNotification(
+                groupId, m_chats[index].name, m_chats[index].keys);
+            const std::string dbKey = m_chats[index].peerIdB64u.empty()
+                                      ? ("name:" + m_chats[index].name)
+                                      : m_chats[index].peerIdB64u;
+            if (m_store) m_store->deleteContact(dbKey);
+            m_chats.erase(m_chats.begin() + index);
+            m_unread.remove(index);
+            if (m_currentChat == index) m_currentChat = -1;
+            else if (m_currentChat > index) m_currentChat -= 1;
+            rebuildChatList();
+            if (!m_chats.empty() && m_currentChat < 0)
+                m_ui->chatList->setCurrentRow(0);
+        } else {
+            // "Remove Contact" on desktop = forget the address-book entry.
+            // iMessage-style: clear the nickname, flip the in-address-book
+            // flag, but never CASCADE-wipe the transcript.  The chat row
+            // stays visible (the rebuildChatList fallback shows a key-prefix
+            // label when name is empty).  Use right-click → "Delete
+            // Conversation" to wipe history separately.
+            m_chats[index].inAddressBook = false;
+            m_chats[index].name.clear();
+            if (m_store) m_store->saveContact(m_chats[index]);
+            rebuildChatList();
+        }
     } else if (result == ContactEditorResult::Blocked) {
         m_chats[index].isBlocked = !m_chats[index].isBlocked;
         if (m_store) m_store->saveContact(m_chats[index]);
@@ -1653,11 +1732,18 @@ void ChatView::onDeleteConversation(int index)
     if (m_store) {
         m_store->deleteMessages(c.peerIdB64u);
         m_store->deleteFileRecordsForChat(ckStd);
-        // Contact row is NOT touched.  "Delete Conversation" wipes
-        // history; "Remove Contact" is the separate address-book
-        // action.  The chat-list filter hides message-less non-group
-        // rows so an explicit contact still "disappears" from chats
-        // after delete, but remains findable via the contacts picker.
+        // Contact row is NOT hard-deleted.  For 1:1s the filter hides
+        // message-less rows already; explicit contacts stay findable
+        // via the contacts picker.  For groups we flip in_address_book
+        // to false so initChats' filter also hides them on relaunch —
+        // a fresh group message would upsert the row back to true and
+        // revive the chat.  Without this flip a deleted group row
+        // would rematerialize empty because groups aren't message-
+        // gated the way 1:1 rows are.
+        if (c.isGroup) {
+            c.inAddressBook = false;
+            m_store->saveContact(c);
+        }
     }
 
     m_messagesByPeer.erase(c.peerIdB64u);
@@ -1705,13 +1791,13 @@ int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
 
     // If the DB already has a row for this peer (e.g. an explicit
     // contact whose chat was deleted earlier), re-hydrate from it so
-    // we don't clobber the nickname with "Unknown contact".  Only fall
-    // back to a fresh stub when the peer is genuinely unknown.
+    // we keep the nickname.  Otherwise create a nameless stub — the
+    // chat list falls back to the peer's key prefix for empty names,
+    // matching iOS's displayName() behavior.
     AppDataStore::Contact nc;
     bool loaded = false;
     if (m_store) loaded = m_store->loadContact(peerIdB64u.toStdString(), nc);
     if (!loaded) {
-        nc.name = "Unknown contact";
         nc.subtitle = "Secure chat";
         nc.peerIdB64u = peerIdB64u.toStdString();
         nc.keys.push_back(peerIdB64u.toStdString());
@@ -1774,18 +1860,21 @@ void ChatView::initChats()
         }
 
         // Chat list is message-derived: we only show rows that have a
-        // transcript the user is likely to want to open.  Groups stay
-        // visible even when empty (they carry roster state).  Fresh
-        // contacts (in-address-book, no messages yet) live in the
-        // contacts picker, not the chat list — click one there to
-        // start a conversation.  Rows stay in the DB for FK integrity
-        // and `findOrCreateChatForPeer` re-hydrates when traffic
-        // resumes.
+        // transcript the user is likely to want to open.  Groups that
+        // are still in the address book stay visible even when empty
+        // (fresh group, no traffic yet) — but groups the user
+        // Deleted-Conversation'd are flagged inAddressBook=false and
+        // get filtered out here so they don't resurrect on relaunch.
+        // Fresh contacts (no messages yet) live in the contacts
+        // picker, not the chat list.  Rows stay in the DB so the FK
+        // holds and `findOrCreateChatForPeer` / `onIncomingGroupMessage`
+        // can re-hydrate them when traffic resumes.
         for (size_t i = m_chats.size(); i-- > 0; ) {
             const auto &c = m_chats[i];
             const auto  it = m_messagesByPeer.find(c.peerIdB64u);
             const bool  noMessages = (it == m_messagesByPeer.end() || it->second.empty());
-            if (!c.isGroup && noMessages) {
+            const bool  hideFresh  = !c.isGroup || !c.inAddressBook;
+            if (hideFresh && noMessages) {
                 m_messagesByPeer.erase(c.peerIdB64u);
                 m_chats.erase(m_chats.begin() + i);
             }
@@ -2423,11 +2512,13 @@ void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
     }
 
     // Figure out which contact/chat this is so we can show a friendly name.
+    // Same prefix-fallback rule as the group-message handler: empty name
+    // (un-added peer) stays on the key prefix.
     QString senderName = fromPeerIdB64u.left(8) + "...";
     const std::string fromStd = fromPeerIdB64u.toStdString();
     for (const auto &c : m_chats) {
         if (std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
-            senderName = qtbridge::qstr(c.name);
+            if (!c.name.empty()) senderName = qtbridge::qstr(c.name);
             break;
         }
     }

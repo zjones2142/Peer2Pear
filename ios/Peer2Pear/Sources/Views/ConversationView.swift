@@ -60,6 +60,7 @@ struct ConversationView: View {
         }
         .onAppear {
             activeFileRequest = pendingRequestsForPeer.first
+            client.markChatRead(chatKey: peerId)
         }
         .sheet(item: $activeFileRequest) { req in
             FileRequestSheet(client: client, request: req) {
@@ -179,6 +180,7 @@ struct GroupConversationView: View {
         }
         .navigationTitle(group?.name ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { client.markChatRead(chatKey: groupId) }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -191,7 +193,18 @@ struct GroupConversationView: View {
         }
         .sheet(isPresented: $showRoster) {
             if let group {
-                GroupRosterSheet(client: client, group: group)
+                GroupRosterSheet(client: client, group: group,
+                                  onOpenChat: { peerId in
+                                      // Close the roster, then hand the
+                                      // request off to ChatListView's
+                                      // navigationDestination.  Small
+                                      // delay so the sheet finishes
+                                      // sliding before the push starts.
+                                      showRoster = false
+                                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                          client.pendingDirectChatPeerId = peerId
+                                      }
+                                  })
             }
         }
         .fileImporter(isPresented: $showFilePicker,
@@ -324,6 +337,11 @@ struct GroupMessageBubble: View {
 struct GroupRosterSheet: View {
     @ObservedObject var client: Peer2PearClient
     let group: P2PGroup
+    /// Relayed to ContactDetailView when the user opens a member's
+    /// card.  Tapping Send Message inside that card invokes this; the
+    /// parent (GroupConversationView) dismisses the sheet and routes
+    /// through `client.pendingDirectChatPeerId`.
+    var onOpenChat: ((String) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var showRename = false
     @State private var newName = ""
@@ -383,7 +401,7 @@ struct GroupRosterSheet: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Other members will see you left.  Your local messages will be cleared.")
+                Text("Other members will see you left.  Your local transcript stays on this device — swipe the chat and tap Delete to wipe it.")
             }
             .sheet(isPresented: $showAddMember) {
                 AddGroupMemberSheet(client: client, group: group)
@@ -426,14 +444,23 @@ struct GroupRosterSheet: View {
                 Spacer()
             }
             ForEach(otherMembers, id: \.self) { peerId in
-                HStack {
-                    Image(systemName: "person").foregroundStyle(.secondary)
-                    Text(peerId.prefix(12) + "...")
-                    Spacer()
-                    if client.peerPresence[peerId] == true {
-                        Circle().fill(.green).frame(width: 8, height: 8)
+                // Tap a member to open their contact info.  Inside the
+                // detail view, "Send Message" calls `onOpenChat`, which
+                // the parent uses to dismiss this sheet and hand the
+                // push off to the root ChatListView stack.
+                NavigationLink {
+                    ContactDetailView(client: client, peerId: peerId,
+                                       onOpenChat: onOpenChat)
+                } label: {
+                    HStack {
+                        Image(systemName: "person").foregroundStyle(.secondary)
+                        Text(client.displayName(for: peerId))
+                        Spacer()
+                        if client.peerPresence[peerId] == true {
+                            Circle().fill(.green).frame(width: 8, height: 8)
+                        }
+                        TrustBadge(trust: client.peerTrust(for: peerId))
                     }
-                    TrustBadge(trust: client.peerTrust(for: peerId))
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     if isEditing {
@@ -470,6 +497,15 @@ struct GroupRosterSheet: View {
                 showRename = true
             } label: {
                 Label("Rename Group", systemImage: "pencil")
+            }
+            // Per-group "Hide Alerts" mirrors the 1:1 toggle in
+            // ContactDetailView.  Writes the DB column immediately so
+            // notification suppression survives relaunch.
+            Toggle(isOn: Binding(
+                get: { client.isMuted(peerId: group.id) },
+                set: { client.setMuted(peerId: group.id, muted: $0) }
+            )) {
+                Label("Hide Alerts", systemImage: "bell.slash")
             }
             Button(role: .destructive) {
                 confirmLeave = true

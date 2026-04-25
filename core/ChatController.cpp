@@ -672,11 +672,24 @@ void ChatController::sendSealedPayload(const std::string& peerIdB64u,
     if (env.empty()) {
         // Fail closed.  Seal failures (hard-block, missing ratchet,
         // unreachable peer) must not leak content — log + drop +
-        // surface a user-visible status for the text path only.
+        // surface a user-visible status.  Group fan-outs were silent
+        // here until we started flagging per-recipient seal errors;
+        // text + group_msg both deserve the same feedback so the user
+        // knows a message didn't reach some of their peers.
         P2P_WARN("[SEND] BLOCKED — cannot seal " << type
                    << " to " << p2p::peerPrefix(peerIdB64u) << "...");
-        if (mode == SendMode::PreferP2P && onStatus)
-            onStatus("Message not sent — encrypted session unavailable. Try again shortly.");
+        if (onStatus) {
+            if (mode == SendMode::PreferP2P) {
+                onStatus("Message not sent — encrypted session unavailable. Try again shortly.");
+            } else if (type == "group_msg") {
+                onStatus("Group message not delivered to " +
+                           p2p::peerPrefix(peerIdB64u) +
+                           "… — encrypted session unavailable.");
+            }
+            // Other envelope types (avatars, ICE signalling, KEM announces)
+            // stay quiet — they're chatty per connect and would flood
+            // the toast channel.
+        }
         return;
     }
 

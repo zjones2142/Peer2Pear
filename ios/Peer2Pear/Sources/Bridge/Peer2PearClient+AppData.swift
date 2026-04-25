@@ -29,6 +29,10 @@ extension Peer2PearClient {
         /// iOS chats-vs-contacts split.  Stranger-message stub rows
         /// have this false; explicit add-contact / import sets it true.
         var inAddressBook: Bool = true
+        /// "Hide Alerts" — when true, inbound messages for this chat
+        /// don't fire a local notification.  Shared field for 1:1s and
+        /// groups; loaded from / persisted to the contacts row.
+        var muted: Bool = false
     }
 
     /// Mirror of AppDataStore::Message.
@@ -77,7 +81,8 @@ extension Peer2PearClient {
                 c.isGroup   ? 1 : 0,
                 c.groupId, c.avatarB64,
                 c.lastActiveSecs,
-                c.inAddressBook ? 1 : 0) == 0
+                c.inAddressBook ? 1 : 0,
+                c.muted ? 1 : 0) == 0
         }
     }
 
@@ -85,6 +90,12 @@ extension Peer2PearClient {
     func dbDeleteContact(peerId: String) -> Bool {
         guard let ctx = rawContext else { return false }
         return p2p_app_delete_contact(ctx, peerId) == 0
+    }
+
+    @discardableResult
+    func dbSetContactMuted(peerId: String, muted: Bool) -> Bool {
+        guard let ctx = rawContext else { return false }
+        return p2p_app_set_contact_muted(ctx, peerId, muted ? 1 : 0) == 0
     }
 
     @discardableResult
@@ -198,7 +209,7 @@ extension Peer2PearClient {
         defer { box.release() }
         p2p_app_load_contacts(ctx, { peerIdC, nameC, subtitleC, keysC,
                                        isBlocked, isGroup, groupIdC,
-                                       avatarC, lastActive, inAB, ud in
+                                       avatarC, lastActive, inAB, muted, ud in
             guard let ud,
                   let peerIdC, let nameC, let subtitleC,
                   let groupIdC, let avatarC else { return }
@@ -218,7 +229,8 @@ extension Peer2PearClient {
                 groupId:       String(cString: groupIdC),
                 avatarB64:     String(cString: avatarC),
                 lastActiveSecs: lastActive,
-                inAddressBook: inAB != 0))
+                inAddressBook: inAB != 0,
+                muted:         muted != 0))
         }, box.toOpaque())
     }
 
@@ -305,11 +317,19 @@ extension Peer2PearClient {
         var newContacts:       Set<String>          = []
         var newNicknames:      [String: String]     = [:]
         var newBlocked:        Set<String>          = []
+        var newMuted:          Set<String>          = []
         var newGroups:         [String: P2PGroup]   = [:]
         var newGroupAvatars:   [String: String]     = [:]
 
         for c in loadedContacts {
+            if c.muted { newMuted.insert(c.peerId) }
             if c.isGroup {
+                // Skip groups the user Delete-Conversation'd — they
+                // carry in_address_book=false and would otherwise
+                // rematerialize empty on every launch.  A fresh
+                // inbound group message upserts the row back to true
+                // and the group reappears.
+                guard c.inAddressBook else { continue }
                 let g = P2PGroup(
                     id:           c.peerId,
                     name:         c.name,
@@ -378,6 +398,7 @@ extension Peer2PearClient {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.knownPeerContacts = newContacts
+            self.mutedPeerIds      = newMuted
             self.contactNicknames  = newNicknames
             self.blockedPeerIds    = newBlocked
             self.groups            = newGroups

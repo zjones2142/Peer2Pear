@@ -76,10 +76,20 @@ public:
         // leaves this true — every contact desktop saves IS in the
         // address book by construction.
         bool         inAddressBook  = true;
+        // "Hide Alerts" / mute — notifications for this chat are
+        // suppressed when true.  Messages still arrive and render
+        // in-app normally; only the OS/desktop banner is skipped.
+        // Applies to 1:1 peers and groups alike.
+        bool         muted          = false;
     };
 
     bool saveContact(const Contact& c);
     bool deleteContact(const std::string& peerIdB64u);
+
+    /// Flip the mute flag on a single contact row without rewriting
+    /// the rest of the record.  Cheap per-field UPDATE so the UI
+    /// toggle doesn't have to round-trip the whole Contact struct.
+    bool setContactMuted(const std::string& peerIdB64u, bool muted);
 
     /// Stream every contact via callback in last_active DESC order.
     /// Streaming (not batching) keeps memory flat for large rosters and
