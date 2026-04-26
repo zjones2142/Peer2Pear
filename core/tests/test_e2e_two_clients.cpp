@@ -1096,10 +1096,11 @@ TEST_F(TwoClientSuite, V2GroupBundle_ExistingMappingWinsOverInnerGroupId) {
     EXPECT_EQ(bob.groupReceived[1].groupId, realGid);
 }
 
-TEST_F(TwoClientSuite, V2GroupBundle_DropContactClearsMapping) {
-    // Leaving / deleting a group removes the bundle binding so a
-    // post-delete replay can't resurface as the old group, and a
-    // fresh re-create of the same groupId mints a new bundle.
+TEST_F(TwoClientSuite, V2GroupBundle_DeleteConversationClearsMapping) {
+    // v3 design: deleteConversation cascades the bundle map row via
+    // group_bundle_map.group_id FK ON DELETE CASCADE.  This is the
+    // "leave + wipe" path; deleteContact (address book only) does
+    // NOT drop bundle mappings any more.
     establishSessions();
     const std::string gid = "grp-bundle-leave";
     alice.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
@@ -1109,9 +1110,9 @@ TEST_F(TwoClientSuite, V2GroupBundle_DropContactClearsMapping) {
     const Bytes original = alice.appData->bundleIdForGroup(gid);
     ASSERT_EQ(original.size(), 16u);
 
-    // Simulate "leave group" — deleteContact drops the contact row +
-    // the bundle mapping (see AppDataStore::deleteContact).
-    alice.appData->deleteContact(gid);
+    // Delete the conversation row — FK cascade sweeps every group_*
+    // child including the bundle mapping.
+    EXPECT_TRUE(alice.appData->deleteConversation(gid));
     EXPECT_TRUE(alice.appData->bundleIdForGroup(gid).empty());
     EXPECT_TRUE(alice.appData->groupIdForBundle(original).empty());
 }

@@ -1740,6 +1740,13 @@ V2Env makeV2Env(CryptoEngine& crypto) {
     e.store->setEncryptionKey(randomKey32());
     e.gp = std::make_unique<GroupProtocol>(crypto);
     e.gp->setAppDataStore(e.store.get());
+    // FK target: every V2 test in this file uses "g" as the group_id
+    // for chain_state / replay_cache / send_state / msg_buffer.  Create
+    // the conversations row up front so those FKs resolve.
+    AppDataStore::Conversation conv;
+    conv.id   = "g";
+    conv.kind = AppDataStore::ConversationKind::Group;
+    EXPECT_TRUE(e.store->saveConversation(conv));
     return e;
 }
 

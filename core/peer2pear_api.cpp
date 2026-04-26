@@ -1526,29 +1526,19 @@ int p2p_app_save_contact(p2p_context* ctx,
                           const char* peer_id,
                           const char* name,
                           const char* subtitle,
-                          const char* const* keys,
-                          int is_blocked,
-                          int is_group,
-                          const char* group_id,
                           const char* avatar_b64,
-                          int64_t last_active_secs,
-                          int in_address_book,
-                          int muted)
+                          int muted,
+                          int64_t last_active_secs)
 {
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
     AppDataStore::Contact c;
     c.peerIdB64u     = peer_id;
-    c.name           = name      ? name     : "";
-    c.subtitle       = subtitle  ? subtitle : "";
-    c.keys           = fromCArray(keys);
-    c.isBlocked      = is_blocked != 0;
-    c.isGroup        = is_group   != 0;
-    c.groupId        = group_id   ? group_id   : "";
+    c.name           = name       ? name       : "";
+    c.subtitle       = subtitle   ? subtitle   : "";
     c.avatarB64      = avatar_b64 ? avatar_b64 : "";
-    c.lastActiveSecs = last_active_secs;
-    c.inAddressBook  = in_address_book != 0;
     c.muted          = muted != 0;
+    c.lastActiveSecs = last_active_secs;
     return ctx->appData->saveContact(c) ? 0 : -1;
 }
 
@@ -1564,6 +1554,48 @@ int p2p_app_set_contact_muted(p2p_context* ctx, const char* peer_id, int muted)
     if (!ctx || !peer_id) return -1;
     P2P_CTX_GUARD(ctx);
     return ctx->appData->setContactMuted(peer_id, muted != 0) ? 0 : -1;
+}
+
+// ── Blocked keys ────────────────────────────────────────────────────────────
+
+int p2p_app_add_blocked_key(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    const int64_t now = static_cast<int64_t>(time(nullptr));
+    return ctx->appData->addBlockedKey(peer_id, now) ? 0 : -1;
+}
+
+int p2p_app_remove_blocked_key(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->removeBlockedKey(peer_id) ? 0 : -1;
+}
+
+int p2p_app_is_blocked_key(p2p_context* ctx, const char* peer_id)
+{
+    if (!ctx || !peer_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->isBlockedKey(peer_id) ? 1 : 0;
+}
+
+void p2p_app_load_blocked_keys(p2p_context* ctx,
+                                p2p_blocked_key_cb cb, void* ud)
+{
+    if (!ctx || !cb) return;
+    // Same lock-discipline pattern as load_contacts: snapshot under
+    // the guard, then fire callbacks unguarded so the consumer can
+    // re-enter the API safely.
+    std::vector<std::pair<std::string, int64_t>> snapshot;
+    {
+        P2P_CTX_GUARD(ctx);
+        ctx->appData->loadAllBlockedKeys(
+            [&](const std::string& p, int64_t t) {
+                snapshot.emplace_back(p, t);
+            });
+    }
+    for (const auto& row : snapshot) cb(row.first.c_str(), row.second, ud);
 }
 
 void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
@@ -1583,20 +1615,13 @@ void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud)
         });
     }
 
-    std::vector<const char*> keysStorage;
     for (const auto& c : snapshot) {
-        toCArray(c.keys, keysStorage);
         cb(c.peerIdB64u.c_str(),
            c.name.c_str(),
            c.subtitle.c_str(),
-           keysStorage.data(),
-           c.isBlocked ? 1 : 0,
-           c.isGroup   ? 1 : 0,
-           c.groupId.c_str(),
            c.avatarB64.c_str(),
-           c.lastActiveSecs,
-           c.inAddressBook ? 1 : 0,
            c.muted ? 1 : 0,
+           c.lastActiveSecs,
            ud);
     }
 }
@@ -1613,51 +1638,174 @@ int p2p_app_save_contact_avatar(p2p_context* ctx,
 }
 
 int p2p_app_save_message(p2p_context* ctx,
-                          const char* peer_id,
+                          const char* conversation_id,
                           int sent,
                           const char* text,
                           int64_t timestamp_secs,
                           const char* msg_id,
+                          const char* sender_id,
                           const char* sender_name)
 {
-    if (!ctx || !peer_id) return -1;
+    if (!ctx || !conversation_id) return -1;
     P2P_CTX_GUARD(ctx);
     AppDataStore::Message m;
     m.sent          = sent != 0;
     m.text          = text        ? text        : "";
     m.timestampSecs = timestamp_secs;
     m.msgId         = msg_id      ? msg_id      : "";
+    m.senderId      = sender_id   ? sender_id   : "";
     m.senderName    = sender_name ? sender_name : "";
-    return ctx->appData->saveMessage(peer_id, m) ? 0 : -1;
+    return ctx->appData->saveMessage(conversation_id, m) ? 0 : -1;
 }
 
-void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
+void p2p_app_load_messages(p2p_context* ctx, const char* conversation_id,
                             p2p_message_cb cb, void* ud)
 {
-    if (!ctx || !peer_id || !cb) return;
+    if (!ctx || !conversation_id || !cb) return;
     P2P_CTX_GUARD(ctx);
-    ctx->appData->loadMessages(peer_id, [&](const AppDataStore::Message& m) {
+    ctx->appData->loadMessages(conversation_id, [&](const AppDataStore::Message& m) {
         cb(m.sent ? 1 : 0,
            m.text.c_str(),
            m.timestampSecs,
            m.msgId.c_str(),
+           m.senderId.c_str(),
            m.senderName.c_str(),
            ud);
     });
 }
 
-int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id)
+int p2p_app_delete_messages(p2p_context* ctx, const char* conversation_id)
 {
-    if (!ctx || !peer_id) return -1;
+    if (!ctx || !conversation_id) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData->deleteMessages(peer_id) ? 0 : -1;
+    return ctx->appData->deleteMessages(conversation_id) ? 0 : -1;
 }
 
-int p2p_app_delete_message(p2p_context* ctx, const char* peer_id, const char* msg_id)
+int p2p_app_delete_message(p2p_context* ctx, const char* conversation_id, const char* msg_id)
 {
-    if (!ctx || !peer_id || !msg_id) return -1;
+    if (!ctx || !conversation_id || !msg_id) return -1;
     P2P_CTX_GUARD(ctx);
-    return ctx->appData->deleteMessage(peer_id, msg_id) ? 0 : -1;
+    return ctx->appData->deleteMessage(conversation_id, msg_id) ? 0 : -1;
+}
+
+// ── Conversations ───────────────────────────────────────────────────────────
+
+int p2p_app_save_conversation(p2p_context* ctx,
+                                const char* id,
+                                const char* kind,
+                                const char* direct_peer_id,
+                                const char* group_name,
+                                const char* group_avatar_b64,
+                                int muted,
+                                int64_t last_active_secs,
+                                int in_chat_list)
+{
+    if (!ctx || !id || !kind) return -1;
+    P2P_CTX_GUARD(ctx);
+    AppDataStore::Conversation c;
+    c.id              = id;
+    c.kind            = std::string(kind) == "group"
+                            ? AppDataStore::ConversationKind::Group
+                            : AppDataStore::ConversationKind::Direct;
+    c.directPeerId    = direct_peer_id   ? direct_peer_id   : "";
+    c.groupName       = group_name       ? group_name       : "";
+    c.groupAvatarB64  = group_avatar_b64 ? group_avatar_b64 : "";
+    c.muted           = muted != 0;
+    c.lastActiveSecs  = last_active_secs;
+    c.inChatList      = in_chat_list != 0;
+    return ctx->appData->saveConversation(c) ? 0 : -1;
+}
+
+int p2p_app_find_or_create_direct_conversation(p2p_context* ctx,
+                                                  const char* peer_id,
+                                                  char* out_id,
+                                                  size_t out_id_cap)
+{
+    if (!ctx || !peer_id || !out_id || out_id_cap == 0) return -1;
+    P2P_CTX_GUARD(ctx);
+    const std::string id = ctx->appData->findOrCreateDirectConversation(peer_id);
+    if (id.empty() || id.size() + 1 > out_id_cap) return -1;
+    std::memcpy(out_id, id.data(), id.size());
+    out_id[id.size()] = '\0';
+    return 0;
+}
+
+int p2p_app_delete_conversation(p2p_context* ctx, const char* id)
+{
+    if (!ctx || !id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->deleteConversation(id) ? 0 : -1;
+}
+
+int p2p_app_set_conversation_muted(p2p_context* ctx, const char* id, int muted)
+{
+    if (!ctx || !id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->setConversationMuted(id, muted != 0) ? 0 : -1;
+}
+
+int p2p_app_set_conversation_in_chat_list(p2p_context* ctx, const char* id, int in_list)
+{
+    if (!ctx || !id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->setConversationInChatList(id, in_list != 0) ? 0 : -1;
+}
+
+void p2p_app_load_conversations(p2p_context* ctx,
+                                  p2p_conversation_cb cb,
+                                  void* ud)
+{
+    if (!ctx || !cb) return;
+    // Snapshot before firing callbacks — same lock-discipline reason
+    // as p2p_app_load_contacts (callbacks may re-enter the API).
+    std::vector<AppDataStore::Conversation> snapshot;
+    {
+        P2P_CTX_GUARD(ctx);
+        ctx->appData->loadAllConversations(
+            [&](const AppDataStore::Conversation& c) {
+                snapshot.push_back(c);
+            });
+    }
+    for (const auto& c : snapshot) {
+        const char* kind = c.kind == AppDataStore::ConversationKind::Group
+                               ? "group" : "direct";
+        cb(c.id.c_str(),
+           kind,
+           c.directPeerId.c_str(),
+           c.groupName.c_str(),
+           c.groupAvatarB64.c_str(),
+           c.muted ? 1 : 0,
+           c.lastActiveSecs,
+           c.inChatList ? 1 : 0,
+           ud);
+    }
+}
+
+int p2p_app_set_conversation_members(p2p_context* ctx,
+                                        const char* conversation_id,
+                                        const char* const* peer_ids)
+{
+    if (!ctx || !conversation_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->setConversationMembers(conversation_id,
+                                                  fromCArray(peer_ids))
+        ? 0 : -1;
+}
+
+void p2p_app_load_conversation_members(p2p_context* ctx,
+                                          const char* conversation_id,
+                                          p2p_conversation_member_cb cb,
+                                          void* ud)
+{
+    if (!ctx || !conversation_id || !cb) return;
+    std::vector<std::string> snapshot;
+    {
+        P2P_CTX_GUARD(ctx);
+        ctx->appData->loadConversationMembers(
+            conversation_id,
+            [&](const std::string& pid) { snapshot.push_back(pid); });
+    }
+    for (const auto& pid : snapshot) cb(pid.c_str(), ud);
 }
 
 int p2p_app_save_setting(p2p_context* ctx, const char* key, const char* value)

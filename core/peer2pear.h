@@ -22,6 +22,7 @@
 #define PEER2PEAR_H
 
 #include <stdint.h>
+#include <stddef.h>  // size_t
 
 #ifdef __cplusplus
 extern "C" {
@@ -743,45 +744,62 @@ void p2p_set_on_peer_key_changed(p2p_context* ctx,
  * call — copy if you need them past the callback's return.
  */
 
-/** Save (insert or update) a contact row.  `keys` is a NULL-terminated
- *  array of base64url public keys (one per peer for groups, one for
- *  1:1 contacts).  `last_active_secs` is unix time; pass 0 for "never".
- *  `in_address_book` toggles the iOS chats-vs-contacts split — pass 1
- *  for explicit user-added contacts, 0 for stranger-message stub rows. */
+/** Save (insert or update) a contact row.  Address-book entry only —
+ *  groups are NOT contacts in v3 (use p2p_app_save_conversation),
+ *  block lives in `blocked_keys` (use p2p_app_add_blocked_key).
+ *  `last_active_secs` is unix time; pass 0 for "never".
+ *  `muted` is the person-level mute (cross-conversation). */
 int p2p_app_save_contact(p2p_context* ctx,
                           const char* peer_id,
                           const char* name,
                           const char* subtitle,
-                          const char* const* keys,
-                          int is_blocked,
-                          int is_group,
-                          const char* group_id,
                           const char* avatar_b64,
-                          int64_t last_active_secs,
-                          int in_address_book,
-                          int muted);
+                          int muted,
+                          int64_t last_active_secs);
 
-/** Delete a contact (and CASCADE its messages). */
+/** Delete a contact (address-book entry only — does NOT touch
+ *  conversations or messages).  Use p2p_app_delete_conversation to
+ *  wipe a chat thread. */
 int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id);
 
-/** Toggle the "hide alerts" / mute flag without rewriting other
- *  fields.  When muted, clients suppress notifications for this chat
- *  — messages still arrive and render in-app normally.  Returns 0 on
- *  success, -1 on invalid args / no matching row. */
+/** Toggle person-level mute.  OR'd with conversation-level mute at
+ *  notification time. */
 int p2p_app_set_contact_muted(p2p_context* ctx, const char* peer_id, int muted);
 
-/** Stream every contact via callback (last_active DESC). */
+// ── Blocked keys (Phase 3h) ─────────────────────────────────────────────────
+//
+// Block is its own concept, separate from address-book curation.
+// A peer can be blocked without being a contact, and a contact can
+// be blocked without losing their address-book entry.
+
+/** Add `peer_id` to the blocked list.  Idempotent — re-blocking
+ *  refreshes the timestamp.  Returns 0 on success, -1 on bad args. */
+int p2p_app_add_blocked_key(p2p_context* ctx, const char* peer_id);
+
+/** Remove `peer_id` from the blocked list.  Returns 0 when a row
+ *  was removed, -1 when the key wasn't blocked or args were bad. */
+int p2p_app_remove_blocked_key(p2p_context* ctx, const char* peer_id);
+
+/** Returns 1 when blocked, 0 when not, -1 on bad args. */
+int p2p_app_is_blocked_key(p2p_context* ctx, const char* peer_id);
+
+/** Stream every blocked key in insertion order (blocked_at ASC).  The
+ *  callback fires once per row with `peer_id` and the unix-secs at
+ *  which it was blocked. */
+typedef void (*p2p_blocked_key_cb)(const char* peer_id,
+                                     int64_t blocked_at_secs,
+                                     void* ud);
+void p2p_app_load_blocked_keys(p2p_context* ctx,
+                                 p2p_blocked_key_cb cb, void* ud);
+
+/** Stream every contact via callback (last_active DESC).  Block state
+ *  is reported via p2p_app_load_blocked_keys, separate stream. */
 typedef void (*p2p_contact_cb)(const char* peer_id,
                                 const char* name,
                                 const char* subtitle,
-                                const char* const* keys,
-                                int is_blocked,
-                                int is_group,
-                                const char* group_id,
                                 const char* avatar_b64,
-                                int64_t last_active_secs,
-                                int in_address_book,
                                 int muted,
+                                int64_t last_active_secs,
                                 void* ud);
 void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud);
 
@@ -790,33 +808,107 @@ int p2p_app_save_contact_avatar(p2p_context* ctx,
                                  const char* peer_id,
                                  const char* avatar_b64);
 
-/** Insert a 1:1 or group message.  For groups, `peer_id` is the group_id
- *  and `sender_name` carries the sender's display name (1:1 leaves it ""). */
+// ── Conversations ───────────────────────────────────────────────────────────
+//
+// Chat threads.  `kind` is "direct" (1:1) or "group".  `direct_peer_id`
+// is the peer's pubkey for direct conversations; pass NULL for groups.
+// `group_name` / `group_avatar_b64` are encrypted at rest; pass NULL
+// for direct.
+
+/** Save (insert or update) a conversation row by id. */
+int p2p_app_save_conversation(p2p_context* ctx,
+                                const char* id,
+                                const char* kind,
+                                const char* direct_peer_id,
+                                const char* group_name,
+                                const char* group_avatar_b64,
+                                int muted,
+                                int64_t last_active_secs,
+                                int in_chat_list);
+
+/** Find an existing direct conversation for `peer_id`, or mint + persist
+ *  a new one.  Writes the resulting id (UUID, NUL-terminated) into
+ *  `out_id` (caller-provided buffer of `out_id_cap` bytes — 64 is
+ *  plenty).  Returns 0 on success, -1 on bad args / DB error. */
+int p2p_app_find_or_create_direct_conversation(p2p_context* ctx,
+                                                  const char* peer_id,
+                                                  char* out_id,
+                                                  size_t out_id_cap);
+
+/** Delete a conversation and CASCADE its messages, members, and
+ *  group_* state. */
+int p2p_app_delete_conversation(p2p_context* ctx, const char* id);
+
+/** Toggle conversation-level mute. */
+int p2p_app_set_conversation_muted(p2p_context* ctx, const char* id, int muted);
+
+/** Hide / un-hide a conversation from the chat list without deleting
+ *  messages. */
+int p2p_app_set_conversation_in_chat_list(p2p_context* ctx, const char* id, int in_list);
+
+/** Stream every conversation via callback (last_active DESC). */
+typedef void (*p2p_conversation_cb)(const char* id,
+                                       const char* kind,
+                                       const char* direct_peer_id,
+                                       const char* group_name,
+                                       const char* group_avatar_b64,
+                                       int muted,
+                                       int64_t last_active_secs,
+                                       int in_chat_list,
+                                       void* ud);
+void p2p_app_load_conversations(p2p_context* ctx,
+                                  p2p_conversation_cb cb,
+                                  void* ud);
+
+/** Replace the entire member roster of a conversation atomically.
+ *  `peer_ids` is a NULL-terminated array of base64url pubkeys. */
+int p2p_app_set_conversation_members(p2p_context* ctx,
+                                        const char* conversation_id,
+                                        const char* const* peer_ids);
+
+/** Stream the peer_id of each member of a conversation. */
+typedef void (*p2p_conversation_member_cb)(const char* peer_id, void* ud);
+void p2p_app_load_conversation_members(p2p_context* ctx,
+                                          const char* conversation_id,
+                                          p2p_conversation_member_cb cb,
+                                          void* ud);
+
+// ── Messages ────────────────────────────────────────────────────────────────
+
+/** Insert a message into `conversation_id`.  The conversation row MUST
+ *  already exist — call p2p_app_find_or_create_direct_conversation
+ *  first for inbound-from-stranger.  `sender_id` is the originator
+ *  peer_id for inbound messages, NULL/"" for outbound. */
 int p2p_app_save_message(p2p_context* ctx,
-                          const char* peer_id,
+                          const char* conversation_id,
                           int sent,
                           const char* text,
                           int64_t timestamp_secs,
                           const char* msg_id,
+                          const char* sender_id,
                           const char* sender_name);
 
-/** Stream messages for `peer_id` in chronological order. */
+/** Stream messages for `conversation_id` in chronological order. */
 typedef void (*p2p_message_cb)(int sent,
                                 const char* text,
                                 int64_t timestamp_secs,
                                 const char* msg_id,
+                                const char* sender_id,
                                 const char* sender_name,
                                 void* ud);
-void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
+void p2p_app_load_messages(p2p_context* ctx, const char* conversation_id,
                             p2p_message_cb cb, void* ud);
 
-/** Wipe all messages for `peer_id`.  Doesn't touch the contact row. */
-int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id);
+/** Wipe all messages for `conversation_id`.  Doesn't delete the
+ *  conversation row itself — caller decides whether the thread
+ *  stays in the chat list (use p2p_app_delete_conversation for
+ *  full removal). */
+int p2p_app_delete_messages(p2p_context* ctx, const char* conversation_id);
 
-/** Delete a single message identified by (peer_id, msg_id).  Used by
- *  the long-press / right-click "Delete Message" UX.  Returns 0 on
- *  success, -1 on invalid args or when no matching row exists. */
-int p2p_app_delete_message(p2p_context* ctx, const char* peer_id, const char* msg_id);
+/** Delete a single message identified by (conversation_id, msg_id).
+ *  Returns 0 on success, -1 on invalid args or when no matching row
+ *  exists. */
+int p2p_app_delete_message(p2p_context* ctx, const char* conversation_id, const char* msg_id);
 
 /** Settings key/value store.  load returns the static-storage scratch
  *  buffer in `ctx`; treat it as valid only until the next p2p_* call. */

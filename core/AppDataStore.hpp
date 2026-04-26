@@ -27,8 +27,8 @@
  * contacts.subtitle, contacts.keys, contacts.avatar, file_transfers.file_name,
  * file_transfers.peer_name, file_transfers.saved_path.
  *
- * Stored plaintext: peer_id (PK lookup), is_blocked, is_group, timestamps,
- * counters, settings.value (callers encrypt sensitive settings themselves).
+ * Stored plaintext: peer_id (PK lookup), timestamps, counters,
+ * settings.value (callers encrypt sensitive settings themselves).
  *
  * Thread-safety: not internally synchronised.  Callers must serialise
  * access — typical pattern is "call from the controller thread".
@@ -58,32 +58,35 @@ public:
                           const std::vector<Bytes>& legacyKeys = {});
 
     // ── Contacts ──────────────────────────────────────────────────────────
+    //
+    // Address book rows.  User-curated only — first inbound message
+    // from a stranger creates a CONVERSATION (see below), never a
+    // contact.  No is_group / group_id / keys list — those concerns
+    // moved to `conversations` and `conversation_members`.
+    //
+    // `muted` is the person-level mute, OR'd with the matching
+    // conversation's `muted` flag at notification time.  Muting Alice
+    // here silences her messages everywhere (1:1 and groups).
 
     struct Contact {
-        std::string  peerIdB64u;     // PK; for groups this is the groupId
+        std::string  peerIdB64u;     // PK; Ed25519 base64url public key
         std::string  name;
         std::string  subtitle;
-        std::vector<std::string> keys;
-        bool         isBlocked      = false;
-        bool         isGroup        = false;
-        std::string  groupId;
         std::string  avatarB64;
-        int64_t      lastActiveSecs = 0;   // 0 = never
-        // iOS chats-vs-contacts split: a stranger's first inbound message
-        // auto-creates a contact row so messages.peer_id satisfies its FK,
-        // but they only appear in the address-book UI once the user
-        // explicitly adds them (taps + New Chat / imports).  Desktop
-        // leaves this true — every contact desktop saves IS in the
-        // address book by construction.
-        bool         inAddressBook  = true;
-        // "Hide Alerts" / mute — notifications for this chat are
-        // suppressed when true.  Messages still arrive and render
-        // in-app normally; only the OS/desktop banner is skipped.
-        // Applies to 1:1 peers and groups alike.
         bool         muted          = false;
+        int64_t      lastActiveSecs = 0;   // 0 = never
+        // Block state lives in `blocked_keys` (Phase 3h), keyed by
+        // peer_id but independent of contact-row existence.  Use
+        // isBlockedKey()/addBlockedKey()/removeBlockedKey() — never
+        // store block on the address-book row.
     };
 
     bool saveContact(const Contact& c);
+
+    /// Remove the address-book entry only.  Conversations and messages
+    /// involving this peer are NOT touched — chat history is the
+    /// user's data, separate from address-book curation.  To wipe a
+    /// chat thread use `deleteConversation`.
     bool deleteContact(const std::string& peerIdB64u);
 
     /// Flip the mute flag on a single contact row without rewriting
@@ -98,9 +101,8 @@ public:
 
     /// Load a single contact by peer ID.  Returns true and populates
     /// `out` when the row exists; false otherwise (leaves `out`
-    /// untouched).  Used when we need to repopulate in-memory state
-    /// from DB without an O(n) scan — e.g. a peer messaging after
-    /// their chat row was deleted but their contact row wasn't.
+    /// untouched).  A peer with no contact row is just "not in your
+    /// address book yet" — they may still appear in conversations.
     bool loadContact(const std::string& peerIdB64u, Contact& out) const;
 
     /// Serialize the address book to the v1 wire format used by
@@ -110,40 +112,170 @@ public:
     std::string exportContactsJson() const;
 
     /// Merge contacts from a v1 JSON blob.  Existing rows (keyed by
-    /// peerIdB64u, or by "name:<name>" for unnamed rows) are never
-    /// overwritten.  Returns the number of rows inserted, or -1 on
-    /// parse error.
+    /// peerIdB64u) are never overwritten.  Returns the number of rows
+    /// inserted, or -1 on parse error.
     int importContactsJson(const std::string& json);
 
     bool  saveContactAvatar(const std::string& peerIdB64u, const std::string& avatarB64);
     bool  saveContactKemPub(const std::string& peerIdB64u, const Bytes& kemPub);
     Bytes loadContactKemPub(const std::string& peerIdB64u) const;
 
+    // ── Conversations ─────────────────────────────────────────────────────
+    //
+    // Chat threads.  One row per direct (1:1) or group conversation.
+    // `id` is always a fresh UUID — for a 1:1 chat it does NOT equal
+    // the peer's peer_id; lookup goes through `directPeerId` which is
+    // partial-UNIQUE-indexed.  Groups have NULL directPeerId; their
+    // members live in `conversation_members`.
+    //
+    // `groupName` and `groupAvatar` are field-encrypted at rest with
+    // AAD = "conversations|<column>|<id>".
+
+    enum class ConversationKind { Direct, Group };
+
+    struct Conversation {
+        std::string       id;             // PK; UUID
+        ConversationKind  kind           = ConversationKind::Direct;
+        std::string       directPeerId;   // 1:1: peer_id; group: empty
+        std::string       groupName;      // group: encrypted name
+        std::string       groupAvatarB64; // group: encrypted avatar
+        bool              muted          = false;
+        int64_t           lastActiveSecs = 0;
+        bool              inChatList     = true;
+    };
+
+    /// Create or replace a conversation row by id.  Members must be
+    /// added separately via `addConversationMember` — saveConversation
+    /// only writes the conversations row.
+    bool saveConversation(const Conversation& c);
+
+    /// Lookup by id.  False if missing.
+    bool loadConversation(const std::string& id, Conversation& out) const;
+
+    /// Stream every conversation in last_active DESC order.
+    void loadAllConversations(
+        const std::function<void(const Conversation&)>& cb) const;
+
+    /// Find an existing direct conversation for `peerIdB64u`, or mint
+    /// a new one + add the peer as the sole member.  Idempotent —
+    /// concurrent callers converge on the same row via the partial
+    /// UNIQUE index on direct_peer_id.  Returns the conversation id
+    /// (empty on DB error).
+    std::string findOrCreateDirectConversation(const std::string& peerIdB64u);
+
+    /// Ensure a group conversation row exists with the given id (which
+    /// equals the group_id used by every group_* table's FK).  Used
+    /// by call sites that touch group_chain_state / group_send_state /
+    /// group_replay_cache / group_msg_buffer / group_bundle_map —
+    /// these all FK to conversations(id) ON DELETE CASCADE in v3, so
+    /// the parent must exist before any child INSERT.  Idempotent;
+    /// no-op when a row with that id already exists.
+    bool ensureGroupConversation(const std::string& groupId);
+
+    /// Cascade-deletes messages, members, group_* state for this
+    /// conversation via the FK ON DELETE CASCADE constraints.
+    bool deleteConversation(const std::string& id);
+
+    /// Per-conversation mute (independent of contact-level mute).
+    bool setConversationMuted(const std::string& id, bool muted);
+
+    /// Hide / un-hide a conversation from the chat list without
+    /// deleting messages.  Useful for "archive" / "leave but don't
+    /// delete" UX.
+    bool setConversationInChatList(const std::string& id, bool inList);
+
+    /// Bump last_active for a conversation.  Called on every send and
+    /// receive; sorting/ordering in the chat list reads this column.
+    void touchConversation(const std::string& id, int64_t whenSecs);
+
+    // ── Conversation members ──────────────────────────────────────────────
+
+    /// Add a peer to a conversation (no-op if already a member).
+    /// Returns false on DB error or invalid foreign key.
+    bool addConversationMember(const std::string& conversationId,
+                                 const std::string& peerIdB64u);
+
+    /// Remove a peer from a conversation.  Returns false if no row
+    /// matched (idempotent caller can ignore).
+    bool removeConversationMember(const std::string& conversationId,
+                                    const std::string& peerIdB64u);
+
+    /// Replace the entire membership of a conversation atomically —
+    /// callers handing us a fresh roster snapshot don't need to diff.
+    bool setConversationMembers(const std::string& conversationId,
+                                  const std::vector<std::string>& peerIds);
+
+    /// Stream the peer_ids of every member of a conversation.
+    void loadConversationMembers(
+        const std::string& conversationId,
+        const std::function<void(const std::string&)>& cb) const;
+
+    // ── Blocked keys ──────────────────────────────────────────────────────
+    //
+    // Phase 3h: block is its own thing, separate from `contacts`.
+    // Inbound messages from a peer in this table are silently dropped
+    // (the runtime check is in the platform bridge — core just owns
+    // the persistence).
+    //
+    // Independent of address-book curation: a user can simultaneously
+    // have a contact entry AND have them blocked, OR be blocked
+    // without ever being added to the address book.  Both states are
+    // valid and orthogonal.
+
+    /// Add `peerIdB64u` to the blocked list.  Idempotent (re-blocking
+    /// is a no-op).  Returns false on DB error or empty input.
+    bool addBlockedKey(const std::string& peerIdB64u, int64_t whenSecs);
+
+    /// Remove `peerIdB64u` from the blocked list.  Returns true when
+    /// a row was removed, false when the key wasn't blocked.
+    bool removeBlockedKey(const std::string& peerIdB64u);
+
+    /// Single-key membership check.  Hot-path-friendly (PK lookup).
+    bool isBlockedKey(const std::string& peerIdB64u) const;
+
+    /// Stream every blocked key in insertion order (blocked_at ASC).
+    /// Used by the iOS bridge to populate its `blockedPeerIds` set on
+    /// launch and by the desktop's "Blocked" picker.
+    void loadAllBlockedKeys(
+        const std::function<void(const std::string& peerIdB64u,
+                                  int64_t blockedAt)>& cb) const;
+
     // ── Messages ──────────────────────────────────────────────────────────
+    //
+    // Keyed by `conversationId` (UUID into `conversations.id`), not by
+    // peer.  For direct chats the conversation tells us who the other
+    // party is; for groups the per-message `senderId` identifies which
+    // member sent it.  Outbound messages set senderId = "" (caller is
+    // self by definition).
 
     struct Message {
         bool         sent;
         std::string  text;
         int64_t      timestampSecs;
         std::string  msgId;
-        std::string  senderName;     // populated for inbound group messages
+        std::string  senderId;       // empty on outbound; peer_id on inbound
+        std::string  senderName;     // self-declared name (group inbound only)
     };
 
-    /// Insert a message and bump contacts.last_active in one transaction.
-    bool saveMessage(const std::string& peerIdB64u, const Message& m);
+    /// Insert a message and bump conversations.last_active in one
+    /// transaction.  The conversation row MUST already exist — callers
+    /// that handle inbound-from-stranger should call
+    /// `findOrCreateDirectConversation` first.
+    bool saveMessage(const std::string& conversationId, const Message& m);
 
-    /// Stream every message for `peerIdB64u` in chronological order.
-    void loadMessages(const std::string& peerIdB64u,
+    /// Stream every message for `conversationId` in chronological order.
+    void loadMessages(const std::string& conversationId,
                       const std::function<void(const Message&)>& cb) const;
 
-    /// Wipe every message for `peerIdB64u`.  Doesn't touch the contacts
-    /// row — caller decides whether the contact stays in the address book.
-    bool deleteMessages(const std::string& peerIdB64u);
+    /// Wipe every message for `conversationId`.  Doesn't touch the
+    /// conversation row itself — caller decides whether the thread
+    /// stays in the chat list.
+    bool deleteMessages(const std::string& conversationId);
 
-    /// Delete a single message by (peerId, msgId).  Used by the
+    /// Delete a single message by (conversationId, msgId).  Used by the
     /// long-press / right-click "Delete Message" UX on both platforms.
     /// Returns true when a row was deleted, false when nothing matched.
-    bool deleteMessage(const std::string& peerIdB64u, const std::string& msgId);
+    bool deleteMessage(const std::string& conversationId, const std::string& msgId);
 
     // ── Settings ──────────────────────────────────────────────────────────
 
@@ -397,7 +529,9 @@ public:
 
 private:
     void createTables();
-    void updateLastActive(const std::string& peerIdB64u);
+    /// Bump contacts.last_active.  No-op when there's no contact row
+    /// (Phase 3 dropped the auto-stub-from-stranger behaviour).
+    void touchContact(const std::string& peerIdB64u, int64_t whenSecs);
 
     // Arch-review #1b: every per-field encrypt MUST supply an AAD
     // that binds the row's logical identity (table, column, row key)

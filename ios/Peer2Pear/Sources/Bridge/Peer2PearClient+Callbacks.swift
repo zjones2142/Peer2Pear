@@ -46,6 +46,13 @@ extension Peer2PearClient {
                 text: String(cString: text),
                 timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
             )
+            // Resolve / mint the conversation_id BEFORE the dispatch —
+            // ensureDirectConversationId hits the C API and is safe
+            // off the main thread, but the in-memory cache update
+            // hops back to main on its own.  v3 contract: stranger's
+            // first inbound message creates a CONVERSATION, not a
+            // contact (address book stays user-curated).
+            let convId = client.ensureDirectConversationId(for: msg.from)
             DispatchQueue.main.async {
                 // Drop messages from blocked peers.  Mirrors desktop
                 // chatview `if (chat.isBlocked) return`.  Silent — no
@@ -55,16 +62,19 @@ extension Peer2PearClient {
                 // Blue-dot marker in ChatListView.  Cleared when the
                 // user opens the thread (ConversationView.onAppear).
                 client.unreadChatIds.insert(msg.from)
-                // Persist: saveMessage internally INSERT-OR-IGNOREs a
-                // stub contacts row for the FK, leaving the sender
-                // out of the address book (in_address_book=0) until
-                // the user explicitly adds them via "+ New Chat".
-                client.dbSaveMessage(peerId: msg.from, message: DBMessage(
-                    sent:          false,
-                    text:          msg.text,
-                    timestampSecs: Int64(msg.timestamp.timeIntervalSince1970),
-                    msgId:         msg.id,
-                    senderName:    ""))
+                // Persist into the v3 messages table keyed by
+                // conversation_id.  senderId carries the originator's
+                // peer_id — needed on a later restart to route the
+                // row back to the right bubble side.
+                if let convId {
+                    client.dbSaveMessage(conversationId: convId, message: DBMessage(
+                        sent:          false,
+                        text:          msg.text,
+                        timestampSecs: Int64(msg.timestamp.timeIntervalSince1970),
+                        msgId:         msg.id,
+                        senderId:      msg.from,
+                        senderName:    ""))
+                }
                 // threadId = sender so iOS groups banners per-conversation.
                 // The content-privacy mode decides how much actually
                 // enters the OS notification store.  Skip entirely if
@@ -140,22 +150,27 @@ extension Peer2PearClient {
                 // from this group's members are admitted.
                 client.setKnownGroupMembers(groupId: gm.groupId,
                                              memberPeerIds: roster)
-                // Persist: upsert the group's contact row + insert the
-                // message.  senderName carries the sender's peer ID so
-                // a later restart can reconstruct who sent what.
-                client.dbSaveContact(DBContact(
-                    peerId:        gm.groupId,
-                    name:          g.name,
-                    keys:          roster,
-                    isGroup:       true,
-                    groupId:       gm.groupId,
-                    avatarB64:     client.groupAvatars[gm.groupId] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
-                client.dbSaveMessage(peerId: gm.groupId, message: DBMessage(
+                // Persist: upsert the group's conversation metadata +
+                // insert the message.  The conversation row itself is
+                // guaranteed to exist (the C++ side calls
+                // ensureGroupConversation + setConversationMembers
+                // before dispatching this callback), so saveMessage's
+                // FK requirement is met.  senderId carries the
+                // originator's peer_id — needed on a later restart.
+                client.dbSaveConversation(DBConversation(
+                    id:              gm.groupId,
+                    kind:            .group,
+                    groupName:       g.name,
+                    groupAvatarB64:  client.groupAvatars[gm.groupId] ?? "",
+                    muted:           client.isMuted(peerId: gm.groupId),
+                    lastActiveSecs:  Int64(g.lastActivity.timeIntervalSince1970),
+                    inChatList:      true))
+                client.dbSaveMessage(conversationId: gm.groupId, message: DBMessage(
                     sent:          gm.from == client.myPeerId,
                     text:          gm.text,
                     timestampSecs: Int64(gm.timestamp.timeIntervalSince1970),
                     msgId:         gm.id,
+                    senderId:      gm.from,
                     senderName:    gm.from))
 
                 // Suppress the banner if the user muted this group.
@@ -206,22 +221,27 @@ extension Peer2PearClient {
                         : "\(fromStr.prefix(8))… left the group",
                     timestamp: Date())
                 client.groupMessages.append(marker)
-                // Persist roster change + marker.
+                // Persist roster change + marker.  Members are kept
+                // in sync by the C++ side (GroupProtocol calls
+                // setConversationMembers when the roster changes), so
+                // we only need to upsert the conversation metadata
+                // and append the marker message.
                 if let g = client.groups[gidStr] {
-                    client.dbSaveContact(DBContact(
-                        peerId:        gidStr,
-                        name:          g.name,
-                        keys:          g.memberIds,
-                        isGroup:       true,
-                        groupId:       gidStr,
-                        avatarB64:     client.groupAvatars[gidStr] ?? "",
-                        lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
+                    client.dbSaveConversation(DBConversation(
+                        id:              gidStr,
+                        kind:            .group,
+                        groupName:       g.name,
+                        groupAvatarB64:  client.groupAvatars[gidStr] ?? "",
+                        muted:           client.isMuted(peerId: gidStr),
+                        lastActiveSecs:  Int64(g.lastActivity.timeIntervalSince1970),
+                        inChatList:      true))
                 }
-                client.dbSaveMessage(peerId: gidStr, message: DBMessage(
+                client.dbSaveMessage(conversationId: gidStr, message: DBMessage(
                     sent:          fromStr == client.myPeerId,
                     text:          marker.text,
                     timestampSecs: Int64(marker.timestamp.timeIntervalSince1970),
                     msgId:         marker.id,
+                    senderId:      fromStr == client.myPeerId ? "" : fromStr,
                     senderName:    fromStr))
             }
         }, selfPtr)
@@ -237,18 +257,22 @@ extension Peer2PearClient {
                 g.name = nameStr
                 g.lastActivity = Date()
                 client.groups[gidStr] = g
-                client.dbSaveContact(DBContact(
-                    peerId:        gidStr,
-                    name:          nameStr,
-                    keys:          g.memberIds,
-                    isGroup:       true,
-                    groupId:       gidStr,
-                    avatarB64:     client.groupAvatars[gidStr] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
+                client.dbSaveConversation(DBConversation(
+                    id:              gidStr,
+                    kind:            .group,
+                    groupName:       nameStr,
+                    groupAvatarB64:  client.groupAvatars[gidStr] ?? "",
+                    muted:           client.isMuted(peerId: gidStr),
+                    lastActiveSecs:  Int64(g.lastActivity.timeIntervalSince1970),
+                    inChatList:      true))
             }
         }, selfPtr)
 
         // ── Group avatar updated ───────────────────────────────────────
+        // v3: group avatars live on the conversation row, not on a
+        // contact (groups aren't contacts).  Re-upsert the whole
+        // conversation row so the field-encrypted avatar lands in
+        // place; group name + last_active come from in-memory state.
         p2p_set_on_group_avatar(ctx, { gid, avatarB64, ud in
             guard let client = Peer2PearClient.from(ud),
                   let gid, let avatarB64 else { return }
@@ -257,7 +281,15 @@ extension Peer2PearClient {
             DispatchQueue.main.async {
                 if client.groupAvatars[gidStr] != avatarStr {
                     client.groupAvatars[gidStr] = avatarStr
-                    client.dbSaveContactAvatar(peerId: gidStr, avatarB64: avatarStr)
+                    let g = client.groups[gidStr]
+                    client.dbSaveConversation(DBConversation(
+                        id:              gidStr,
+                        kind:            .group,
+                        groupName:       g?.name ?? "",
+                        groupAvatarB64:  avatarStr,
+                        muted:           client.isMuted(peerId: gidStr),
+                        lastActiveSecs:  Int64((g?.lastActivity ?? Date()).timeIntervalSince1970),
+                        inChatList:      true))
                 }
             }
         }, selfPtr)

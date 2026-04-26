@@ -321,18 +321,42 @@ final class Peer2PearClient: ObservableObject {
     /// the user re-verifies via `markPeerVerified`.
     @Published var keyChanges: [String: P2PKeyChange] = [:]
 
-    /// Peers the user added via "New Chat" before any messages flowed.
-    /// ChatListView unions this with the message-derived peer set so a
-    /// freshly-added contact shows up immediately.  Persisted as
-    /// in_address_book=1 contact rows in the AppDataStore so restarts
-    /// don't lose contacts that haven't yet exchanged a message.
+    /// Peers the user explicitly added to the address book — drives
+    /// ContactsListView and is unioned with message-derived peers in
+    /// ChatListView.  Backed 1:1 by the v3 contacts table now: every
+    /// row in `contacts` is by definition a curated address-book
+    /// entry (no more in_address_book toggle).
     @Published var knownPeerContacts: Set<String> = []
+
+    /// peer_id → conversation_id mapping for 1:1 chats.  Populated at
+    /// startup from the conversations table and lazily extended via
+    /// `ensureDirectConversationId(for:)` when a stranger first
+    /// messages us or we send to a peer for the first time.  The view
+    /// layer keeps `messages` peer-keyed; this dict is the indirection
+    /// that lets the bridge re-key those reads/writes onto
+    /// `messages.conversation_id` under the hood.
+    @Published var directConversationIdByPeer: [String: String] = [:]
+
+    /// Look up (or mint + cache) the conversation_id for a 1:1 chat
+    /// with `peerId`.  Returns nil only when `rawContext` is nil —
+    /// concurrent callers converge on the same id via the partial
+    /// UNIQUE index in the conversations table.
+    @discardableResult
+    func ensureDirectConversationId(for peerId: String) -> String? {
+        if let cached = directConversationIdByPeer[peerId] { return cached }
+        guard let convId = dbFindOrCreateDirectConversation(peerId: peerId) else {
+            return nil
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.directConversationIdByPeer[peerId] = convId
+        }
+        return convId
+    }
 
     /// Register a peer as a known contact.  Safe to call on an already-
     /// known peer (idempotent), and skips self (the core filters self
-    /// out everywhere else, keep the invariant here too).  Upserts the
-    /// matching contacts row with in_address_book=1 so a future restart
-    /// reloads the peer as an explicit contact.
+    /// out everywhere else, keep the invariant here too).  Upserts a
+    /// row in the v3 contacts table.
     func addContact(peerId: String) {
         let trimmed = peerId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != myPeerId else { return }
@@ -340,32 +364,23 @@ final class Peer2PearClient: ObservableObject {
             guard let self else { return }
             self.knownPeerContacts.insert(trimmed)
             self.dbSaveContact(DBContact(
-                peerId:        trimmed,
-                name:          self.contactNicknames[trimmed] ?? "",
-                keys:          [trimmed],
-                isBlocked:     self.blockedPeerIds.contains(trimmed),
-                inAddressBook: true))
+                peerId: trimmed,
+                name:   self.contactNicknames[trimmed] ?? "",
+                muted:  self.mutedPeerIds.contains(trimmed)))
         }
     }
 
-    /// Remove a peer from the address book and clear their nickname.
-    /// Leaves message history intact — the key pair still identifies
-    /// the peer, so if they message again the chat row stays attached
-    /// to the same cryptographic identity.  Use `deleteChat(peerId:)`
-    /// to wipe the transcript separately.  In the DB the row stays
-    /// (so messages.peer_id FK is satisfied) but in_address_book flips
-    /// to 0 and name resets to empty.
+    /// Remove a peer from the address book.  v3 contract: this drops
+    /// the `contacts` row only; conversations and messages with this
+    /// peer are NOT touched (chat history is the user's data, separate
+    /// from address-book curation).  Use `deleteChat(peerId:)` to wipe
+    /// the transcript separately.
     func removeContact(peerId: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.knownPeerContacts.remove(peerId)
             self.contactNicknames.removeValue(forKey: peerId)
-            self.dbSaveContact(DBContact(
-                peerId:        peerId,
-                name:          "",
-                keys:          [peerId],
-                isBlocked:     self.blockedPeerIds.contains(peerId),
-                inAddressBook: false))
+            self.dbDeleteContact(peerId: peerId)
         }
     }
 
@@ -375,13 +390,22 @@ final class Peer2PearClient: ObservableObject {
     /// "Delete Message" action on message bubbles.
     ///
     /// `chatKey` is the peer ID for 1:1s and the group ID for group
-    /// messages — matches the `peer_id` column in the messages table.
+    /// messages — under v3 we resolve it to a conversation_id before
+    /// the DB write (groups: chatKey == conv_id; direct: lookup via
+    /// directConversationIdByPeer).
     func deleteMessage(chatKey: String, msgId: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.messages.removeAll { $0.id == msgId }
             self.groupMessages.removeAll { $0.id == msgId }
-            self.dbDeleteMessage(peerId: chatKey, msgId: msgId)
+            // Group: chatKey IS the conversation_id (group_id == conv_id
+            // in v3 by design).  Direct: walk the peer→conv index.
+            let convId: String? = self.groups[chatKey] != nil
+                ? chatKey
+                : self.directConversationIdByPeer[chatKey]
+            if let convId {
+                self.dbDeleteMessage(conversationId: convId, msgId: msgId)
+            }
         }
     }
 
@@ -396,6 +420,10 @@ final class Peer2PearClient: ObservableObject {
     /// peer or group messages again, the chat re-materializes with
     /// its prior identity intact.  Use `removeContact` / `leaveGroup`
     /// separately to drop the address-book / membership side.
+    ///
+    /// v3: this calls `dbDeleteConversation` which CASCADEs through
+    /// messages + members + group_* state — we don't have to wipe
+    /// each table individually.
     func deleteChat(peerId: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -406,12 +434,9 @@ final class Peer2PearClient: ObservableObject {
             // Group bucket (the `peerId` arg doubles as a groupId for
             // group-chat call sites).  Safe to run both branches: the
             // keys don't overlap — groupIds are UUIDs, peer IDs are
-            // 43-char base64url.  If this was a group, flip its
-            // contacts row to in_address_book=false so loadStateFromDb
-            // won't rematerialize it on next launch (it would come
-            // back empty otherwise because group entries aren't
-            // message-gated at load time).  A fresh inbound group
-            // message upserts the row back to true and revives the chat.
+            // 43-char base64url.  v3 stores groups in `conversations`
+            // (kind='group'), and dropping the conversation cascades
+            // into messages/members/group_* automatically.
             let wasGroup = self.groups[peerId] != nil
             self.groupMessages.removeAll { $0.groupId == peerId }
             self.groups.removeValue(forKey: peerId)
@@ -424,16 +449,26 @@ final class Peer2PearClient: ObservableObject {
             for tid in toRemove {
                 self.transfers.removeValue(forKey: tid)
             }
-            self.dbDeleteMessages(peerId: peerId)
+
+            // Resolve the conversation id and cascade-delete it.
+            // Group: chatKey == group_id == conv_id (v3 invariant).
+            // Direct: lookup via the peer→conv index.  No cached row
+            // means there's nothing to delete on disk — the @Published
+            // wipe above is the whole effect.
+            let convId: String? = wasGroup
+                ? peerId
+                : self.directConversationIdByPeer[peerId]
+            if let convId {
+                self.dbDeleteConversation(id: convId)
+            }
+            // file_transfers is keyed by chatKey (peerId or groupId),
+            // independent of the conversations cascade — explicit wipe.
             self.dbDeleteFileRecordsForChat(chatKey: peerId)
 
-            if wasGroup {
-                self.dbSaveContact(DBContact(
-                    peerId:        peerId,
-                    keys:          [peerId],
-                    isGroup:       true,
-                    groupId:       peerId,
-                    inAddressBook: false))
+            // Drop the peer→conv mapping so the next message restarts
+            // with a fresh row (the user explicitly cleared this chat).
+            if !wasGroup {
+                self.directConversationIdByPeer.removeValue(forKey: peerId)
             }
         }
     }
@@ -450,6 +485,13 @@ final class Peer2PearClient: ObservableObject {
     /// messages should not fire a local notification.  Persisted as
     /// the `muted` column on the contacts table; loaded on unlock.
     @Published var mutedPeerIds: Set<String> = []
+
+    /// Direct conversations the user archived from `ConversationDetailView`'s
+    /// "Hide from Chat List" toggle.  Mirrors `conversations.in_chat_list = 0`
+    /// for direct rows — populated on load from the DB and updated by
+    /// the toggle's write path.  Read-side: views can filter
+    /// `chatPeerIds` against this set when archive should hide rows.
+    @Published var archivedDirectPeerIds: Set<String> = []
 
     /// Set by any view that wants the root `ChatListView` nav stack to
     /// open a specific 1:1 chat — e.g. "Send Message" on a contact
@@ -490,29 +532,65 @@ final class Peer2PearClient: ObservableObject {
     /// Flip the mute flag for a chat (1:1 peerId or groupId).  Writes
     /// the single-column DB update immediately so the state survives
     /// lock/unlock and relaunch.  Safe to call on the main thread.
+    ///
+    /// v3 split: groups live in conversations and use the per-thread
+    /// mute column; 1:1s flip the contact-level mute (cross-conversation,
+    /// silences the same person in groups too).
     func setMuted(peerId: String, muted: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if muted { self.mutedPeerIds.insert(peerId) }
             else     { self.mutedPeerIds.remove(peerId) }
-            self.dbSetContactMuted(peerId: peerId, muted: muted)
+            if self.groups[peerId] != nil {
+                // Groups: per-conversation mute (peerId == group_id == conv_id).
+                self.dbSetConversationMuted(id: peerId, muted: muted)
+            } else {
+                // Direct: person-level mute on the contact row.
+                self.dbSetContactMuted(peerId: peerId, muted: muted)
+            }
+        }
+    }
+
+    /// Per-thread mute for a 1:1 conversation.  Distinct from
+    /// `setMuted(peerId:)`, which writes the contact-row (person-level)
+    /// flag.  Used by `ConversationDetailView` so the user can silence
+    /// notifications for a single thread without touching the
+    /// address-book entry.  Resolves the conversation_id via
+    /// `directConversationIdByPeer` and writes `conversations.muted`.
+    /// `mutedPeerIds` aggregates both flags so the in-memory check
+    /// (`isMuted`) stays a single set lookup.
+    func setConversationMuted(peerId: String, muted: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if muted { self.mutedPeerIds.insert(peerId) }
+            else     { self.mutedPeerIds.remove(peerId) }
+            if let convId = self.directConversationIdByPeer[peerId] {
+                self.dbSetConversationMuted(id: convId, muted: muted)
+            }
         }
     }
 
     /// Toggle block state for a peer.  `blocked == true` adds to the
-    /// set; `blocked == false` removes.  Persisted via the snapshot
-    /// so blocks survive relaunch.
+    /// set; `blocked == false` removes.  Persisted as a contact-row
+    /// flag so blocks survive relaunch.  Block is a person-level
+    /// concept (always touches the contacts table, never a
+    /// conversation row).
     func setBlocked(peerId: String, blocked: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if blocked { self.blockedPeerIds.insert(peerId) }
-            else       { self.blockedPeerIds.remove(peerId) }
-            self.dbSaveContact(DBContact(
-                peerId:        peerId,
-                name:          self.contactNicknames[peerId] ?? "",
-                keys:          [peerId],
-                isBlocked:     blocked,
-                inAddressBook: self.knownPeerContacts.contains(peerId)))
+            // Block lives in its own `blocked_keys` table (Phase 3h),
+            // separate from `contacts`.  We do NOT touch the address
+            // book here — a stranger stays a stranger after block, a
+            // curated contact keeps their nickname / avatar.  The
+            // @Published set is the runtime mirror; persistence and
+            // launch hydration go through the new dedicated bridges.
+            if blocked {
+                self.blockedPeerIds.insert(peerId)
+                self.dbAddBlockedKey(peerId: peerId)
+            } else {
+                self.blockedPeerIds.remove(peerId)
+                self.dbRemoveBlockedKey(peerId: peerId)
+            }
         }
     }
 
@@ -539,6 +617,11 @@ final class Peer2PearClient: ObservableObject {
     /// Set or clear the user's nickname for a peer.  Empty / whitespace
     /// strings clear the entry so future renders fall back to the
     /// peer-published display name (or, if none, the key prefix).
+    ///
+    /// v3: setting a nickname promotes the peer into the address book
+    /// (an explicit "this is a person I know" signal).  Clearing the
+    /// nickname leaves them in the address book — call `removeContact`
+    /// to drop the row entirely.
     func setNickname(peerId: String, nickname: String) {
         let trimmed = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
         DispatchQueue.main.async { [weak self] in
@@ -548,18 +631,16 @@ final class Peer2PearClient: ObservableObject {
             } else {
                 self.contactNicknames[peerId] = trimmed
                 // Setting a nickname is a strong "this person is now
-                // in my address book" signal — promote stranger-stub
-                // rows so the peer also surfaces in ContactsListView,
-                // not just the chat thread they came from.
+                // in my address book" signal — promote stranger
+                // conversations into the contacts table so the peer
+                // also surfaces in ContactsListView, not just the
+                // thread they came from.
                 self.knownPeerContacts.insert(peerId)
             }
             self.dbSaveContact(DBContact(
-                peerId:        peerId,
-                name:          trimmed,
-                keys:          [peerId],
-                isBlocked:     self.blockedPeerIds.contains(peerId),
-                inAddressBook: !trimmed.isEmpty
-                                || self.knownPeerContacts.contains(peerId)))
+                peerId: peerId,
+                name:   trimmed,
+                muted:  self.mutedPeerIds.contains(peerId)))
         }
     }
 
@@ -923,16 +1004,18 @@ final class Peer2PearClient: ObservableObject {
             self.groupMessages     = []
             self.groups            = [:]
             self.groupAvatars      = [:]
-            self.knownPeerContacts = []
-            self.contactNicknames  = [:]
-            self.blockedPeerIds    = []
-            self.mutedPeerIds      = []
-            self.unreadChatIds     = []
-            self.peerPresence      = [:]
-            self.peerAvatars       = [:]
-            self.pendingFileRequests = []
-            self.transfers         = [:]
-            self.keyChanges        = [:]
+            self.knownPeerContacts          = []
+            self.contactNicknames           = [:]
+            self.blockedPeerIds             = []
+            self.mutedPeerIds               = []
+            self.archivedDirectPeerIds      = []
+            self.unreadChatIds              = []
+            self.peerPresence               = [:]
+            self.peerAvatars                = [:]
+            self.pendingFileRequests        = []
+            self.transfers                  = [:]
+            self.keyChanges                 = [:]
+            self.directConversationIdByPeer = [:]
         }
     }
 
@@ -1226,18 +1309,26 @@ final class Peer2PearClient: ObservableObject {
             text: text,
             timestamp: Date(),
             to: peerId)
+        // Resolve / mint the conversation_id eagerly so the dispatch
+        // below has a concrete id to write against.  Calls into the
+        // C API but doesn't touch any UI state — safe outside the
+        // main-queue async block.
+        let convId = ensureDirectConversationId(for: peerId)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.messages.append(echo)
-            // saveMessage internally INSERT-OR-IGNOREs a contacts stub
-            // row to satisfy the FK, so callers don't have to worry
-            // about ordering vs. addContact.
-            self.dbSaveMessage(peerId: peerId, message: DBMessage(
-                sent:          true,
-                text:          echo.text,
-                timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
-                msgId:         echo.id,
-                senderName:    ""))
+            // The conversation row is guaranteed to exist after
+            // ensureDirectConversationId — saveMessage requires it.
+            // Outbound: senderId == "" by convention (caller is self).
+            if let convId {
+                self.dbSaveMessage(conversationId: convId, message: DBMessage(
+                    sent:          true,
+                    text:          echo.text,
+                    timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
+                    msgId:         echo.id,
+                    senderId:      "",
+                    senderName:    ""))
+            }
         }
         p2p_send_text(ctx, peerId, text)
     }

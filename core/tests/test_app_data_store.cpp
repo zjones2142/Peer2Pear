@@ -59,19 +59,35 @@ TestEnv makeEnv(const Bytes& dbKey,
     return e;
 }
 
+// Convenience: insert a conversations row with kind='group' under the
+// given id.  Required before any group_* CRUD test that references
+// `group_id` — the v3 FK constraint now sweeps group_* rows when the
+// parent conversation goes away.
+void makeGroupConv(TestEnv& e, const std::string& id) {
+    AppDataStore::Conversation c;
+    c.id   = id;
+    c.kind = AppDataStore::ConversationKind::Group;
+    EXPECT_TRUE(e.store->saveConversation(c));
+}
+
+// Convenience: ensure a direct conversation exists for `peerId` and
+// return its id (the freshly-minted UUID).  Used by message tests
+// that need a stable conversation_id to write to.
+std::string makeDirectConv(TestEnv& e, const std::string& peerId) {
+    return e.store->findOrCreateDirectConversation(peerId);
+}
+
 } // namespace
 
 TEST(AppDataStore, ContactRoundTrip) {
     auto env = makeEnv(randomKey32(), randomKey32());
 
     AppDataStore::Contact c;
-    c.peerIdB64u = "abc123";
-    c.name       = "Alice";
-    c.subtitle   = "online";
-    c.keys       = {"k1", "k2"};
-    c.isBlocked  = false;
-    c.isGroup    = false;
-    c.avatarB64  = "PNGbytes";
+    c.peerIdB64u     = "abc123";
+    c.name           = "Alice";
+    c.subtitle       = "online";
+    c.avatarB64      = "PNGbytes";
+    c.muted          = false;
     c.lastActiveSecs = 1700000000;
     ASSERT_TRUE(env.store->saveContact(c));
 
@@ -80,97 +96,126 @@ TEST(AppDataStore, ContactRoundTrip) {
         loaded.push_back(c2);
     });
     ASSERT_EQ(loaded.size(), 1u);
-    EXPECT_EQ(loaded[0].peerIdB64u, "abc123");
-    EXPECT_EQ(loaded[0].name,       "Alice");
-    EXPECT_EQ(loaded[0].subtitle,   "online");
-    ASSERT_EQ(loaded[0].keys.size(), 2u);
-    EXPECT_EQ(loaded[0].keys[0],    "k1");
-    EXPECT_EQ(loaded[0].keys[1],    "k2");
-    EXPECT_EQ(loaded[0].avatarB64,  "PNGbytes");
+    EXPECT_EQ(loaded[0].peerIdB64u,    "abc123");
+    EXPECT_EQ(loaded[0].name,          "Alice");
+    EXPECT_EQ(loaded[0].subtitle,      "online");
+    EXPECT_EQ(loaded[0].avatarB64,     "PNGbytes");
+    EXPECT_FALSE(loaded[0].muted);
     EXPECT_EQ(loaded[0].lastActiveSecs, 1700000000);
 }
 
 TEST(AppDataStore, MessageRoundTripAndOrdering) {
     auto env = makeEnv(randomKey32(), randomKey32());
-
-    AppDataStore::Contact c;
-    c.peerIdB64u = "peer1";
-    c.name = "Bob";
-    env.store->saveContact(c);
+    const std::string convId = makeDirectConv(env, "peer1");
 
     // Insert in reverse-chronological order to prove the ORDER BY works.
-    AppDataStore::Message a{true,  "hello",    1700000002, "id-a", ""};
-    AppDataStore::Message b{false, "hi back",  1700000001, "id-b", ""};
-    env.store->saveMessage("peer1", a);
-    env.store->saveMessage("peer1", b);
+    AppDataStore::Message a{true,  "hello",    1700000002, "id-a", "",      ""};
+    AppDataStore::Message b{false, "hi back",  1700000001, "id-b", "peer1", ""};
+    env.store->saveMessage(convId, a);
+    env.store->saveMessage(convId, b);
 
     std::vector<AppDataStore::Message> loaded;
-    env.store->loadMessages("peer1", [&](const AppDataStore::Message& m) {
+    env.store->loadMessages(convId, [&](const AppDataStore::Message& m) {
         loaded.push_back(m);
     });
     ASSERT_EQ(loaded.size(), 2u);
     EXPECT_EQ(loaded[0].text, "hi back");    // earlier ts
     EXPECT_EQ(loaded[1].text, "hello");      // later ts
     EXPECT_TRUE(loaded[1].sent);
-    EXPECT_EQ(loaded[0].msgId, "id-b");
+    EXPECT_EQ(loaded[0].msgId,    "id-b");
+    EXPECT_EQ(loaded[0].senderId, "peer1");
+    EXPECT_EQ(loaded[1].senderId, "");        // outbound: empty senderId
 }
 
-TEST(AppDataStore, SaveMessageBumpsLastActive) {
+TEST(AppDataStore, SaveMessageBumpsConversationLastActive) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const std::string convId = makeDirectConv(env, "peer2");
+
+    AppDataStore::Message m{true, "ping", 1700000003, "id", "", ""};
+    env.store->saveMessage(convId, m);
+
+    AppDataStore::Conversation c;
+    ASSERT_TRUE(env.store->loadConversation(convId, c));
+    EXPECT_EQ(c.lastActiveSecs, 1700000003);
+}
+
+TEST(AppDataStore, SaveMessageBumpsContactLastActiveOnInbound) {
     auto env = makeEnv(randomKey32(), randomKey32());
     AppDataStore::Contact c;
-    c.peerIdB64u    = "peer2";
+    c.peerIdB64u    = "peer-inbound";
     c.name          = "Carol";
     c.lastActiveSecs = 0;
     env.store->saveContact(c);
 
-    AppDataStore::Message m{true, "ping", 1700000003, "id", ""};
-    env.store->saveMessage("peer2", m);
+    const std::string convId = makeDirectConv(env, "peer-inbound");
+    // Inbound message — sender_id matches the contact peer_id.
+    AppDataStore::Message m{false, "ping", 1700000003, "id", "peer-inbound", ""};
+    env.store->saveMessage(convId, m);
 
-    std::vector<AppDataStore::Contact> after;
-    env.store->loadAllContacts([&](const AppDataStore::Contact& c2) {
-        after.push_back(c2);
-    });
-    ASSERT_EQ(after.size(), 1u);
-    EXPECT_GT(after[0].lastActiveSecs, 0);   // bumped to now(-ish)
+    AppDataStore::Contact loaded;
+    ASSERT_TRUE(env.store->loadContact("peer-inbound", loaded));
+    EXPECT_EQ(loaded.lastActiveSecs, 1700000003);
 }
 
-TEST(AppDataStore, DeleteContactCascadesMessages) {
-    // FK cascade is the fix for desktop DBM's behaviour where
-    // deleteContact left orphan rows in messages.  PRAGMA foreign_keys=ON
-    // is set by AppDataStore::bind().
+TEST(AppDataStore, DeleteContactDoesNotCascadeMessages) {
+    // v3 design: contact deletion is address-book curation only.
+    // Chat history (conversations + messages) lives in its own
+    // namespace and is unaffected.  Use deleteConversation for that.
     auto env = makeEnv(randomKey32(), randomKey32());
 
     AppDataStore::Contact c;
-    c.peerIdB64u = "del-me";
+    c.peerIdB64u = "leave-history";
     c.name = "Mallory";
     env.store->saveContact(c);
-    env.store->saveMessage("del-me",
-                            {true, "goodbye", 1700000004, "id", ""});
+    const std::string convId = makeDirectConv(env, "leave-history");
+    env.store->saveMessage(convId,
+                            {true, "goodbye", 1700000004, "id", "", ""});
 
-    ASSERT_TRUE(env.store->deleteContact("del-me"));
+    ASSERT_TRUE(env.store->deleteContact("leave-history"));
+
+    // Contact gone.
+    AppDataStore::Contact loaded;
+    EXPECT_FALSE(env.store->loadContact("leave-history", loaded));
+
+    // Conversation + its messages remain.
+    int msgCount = 0;
+    env.store->loadMessages(convId,
+                             [&](const AppDataStore::Message&) { ++msgCount; });
+    EXPECT_EQ(msgCount, 1);
+}
+
+TEST(AppDataStore, DeleteConversationCascadesMessages) {
+    // FK ON DELETE CASCADE on messages.conversation_id sweeps the
+    // thread's history when the conversation is removed.  PRAGMA
+    // foreign_keys=ON is set per-connection by SqlCipherDb::open.
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const std::string convId = makeDirectConv(env, "drop-thread");
+    env.store->saveMessage(convId,
+                            {true, "first",  1700000004, "m1", "", ""});
+    env.store->saveMessage(convId,
+                            {true, "second", 1700000005, "m2", "", ""});
+
+    ASSERT_TRUE(env.store->deleteConversation(convId));
 
     int msgCount = 0;
-    env.store->loadMessages("del-me",
+    env.store->loadMessages(convId,
                              [&](const AppDataStore::Message&) { ++msgCount; });
     EXPECT_EQ(msgCount, 0);
 }
 
-TEST(AppDataStore, DeleteMessagesLeavesContactIntact) {
+TEST(AppDataStore, DeleteMessagesLeavesConversationIntact) {
     auto env = makeEnv(randomKey32(), randomKey32());
-    AppDataStore::Contact c;
-    c.peerIdB64u = "keep-me";
-    c.name = "Dave";
-    env.store->saveContact(c);
-    env.store->saveMessage("keep-me",
-                            {true, "text", 1700000005, "id", ""});
+    const std::string convId = makeDirectConv(env, "keep-thread");
+    env.store->saveMessage(convId,
+                            {true, "text", 1700000005, "id", "", ""});
 
-    ASSERT_TRUE(env.store->deleteMessages("keep-me"));
+    ASSERT_TRUE(env.store->deleteMessages(convId));
 
-    int contactCount = 0;
-    env.store->loadAllContacts([&](const AppDataStore::Contact&) { ++contactCount; });
-    EXPECT_EQ(contactCount, 1);
+    AppDataStore::Conversation c;
+    EXPECT_TRUE(env.store->loadConversation(convId, c))
+        << "conversation row should still exist after wiping messages";
     int msgCount = 0;
-    env.store->loadMessages("keep-me",
+    env.store->loadMessages(convId,
                              [&](const AppDataStore::Message&) { ++msgCount; });
     EXPECT_EQ(msgCount, 0);
 }
@@ -372,63 +417,50 @@ TEST(AppDataStore, FileRecordRoundTrip) {
     EXPECT_EQ(out[0].status,    3);
 }
 
-TEST(AppDataStore, SaveMessageAutoCreatesContactStubForFK) {
-    // Regression: PRAGMA foreign_keys=ON makes the messages.peer_id FK
-    // active, so saveMessage MUST guarantee a contacts row exists or
-    // the INSERT silently fails.  iOS hit this when a stranger's first
-    // inbound message landed before any addContact call — the message
-    // never got persisted and reappeared as missing on next launch.
+TEST(AppDataStore, StrangerFirstMessageCreatesConversationOnly) {
+    // v3 design: a peer messaging us out of the blue gets a
+    // conversation row but does NOT auto-create a contact.  Address
+    // book curation is user-driven only.  Caller (ChatController)
+    // is responsible for calling findOrCreateDirectConversation
+    // before saveMessage; we test the AppDataStore primitive here.
     auto env = makeEnv(randomKey32(), randomKey32());
 
-    // No saveContact first.
-    AppDataStore::Message m{false, "hi from stranger", 1700000010, "id-x", ""};
-    ASSERT_TRUE(env.store->saveMessage("stranger-peer", m));
+    const std::string convId = env.store->findOrCreateDirectConversation("stranger");
+    ASSERT_FALSE(convId.empty());
 
-    // The stub row should exist now, not in the address book.
-    std::vector<AppDataStore::Contact> contacts;
-    env.store->loadAllContacts([&](const AppDataStore::Contact& c) {
-        contacts.push_back(c);
-    });
-    ASSERT_EQ(contacts.size(), 1u);
-    EXPECT_EQ(contacts[0].peerIdB64u,    "stranger-peer");
-    EXPECT_FALSE(contacts[0].inAddressBook);
+    AppDataStore::Message m{false, "hi from stranger", 1700000010, "id-x",
+                              "stranger", ""};
+    ASSERT_TRUE(env.store->saveMessage(convId, m));
 
-    // Message should round-trip.
+    // No contact row was created — strangers must be added explicitly.
+    int contactCount = 0;
+    env.store->loadAllContacts(
+        [&](const AppDataStore::Contact&) { ++contactCount; });
+    EXPECT_EQ(contactCount, 0);
+
+    // Message round-trips.
     std::vector<AppDataStore::Message> msgs;
-    env.store->loadMessages("stranger-peer", [&](const AppDataStore::Message& m2) {
+    env.store->loadMessages(convId, [&](const AppDataStore::Message& m2) {
         msgs.push_back(m2);
     });
     ASSERT_EQ(msgs.size(), 1u);
     EXPECT_EQ(msgs[0].text, "hi from stranger");
+    EXPECT_EQ(msgs[0].senderId, "stranger");
 
-    // Stub-then-addContact should NOT clobber the address-book status:
-    // saveMessage's INSERT OR IGNORE leaves the existing row alone.
-    AppDataStore::Contact promoted;
-    promoted.peerIdB64u    = "stranger-peer";
-    promoted.name          = "Now Named";
-    promoted.inAddressBook = true;
-    ASSERT_TRUE(env.store->saveContact(promoted));
-
-    AppDataStore::Message m2{true, "now we're friends", 1700000011, "id-y", ""};
-    ASSERT_TRUE(env.store->saveMessage("stranger-peer", m2));
-
-    contacts.clear();
-    env.store->loadAllContacts([&](const AppDataStore::Contact& c) {
-        contacts.push_back(c);
-    });
-    ASSERT_EQ(contacts.size(), 1u);
-    EXPECT_EQ(contacts[0].name,         "Now Named");
-    EXPECT_TRUE(contacts[0].inAddressBook);   // preserved through second saveMessage
+    // Calling findOrCreateDirectConversation again returns the SAME id.
+    EXPECT_EQ(env.store->findOrCreateDirectConversation("stranger"), convId);
 }
 
-TEST(AppDataStore, EmptyPeerIdGuards) {
+TEST(AppDataStore, EmptyIdGuards) {
     auto env = makeEnv(randomKey32(), randomKey32());
     AppDataStore::Contact c;
-    c.peerIdB64u = "";  // invalid
+    c.peerIdB64u = "";
     EXPECT_FALSE(env.store->saveContact(c));
-    EXPECT_FALSE(env.store->saveMessage("", {true, "x", 0, "", ""}));
-    EXPECT_FALSE(env.store->deleteMessages(""));
     EXPECT_FALSE(env.store->deleteContact(""));
+    EXPECT_FALSE(env.store->saveMessage("", {true, "x", 0, "", "", ""}));
+    EXPECT_FALSE(env.store->deleteMessages(""));
+    EXPECT_TRUE(env.store->findOrCreateDirectConversation("").empty());
+    EXPECT_FALSE(env.store->deleteConversation(""));
 }
 
 // ── Phase 1: Causally-Linked Pairwise schema ────────────────────────────────
@@ -455,6 +487,7 @@ TEST(AppDataStore, ReplayCacheRoundTrip) {
 
     const std::string peer = "bob";
     const std::string gid  = "group1";
+    makeGroupConv(env, gid);  // FK target for group_replay_cache.group_id
     const Bytes sid = makeSessionId(0xA1);
     const Bytes env5 = {0x01, 0x02, 0x03, 0x04, 0x05};
 
@@ -472,6 +505,7 @@ TEST(AppDataStore, ReplayCacheRangeStreamsInCounterOrder) {
     auto env = makeEnv(randomKey32(), randomKey32());
     const std::string peer = "bob";
     const std::string gid  = "group1";
+    makeGroupConv(env, gid);
     const Bytes sid = makeSessionId(0xB2);
 
     // Insert out-of-order, expect ascending iteration.
@@ -498,6 +532,7 @@ TEST(AppDataStore, ReplayCacheRangeStreamsInCounterOrder) {
 
 TEST(AppDataStore, ReplayCacheIsolatedByPeerAndSession) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid1 = makeSessionId(0xC3);
     const Bytes sid2 = makeSessionId(0xD4);
 
@@ -513,6 +548,7 @@ TEST(AppDataStore, ReplayCacheIsolatedByPeerAndSession) {
 
 TEST(AppDataStore, ReplayCachePurgeOlderThanCutoff) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0xE5);
 
     // Three rows at increasing ages.
@@ -530,6 +566,7 @@ TEST(AppDataStore, ReplayCachePurgeOlderThanCutoff) {
 
 TEST(AppDataStore, ChainStateRoundTrip) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "group1");
 
     AppDataStore::ChainState s;
     s.sessionId    = makeSessionId(0xF6);
@@ -557,6 +594,7 @@ TEST(AppDataStore, ChainStateRoundTrip) {
 
 TEST(AppDataStore, ChainStateUpsertsInPlace) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
 
     AppDataStore::ChainState s;
     s.sessionId = makeSessionId(0x07);
@@ -581,6 +619,7 @@ TEST(AppDataStore, ChainStateMissReturnsFalse) {
 
 TEST(AppDataStore, ChainStateDropRemovesRow) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     AppDataStore::ChainState s;
     s.sessionId = makeSessionId(0x09);
     env.store->saveChainState("g", "alice", s);
@@ -594,6 +633,7 @@ TEST(AppDataStore, ChainStateDropRemovesRow) {
 
 TEST(AppDataStore, BufferRoundTripPreservesContent) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0x11);
     const Bytes ph  = makePrevHash(0x22);
 
@@ -618,6 +658,7 @@ TEST(AppDataStore, BufferRoundTripPreservesContent) {
 
 TEST(AppDataStore, BufferRangeIsCounterAscending) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0x33);
 
     env.store->addBufferEntry("g", "a", sid, 9, {}, {}, "m9", "i", "Alice", 0);
@@ -635,6 +676,7 @@ TEST(AppDataStore, BufferRangeIsCounterAscending) {
 
 TEST(AppDataStore, BufferDropRangeRemovesOnlyRequestedCounters) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0x44);
 
     env.store->addBufferEntry("g", "a", sid, 5, {}, {}, "m5", "five",  "A", 0);
@@ -652,6 +694,7 @@ TEST(AppDataStore, BufferDropRangeRemovesOnlyRequestedCounters) {
 
 TEST(AppDataStore, BufferDropForSessionWipesOnlyOldSession) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sidOld = makeSessionId(0x55);
     const Bytes sidNew = makeSessionId(0x66);
 
@@ -675,6 +718,7 @@ TEST(AppDataStore, BufferBodyIsEncryptedAtRest) {
     // raw SQLCipher dump (page-level decrypted) doesn't leak plaintext.
     // Same defense the messages.text column already passes.
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0x77);
     const std::string secret = "diary entry: I love peer2pear";
 
@@ -694,6 +738,7 @@ TEST(AppDataStore, BufferBodyIsEncryptedAtRest) {
 
 TEST(AppDataStore, SendStateMissReturnsDefault) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    // No FK target needed — missing-row path doesn't INSERT.
     AppDataStore::SendState s{42, makePrevHash(0xFF)};  // dirty initial
     EXPECT_TRUE(env.store->loadSendState(
         "bob", "g", makeSessionId(0x01), s));
@@ -703,6 +748,7 @@ TEST(AppDataStore, SendStateMissReturnsDefault) {
 
 TEST(AppDataStore, SendStateRoundTrip) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0x88);
     const Bytes hash = makePrevHash(0xAB);
 
@@ -719,6 +765,7 @@ TEST(AppDataStore, SendStateRoundTrip) {
 
 TEST(AppDataStore, SendStateUpsertsInPlace) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0x99);
 
     AppDataStore::SendState s;
@@ -737,6 +784,7 @@ TEST(AppDataStore, SendStateUpsertsInPlace) {
 
 TEST(AppDataStore, SendStateIsolatedByPeerAndSession) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid1 = makeSessionId(0x10);
     const Bytes sid2 = makeSessionId(0x20);
 
@@ -759,6 +807,7 @@ TEST(AppDataStore, SendStateIsolatedByPeerAndSession) {
 
 TEST(AppDataStore, SendStateDropRemovesRow) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g");
     const Bytes sid = makeSessionId(0x11);
 
     AppDataStore::SendState s;
@@ -783,6 +832,7 @@ TEST(AppDataStore, BundleMapMissReturnsEmpty) {
 
 TEST(AppDataStore, BundleMapEnsureMintsStable16BId) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g1");
 
     Bytes b1 = env.store->ensureBundleIdForGroup("g1");
     ASSERT_EQ(b1.size(), 16u) << "bundle_id is 16 random bytes";
@@ -797,6 +847,8 @@ TEST(AppDataStore, BundleMapEnsureMintsStable16BId) {
 
 TEST(AppDataStore, BundleMapDistinctGroupsGetDistinctIds) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g1");
+    makeGroupConv(env, "g2");
 
     Bytes a = env.store->ensureBundleIdForGroup("g1");
     Bytes b = env.store->ensureBundleIdForGroup("g2");
@@ -807,6 +859,7 @@ TEST(AppDataStore, BundleMapDistinctGroupsGetDistinctIds) {
 
 TEST(AppDataStore, BundleMapAddMappingPreservesProvidedId) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g1");
 
     // Receiver path: a peer's group_member_update tells us the bundle_id
     // for a group we already know about.
@@ -819,6 +872,7 @@ TEST(AppDataStore, BundleMapAddMappingPreservesProvidedId) {
 
 TEST(AppDataStore, BundleMapAddIsIdempotent) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g1");
 
     const Bytes id1 = Bytes(16, 0xAA);
     EXPECT_TRUE(env.store->addBundleMapping("g1", id1, 100));
@@ -831,6 +885,7 @@ TEST(AppDataStore, BundleMapAddIsIdempotent) {
 
 TEST(AppDataStore, BundleMapDropRemovesBothDirections) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g1");
 
     Bytes b = env.store->ensureBundleIdForGroup("g1");
     EXPECT_TRUE(env.store->dropBundleMapping("g1"));
@@ -850,6 +905,8 @@ TEST(AppDataStore, BundleMapEmptyGuards) {
 
 TEST(AppDataStore, BundleMapBundleUniqueAcrossGroups) {
     auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "g1");
+    makeGroupConv(env, "g2");
 
     const Bytes shared = Bytes(16, 0xCD);
     EXPECT_TRUE(env.store->addBundleMapping("g1", shared, 1));
@@ -858,4 +915,312 @@ TEST(AppDataStore, BundleMapBundleUniqueAcrossGroups) {
     EXPECT_TRUE(env.store->addBundleMapping("g2", shared, 2));
     EXPECT_EQ(env.store->groupIdForBundle(shared), "g1");
     EXPECT_TRUE(env.store->bundleIdForGroup("g2").empty());
+}
+
+// ── Phase 3: Conversations + members ────────────────────────────────────────
+
+TEST(AppDataStore, ConversationDirectRoundTrip) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Conversation c;
+    c.id            = "uuid-direct-1";
+    c.kind          = AppDataStore::ConversationKind::Direct;
+    c.directPeerId  = "alice";
+    c.muted         = true;
+    c.lastActiveSecs = 1700000123;
+    c.inChatList    = false;
+    ASSERT_TRUE(env.store->saveConversation(c));
+
+    AppDataStore::Conversation loaded;
+    ASSERT_TRUE(env.store->loadConversation("uuid-direct-1", loaded));
+    EXPECT_EQ(loaded.kind,           AppDataStore::ConversationKind::Direct);
+    EXPECT_EQ(loaded.directPeerId,   "alice");
+    EXPECT_TRUE (loaded.muted);
+    EXPECT_FALSE(loaded.inChatList);
+    EXPECT_EQ(loaded.lastActiveSecs, 1700000123);
+}
+
+TEST(AppDataStore, ConversationGroupHoldsEncryptedName) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Conversation c;
+    c.id              = "uuid-group-1";
+    c.kind            = AppDataStore::ConversationKind::Group;
+    c.groupName       = "Project Hydra";
+    c.groupAvatarB64  = "AVATAR_B64_BLOB";
+    ASSERT_TRUE(env.store->saveConversation(c));
+
+    // Round-trip plaintext.
+    AppDataStore::Conversation loaded;
+    ASSERT_TRUE(env.store->loadConversation("uuid-group-1", loaded));
+    EXPECT_EQ(loaded.groupName,      "Project Hydra");
+    EXPECT_EQ(loaded.groupAvatarB64, "AVATAR_B64_BLOB");
+
+    // Raw column should be ENC2: ciphertext, not plaintext.
+    SqlCipherQuery raw(env.db->handle());
+    raw.prepare("SELECT group_name FROM conversations WHERE id='uuid-group-1';");
+    ASSERT_TRUE(raw.exec()); ASSERT_TRUE(raw.next());
+    const std::string stored = raw.valueText(0);
+    EXPECT_EQ(stored.substr(0, 5), "ENC2:");
+    EXPECT_EQ(stored.find("Project Hydra"), std::string::npos);
+}
+
+TEST(AppDataStore, FindOrCreateDirectIsIdempotent) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    const std::string a = env.store->findOrCreateDirectConversation("peer-A");
+    const std::string b = env.store->findOrCreateDirectConversation("peer-A");
+    EXPECT_FALSE(a.empty());
+    EXPECT_EQ(a, b) << "second call must return the same conversation id";
+
+    // The membership row was created.
+    std::vector<std::string> members;
+    env.store->loadConversationMembers(a, [&](const std::string& p) {
+        members.push_back(p);
+    });
+    ASSERT_EQ(members.size(), 1u);
+    EXPECT_EQ(members[0], "peer-A");
+}
+
+TEST(AppDataStore, FindOrCreateDirectDistinctPeersGetDistinctIds) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const std::string a = env.store->findOrCreateDirectConversation("peer-A");
+    const std::string b = env.store->findOrCreateDirectConversation("peer-B");
+    EXPECT_FALSE(a.empty());
+    EXPECT_FALSE(b.empty());
+    EXPECT_NE(a, b);
+}
+
+TEST(AppDataStore, ConversationMembersSetReplacesAtomically) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "uuid-grp");
+
+    ASSERT_TRUE(env.store->setConversationMembers("uuid-grp",
+        {"alice", "bob", "carol"}));
+
+    std::vector<std::string> first;
+    env.store->loadConversationMembers("uuid-grp",
+        [&](const std::string& p) { first.push_back(p); });
+    ASSERT_EQ(first.size(), 3u);
+    // ORDER BY peer_id ASC — stable, easy to assert against.
+    EXPECT_EQ(first[0], "alice");
+    EXPECT_EQ(first[1], "bob");
+    EXPECT_EQ(first[2], "carol");
+
+    // Replace with a different roster.
+    ASSERT_TRUE(env.store->setConversationMembers("uuid-grp",
+        {"dave", "alice"}));
+    std::vector<std::string> after;
+    env.store->loadConversationMembers("uuid-grp",
+        [&](const std::string& p) { after.push_back(p); });
+    ASSERT_EQ(after.size(), 2u);
+    EXPECT_EQ(after[0], "alice");
+    EXPECT_EQ(after[1], "dave");
+}
+
+TEST(AppDataStore, ConversationMembersAddRemove) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "uuid-grp");
+
+    EXPECT_TRUE (env.store->addConversationMember("uuid-grp", "alice"));
+    EXPECT_TRUE (env.store->addConversationMember("uuid-grp", "alice"));  // dup-tolerant
+    EXPECT_TRUE (env.store->addConversationMember("uuid-grp", "bob"));
+    EXPECT_TRUE (env.store->removeConversationMember("uuid-grp", "alice"));
+    EXPECT_FALSE(env.store->removeConversationMember("uuid-grp", "alice"));  // already gone
+
+    std::vector<std::string> remaining;
+    env.store->loadConversationMembers("uuid-grp",
+        [&](const std::string& p) { remaining.push_back(p); });
+    ASSERT_EQ(remaining.size(), 1u);
+    EXPECT_EQ(remaining[0], "bob");
+}
+
+TEST(AppDataStore, DeleteConversationCascadesMembers) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    makeGroupConv(env, "uuid-grp");
+    env.store->setConversationMembers("uuid-grp", {"alice", "bob"});
+
+    ASSERT_TRUE(env.store->deleteConversation("uuid-grp"));
+
+    int count = 0;
+    env.store->loadConversationMembers("uuid-grp",
+        [&](const std::string&) { ++count; });
+    EXPECT_EQ(count, 0);
+}
+
+TEST(AppDataStore, ContactAndConversationMuteAreIndependent) {
+    // Contact-mute is the cross-thread person mute; conversation-mute
+    // is the per-thread mute.  They don't overwrite each other —
+    // notification logic ORs them at delivery time.
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Contact c;
+    c.peerIdB64u = "alice";
+    c.name = "Alice";
+    env.store->saveContact(c);
+    const std::string convId = makeDirectConv(env, "alice");
+
+    EXPECT_TRUE(env.store->setContactMuted("alice", true));
+    AppDataStore::Conversation conv;
+    ASSERT_TRUE(env.store->loadConversation(convId, conv));
+    EXPECT_FALSE(conv.muted) << "contact-mute must not set conversation-mute";
+
+    AppDataStore::Contact reloaded;
+    ASSERT_TRUE(env.store->loadContact("alice", reloaded));
+    EXPECT_TRUE(reloaded.muted);
+
+    // Reverse: muting the conversation must not flip contact.muted.
+    EXPECT_TRUE(env.store->setContactMuted("alice", false));
+    EXPECT_TRUE(env.store->setConversationMuted(convId, true));
+    ASSERT_TRUE(env.store->loadContact("alice", reloaded));
+    ASSERT_TRUE(env.store->loadConversation(convId, conv));
+    EXPECT_FALSE(reloaded.muted);
+    EXPECT_TRUE (conv.muted);
+}
+
+TEST(AppDataStore, ConversationsListedInLastActiveOrder) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Conversation old;
+    old.id = "u-old"; old.kind = AppDataStore::ConversationKind::Direct;
+    old.directPeerId = "p1"; old.lastActiveSecs = 100;
+    env.store->saveConversation(old);
+
+    AppDataStore::Conversation recent;
+    recent.id = "u-recent"; recent.kind = AppDataStore::ConversationKind::Direct;
+    recent.directPeerId = "p2"; recent.lastActiveSecs = 200;
+    env.store->saveConversation(recent);
+
+    std::vector<std::string> seen;
+    env.store->loadAllConversations(
+        [&](const AppDataStore::Conversation& c) { seen.push_back(c.id); });
+    ASSERT_EQ(seen.size(), 2u);
+    EXPECT_EQ(seen[0], "u-recent");
+    EXPECT_EQ(seen[1], "u-old");
+}
+
+TEST(AppDataStore, InboundMessageAutoUnhidesConversation) {
+    // Phase 3e: a conversation the user explicitly archived
+    // (in_chat_list=0) pops back into the chat list when the
+    // other party messages us.  Outbound saves don't auto-unhide.
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const std::string convId = makeDirectConv(env, "alice");
+    ASSERT_TRUE(env.store->setConversationInChatList(convId, false));
+
+    // Outbound: stays hidden.
+    env.store->saveMessage(convId,
+        {/*sent=*/true, "hi anyway", 100, "m1", /*senderId=*/"", ""});
+    AppDataStore::Conversation c;
+    ASSERT_TRUE(env.store->loadConversation(convId, c));
+    EXPECT_FALSE(c.inChatList) << "outbound to a hidden chat keeps it hidden";
+
+    // Inbound: pops back.
+    env.store->saveMessage(convId,
+        {/*sent=*/false, "ping", 200, "m2", /*senderId=*/"alice", ""});
+    ASSERT_TRUE(env.store->loadConversation(convId, c));
+    EXPECT_TRUE(c.inChatList) << "inbound on a hidden chat must auto-unhide";
+}
+
+// ── Phase 3h: blocked_keys (block decoupled from contacts) ──────────────────
+
+TEST(AppDataStore, BlockedKeyRoundTrip) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    EXPECT_FALSE(env.store->isBlockedKey("alice"));
+    ASSERT_TRUE(env.store->addBlockedKey("alice", 100));
+    EXPECT_TRUE(env.store->isBlockedKey("alice"));
+
+    ASSERT_TRUE(env.store->removeBlockedKey("alice"));
+    EXPECT_FALSE(env.store->isBlockedKey("alice"));
+    EXPECT_FALSE(env.store->removeBlockedKey("alice"))
+        << "remove on missing row returns false";
+}
+
+TEST(AppDataStore, BlockedKeyAddIsIdempotent) {
+    // Re-blocking refreshes the timestamp without error.
+    auto env = makeEnv(randomKey32(), randomKey32());
+    EXPECT_TRUE(env.store->addBlockedKey("alice", 100));
+    EXPECT_TRUE(env.store->addBlockedKey("alice", 200));
+    EXPECT_TRUE(env.store->isBlockedKey("alice"));
+
+    std::vector<std::pair<std::string, int64_t>> rows;
+    env.store->loadAllBlockedKeys(
+        [&](const std::string& p, int64_t t) { rows.emplace_back(p, t); });
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].first,  "alice");
+    EXPECT_EQ(rows[0].second, 200) << "re-block should refresh timestamp";
+}
+
+TEST(AppDataStore, BlockedKeysAreOrthogonalToContacts) {
+    // A blocked key with no contacts row stands on its own; a contact
+    // without a blocked_keys row is unblocked.  Block doesn't touch
+    // contacts and contacts don't touch blocked_keys.
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Contact c;
+    c.peerIdB64u = "alice";
+    c.name = "Alice";
+    env.store->saveContact(c);
+
+    // Block a stranger (no contact row); contact for alice stays unblocked.
+    env.store->addBlockedKey("stranger", 100);
+    EXPECT_TRUE(env.store->isBlockedKey("stranger"));
+    EXPECT_FALSE(env.store->isBlockedKey("alice"));
+
+    AppDataStore::Contact loaded;
+    EXPECT_TRUE(env.store->loadContact("alice", loaded));
+    EXPECT_FALSE(env.store->loadContact("stranger", loaded))
+        << "blocking didn't auto-create a contact row";
+
+    // Block the curated contact too — both block records coexist with
+    // the address-book entry untouched.
+    env.store->addBlockedKey("alice", 200);
+    EXPECT_TRUE(env.store->isBlockedKey("alice"));
+    EXPECT_TRUE(env.store->loadContact("alice", loaded));
+    EXPECT_EQ(loaded.name, "Alice")
+        << "block didn't mutate the curated contact's name";
+}
+
+TEST(AppDataStore, BlockedKeysListedInInsertionOrder) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    env.store->addBlockedKey("third",  300);
+    env.store->addBlockedKey("first",  100);
+    env.store->addBlockedKey("second", 200);
+
+    std::vector<std::string> order;
+    env.store->loadAllBlockedKeys(
+        [&](const std::string& p, int64_t) { order.push_back(p); });
+    ASSERT_EQ(order.size(), 3u);
+    EXPECT_EQ(order[0], "first");
+    EXPECT_EQ(order[1], "second");
+    EXPECT_EQ(order[2], "third");
+}
+
+TEST(AppDataStore, BlockedKeyEmptyGuards) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    EXPECT_FALSE(env.store->addBlockedKey("", 0));
+    EXPECT_FALSE(env.store->removeBlockedKey(""));
+    EXPECT_FALSE(env.store->isBlockedKey(""));
+}
+
+TEST(AppDataStore, DirectPeerIdIsUniquePerPeer) {
+    // Partial UNIQUE index: at most one direct conversation per peer.
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::Conversation a;
+    a.id = "u-1"; a.kind = AppDataStore::ConversationKind::Direct;
+    a.directPeerId = "alice";
+    ASSERT_TRUE(env.store->saveConversation(a));
+
+    AppDataStore::Conversation b;
+    b.id = "u-2"; b.kind = AppDataStore::ConversationKind::Direct;
+    b.directPeerId = "alice";  // collides
+    EXPECT_FALSE(env.store->saveConversation(b));
+
+    // Multiple groups (NULL direct_peer_id) coexist fine.
+    AppDataStore::Conversation g1, g2;
+    g1.id = "g-1"; g1.kind = AppDataStore::ConversationKind::Group;
+    g2.id = "g-2"; g2.kind = AppDataStore::ConversationKind::Group;
+    EXPECT_TRUE(env.store->saveConversation(g1));
+    EXPECT_TRUE(env.store->saveConversation(g2));
 }

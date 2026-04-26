@@ -52,6 +52,11 @@ signals:
     void exportContactsClicked();
     void importContactsClicked();
 
+    // Open the Archived Chats recovery dialog.  MainWindow listens
+    // and routes through ChatView so the underlying chat list can
+    // be re-synced after Restore / Delete.
+    void archivedChatsClicked();
+
     // File-transfer consent settings changed.
     void fileAutoAcceptMaxChanged(int mb);
     void fileHardMaxChanged(int mb);
@@ -114,6 +119,7 @@ private:
     QWidget *makeFileTransferSection();
     QWidget *makeRelaySection();
     QWidget *makePrivacySection();
+    QWidget *makeArchivedChatsSection();
     QWidget *makeAboutHelpSection();
 
     // Profile

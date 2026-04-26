@@ -1169,12 +1169,21 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 Bytes prevHash;
                 if (!prevB64.empty()) prevHash = CryptoEngine::fromBase64Url(prevB64);
 
+                // v3: ensure the conversations row exists before any
+                // group_* CRUD fires — chain_state, msg_buffer, etc.
+                // FK to conversations(id) and would silently drop the
+                // INSERT otherwise.  Idempotent.
+                if (m_appData) m_appData->ensureGroupConversation(gid);
+
                 // Trust-bootstrap the roster from the (now decrypted)
                 // envelope — same model as v1: a peer claiming
                 // membership can update our view because the outer
                 // 1:1 ratchet already authenticated them.
                 m_groupProto.upsertMembersFromTrustedMessage(
                     gid, senderId, memberKeys);
+                if (m_appData) {
+                    m_appData->setConversationMembers(gid, memberKeys);
+                }
 
                 auto result = m_groupProto.dispatchGroupMessageV2(
                     gid, senderId, sessionId, ctr, prevHash,
@@ -1807,6 +1816,14 @@ void ChatController::setKnownGroupMembers(const std::string& groupId,
                                            const std::vector<std::string>& members)
 {
     m_groupProto.setKnownMembers(groupId, members);
+    // v3: persist the conversation row + members so group_* CRUD
+    // (which FKs to conversations(id)) finds the parent, and so the
+    // chat list surfaces the group on next launch.  No-op when
+    // m_appData is null (legacy callers without the data store).
+    if (m_appData) {
+        m_appData->ensureGroupConversation(groupId);
+        m_appData->setConversationMembers(groupId, members);
+    }
 }
 
 // ── Post-Quantum KEM pub exchange ───────────────────────────────────────────

@@ -17,6 +17,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ChatNotifier.h"
@@ -145,6 +146,21 @@ private slots:
     void onDeleteConversation(int index);
     void onOpenContactsPicker();
 
+private:
+    /// Open the address-book editor for a peer.  When the peer
+    /// already has a `contacts` row we hydrate from it; otherwise a
+    /// blank Contact stub is presented so the user can curate them
+    /// into the address book in one step.  Persistence + in-memory
+    /// cache update happen here so the caller (group / conversation
+    /// editor) doesn't have to know about saveContact / deleteContact.
+    void openContactDialogForPeer(const QString &peerIdB64u);
+
+    /// Open Add-Contact with the public-key field pre-filled.  Used
+    /// by the conversation editor's "Add Contact" affordance when the
+    /// peer is not yet in the address book — keeps the existing
+    /// add-contact validation + duplicate-key checks in one place.
+    void openAddContactPrefilled(const QString &peerIdB64u);
+
 public:
     void initChats();
     /// Safety-numbers: called when ChatController::onPeerKeyChanged
@@ -156,6 +172,22 @@ public:
     /// + peerTrust before raising the consent QMessageBox.
     void setRequireVerifiedFiles(bool on) { m_requireVerifiedFiles = on; }
 
+    /// Read-only view of the in-memory address book.  Returned by
+    /// reference so callers can hand the snapshot to dialogs (e.g.
+    /// the Archived Chats dialog) without copying — the map is
+    /// stable for the lifetime of ChatView and only mutated by
+    /// initChats / openContactDialogForPeer.
+    const std::unordered_map<std::string, AppDataStore::Contact> &
+    addressBookSnapshot() const { return m_contactsByPeer; }
+
+    /// Refresh the chat list after the user restored or permanently
+    /// deleted a row from the Archived Chats dialog.  A Restored row
+    /// must reappear in the visible list; a Deleted row must drop
+    /// any in-memory state we still hold for it.  initChats is the
+    /// less-clever, more-robust path — archive actions are not
+    /// high-frequency, so a full reload is acceptable.
+    void reloadAfterArchiveAction() { initChats(); rebuildChatList(); }
+
 private:
     void rebuildChatList();
     void loadChat(int index);
@@ -163,30 +195,34 @@ private:
     QLabel *m_emptyLabel = nullptr;
 
     void clearMessages();
-    /// Render one message bubble.  Pass `msgId` + `chatKey` (peerIdB64u
-    /// for 1:1s, groupId for groups) to make the bubble long-press /
-    /// right-click deletable; leaving them empty produces a static
-    /// system bubble (e.g. "No keys saved for this contact") with no
-    /// context menu.
+    /// Render one message bubble.  Pass `msgId` + `convId` (the
+    /// conversation UUID) to make the bubble long-press / right-click
+    /// deletable; leaving them empty produces a static system bubble
+    /// (e.g. "No keys saved for this contact") with no context menu.
     void addMessageBubble(const QString &text, bool sent,
                           const QString &senderName = QString(),
                           const QString &msgId = QString(),
-                          const QString &chatKey = QString());
-    void onDeleteSingleMessage(const QString &chatKey, const QString &msgId);
+                          const QString &convId = QString());
+    void onDeleteSingleMessage(const QString &convId, const QString &msgId);
     void addFileBubble(const QString &fileName, qint64 fileSize, bool sent);
     void addDateSeparator(const QDateTime &dt);
 
     // File tab — the per-file card lives in desktop/dialogs.{h,cpp}
     void rebuildFilesTab();
 
-    // Find the 1:1 chat index for a peer (-1 if none).  Skips group
-    // chats — groups are matched by groupId via their own helpers.
+    // Find the 1:1 chat row index for `peerIdB64u` (-1 if none).
+    // Skips groups; matches on Conversation::directPeerId.
     int findChatForPeer(const QString &peerIdB64u) const;
-    // As above but auto-creates a nameless stub chat (rendered by key
-    // is found.  Used for inbound traffic from a peer we haven't
-    // explicitly added yet.
-    int findOrCreateChatForPeer(const QString &peerIdB64u);
-    static QString chatKey(const AppDataStore::Contact &c);
+    // As above but auto-creates a 1:1 conversation row (via
+    // m_store->findOrCreateDirectConversation) when missing.  Used for
+    // inbound traffic from a peer we haven't explicitly added.
+    int findOrCreateDirectChatForPeer(const QString &peerIdB64u);
+
+    // Display helpers that hide the contact / group split from callers.
+    QString displayNameFor(const AppDataStore::Conversation &conv) const;
+    QString avatarB64For (const AppDataStore::Conversation &conv) const;
+    bool    isMutedFor   (const AppDataStore::Conversation &conv) const;
+    bool    isBlockedFor (const AppDataStore::Conversation &conv) const;
 
     Ui::MainWindow  *m_ui         = nullptr;
     ChatController  *m_controller = nullptr;
@@ -195,7 +231,14 @@ private:
 
     std::function<bool()> m_shouldToastFn;
 
-    std::vector<AppDataStore::Contact> m_chats;
+    // v3 split: conversations drive the chat list; contacts are the
+    // address-book side-table looked up by `directPeerId`; blocked_keys
+    // is its own thing (Phase 3h) — independent of contacts and groups.
+    std::vector<AppDataStore::Conversation> m_chats;
+    std::unordered_map<std::string, std::vector<std::string>> m_membersByConv;
+    std::unordered_map<std::string, AppDataStore::Contact>    m_contactsByPeer;
+    std::unordered_set<std::string>                            m_blockedKeys;
+
     bool              m_requireVerifiedFiles = false;
     int               m_currentChat = -1;
 
@@ -205,13 +248,13 @@ private:
     // Per-member online status (peerIdB64u → online); shared across DM and group chats
     QMap<QString, bool> m_memberOnline;
 
-    // Messages keyed by peerIdB64u (DMs) or groupId (groups) — kept
-    // in-memory alongside m_chats since AppDataStore::Contact no
-    // longer carries an embedded message list.
-    std::unordered_map<std::string, std::vector<AppDataStore::Message>> m_messagesByPeer;
+    // Messages keyed by conversation UUID — replaces the old
+    // peer-id-or-group-id chatKey indirection.
+    std::unordered_map<std::string, std::vector<AppDataStore::Message>> m_messagesByConv;
 
-    // File records keyed by stable chatKey() — never needs index remapping
-    QMap<QString, std::vector<AppDataStore::FileRecord>> m_filesByKey;
+    // File records keyed by conversation UUID — same key namespace as
+    // m_messagesByConv so promoteChatToTop never needs to remap.
+    std::unordered_map<std::string, std::vector<AppDataStore::FileRecord>> m_filesByConv;
 
     int  totalUnread() const;
     void ensureUnreadSize();

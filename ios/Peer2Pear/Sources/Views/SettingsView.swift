@@ -29,6 +29,7 @@ struct SettingsView: View {
                     TrustSection(client: client)
                     FileTransferSection(client: client)
                     RelayServersSection(client: client)
+                    ArchivedChatsSection(client: client)
                     LockSection(client: client, dismiss: dismiss)
                 }
                 .padding(.horizontal)
@@ -690,6 +691,50 @@ private struct FileTransferSection: View {
                 }
             }
             .tint(.green)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+}
+
+// Archived Chats — entry point for the recovery view.  The editors
+// (ConversationDetailView, GroupDetailView) hide a thread by flipping
+// `conversations.in_chat_list = 0`, which removes the row from
+// ChatListView; once gone the editor that hid it is unreachable, so
+// the only un-hide paths are an inbound message or this Settings row.
+// Push, not sheet, so the Settings sheet stays as the user's anchor —
+// a NavigationLink inside the same NavigationStack lets the user back
+// out to Settings rather than dismissing all the way to the chat list.
+private struct ArchivedChatsSection: View {
+    @ObservedObject var client: Peer2PearClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "archivebox")
+                    .foregroundStyle(.green)
+                Text("Archived Chats")
+                    .font(.headline)
+            }
+
+            NavigationLink {
+                ArchivedChatsView(client: client)
+            } label: {
+                HStack {
+                    Text("View archived chats")
+                        .font(.subheadline)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            Text("Threads you hid from the chat list show up here so you can restore or delete them.  An inbound message also automatically un-hides a thread.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding(12)
         .background(Color(.secondarySystemBackground))

@@ -1,5 +1,6 @@
 #include "AppDataStore.hpp"
 #include "shared.hpp"
+#include "uuid.hpp"  // p2p::makeUuid for findOrCreateDirectConversation
 
 #include <sodium.h>
 #include <sqlite3.h>
@@ -53,31 +54,6 @@ bool base64Decode(const std::string& in, std::vector<uint8_t>& out)
     }
     out.resize(actualLen);
     return true;
-}
-
-// Join/split the contacts.keys list using '|' — same encoding as desktop.
-std::string joinKeys(const std::vector<std::string>& keys)
-{
-    std::string out;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i) out += '|';
-        out += keys[i];
-    }
-    return out;
-}
-
-std::vector<std::string> splitKeys(const std::string& s)
-{
-    std::vector<std::string> out;
-    if (s.empty()) return out;
-    size_t start = 0;
-    for (size_t i = 0; i <= s.size(); ++i) {
-        if (i == s.size() || s[i] == '|') {
-            if (i > start) out.emplace_back(s.substr(start, i - start));
-            start = i + 1;
-        }
-    }
-    return out;
 }
 
 // RAII transaction.  Rolls back on destruction unless commit() was called.
@@ -242,58 +218,7 @@ void AppDataStore::createTables()
 {
     SqlCipherQuery q(*m_db);
 
-    // contacts: peer_id is the canonical lookup key — for groups this is
-    // the groupId, NOT a "name:Foo" sentinel like desktop's DBM uses.
-    // The fallback there made unnamed groups un-keyable and rotted on
-    // rename; new code requires a real ID.
-    q.exec(
-        "CREATE TABLE IF NOT EXISTS contacts ("
-        "  peer_id          TEXT PRIMARY KEY NOT NULL,"
-        "  name             TEXT NOT NULL DEFAULT '',"
-        "  subtitle         TEXT NOT NULL DEFAULT '',"
-        "  keys             TEXT NOT NULL DEFAULT '',"
-        "  is_blocked       INTEGER NOT NULL DEFAULT 0,"
-        "  is_group         INTEGER NOT NULL DEFAULT 0,"
-        "  group_id         TEXT NOT NULL DEFAULT '',"
-        "  avatar           TEXT NOT NULL DEFAULT '',"
-        "  last_active      INTEGER NOT NULL DEFAULT 0,"
-        "  in_address_book  INTEGER NOT NULL DEFAULT 1,"
-        "  muted            INTEGER NOT NULL DEFAULT 0,"
-        "  kem_pub          BLOB"
-        ");"
-    );
-    // Idempotent additive migrations for a desktop DBM-created table
-    // that pre-dates new columns.  SQLite errors with "duplicate column"
-    // if the column exists; we swallow that — q.exec just returns false.
-    q.exec("ALTER TABLE contacts ADD COLUMN is_blocked       INTEGER NOT NULL DEFAULT 0;");
-    q.exec("ALTER TABLE contacts ADD COLUMN is_group         INTEGER NOT NULL DEFAULT 0;");
-    q.exec("ALTER TABLE contacts ADD COLUMN group_id         TEXT    NOT NULL DEFAULT '';");
-    q.exec("ALTER TABLE contacts ADD COLUMN avatar           TEXT    NOT NULL DEFAULT '';");
-    q.exec("ALTER TABLE contacts ADD COLUMN last_active      INTEGER NOT NULL DEFAULT 0;");
-    q.exec("ALTER TABLE contacts ADD COLUMN in_address_book  INTEGER NOT NULL DEFAULT 1;");
-    q.exec("ALTER TABLE contacts ADD COLUMN muted            INTEGER NOT NULL DEFAULT 0;");
-    q.exec("ALTER TABLE contacts ADD COLUMN kem_pub          BLOB;");
-
-    // messages: FK to contacts so deleteContact cascades.  Index on
-    // (peer_id, timestamp) so loadMessages doesn't full-scan once
-    // history grows past a few thousand rows.
-    q.exec(
-        "CREATE TABLE IF NOT EXISTS messages ("
-        "  id           INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  peer_id      TEXT NOT NULL,"
-        "  sent         INTEGER NOT NULL,"
-        "  text         TEXT NOT NULL DEFAULT '',"
-        "  timestamp    INTEGER NOT NULL,"
-        "  msg_id       TEXT NOT NULL DEFAULT '',"
-        "  sender_name  TEXT NOT NULL DEFAULT '',"
-        "  FOREIGN KEY(peer_id) REFERENCES contacts(peer_id) ON DELETE CASCADE"
-        ");"
-    );
-    q.exec("ALTER TABLE messages ADD COLUMN msg_id      TEXT NOT NULL DEFAULT '';");
-    q.exec("ALTER TABLE messages ADD COLUMN sender_name TEXT NOT NULL DEFAULT '';");
-    q.exec("CREATE INDEX IF NOT EXISTS idx_messages_peer_ts"
-           " ON messages(peer_id, timestamp);");
-
+    // Settings table comes first — we read schema_version from it.
     q.exec(
         "CREATE TABLE IF NOT EXISTS settings ("
         "  key   TEXT PRIMARY KEY,"
@@ -301,6 +226,141 @@ void AppDataStore::createTables()
         ");"
     );
 
+    // ── Schema v3 hard-break gate ────────────────────────────────────────
+    //
+    // v3 splits contacts (people) from conversations (chat threads) and
+    // retargets messages.peer_id → conversations.id.  See the audit /
+    // commit message for the full design rationale.  No automatic data
+    // migration is provided — pre-v3 DBs have their (now-incompatible)
+    // tables dropped and the user starts fresh.  The user explicitly
+    // chose this path; if you're reading this with chat history you
+    // care about, restore from backup before upgrading.
+    bool isV3 = false;
+    {
+        SqlCipherQuery v(m_db->handle());
+        v.prepare("SELECT value FROM settings WHERE key='schema_version';");
+        if (v.exec() && v.next()) isV3 = (v.valueText(0) == "3");
+    }
+    if (!isV3) {
+        // Drop every v2-shaped table we're about to recreate in
+        // incompatible shape.  Order matters — child tables (with FKs
+        // pointing into the dropped parents) come first so we don't
+        // hit FK errors mid-drop.  PRAGMA foreign_keys = OFF for the
+        // duration so the cascades-on-drop don't fire.
+        q.exec("PRAGMA foreign_keys = OFF;");
+        q.exec("DROP TABLE IF EXISTS messages;");
+        q.exec("DROP TABLE IF EXISTS conversation_members;");
+        q.exec("DROP TABLE IF EXISTS conversations;");
+        q.exec("DROP TABLE IF EXISTS contacts;");
+        q.exec("DROP TABLE IF EXISTS group_replay_cache;");
+        q.exec("DROP TABLE IF EXISTS group_chain_state;");
+        q.exec("DROP TABLE IF EXISTS group_msg_buffer;");
+        q.exec("DROP TABLE IF EXISTS group_send_state;");
+        q.exec("DROP TABLE IF EXISTS group_bundle_map;");
+        // blocked_keys (Phase 3h) is additive on top of v3 — leave it
+        // alone here so a v2→v3 upgrade path doesn't lose block state
+        // a user has already curated.  CREATE IF NOT EXISTS below is
+        // the only thing that touches it.
+        // Preserved across v2→v3: file_transfers (separate refactor),
+        // group_seq_counters (legacy SenderChain — dies with that path).
+    }
+    // FK enforcement on for the rebuild.  SQLite defaults this off
+    // per-connection; setting it here keeps the cascade semantics
+    // we declare on the v3 tables actually fire.
+    q.exec("PRAGMA foreign_keys = ON;");
+
+    // ── contacts ────────────────────────────────────────────────────────
+    // Address book.  User-curated only — first message from a stranger
+    // creates a conversation row but NOT a contact.  No is_group, no
+    // group_id, no embedded keys list: groups live in `conversations`
+    // and group rosters in `conversation_members`.
+    //
+    // `muted` here is the person-level mute (across all conversations
+    // they appear in); the per-conversation mute lives on `conversations`.
+    // Notification logic ORs the two.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS contacts ("
+        "  peer_id      TEXT PRIMARY KEY NOT NULL,"
+        "  name         TEXT NOT NULL DEFAULT '',"
+        "  subtitle     TEXT NOT NULL DEFAULT '',"
+        "  avatar       TEXT NOT NULL DEFAULT '',"
+        "  kem_pub      BLOB,"
+        "  muted        INTEGER NOT NULL DEFAULT 0,"
+        "  last_active  INTEGER NOT NULL DEFAULT 0"
+        ");"
+    );
+    // Phase 3h purge: legacy v3 DBs still carry an `is_blocked` column
+    // that nothing reads or writes anymore (block moved to the
+    // dedicated `blocked_keys` table).  Drop it idempotently — fresh
+    // DBs created without the column have nothing to remove and the
+    // exec quietly returns false.
+    q.exec("ALTER TABLE contacts DROP COLUMN is_blocked;");
+
+    // ── conversations ───────────────────────────────────────────────────
+    // Chat threads.  One row per direct (1:1) or group conversation.
+    // `id` is always a fresh UUID minted at creation time — distinct
+    // from peer_id even for 1:1, so deleting a contact doesn't drop
+    // their chat thread (and vice versa).
+    //
+    // `direct_peer_id` is the denormalised lookup key for 1:1 chats —
+    // partial UNIQUE index below enforces "at most one direct
+    // conversation per peer" without paying for a join through
+    // conversation_members on every send/receive.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS conversations ("
+        "  id              TEXT PRIMARY KEY NOT NULL,"
+        "  kind            TEXT NOT NULL CHECK (kind IN ('direct','group')),"
+        "  direct_peer_id  TEXT,"
+        "  group_name      TEXT NOT NULL DEFAULT '',"
+        "  group_avatar    TEXT NOT NULL DEFAULT '',"
+        "  muted           INTEGER NOT NULL DEFAULT 0,"
+        "  last_active     INTEGER NOT NULL DEFAULT 0,"
+        "  in_chat_list    INTEGER NOT NULL DEFAULT 1"
+        ");"
+    );
+    q.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_direct_peer"
+           " ON conversations(direct_peer_id) WHERE direct_peer_id IS NOT NULL;");
+
+    // ── conversation_members ────────────────────────────────────────────
+    // Membership of a conversation, excluding self.  Direct conversations
+    // have exactly one row (the peer); groups have one row per other
+    // member.  Intentionally NO FK to contacts — a peer can be in a
+    // conversation without being in our address book (e.g. a group
+    // member we've never explicitly added).
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS conversation_members ("
+        "  conversation_id  TEXT NOT NULL,"
+        "  peer_id          TEXT NOT NULL,"
+        "  PRIMARY KEY (conversation_id, peer_id),"
+        "  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE"
+        ");"
+    );
+
+    // ── messages ────────────────────────────────────────────────────────
+    // FK retargeted from contacts(peer_id) to conversations(id).
+    // sender_id explicitly identifies who sent the message — for direct
+    // chats the conversation tells us who the other party is; for
+    // groups we need to know which member sent it.  Outbound: sender_id
+    // is empty (caller is self).  Inbound: sender_id is the peer_id of
+    // the originator.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "  id               INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  conversation_id  TEXT NOT NULL,"
+        "  sent             INTEGER NOT NULL,"
+        "  text             TEXT NOT NULL DEFAULT '',"
+        "  timestamp        INTEGER NOT NULL,"
+        "  msg_id           TEXT NOT NULL DEFAULT '',"
+        "  sender_id        TEXT NOT NULL DEFAULT '',"
+        "  sender_name      TEXT NOT NULL DEFAULT '',"
+        "  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE"
+        ");"
+    );
+    q.exec("CREATE INDEX IF NOT EXISTS idx_messages_conv_ts"
+           " ON messages(conversation_id, timestamp);");
+
+    // group_seq_counters: legacy SenderChain v1 counters.  Untouched
+    // by Phase 3 — dies with the SenderChain deletion (deferred).
     q.exec(
         "CREATE TABLE IF NOT EXISTS group_seq_counters ("
         "  seq_key    TEXT NOT NULL,"
@@ -348,7 +408,8 @@ void AppDataStore::createTables()
         "  counter          INTEGER NOT NULL,"
         "  sealed_envelope  BLOB NOT NULL,"
         "  sent_at          INTEGER NOT NULL,"
-        "  PRIMARY KEY (peer_id, group_id, session_id, counter)"
+        "  PRIMARY KEY (peer_id, group_id, session_id, counter),"
+        "  FOREIGN KEY (group_id) REFERENCES conversations(id) ON DELETE CASCADE"
         ");"
     );
     // Index used by the periodic TTL purge — scans rows where
@@ -373,7 +434,8 @@ void AppDataStore::createTables()
         "  gap_to            INTEGER NOT NULL DEFAULT 0,"
         "  last_retry_at     INTEGER NOT NULL DEFAULT 0,"
         "  retry_count       INTEGER NOT NULL DEFAULT 0,"
-        "  PRIMARY KEY (group_id, sender_peer_id)"
+        "  PRIMARY KEY (group_id, sender_peer_id),"
+        "  FOREIGN KEY (group_id) REFERENCES conversations(id) ON DELETE CASCADE"
         ");"
     );
 
@@ -396,15 +458,10 @@ void AppDataStore::createTables()
         "  body              TEXT NOT NULL DEFAULT '',"
         "  sender_name       TEXT NOT NULL DEFAULT '',"
         "  received_at       INTEGER NOT NULL,"
-        "  PRIMARY KEY (group_id, sender_peer_id, session_id, counter)"
+        "  PRIMARY KEY (group_id, sender_peer_id, session_id, counter),"
+        "  FOREIGN KEY (group_id) REFERENCES conversations(id) ON DELETE CASCADE"
         ");"
     );
-    // Idempotent migration for installs that created the buffer table
-    // before sealed_env_hash + msg_id were added.  SQLite errors with
-    // "duplicate column" if the column exists; q.exec just returns false
-    // — same swallow pattern as the contacts table above.
-    q.exec("ALTER TABLE group_msg_buffer ADD COLUMN sealed_env_hash BLOB;");
-    q.exec("ALTER TABLE group_msg_buffer ADD COLUMN msg_id TEXT NOT NULL DEFAULT '';");
 
     // group_send_state: sender's per-(recipient, group, session)
     // monotonic counter + last sealed-envelope hash.  Updated
@@ -421,7 +478,8 @@ void AppDataStore::createTables()
         "  session_id   BLOB NOT NULL,"
         "  next_counter INTEGER NOT NULL DEFAULT 1,"
         "  last_hash    BLOB,"
-        "  PRIMARY KEY (peer_id, group_id, session_id)"
+        "  PRIMARY KEY (peer_id, group_id, session_id),"
+        "  FOREIGN KEY (group_id) REFERENCES conversations(id) ON DELETE CASCADE"
         ");"
     );
 
@@ -443,20 +501,61 @@ void AppDataStore::createTables()
         "CREATE TABLE IF NOT EXISTS group_bundle_map ("
         "  group_id   TEXT PRIMARY KEY NOT NULL,"
         "  bundle_id  BLOB NOT NULL UNIQUE,"
-        "  created_at INTEGER NOT NULL"
+        "  created_at INTEGER NOT NULL,"
+        "  FOREIGN KEY (group_id) REFERENCES conversations(id) ON DELETE CASCADE"
         ");"
     );
     q.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_group_bundle_map_bundle"
            " ON group_bundle_map(bundle_id);");
+
+    // ── blocked_keys ────────────────────────────────────────────────────
+    //
+    // Phase 3h: block is its own thing, separate from the address book.
+    // Inbound messages from a peer in this table are silently dropped
+    // regardless of whether a `contacts` row exists for that peer.
+    // This is the proper architectural fix for the prior coupling
+    // (block previously wrote contacts.is_blocked, which forced an
+    // auto-stub contact row and polluted the address book).
+    //
+    // Additive — doesn't disturb existing v3 tables, no version bump
+    // required.  contacts.is_blocked column still exists for now but
+    // is no longer written or read; cleanup is a follow-up.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS blocked_keys ("
+        "  peer_id    TEXT PRIMARY KEY NOT NULL,"
+        "  blocked_at INTEGER NOT NULL"
+        ");"
+    );
+
+    // Stamp the schema version.  Future migrations gate on this — see
+    // the v3 hard-break block at the top of this function for how the
+    // current release handles upgrades from pre-v3 DBs.
+    {
+        SqlCipherQuery v(*m_db);
+        v.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('schema_version','3');");
+        v.exec();
+    }
 }
 
-void AppDataStore::updateLastActive(const std::string& peerIdB64u)
+void AppDataStore::touchContact(const std::string& peerIdB64u, int64_t whenSecs)
 {
     if (peerIdB64u.empty() || !m_db) return;
+    // No-op when there's no contact row — strangers messaging us
+    // don't get auto-added to the address book (Phase 3 design).
     SqlCipherQuery q(*m_db);
     q.prepare("UPDATE contacts SET last_active=:ts WHERE peer_id=:peer_id;");
-    q.bindValue(":ts", static_cast<int64_t>(time(nullptr)));
+    q.bindValue(":ts", whenSecs);
     q.bindValue(":peer_id", peerIdB64u);
+    q.exec();
+}
+
+void AppDataStore::touchConversation(const std::string& id, int64_t whenSecs)
+{
+    if (id.empty() || !m_db) return;
+    SqlCipherQuery q(*m_db);
+    q.prepare("UPDATE conversations SET last_active=:ts WHERE id=:id;");
+    q.bindValue(":ts", whenSecs);
+    q.bindValue(":id", id);
     q.exec();
 }
 
@@ -468,19 +567,12 @@ bool AppDataStore::saveContact(const Contact& c)
     SqlCipherQuery q(*m_db);
     q.prepare(
         "INSERT INTO contacts"
-        " (peer_id,name,subtitle,keys,is_blocked,is_group,group_id,avatar,"
-        "  last_active,in_address_book,muted)"
-        " VALUES (:peer_id,:name,:subtitle,:keys,:is_blocked,:is_group,"
-        "         :group_id,:avatar,:last_active,:in_ab,:muted)"
+        " (peer_id,name,subtitle,avatar,muted,last_active)"
+        " VALUES (:peer_id,:name,:subtitle,:avatar,:muted,:last_active)"
         " ON CONFLICT(peer_id) DO UPDATE SET"
         "   name=excluded.name,"
         "   subtitle=excluded.subtitle,"
-        "   keys=excluded.keys,"
-        "   is_blocked=excluded.is_blocked,"
-        "   is_group=excluded.is_group,"
-        "   group_id=excluded.group_id,"
         "   avatar=excluded.avatar,"
-        "   in_address_book=excluded.in_address_book,"
         "   muted=excluded.muted;"
     );
     q.bindValue(":peer_id",     c.peerIdB64u);
@@ -488,36 +580,20 @@ bool AppDataStore::saveContact(const Contact& c)
                                   fieldAad("contacts", "name", c.peerIdB64u)));
     q.bindValue(":subtitle",    encryptField(c.subtitle,
                                   fieldAad("contacts", "subtitle", c.peerIdB64u)));
-    q.bindValue(":keys",        encryptField(joinKeys(c.keys),
-                                  fieldAad("contacts", "keys", c.peerIdB64u)));
-    q.bindValue(":is_blocked",  c.isBlocked ? 1 : 0);
-    q.bindValue(":is_group",    c.isGroup   ? 1 : 0);
-    // Encrypt group_id alongside name/keys/avatar.  All other
-    // PII-shaped contact fields are field-encrypted; leaving group_id
-    // plaintext would mean a SQLCipher-page-key compromise still leaks
-    // group membership topology.
-    q.bindValue(":group_id",    encryptField(c.groupId,
-                                  fieldAad("contacts", "group_id", c.peerIdB64u)));
     q.bindValue(":avatar",      encryptField(c.avatarB64,
                                   fieldAad("contacts", "avatar", c.peerIdB64u)));
-    q.bindValue(":last_active", c.lastActiveSecs);
-    q.bindValue(":in_ab",       c.inAddressBook ? 1 : 0);
     q.bindValue(":muted",       c.muted ? 1 : 0);
+    q.bindValue(":last_active", c.lastActiveSecs);
     return q.exec();
 }
 
 bool AppDataStore::deleteContact(const std::string& peerIdB64u)
 {
     if (!m_db || peerIdB64u.empty()) return false;
-
-    // Phase 2: a group's contact row uses peer_id == groupId, so the
-    // same string is the bundle_map key.  Drop the wire-id mapping
-    // alongside the contact so a future re-create of the same groupId
-    // mints a fresh bundle (and the old bundle stops resolving on this
-    // device — defense in depth against post-leave replay).  Cheap
-    // no-op for 1:1 contacts where no row exists.
-    dropBundleMapping(peerIdB64u);
-
+    // Address-book removal only.  Conversations, messages, and
+    // group_* state involving this peer are intentionally NOT touched
+    // — chat history is separate from address-book curation.  Use
+    // deleteConversation to wipe a thread.
     SqlCipherQuery q(*m_db);
     q.prepare("DELETE FROM contacts WHERE peer_id=:peer_id;");
     q.bindValue(":peer_id", peerIdB64u);
@@ -529,8 +605,7 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
     if (!m_db || !cb) return;
     SqlCipherQuery q(m_db->handle());
     q.prepare(
-        "SELECT peer_id,name,subtitle,keys,is_blocked,is_group,"
-        "       group_id,avatar,last_active,in_address_book,muted"
+        "SELECT peer_id,name,subtitle,avatar,muted,last_active"
         " FROM contacts ORDER BY last_active DESC, rowid ASC;"
     );
     if (!q.exec()) return;
@@ -541,17 +616,10 @@ void AppDataStore::loadAllContacts(const std::function<void(const Contact&)>& cb
                                           fieldAad("contacts", "name",     c.peerIdB64u));
         c.subtitle       = decryptField(q.valueText(2),
                                           fieldAad("contacts", "subtitle", c.peerIdB64u));
-        c.keys           = splitKeys(decryptField(q.valueText(3),
-                                          fieldAad("contacts", "keys",     c.peerIdB64u)));
-        c.isBlocked      = q.valueInt(4) == 1;
-        c.isGroup        = q.valueInt(5) == 1;
-        c.groupId        = decryptField(q.valueText(6),
-                                          fieldAad("contacts", "group_id", c.peerIdB64u));
-        c.avatarB64      = decryptField(q.valueText(7),
+        c.avatarB64      = decryptField(q.valueText(3),
                                           fieldAad("contacts", "avatar",   c.peerIdB64u));
-        c.lastActiveSecs = q.valueInt64(8);
-        c.inAddressBook  = q.valueInt(9) == 1;
-        c.muted          = q.valueInt(10) == 1;
+        c.muted          = q.valueInt(4) == 1;
+        c.lastActiveSecs = q.valueInt64(5);
         cb(c);
     }
 }
@@ -561,8 +629,7 @@ bool AppDataStore::loadContact(const std::string& peerIdB64u, Contact& out) cons
     if (!m_db || peerIdB64u.empty()) return false;
     SqlCipherQuery q(m_db->handle());
     q.prepare(
-        "SELECT peer_id,name,subtitle,keys,is_blocked,is_group,"
-        "       group_id,avatar,last_active,in_address_book,muted"
+        "SELECT peer_id,name,subtitle,avatar,muted,last_active"
         " FROM contacts WHERE peer_id=:pid LIMIT 1;"
     );
     q.bindValue(":pid", peerIdB64u);
@@ -572,17 +639,10 @@ bool AppDataStore::loadContact(const std::string& peerIdB64u, Contact& out) cons
                                         fieldAad("contacts", "name",     out.peerIdB64u));
     out.subtitle       = decryptField(q.valueText(2),
                                         fieldAad("contacts", "subtitle", out.peerIdB64u));
-    out.keys           = splitKeys(decryptField(q.valueText(3),
-                                        fieldAad("contacts", "keys",     out.peerIdB64u)));
-    out.isBlocked      = q.valueInt(4) == 1;
-    out.isGroup        = q.valueInt(5) == 1;
-    out.groupId        = decryptField(q.valueText(6),
-                                        fieldAad("contacts", "group_id", out.peerIdB64u));
-    out.avatarB64      = decryptField(q.valueText(7),
+    out.avatarB64      = decryptField(q.valueText(3),
                                         fieldAad("contacts", "avatar",   out.peerIdB64u));
-    out.lastActiveSecs = q.valueInt64(8);
-    out.inAddressBook  = q.valueInt(9) == 1;
-    out.muted          = q.valueInt(10) == 1;
+    out.muted          = q.valueInt(4) == 1;
+    out.lastActiveSecs = q.valueInt64(5);
     return true;
 }
 
@@ -598,12 +658,21 @@ bool AppDataStore::setContactMuted(const std::string& peerIdB64u, bool muted)
 
 std::string AppDataStore::exportContactsJson() const
 {
+    // Wire format kept compatible with v1 ("name" + "keys" array per
+    // entry) for cross-version sharing.  Contacts are now strictly 1:1
+    // peers — `keys` will always be a one-element array containing
+    // the peer's public key.  Blocked rows are omitted.
     nlohmann::json arr = nlohmann::json::array();
     loadAllContacts([&](const Contact& c) {
-        if (c.isBlocked) return;
+        // v3 export: blocked-state lives in `blocked_keys` (Phase 3h),
+        // a separate concept from address-book curation.  Exporting
+        // contacts intentionally does NOT include block state — that's
+        // a per-device security action, not a portable address-book
+        // attribute.  Recipients of an exported list shouldn't inherit
+        // blocks from the sender.
         nlohmann::json obj;
         obj["name"] = c.name;
-        obj["keys"] = c.keys;
+        obj["keys"] = nlohmann::json::array({ c.peerIdB64u });
         arr.push_back(std::move(obj));
     });
     nlohmann::json root;
@@ -624,13 +693,10 @@ int AppDataStore::importContactsJson(const std::string& json)
         return -1;
     }
 
-    // Snapshot existing IDs once so the import never overwrites.  Matches
-    // desktop's prior behavior: row is keyed by peerIdB64u when present,
-    // or "name:<name>" for unnamed group-style rows.
+    // Snapshot existing peer_ids once so the import never overwrites.
     std::unordered_set<std::string> existing;
     loadAllContacts([&](const Contact& c) {
-        if (!c.peerIdB64u.empty())      existing.insert(c.peerIdB64u);
-        else if (!c.name.empty())       existing.insert("name:" + c.name);
+        if (!c.peerIdB64u.empty()) existing.insert(c.peerIdB64u);
     });
 
     int imported = 0;
@@ -640,22 +706,20 @@ int AppDataStore::importContactsJson(const std::string& json)
         if (entry.contains("name") && entry["name"].is_string()) {
             c.name = p2p::trimmed(entry["name"].get<std::string>());
         }
-        if (entry.contains("keys") && entry["keys"].is_array()) {
-            for (const auto& k : entry["keys"]) {
-                if (k.is_string()) c.keys.push_back(k.get<std::string>());
-            }
+        // v1 wire format used a `keys` array; first key is the peer's
+        // public key.  Group-shaped exports (multi-key) from older
+        // versions are silently dropped — no equivalent in v3.
+        if (entry.contains("keys") && entry["keys"].is_array()
+            && !entry["keys"].empty()
+            && entry["keys"].front().is_string()) {
+            c.peerIdB64u = entry["keys"].front().get<std::string>();
         }
-        if (c.name.empty() && c.keys.empty()) continue;
-
-        if (!c.keys.empty()) c.peerIdB64u = c.keys.front();
-        const std::string key = c.peerIdB64u.empty()
-            ? ("name:" + c.name)
-            : c.peerIdB64u;
-        if (existing.count(key)) continue;
+        if (c.peerIdB64u.empty()) continue;
+        if (existing.count(c.peerIdB64u)) continue;
 
         c.subtitle = "Secure chat";
         if (saveContact(c)) {
-            existing.insert(key);
+            existing.insert(c.peerIdB64u);
             ++imported;
         }
     }
@@ -694,102 +758,425 @@ Bytes AppDataStore::loadContactKemPub(const std::string& peerIdB64u) const
     return {};
 }
 
-// ── Messages ────────────────────────────────────────────────────────────────
+// ── Conversations ───────────────────────────────────────────────────────────
 
-bool AppDataStore::saveMessage(const std::string& peerIdB64u, const Message& m)
+namespace {
+constexpr const char* kKindDirect = "direct";
+constexpr const char* kKindGroup  = "group";
+
+const char* kindToString(AppDataStore::ConversationKind k)
 {
-    if (!m_db || peerIdB64u.empty()) return false;
+    return k == AppDataStore::ConversationKind::Group ? kKindGroup : kKindDirect;
+}
 
-    // Single transaction so the contact-stub INSERT, message INSERT,
-    // and last_active UPDATE are atomic.  Desktop DBM ran INSERT +
-    // last_active as two separate fsyncs which both doubled the write
-    // latency and left a window where a crash mid-pair would store the
-    // message without the activity bump.
+AppDataStore::ConversationKind kindFromString(const std::string& s)
+{
+    return s == kKindGroup ? AppDataStore::ConversationKind::Group
+                           : AppDataStore::ConversationKind::Direct;
+}
+}  // namespace
+
+bool AppDataStore::saveConversation(const Conversation& c)
+{
+    if (!m_db || c.id.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT INTO conversations"
+        " (id,kind,direct_peer_id,group_name,group_avatar,muted,"
+        "  last_active,in_chat_list)"
+        " VALUES (:id,:kind,:direct_peer,:gname,:gavatar,:muted,"
+        "         :last_active,:in_list)"
+        " ON CONFLICT(id) DO UPDATE SET"
+        "   kind=excluded.kind,"
+        "   direct_peer_id=excluded.direct_peer_id,"
+        "   group_name=excluded.group_name,"
+        "   group_avatar=excluded.group_avatar,"
+        "   muted=excluded.muted,"
+        "   in_chat_list=excluded.in_chat_list;"
+    );
+    q.bindValue(":id",    c.id);
+    q.bindValue(":kind",  std::string(kindToString(c.kind)));
+    // direct_peer_id is NULL for groups so the partial UNIQUE index
+    // doesn't reject multiple groups.  SqlCipherQuery's bindValue
+    // takes a string — empty string maps to NULL for TEXT columns
+    // when we explicitly bind NULL, which we do here for groups.
+    if (c.kind == ConversationKind::Direct && !c.directPeerId.empty()) {
+        q.bindValue(":direct_peer", c.directPeerId);
+    } else {
+        q.bindValue(":direct_peer", nullptr);
+    }
+    q.bindValue(":gname",       encryptField(c.groupName,
+                                  fieldAad("conversations", "group_name",   c.id)));
+    q.bindValue(":gavatar",     encryptField(c.groupAvatarB64,
+                                  fieldAad("conversations", "group_avatar", c.id)));
+    q.bindValue(":muted",       c.muted ? 1 : 0);
+    q.bindValue(":last_active", c.lastActiveSecs);
+    q.bindValue(":in_list",     c.inChatList ? 1 : 0);
+    return q.exec();
+}
+
+bool AppDataStore::loadConversation(const std::string& id, Conversation& out) const
+{
+    if (!m_db || id.empty()) return false;
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT id,kind,direct_peer_id,group_name,group_avatar,muted,"
+        "       last_active,in_chat_list"
+        " FROM conversations WHERE id=:id LIMIT 1;"
+    );
+    q.bindValue(":id", id);
+    if (!q.exec() || !q.next()) return false;
+    out.id              = q.valueText(0);
+    out.kind            = kindFromString(q.valueText(1));
+    out.directPeerId    = q.valueText(2);
+    out.groupName       = decryptField(q.valueText(3),
+                                          fieldAad("conversations", "group_name",   out.id));
+    out.groupAvatarB64  = decryptField(q.valueText(4),
+                                          fieldAad("conversations", "group_avatar", out.id));
+    out.muted           = q.valueInt(5) == 1;
+    out.lastActiveSecs  = q.valueInt64(6);
+    out.inChatList      = q.valueInt(7) == 1;
+    return true;
+}
+
+void AppDataStore::loadAllConversations(
+    const std::function<void(const Conversation&)>& cb) const
+{
+    if (!m_db || !cb) return;
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT id,kind,direct_peer_id,group_name,group_avatar,muted,"
+        "       last_active,in_chat_list"
+        " FROM conversations ORDER BY last_active DESC, rowid ASC;"
+    );
+    if (!q.exec()) return;
+    while (q.next()) {
+        Conversation c;
+        c.id              = q.valueText(0);
+        c.kind            = kindFromString(q.valueText(1));
+        c.directPeerId    = q.valueText(2);
+        c.groupName       = decryptField(q.valueText(3),
+                                          fieldAad("conversations", "group_name",   c.id));
+        c.groupAvatarB64  = decryptField(q.valueText(4),
+                                          fieldAad("conversations", "group_avatar", c.id));
+        c.muted           = q.valueInt(5) == 1;
+        c.lastActiveSecs  = q.valueInt64(6);
+        c.inChatList      = q.valueInt(7) == 1;
+        cb(c);
+    }
+}
+
+bool AppDataStore::ensureGroupConversation(const std::string& groupId)
+{
+    if (!m_db || groupId.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT OR IGNORE INTO conversations (id,kind,last_active,in_chat_list)"
+        " VALUES (:id,'group',:ts,1);"
+    );
+    q.bindValue(":id", groupId);
+    q.bindValue(":ts", static_cast<int64_t>(time(nullptr)));
+    return q.exec();
+}
+
+std::string AppDataStore::findOrCreateDirectConversation(const std::string& peerIdB64u)
+{
+    if (!m_db || peerIdB64u.empty()) return {};
+
+    {
+        SqlCipherQuery q(m_db->handle());
+        q.prepare(
+            "SELECT id FROM conversations"
+            " WHERE direct_peer_id=:pid LIMIT 1;"
+        );
+        q.bindValue(":pid", peerIdB64u);
+        if (q.exec() && q.next()) return q.valueText(0);
+    }
+
+    // Mint a fresh UUID via the project's existing helper.  The
+    // partial UNIQUE index on direct_peer_id makes the INSERT race-safe
+    // — concurrent callers that lose the race re-read the winner's row.
+    const std::string id = p2p::makeUuid();
+    SqlCipherQuery ins(*m_db);
+    ins.prepare(
+        "INSERT INTO conversations (id,kind,direct_peer_id,last_active,in_chat_list)"
+        " VALUES (:id,'direct',:pid,:ts,1);"
+    );
+    ins.bindValue(":id", id);
+    ins.bindValue(":pid", peerIdB64u);
+    ins.bindValue(":ts", static_cast<int64_t>(time(nullptr)));
+    if (!ins.exec()) {
+        // Lost the race — re-read the winning row.
+        SqlCipherQuery q(m_db->handle());
+        q.prepare("SELECT id FROM conversations WHERE direct_peer_id=:pid LIMIT 1;");
+        q.bindValue(":pid", peerIdB64u);
+        if (q.exec() && q.next()) return q.valueText(0);
+        return {};
+    }
+
+    // Direct conversation has exactly one member (the peer).
+    addConversationMember(id, peerIdB64u);
+    return id;
+}
+
+bool AppDataStore::deleteConversation(const std::string& id)
+{
+    if (!m_db || id.empty()) return false;
+    // FK ON DELETE CASCADE on messages, conversation_members, and the
+    // group_* tables sweeps everything tied to this conversation.
+    SqlCipherQuery q(*m_db);
+    q.prepare("DELETE FROM conversations WHERE id=:id;");
+    q.bindValue(":id", id);
+    return q.exec();
+}
+
+bool AppDataStore::setConversationMuted(const std::string& id, bool muted)
+{
+    if (!m_db || id.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare("UPDATE conversations SET muted=:m WHERE id=:id;");
+    q.bindValue(":m",  muted ? 1 : 0);
+    q.bindValue(":id", id);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+bool AppDataStore::setConversationInChatList(const std::string& id, bool inList)
+{
+    if (!m_db || id.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare("UPDATE conversations SET in_chat_list=:v WHERE id=:id;");
+    q.bindValue(":v",  inList ? 1 : 0);
+    q.bindValue(":id", id);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+// ── Conversation members ─────────────────────────────────────────────────────
+
+bool AppDataStore::addConversationMember(const std::string& conversationId,
+                                            const std::string& peerIdB64u)
+{
+    if (!m_db || conversationId.empty() || peerIdB64u.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT OR IGNORE INTO conversation_members (conversation_id,peer_id)"
+        " VALUES (:cid,:pid);"
+    );
+    q.bindValue(":cid", conversationId);
+    q.bindValue(":pid", peerIdB64u);
+    return q.exec();
+}
+
+bool AppDataStore::removeConversationMember(const std::string& conversationId,
+                                               const std::string& peerIdB64u)
+{
+    if (!m_db || conversationId.empty() || peerIdB64u.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "DELETE FROM conversation_members"
+        " WHERE conversation_id=:cid AND peer_id=:pid;"
+    );
+    q.bindValue(":cid", conversationId);
+    q.bindValue(":pid", peerIdB64u);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+bool AppDataStore::setConversationMembers(const std::string& conversationId,
+                                             const std::vector<std::string>& peerIds)
+{
+    if (!m_db || conversationId.empty()) return false;
+
     Tx tx(m_db->handle());
 
-    // FK guarantee: the messages.peer_id FK requires a contacts row to
-    // exist before the INSERT can land.  iOS callers append to their
-    // in-memory message array before they have a chance to create the
-    // contact row (e.g. inbound from a stranger we've never added),
-    // so silently ensure a minimal stub row here.  INSERT OR IGNORE
-    // means an existing row (with its is_group / in_address_book /
-    // name / etc. intact) is left alone — only true strangers get a
-    // fresh stub with in_address_book=0.
     {
-        SqlCipherQuery ensure(*m_db);
-        ensure.prepare(
-            "INSERT OR IGNORE INTO contacts (peer_id, in_address_book)"
-            " VALUES (:peer_id, 0);"
-        );
-        ensure.bindValue(":peer_id", peerIdB64u);
-        ensure.exec();
+        SqlCipherQuery del(*m_db);
+        del.prepare("DELETE FROM conversation_members WHERE conversation_id=:cid;");
+        del.bindValue(":cid", conversationId);
+        if (!del.exec()) return false;
     }
+    for (const std::string& pid : peerIds) {
+        if (pid.empty()) continue;
+        SqlCipherQuery ins(*m_db);
+        ins.prepare(
+            "INSERT OR IGNORE INTO conversation_members (conversation_id,peer_id)"
+            " VALUES (:cid,:pid);"
+        );
+        ins.bindValue(":cid", conversationId);
+        ins.bindValue(":pid", pid);
+        if (!ins.exec()) return false;
+    }
+    return tx.commit();
+}
+
+void AppDataStore::loadConversationMembers(
+    const std::string& conversationId,
+    const std::function<void(const std::string&)>& cb) const
+{
+    if (!m_db || !cb || conversationId.empty()) return;
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT peer_id FROM conversation_members"
+        " WHERE conversation_id=:cid ORDER BY peer_id ASC;"
+    );
+    q.bindValue(":cid", conversationId);
+    if (!q.exec()) return;
+    while (q.next()) cb(q.valueText(0));
+}
+
+// ── Blocked keys ────────────────────────────────────────────────────────────
+
+bool AppDataStore::addBlockedKey(const std::string& peerIdB64u, int64_t whenSecs)
+{
+    if (!m_db || peerIdB64u.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    // INSERT OR REPLACE so re-blocking refreshes the timestamp without
+    // erroring on the PK collision.  Idempotent from the caller's view.
+    q.prepare(
+        "INSERT OR REPLACE INTO blocked_keys (peer_id, blocked_at)"
+        " VALUES (:peer, :ts);"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":ts",   whenSecs);
+    return q.exec();
+}
+
+bool AppDataStore::removeBlockedKey(const std::string& peerIdB64u)
+{
+    if (!m_db || peerIdB64u.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare("DELETE FROM blocked_keys WHERE peer_id=:peer;");
+    q.bindValue(":peer", peerIdB64u);
+    return q.exec() && q.numRowsAffected() > 0;
+}
+
+bool AppDataStore::isBlockedKey(const std::string& peerIdB64u) const
+{
+    if (!m_db || peerIdB64u.empty()) return false;
+    SqlCipherQuery q(m_db->handle());
+    q.prepare("SELECT 1 FROM blocked_keys WHERE peer_id=:peer LIMIT 1;");
+    q.bindValue(":peer", peerIdB64u);
+    return q.exec() && q.next();
+}
+
+void AppDataStore::loadAllBlockedKeys(
+    const std::function<void(const std::string&, int64_t)>& cb) const
+{
+    if (!m_db || !cb) return;
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT peer_id, blocked_at FROM blocked_keys"
+        " ORDER BY blocked_at ASC;"
+    );
+    if (!q.exec()) return;
+    while (q.next()) cb(q.valueText(0), q.valueInt64(1));
+}
+
+// ── Messages ────────────────────────────────────────────────────────────────
+
+bool AppDataStore::saveMessage(const std::string& conversationId, const Message& m)
+{
+    if (!m_db || conversationId.empty()) return false;
+
+    // Single transaction so the message INSERT and conversation
+    // last_active bump are atomic + share one fsync.  The conversation
+    // row MUST exist — callers that handle inbound-from-stranger
+    // should call findOrCreateDirectConversation first.
+    Tx tx(m_db->handle());
 
     {
         SqlCipherQuery q(*m_db);
         q.prepare(
-            "INSERT INTO messages (peer_id,sent,text,timestamp,msg_id,sender_name)"
-            " VALUES (:peer_id,:sent,:text,:ts,:msg_id,:sender_name);"
+            "INSERT INTO messages"
+            " (conversation_id,sent,text,timestamp,msg_id,sender_id,sender_name)"
+            " VALUES (:cid,:sent,:text,:ts,:msg_id,:sender_id,:sender_name);"
         );
-        q.bindValue(":peer_id",     peerIdB64u);
+        q.bindValue(":cid",         conversationId);
         q.bindValue(":sent",        m.sent ? 1 : 0);
-        // Messages bind (peer_id, msg_id) into the AAD so a blob from
-        // alice@msg1 cannot be swapped into bob@msg1 or alice@msg2.
-        const std::string rowKey = peerIdB64u + "|" + m.msgId;
+        // Messages bind (conversation_id, msg_id) into the AAD so a
+        // blob from convA@msg1 cannot be swapped into convB@msg1 or
+        // convA@msg2.
+        const std::string rowKey = conversationId + "|" + m.msgId;
         q.bindValue(":text",        encryptField(m.text,
                                       fieldAad("messages", "text", rowKey)));
         q.bindValue(":ts",          m.timestampSecs);
         q.bindValue(":msg_id",      m.msgId);
+        q.bindValue(":sender_id",   m.senderId);
         q.bindValue(":sender_name", encryptField(m.senderName,
                                       fieldAad("messages", "sender_name", rowKey)));
         if (!q.exec()) return false;
     }
-    updateLastActive(peerIdB64u);
+    touchConversation(conversationId, m.timestampSecs > 0
+                                          ? m.timestampSecs
+                                          : static_cast<int64_t>(time(nullptr)));
+    // Bump the sender's contact last_active too, when the message is
+    // inbound and we have an address-book row for them.  Outbound
+    // messages don't touch any contact (sender is self).
+    if (!m.sent && !m.senderId.empty()) {
+        touchContact(m.senderId, m.timestampSecs > 0
+                                     ? m.timestampSecs
+                                     : static_cast<int64_t>(time(nullptr)));
+    }
+    // Auto-unhide on inbound: if the user previously archived this
+    // conversation (in_chat_list=0), pop it back into the chat list
+    // when the other party speaks up.  Matches the "hide until they
+    // message me again" mental model.  Outbound stays sticky — sending
+    // to a hidden chat doesn't auto-unhide (the user already has the
+    // chat in front of them; if they want it back in the list they
+    // can flip the toggle themselves).
+    if (!m.sent) {
+        SqlCipherQuery unhide(*m_db);
+        unhide.prepare(
+            "UPDATE conversations SET in_chat_list=1"
+            " WHERE id=:id AND in_chat_list=0;"
+        );
+        unhide.bindValue(":id", conversationId);
+        unhide.exec();
+    }
     return tx.commit();
 }
 
-void AppDataStore::loadMessages(const std::string& peerIdB64u,
+void AppDataStore::loadMessages(const std::string& conversationId,
                                 const std::function<void(const Message&)>& cb) const
 {
-    if (!m_db || !cb || peerIdB64u.empty()) return;
+    if (!m_db || !cb || conversationId.empty()) return;
     SqlCipherQuery q(m_db->handle());
     q.prepare(
-        "SELECT sent,text,timestamp,msg_id,sender_name FROM messages"
-        " WHERE peer_id=:peer_id ORDER BY timestamp ASC, id ASC;"
+        "SELECT sent,text,timestamp,msg_id,sender_id,sender_name FROM messages"
+        " WHERE conversation_id=:cid ORDER BY timestamp ASC, id ASC;"
     );
-    q.bindValue(":peer_id", peerIdB64u);
+    q.bindValue(":cid", conversationId);
     if (!q.exec()) return;
     while (q.next()) {
         Message m;
         m.sent          = q.valueInt(0) == 1;
         m.timestampSecs = q.valueInt64(2);
         m.msgId         = q.valueText(3);
-        const std::string rowKey = peerIdB64u + "|" + m.msgId;
+        m.senderId      = q.valueText(4);
+        const std::string rowKey = conversationId + "|" + m.msgId;
         m.text          = decryptField(q.valueText(1),
                                           fieldAad("messages", "text",        rowKey));
-        m.senderName    = decryptField(q.valueText(4),
+        m.senderName    = decryptField(q.valueText(5),
                                           fieldAad("messages", "sender_name", rowKey));
         cb(m);
     }
 }
 
-bool AppDataStore::deleteMessages(const std::string& peerIdB64u)
+bool AppDataStore::deleteMessages(const std::string& conversationId)
 {
-    if (!m_db || peerIdB64u.empty()) return false;
+    if (!m_db || conversationId.empty()) return false;
     SqlCipherQuery q(*m_db);
-    q.prepare("DELETE FROM messages WHERE peer_id=:peer_id;");
-    q.bindValue(":peer_id", peerIdB64u);
+    q.prepare("DELETE FROM messages WHERE conversation_id=:cid;");
+    q.bindValue(":cid", conversationId);
     return q.exec();
 }
 
-bool AppDataStore::deleteMessage(const std::string& peerIdB64u,
+bool AppDataStore::deleteMessage(const std::string& conversationId,
                                  const std::string& msgId)
 {
-    if (!m_db || peerIdB64u.empty() || msgId.empty()) return false;
+    if (!m_db || conversationId.empty() || msgId.empty()) return false;
     SqlCipherQuery q(*m_db);
-    q.prepare("DELETE FROM messages WHERE peer_id=:peer_id AND msg_id=:msg_id;");
-    q.bindValue(":peer_id", peerIdB64u);
-    q.bindValue(":msg_id",  msgId);
+    q.prepare("DELETE FROM messages WHERE conversation_id=:cid AND msg_id=:msg_id;");
+    q.bindValue(":cid",    conversationId);
+    q.bindValue(":msg_id", msgId);
     // exec() returns true for SQLITE_DONE even when zero rows matched;
     // honor the docstring's "returns false when nothing matched".
     return q.exec() && q.numRowsAffected() > 0;

@@ -105,6 +105,12 @@ void SettingsPanel::buildUI()
     // ── Appearance (theme) ─────────────────────────────────────────────────
     bodyLayout->addWidget(makeAppearanceSection());
 
+    // ── Archived Chats (recovery) ──────────────────────────────────────────
+    // Sits between Appearance and About because it's a data-management
+    // action — the user gets here when they realise they hid a chat and
+    // want it back.  Empty most of the time; one-row card stays compact.
+    bodyLayout->addWidget(makeArchivedChatsSection());
+
     // ── About section ─────────────────────────────────────────────────────────
     // Version    = app version (matches project(Peer2Pear VERSION ...) in CMakeLists.txt)
     // Protocol   = wire-protocol version (matches the relay's /healthz "version" field
@@ -762,6 +768,81 @@ QWidget *SettingsPanel::makeDataSection()
     il->addStretch();
     il->addWidget(importBtn);
     cardLayout->addWidget(importRow);
+
+    return card;
+}
+
+// ── Archived Chats card ─────────────────────────────────────────────────────
+//
+// One-row entry that opens the recovery dialog.  Hidden conversations
+// would otherwise be unreachable once the per-chat editor is gone from
+// the chat list; this section is the way back in.
+QWidget *SettingsPanel::makeArchivedChatsSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    QLabel *heading = new QLabel("ARCHIVED CHATS");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    // Two-line layout (label + sub-label) on the left, "Open" button
+    // on the right — mirrors the Auto-accept / Require-P2P rows that
+    // already use a vertical column with a sub-label below.
+    QWidget *row = new QWidget();
+    row->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *rv = new QVBoxLayout(row);
+    rv->setContentsMargins(16, 10, 16, 10);
+    rv->setSpacing(4);
+
+    QHBoxLayout *top = new QHBoxLayout();
+    top->setContentsMargins(0, 0, 0, 0);
+    top->setSpacing(8);
+
+    QLabel *label = new QLabel("Archived Chats");
+    label->setStyleSheet(
+        "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+        );
+
+    QPushButton *openBtn = new QPushButton("Open");
+    openBtn->setObjectName("openArchivedChatsBtn");
+    openBtn->setFixedSize(76, 28);
+    themeStyles::applyRole(openBtn, "dialogAccentBtn",
+        themeStyles::dialogAccentBtnCss(ThemeManager::instance().current()));
+    connect(openBtn, &QPushButton::clicked,
+            this, &SettingsPanel::archivedChatsClicked);
+
+    top->addWidget(label);
+    top->addStretch();
+    top->addWidget(openBtn);
+    rv->addLayout(top);
+
+    QLabel *sub = new QLabel(
+        "Hidden conversations. Restore a chat to bring it back to your "
+        "list, or delete it permanently."
+        );
+    sub->setStyleSheet(
+        "color: #777777; font-size: 11px; background: transparent; border: none;"
+        );
+    sub->setWordWrap(true);
+    rv->addWidget(sub);
+
+    cardLayout->addWidget(row);
 
     return card;
 }

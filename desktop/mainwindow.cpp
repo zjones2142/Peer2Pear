@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "./ui_mainwindow.h"
+#include "dialogs.h"        // openArchivedChatsDialog
 #include "onboardingdialog.h"
 #include "qt_interop.hpp"  // Qt↔std boundary helpers for CryptoEngine calls
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
@@ -608,6 +609,23 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onExportContacts);
     connect(m_settingsPanel, &SettingsPanel::importContactsClicked,
             this, &MainWindow::onImportContacts);
+
+    // Archived Chats — opens the recovery dialog.  The dialog is
+    // self-contained (reads + writes the store directly); we just
+    // hand it the address-book snapshot for display-name resolution
+    // and route the per-row action callback through ChatView so
+    // m_chats / m_messagesByConv / etc. stay in sync.
+    connect(m_settingsPanel, &SettingsPanel::archivedChatsClicked,
+            this, [this]() {
+        if (!m_chatView) return;
+        dialogs::openArchivedChatsDialog(
+            m_settingsPanel,
+            &m_store,
+            m_chatView->addressBookSnapshot(),
+            [cv = m_chatView](const dialogs::ArchivedChatEvent &) {
+                cv->reloadAfterArchiveAction();
+            });
+    });
 
     // Apply persisted notification state to the notifier.  Both the
     // global on/off and the content-privacy mode are mirrored from

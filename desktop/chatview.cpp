@@ -147,17 +147,60 @@ static QString processText(const QString &text, const QFontMetrics &fm, int maxW
 }
 
 using dialogs::openContactEditor;
-using ContactEditorResult = dialogs::ContactEditorResult;
+using dialogs::openConversationEditor;
+using dialogs::openGroupEditor;
+using ContactEditorResult      = dialogs::ContactEditorResult;
+using ConversationEditorResult = dialogs::ConversationEditorResult;
+using GroupEditorResult        = dialogs::GroupEditorResult;
 
 // ── ChatView implementation ───────────────────────────────────────────────────
 
-// Returns a stable string key for file-record lookup: peerIdB64u for DMs,
-// groupId for group chats.  Never changes when the chat is reordered.
-QString ChatView::chatKey(const AppDataStore::Contact &c)
+// v3 display helpers.  A 1:1 conversation has no embedded display name —
+// it points at a contact row via `directPeerId`.  When that row is
+// missing (we received from a stranger we haven't curated), we fall
+// back to a key-prefix label so the row is never blank.
+
+QString ChatView::displayNameFor(const AppDataStore::Conversation &conv) const
 {
-    if (c.isGroup)             return qtbridge::qstr(c.groupId);
-    if (!c.peerIdB64u.empty()) return qtbridge::qstr(c.peerIdB64u);
-    return "name:" + qtbridge::qstr(c.name);
+    if (conv.kind == AppDataStore::ConversationKind::Group)
+        return qtbridge::qstr(conv.groupName);
+    auto it = m_contactsByPeer.find(conv.directPeerId);
+    if (it != m_contactsByPeer.end() && !it->second.name.empty())
+        return qtbridge::qstr(it->second.name);
+    if (!conv.directPeerId.empty())
+        return qtbridge::qstr(p2p::peerPrefix(conv.directPeerId)) + "…";
+    return QString();
+}
+
+QString ChatView::avatarB64For(const AppDataStore::Conversation &conv) const
+{
+    if (conv.kind == AppDataStore::ConversationKind::Group)
+        return qtbridge::qstr(conv.groupAvatarB64);
+    auto it = m_contactsByPeer.find(conv.directPeerId);
+    if (it != m_contactsByPeer.end()) return qtbridge::qstr(it->second.avatarB64);
+    return QString();
+}
+
+// Effective mute = per-thread mute OR per-person mute.  The contact-
+// level mute silences a peer everywhere they show up (all their 1:1s
+// and groups they're in); per-thread mute targets only this row.
+bool ChatView::isMutedFor(const AppDataStore::Conversation &conv) const
+{
+    if (conv.muted) return true;
+    if (conv.kind == AppDataStore::ConversationKind::Direct) {
+        auto it = m_contactsByPeer.find(conv.directPeerId);
+        if (it != m_contactsByPeer.end() && it->second.muted) return true;
+    }
+    return false;
+}
+
+// Block lives in `blocked_keys` (Phase 3h), independent of contacts.
+// Groups have no per-thread block; per-member blocks fall back through
+// the same direct-peer check inside group dispatch.
+bool ChatView::isBlockedFor(const AppDataStore::Conversation &conv) const
+{
+    if (conv.kind != AppDataStore::ConversationKind::Direct) return false;
+    return m_blockedKeys.count(conv.directPeerId) > 0;
 }
 
 ChatView::ChatView(Ui::MainWindow *ui, ChatController *controller,
@@ -265,16 +308,29 @@ void ChatView::subscribeAllPresence()
     std::unordered_set<std::string> seen;
     std::vector<std::string> peerIds;
     const std::string myKey = m_controller->myIdB64u();
+
+    auto trimStd = [](const std::string& k) {
+        // Whitespace-trim in place — keys can ride along newlines from paste.
+        const auto first = k.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        const auto last  = k.find_last_not_of(" \t\r\n");
+        return k.substr(first, last - first + 1);
+    };
+
     for (const auto &c : m_chats) {
-        for (const std::string &k : c.keys) {
-            // Trim whitespace in place (keys may carry newlines from paste).
-            const auto first = k.find_first_not_of(" \t\r\n");
-            const auto last  = k.find_last_not_of(" \t\r\n");
-            if (first == std::string::npos) continue;
-            std::string trimmed = k.substr(first, last - first + 1);
-            if (trimmed == myKey) continue;
-            if (seen.insert(trimmed).second)
-                peerIds.push_back(std::move(trimmed));
+        if (c.kind == AppDataStore::ConversationKind::Direct) {
+            std::string t = trimStd(c.directPeerId);
+            if (!t.empty() && t != myKey && seen.insert(t).second)
+                peerIds.push_back(std::move(t));
+        } else {
+            const auto it = m_membersByConv.find(c.id);
+            if (it == m_membersByConv.end()) continue;
+            for (const std::string &k : it->second) {
+                std::string t = trimStd(k);
+                if (t.empty() || t == myKey) continue;
+                if (seen.insert(t).second)
+                    peerIds.push_back(std::move(t));
+            }
         }
     }
     if (!peerIds.empty())
@@ -295,10 +351,12 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
     };
 
     for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-        if (m_chats[i].isGroup) {
-            // Check if this peer is a member of the group
+        if (m_chats[i].kind == AppDataStore::ConversationKind::Group) {
+            // Membership check via the conversation_members map.
+            const auto memIt = m_membersByConv.find(m_chats[i].id);
+            if (memIt == m_membersByConv.end()) continue;
             bool isMember = false;
-            for (const std::string &k : m_chats[i].keys)
+            for (const std::string &k : memIt->second)
                 if (trimStd(k) == peerIdStd) { isMember = true; break; }
             if (!isMember) continue;
 
@@ -306,7 +364,7 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
             if (i == m_currentChat) {
                 const std::string myKey = m_controller->myIdB64u();
                 int onlineCount = 0, totalMembers = 0;
-                for (const std::string &k : m_chats[i].keys) {
+                for (const std::string &k : memIt->second) {
                     const std::string trimmed = trimStd(k);
                     if (trimmed.empty() || trimmed == myKey) continue;
                     ++totalMembers;
@@ -314,7 +372,7 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
                         ++onlineCount;
                 }
                 const QString statusText = (totalMembers == 0)
-                    ? qtbridge::qstr(m_chats[i].subtitle)
+                    ? QString("Group chat")
                     : QString("%1 of %2 members online").arg(onlineCount).arg(totalMembers);
                 m_ui->chatSubLabel->setText(statusText);
                 themeStyles::applyRole(m_ui->chatSubLabel,
@@ -326,19 +384,15 @@ void ChatView::onPresenceChanged(const QString &peerIdB64u, bool online)
             continue;  // don't return — this peer may be in multiple groups
         }
 
-        // 1:1 DM chat
-        bool match = (trimStd(m_chats[i].peerIdB64u) == peerIdStd);
-        if (!match) {
-            for (const std::string &k : m_chats[i].keys)
-                if (trimStd(k) == peerIdStd) { match = true; break; }
-        }
-        if (!match) continue;
+        // 1:1 DM chat — match on directPeerId.
+        if (trimStd(m_chats[i].directPeerId) != peerIdStd) continue;
 
-        const bool wasOnline = m_memberOnline.value(peerIdB64u, false);
-        (void)wasOnline;
-
-        // Send our avatar on first contact only if it's a real photo
-        if (online && m_chats[i].avatarB64.empty() && m_store
+        // Send our avatar on first contact only if it's a real photo.
+        // The "first contact" check looks at the contact row; if no
+        // avatar was ever stored for this peer, we treat this as the
+        // first time we're online with them.
+        QString existingAvatar = avatarB64For(m_chats[i]);
+        if (online && existingAvatar.isEmpty() && m_store
                 && m_store->loadSetting("avatarIsPhoto") == "true") {
             const std::string myName   = m_store->loadSetting("displayName");
             const std::string myAvatar = m_store->loadSetting("avatarData");
@@ -385,95 +439,67 @@ void ChatView::onIncomingMessage(const QString &fromPeerIdB64u,
 
     auto shouldToast = [&]() { return m_shouldToastFn ? m_shouldToastFn() : true; };
 
-    auto trimStd = [](const std::string& s) {
-        const auto first = s.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos) return std::string{};
-        const auto last = s.find_last_not_of(" \t\r\n");
-        return s.substr(first, last - first + 1);
-    };
+    // First-inbound from a stranger: v3 mints a conversation row only —
+    // no auto-stub Contact.  findOrCreateDirectConversation is idempotent
+    // so any second receipt before our in-memory row catches up still
+    // converges on the same id.
+    int idx = findChatForPeer(from);
+    if (idx == -1) {
+        if (!m_store) return;
+        const std::string convId = m_store->findOrCreateDirectConversation(fromStd);
+        if (convId.empty()) return;
 
-    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-        if (m_chats[i].isGroup) continue;
+        AppDataStore::Conversation conv;
+        if (!m_store->loadConversation(convId, conv)) return;
 
-        bool hit = (trimStd(m_chats[i].peerIdB64u) == fromStd);
-        if (!hit) for (const std::string &k : m_chats[i].keys)
-                if (trimStd(k) == fromStd) { hit = true; break; }
-        if (!hit) continue;
+        // Push the new conversation to the top — onIncomingMessage's
+        // job is to surface the thread.  Members for a 1:1 are just
+        // [self, peer]; we only need the peer for presence subscription.
+        m_chats.insert(m_chats.begin(), conv);
+        m_membersByConv[conv.id] = { fromStd };
+        ensureUnreadSize();
+        m_unread.prepend(0);
+        if (m_currentChat >= 0) m_currentChat += 1;
+        idx = 0;
+    }
 
-        if (m_chats[i].isBlocked) return;
+    if (isBlockedFor(m_chats[idx])) return;
 
-        auto &msgs = m_messagesByPeer[m_chats[i].peerIdB64u];
+    const std::string convId = m_chats[idx].id;
+    auto &msgs = m_messagesByConv[convId];
 
-        // UI-side dedup against already-stored messages
-        if (!msgIdStd.empty())
-            for (const auto &m : msgs)
-                if (m.msgId == msgIdStd) return;
+    // UI-side dedup against already-stored messages
+    if (!msgIdStd.empty())
+        for (const auto &m : msgs)
+            if (m.msgId == msgIdStd) return;
 
-        const bool needsSep = msgs.empty() ||
-                              (tsSecs - msgs.back().timestampSecs) >= kDateSepSecs;
+    const bool needsSep = msgs.empty() ||
+                          (tsSecs - msgs.back().timestampSecs) >= kDateSepSecs;
 
-        AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, ""};
-        msgs.push_back(msg);
-        m_chats[i].lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
-        if (m_store) { m_store->saveContact(m_chats[i]); m_store->saveMessage(m_chats[i].peerIdB64u, msg); }
+    AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, fromStd, ""};
+    msgs.push_back(msg);
+    m_chats[idx].lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+    // saveMessage bumps conversations.last_active in the same TX, so we
+    // don't need a separate touchConversation call.
+    if (m_store) m_store->saveMessage(convId, msg);
 
-        if (i == m_currentChat) {
-            if (needsSep) addDateSeparator(timestamp);
-            addMessageBubble(text, false, /*senderName=*/QString(),
-                              qtbridge::qstr(msgIdStd), chatKey(m_chats[i]));
-            promoteChatToTop(i);
-            rebuildChatList();
-        } else {
-            m_unread[i] += 1;
-            emit unreadChanged(totalUnread());
-            promoteChatToTop(i);
-            rebuildChatList();
-            if (m_notifier && shouldToast() && !m_chats[0].muted)
-                m_notifier->notify(qtbridge::qstr(m_chats[0].name), text);
+    if (idx == m_currentChat) {
+        if (needsSep) addDateSeparator(timestamp);
+        addMessageBubble(text, false, /*senderName=*/QString(),
+                          qtbridge::qstr(msgIdStd), qtbridge::qstr(convId));
+        promoteChatToTop(idx);
+        rebuildChatList();
+    } else {
+        m_unread[idx] += 1;
+        emit unreadChanged(totalUnread());
+        promoteChatToTop(idx);
+        rebuildChatList();
+        // After promote, the source row is now at index 0.
+        if (m_notifier && shouldToast() && !isMutedFor(m_chats[0])) {
+            const QString label = displayNameFor(m_chats[0]);
+            m_notifier->notify(label, text);
         }
-        return;
     }
-
-    // No matching row in m_chats — either a true stranger or an
-    // explicit contact the chat-list filter evicted on startup.  Try
-    // the DB first so we don't clobber a real nickname / inAB bit
-    // with an "Unknown contact" stub (saveContact UPSERTs all fields).
-    AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, ""};
-    AppDataStore::Contact nc;
-    bool loadedFromDb = false;
-    if (m_store) loadedFromDb = m_store->loadContact(fromStd, nc);
-    if (!loadedFromDb) {
-        // Leave `nc.name` empty — identity for an un-added peer is
-        // their public key.  rebuildChatList falls back to an 8-char
-        // key prefix for empty names, and the "upgrade on avatar"
-        // path in onAvatarReceived fills the real display name when
-        // the peer broadcasts one.
-        nc.subtitle = "Secure chat";
-        nc.peerIdB64u = fromStd;
-        nc.keys.push_back(fromStd);
-        nc.inAddressBook = false;
-    }
-    m_messagesByPeer[nc.peerIdB64u].push_back(msg);
-    m_chats.insert(m_chats.begin(), nc);
-    if (m_store) {
-        // Only persist the contact row when we minted a fresh stub;
-        // rehydrated rows already carry the correct nickname/inAB
-        // from the DB.
-        if (!loadedFromDb) m_store->saveContact(nc);
-        m_store->saveMessage(fromStd, msg);
-    }
-    ensureUnreadSize();
-    m_unread.prepend(0);
-    if (m_currentChat >= 0) m_currentChat += 1;
-    m_unread[0] += 1;
-    emit unreadChanged(totalUnread());
-    if (m_notifier && shouldToast() && !nc.muted) {
-        const QString label = !nc.name.empty()
-            ? qtbridge::qstr(nc.name)
-            : qtbridge::qstr(p2p::peerPrefix(nc.peerIdB64u)) + "…";
-        m_notifier->notify(label, text);
-    }
-    rebuildChatList();
 }
 
 void ChatView::onStatus(const QString &s)
@@ -544,27 +570,43 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     const std::string msgIdStd    = msgId.toStdString();
     const int64_t     tsSecs      = qtbridge::epochSecs(ts);
 
+    // ChatController already wired the v3 conversation row + members
+    // table via setKnownGroupMembers (called from the group_msg dispatch
+    // before this slot fires).  We just locate the in-memory copy and,
+    // if it's missing, hydrate from the store.
     int idx = -1;
     for (int i = 0; i < static_cast<int>(m_chats.size()); ++i)
-        if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) { idx = i; break; }
+        if (m_chats[i].kind == AppDataStore::ConversationKind::Group
+            && m_chats[i].id == groupIdStd) { idx = i; break; }
 
     if (idx == -1) {
-        AppDataStore::Contact ng;
-        ng.isGroup = true;
-        ng.groupId = groupIdStd;
-        ng.peerIdB64u = groupIdStd;
-        ng.name = groupName.isEmpty() ? std::string("Group Chat") : groupName.toStdString();
-        ng.subtitle = "Group chat";
-        ng.keys.push_back(fromStd);
-        m_chats.push_back(ng);
-        if (m_store) m_store->saveContact(ng);
+        if (!m_store) return;
+        AppDataStore::Conversation conv;
+        if (!m_store->loadConversation(groupIdStd, conv)) {
+            // ChatController.ensureGroupConversation hasn't run yet (or
+            // failed); skip rather than minting a nameless local row.
+            return;
+        }
+        // Some legacy callers ship the group_msg before setKnownMembers;
+        // backfill the name + members the wire delivered.
+        if (conv.groupName.empty() && !groupName.isEmpty()) {
+            conv.groupName = groupName.toStdString();
+            m_store->saveConversation(conv);
+        }
+        m_chats.push_back(conv);
         idx = static_cast<int>(m_chats.size()) - 1;
+
+        // Pull authoritative member roster from the store.
+        std::vector<std::string> mem;
+        m_store->loadConversationMembers(conv.id, [&](const std::string& p) {
+            mem.push_back(p);
+        });
+        m_membersByConv[conv.id] = std::move(mem);
         ensureUnreadSize();
         rebuildChatList();
     }
 
-    AppDataStore::Contact &chat = m_chats[idx];
-    if (chat.isBlocked) return;
+    if (isBlockedFor(m_chats[idx])) return;
 
     auto trimStd = [](const std::string& s) {
         const auto first = s.find_first_not_of(" \t\r\n");
@@ -573,30 +615,33 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
         return s.substr(first, last - first + 1);
     };
 
-    // Merge any new member keys we didn't know about before
-    // This is how members discover each other without manual key exchange
-    bool keysUpdated = false;
+    // Merge any new member keys we didn't know about before — this is
+    // how members discover each other without manual key exchange.
+    // ChatController writes the same set into conversation_members on
+    // its end via upsertMembersFromTrustedMessage; we're keeping the
+    // in-memory copy aligned for the chat-list / presence subscriber.
+    auto &members = m_membersByConv[m_chats[idx].id];
+    bool membersUpdated = false;
     const std::string myKey = m_controller->myIdB64u();
     for (const QString &key : memberKeys) {
         const std::string keyStd = key.toStdString();
         const std::string keyTrimmed = trimStd(keyStd);
         if (keyTrimmed.empty()) continue;
-        if (keyTrimmed == myKey) continue; // don't add own key to group member list
-        if (std::find(chat.keys.begin(), chat.keys.end(), keyStd) == chat.keys.end()) {
-            chat.keys.push_back(keyStd);
-            keysUpdated = true;
+        if (keyTrimmed == myKey) continue;
+        if (std::find(members.begin(), members.end(), keyStd) == members.end()) {
+            members.push_back(keyStd);
+            membersUpdated = true;
         }
     }
-    if (keysUpdated && m_store)
-        m_store->saveContact(chat); // persist the updated key list
+    if (membersUpdated && m_store)
+        m_store->setConversationMembers(m_chats[idx].id, members);
 
     // If text is empty this was a member-update-only message (no chat bubble needed).
-    // Key merge above already ran, so just bail out.
-    if (text.isEmpty())
-        return;
+    // Member merge above already ran, so just bail out.
+    if (text.isEmpty()) return;
 
-    const std::string dbKey = chat.groupId.empty() ? ("name:" + chat.name) : chat.groupId;
-    auto &msgs = m_messagesByPeer[dbKey];
+    const std::string convId = m_chats[idx].id;
+    auto &msgs = m_messagesByConv[convId];
 
     if (!msgIdStd.empty())
         for (const auto &m : msgs)
@@ -605,36 +650,33 @@ void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
     const bool needsSep = msgs.empty() ||
                           (tsSecs - msgs.back().timestampSecs) >= kDateSepSecs;
 
-    // Look up sender name from contacts.  When the matching contact
-    // row exists but has no nickname (un-added peer), stick with the
-    // 8-char key-prefix fallback rather than rendering a blank label.
+    // Look up sender name from the address book.  Empty name => stick
+    // with the 8-char key-prefix fallback rather than blank.
     QString senderName = fromPeerIdB64u.left(8) + "...";
-    for (const auto &c : m_chats) {
-        if (!c.isGroup && std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
-            if (!c.name.empty()) senderName = qtbridge::qstr(c.name);
-            break;
-        }
-    }
+    auto contactIt = m_contactsByPeer.find(fromStd);
+    if (contactIt != m_contactsByPeer.end() && !contactIt->second.name.empty())
+        senderName = qtbridge::qstr(contactIt->second.name);
 
-    AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, senderName.toStdString()};
+    AppDataStore::Message msg{false, textStd, tsSecs, msgIdStd, fromStd,
+                               senderName.toStdString()};
     msgs.push_back(msg);
-    chat.lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
-    if (m_store) m_store->saveMessage(dbKey, msg);
+    m_chats[idx].lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+    if (m_store) m_store->saveMessage(convId, msg);
 
     if (idx == m_currentChat) {
         if (needsSep) addDateSeparator(ts);
         addMessageBubble(text, false, senderName,
-                          qtbridge::qstr(msgIdStd), chatKey(chat));
+                          qtbridge::qstr(msgIdStd), qtbridge::qstr(convId));
         promoteChatToTop(idx);
         rebuildChatList();
     } else {
-        const QString chatName = qtbridge::qstr(chat.name);
+        const QString chatName = displayNameFor(m_chats[idx]);
 
         m_unread[idx] += 1;
         emit unreadChanged(totalUnread());
         promoteChatToTop(idx);
         rebuildChatList();
-        if (m_notifier && !chat.muted)
+        if (m_notifier && !isMutedFor(m_chats[0]))
             m_notifier->notifyGroup(senderName, chatName, text);
     }
 }
@@ -654,34 +696,31 @@ void ChatView::onGroupMemberLeft(const QString& fromPeerIdB64u,
     // Find the group
     int targetIndex = -1;
     for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-        if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) {
+        if (m_chats[i].kind == AppDataStore::ConversationKind::Group
+            && m_chats[i].id == groupIdStd) {
             targetIndex = i;
             break;
         }
     }
     if (targetIndex == -1) return;
 
-    AppDataStore::Contact &chat = m_chats[targetIndex];
+    // Remove the leaver from our local group member list (mirror to
+    // conversation_members so a relaunch sees the trimmed roster).
+    auto &members = m_membersByConv[groupIdStd];
+    members.erase(std::remove(members.begin(), members.end(), fromStd), members.end());
+    if (m_store) m_store->removeConversationMember(groupIdStd, fromStd);
 
-    // Remove the leaver's key from our local group member list
-    chat.keys.erase(std::remove(chat.keys.begin(), chat.keys.end(), fromStd), chat.keys.end());
-    if (m_store) m_store->saveContact(chat);
-
-    // Find a display name for the leaver
+    // Find a display name for the leaver via the address book.
     QString leaverName = fromPeerIdB64u.left(8) + "..."; // fallback to truncated key
-    for (const auto &c : m_chats) {
-        if (!c.isGroup && std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
-            leaverName = qtbridge::qstr(c.name);
-            break;
-        }
-    }
+    auto contactIt = m_contactsByPeer.find(fromStd);
+    if (contactIt != m_contactsByPeer.end() && !contactIt->second.name.empty())
+        leaverName = qtbridge::qstr(contactIt->second.name);
 
-    // Show system message like Snapchat
+    // System message — sender_id empty marks it as locally-generated.
     const QString systemText = leaverName + " left the group";
-    AppDataStore::Message systemMsg{ false, systemText.toStdString(), tsSecs, "", "" };
-    const std::string dbKey = chat.groupId.empty() ? ("name:" + chat.name) : chat.groupId;
-    m_messagesByPeer[dbKey].push_back(systemMsg);
-    if (m_store) m_store->saveMessage(dbKey, systemMsg);
+    AppDataStore::Message systemMsg{ false, systemText.toStdString(), tsSecs, "", "", "" };
+    m_messagesByConv[groupIdStd].push_back(systemMsg);
+    if (m_store) m_store->saveMessage(groupIdStd, systemMsg);
 
     if (targetIndex == m_currentChat) {
         addMessageBubble(systemText, false);
@@ -713,33 +752,41 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
     // Locate the chat this file belongs to — group chat or 1:1
     int chatIndex = -1;
     if (!groupIdStd.empty()) {
-        // Find existing group chat by groupId, or create one
+        // Find existing group chat by id; if missing the conversation
+        // row should already exist (set up by setKnownGroupMembers
+        // before any group_msg fires).  Fall back to a hydrate-from-DB
+        // pass like onIncomingGroupMessage does.
         for (int i = 0; i < static_cast<int>(m_chats.size()); ++i)
-            if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) { chatIndex = i; break; }
+            if (m_chats[i].kind == AppDataStore::ConversationKind::Group
+                && m_chats[i].id == groupIdStd) { chatIndex = i; break; }
 
         if (chatIndex == -1) {
-            AppDataStore::Contact ng;
-            ng.isGroup = true;
-            ng.groupId = groupIdStd;
-            ng.peerIdB64u = groupIdStd;
-            ng.name = groupName.isEmpty() ? std::string("Group Chat") : groupName.toStdString();
-            ng.subtitle = "Group chat";
-            ng.keys.push_back(fromStd);
-            m_chats.push_back(ng);
-            if (m_store) m_store->saveContact(ng);
+            if (!m_store) return;
+            AppDataStore::Conversation conv;
+            if (!m_store->loadConversation(groupIdStd, conv)) return;
+            if (conv.groupName.empty() && !groupName.isEmpty()) {
+                conv.groupName = groupName.toStdString();
+                m_store->saveConversation(conv);
+            }
+            m_chats.push_back(conv);
+            std::vector<std::string> mem;
+            m_store->loadConversationMembers(conv.id, [&](const std::string& p) {
+                mem.push_back(p);
+            });
+            m_membersByConv[conv.id] = std::move(mem);
             chatIndex = static_cast<int>(m_chats.size()) - 1;
             ensureUnreadSize();
             rebuildChatList();
         }
     } else {
-        chatIndex = findOrCreateChatForPeer(from);
+        chatIndex = findOrCreateDirectChatForPeer(from);
     }
     if (chatIndex < 0) return;
-    if (m_chats[chatIndex].isBlocked) return;   // drop files from blocked contacts
-    const QString key = chatKey(m_chats[chatIndex]);
+    if (isBlockedFor(m_chats[chatIndex])) return;   // drop files from blocked contacts
+    const std::string convId = m_chats[chatIndex].id;
 
     // Find an existing in-progress record for this transferId, or create one
-    auto &records = m_filesByKey[key];
+    auto &records = m_filesByConv[convId];
     AppDataStore::FileRecord *rec = nullptr;
     for (auto &r : records)
         if (r.transferId == transferStd) { rec = &r; break; }
@@ -748,11 +795,11 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
         // First chunk we've heard about — create the record
         AppDataStore::FileRecord newRec;
         newRec.transferId    = transferStd;
-        newRec.chatKey       = key.toStdString();
+        newRec.chatKey       = convId;
         newRec.fileName      = fileName.toStdString();
         newRec.fileSize      = fileSize;
         newRec.peerIdB64u    = fromStd;
-        newRec.peerName      = m_chats[chatIndex].name;
+        newRec.peerName      = displayNameFor(m_chats[chatIndex]).toStdString();
         newRec.timestampSecs = qtbridge::epochSecs(timestamp);
         newRec.sent          = false;
         newRec.status        = static_cast<int>(FileTransferStatus::Receiving);
@@ -781,16 +828,16 @@ void ChatView::onFileChunkReceived(const QString &fromPeerIdB64u,
             qWarning() << "File transfer failed:" << fileName << "(no savedPath)";
         }
 
-        if (m_store) m_store->saveFileRecord(key.toStdString(), *rec);
+        if (m_store) m_store->saveFileRecord(convId, *rec);
 
         // In-app toast + system tray notification
         {
-            const QString senderName = qtbridge::qstr(m_chats[chatIndex].name);
+            const QString senderName = displayNameFor(m_chats[chatIndex]);
             const QString toastMsg = saved
                 ? QString("📎 %1 from %2").arg(fileName, senderName)
                 : QString("⚠ File from %1 failed: %2").arg(senderName, fileName);
             showToast(toastMsg);
-            if (m_notifier && !m_chats[chatIndex].muted)
+            if (m_notifier && !isMutedFor(m_chats[chatIndex]))
                 m_notifier->notify(senderName, toastMsg);
         }
 
@@ -835,14 +882,15 @@ void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
     int chatIndex = -1;
     if (!groupIdStd.empty()) {
         for (int i = 0; i < static_cast<int>(m_chats.size()); ++i)
-            if (m_chats[i].isGroup && m_chats[i].groupId == groupIdStd) { chatIndex = i; break; }
+            if (m_chats[i].kind == AppDataStore::ConversationKind::Group
+                && m_chats[i].id == groupIdStd) { chatIndex = i; break; }
     } else {
         chatIndex = findChatForPeer(toPeerIdB64u.trimmed());
     }
     if (chatIndex < 0) return;
 
-    const QString key = chatKey(m_chats[chatIndex]);
-    auto &records = m_filesByKey[key];
+    const std::string convId = m_chats[chatIndex].id;
+    auto &records = m_filesByConv[convId];
     AppDataStore::FileRecord *rec = nullptr;
     for (auto &r : records) {
         if (r.transferId == transferStd && r.sent) { rec = &r; break; }
@@ -856,7 +904,7 @@ void ChatView::onFileChunkSent(const QString &toPeerIdB64u,
     rec->chunksTotal    = chunksTotal;
     if (chunksSent >= chunksTotal && chunksTotal > 0) {
         rec->status = static_cast<int>(FileTransferStatus::Complete);
-        if (m_store) m_store->saveFileRecord(key.toStdString(), *rec);
+        if (m_store) m_store->saveFileRecord(convId, *rec);
     }
 
     if (chatIndex == m_currentChat)
@@ -873,136 +921,85 @@ void ChatView::onAvatarReceived(const QString &peerIdB64u,
     const std::string avatarStd   = avatarB64.toStdString();
     const std::string displayStd  = displayName.toStdString();
 
-    auto trimStd = [](const std::string& s) {
-        const auto first = s.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos) return std::string{};
-        const auto last = s.find_last_not_of(" \t\r\n");
-        return s.substr(first, last - first + 1);
-    };
-
-    for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-        if (m_chats[i].isGroup) continue;
-        if (trimStd(m_chats[i].peerIdB64u) != peerIdStd) continue;
-
-        // First genuine contact = had no avatar and now receiving one
-        const bool firstTime = m_chats[i].avatarB64.empty() && !avatarStd.empty();
-
-        // If this was an auto-created stranger row (text arrived before
-        // any avatar, so the name was left empty / key-prefix-displayed),
-        // upgrade the name now that the peer has broadcast one.
-        if (!displayStd.empty() && m_chats[i].name.empty()) {
-            m_chats[i].name = displayStd;
-            if (m_store) m_store->saveContact(m_chats[i]);
+    // v3 rule: address-book is user-curated.  An avatar broadcast does
+    // NOT auto-create a contact.  We do, however, refresh existing
+    // contact rows + the displayed avatar on any conversation row that
+    // points at this peer.
+    bool firstTime = false;
+    auto contactIt = m_contactsByPeer.find(peerIdStd);
+    if (contactIt != m_contactsByPeer.end()) {
+        firstTime = contactIt->second.avatarB64.empty() && !avatarStd.empty();
+        // Update name only when we don't already have one — never
+        // clobber the user's local nickname with the peer's broadcast.
+        if (!displayStd.empty() && contactIt->second.name.empty())
+            contactIt->second.name = displayStd;
+        contactIt->second.avatarB64 = avatarStd;
+        if (m_store) {
+            // Persist via the dedicated UPDATE (saveContact would also
+            // rewrite name/subtitle/etc unnecessarily; saveContactAvatar
+            // is a single-column UPDATE).  Push the rebuilt name only
+            // when we touched it above.
+            if (!displayStd.empty() && contactIt->second.name == displayStd)
+                m_store->saveContact(contactIt->second);
+            m_store->saveContactAvatar(peerIdStd, avatarStd);
         }
-
-        // Empty avatarB64 means the sender reset to default — clear so the UI
-        // falls back to initials derived from our locally saved name for them
-        m_chats[i].avatarB64 = avatarStd;
-
-        // Persist to DB
-        if (m_store) m_store->saveContactAvatar(peerIdStd, avatarStd);
-
-        // Send our avatar back only on first receive to avoid infinite exchange loop
-        if (firstTime && m_store) {
-            const std::string myName   = m_store->loadSetting("displayName");
-            const std::string myAvatar = m_store->loadSetting("avatarData");
-            if (!myName.empty()) {
-                const std::string myAvatarIsPhoto = m_store->loadSetting("avatarIsPhoto");
-                const std::string broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : std::string();
-                m_controller->sendAvatar(peerIdStd, myName, broadcastAvatar);
-            }
-        }
-
-        // Rebuild the list so the avatar label updates immediately
-        rebuildChatList();
-
-        // Refresh the active chat header avatar if this contact is selected
-        if (m_currentChat == i) {
-            if (!avatarB64.isEmpty()) {
-                QPixmap px;
-                px.loadFromData(QByteArray::fromBase64(avatarB64.toUtf8()));
-                if (!px.isNull()) {
-                    m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
-                    m_ui->chatAvatarLabel->setText("");
-                }
-            } else {
-                const QString qName = qtbridge::qstr(m_chats[i].name);
-                const QString ch = qName.isEmpty() ? "?" : QString(qName[0]);
-                m_ui->chatAvatarLabel->setPixmap(
-                    renderInitialsAvatar(ch, avatarColorForName(qName), 44));
-                m_ui->chatAvatarLabel->setText("");
-            }
-            m_ui->chatTitleLabel->setText(qtbridge::qstr(m_chats[i].name));
-        }
-
-        if (firstTime)
-            showToast(qtbridge::qstr(m_chats[i].name) + "'s profile has been updated");
-        return;
     }
 
-    // ── First-contact avatar from unknown peer ──────────────────────────────
-    //
-    // No matching row in m_chats.  Try the DB first so we don't clobber an
-    // explicit contact (the chat-list filter evicts message-less rows from
-    // m_chats on startup).  saveContact UPSERTs every column, so stubbing
-    // blindly would destroy a real nickname + flip in_address_book.
-    AppDataStore::Contact nc;
-    bool loadedFromDb = false;
-    if (m_store) loadedFromDb = m_store->loadContact(peerIdStd, nc);
-    if (loadedFromDb) {
-        // Refresh only the peer-broadcast-controlled fields; preserve
-        // the user's nickname + address-book bit.
-        if (!avatarStd.empty()) nc.avatarB64 = avatarStd;
-    } else {
-        // Peer hasn't been added — identify them by public key.  Only
-        // take the broadcast display name when it's non-empty; the
-        // empty-name path lets rebuildChatList fall back to the key
-        // prefix so strangers never appear as "Unknown contact".
-        nc.name           = displayStd;
-        nc.subtitle       = "Secure chat";
-        nc.peerIdB64u     = peerIdStd;
-        nc.keys.push_back(peerIdStd);
-        nc.avatarB64      = avatarStd;
-        nc.inAddressBook  = false;
-    }
-    nc.lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+    // Find the matching 1:1 conversation row (if any) so we can refresh
+    // its rendering.  The conversation persists regardless of contact —
+    // a stranger we received from earlier already has a row.
+    int idx = findChatForPeer(peerIdB64u);
 
-    m_chats.insert(m_chats.begin(), nc);
-    if (m_store) {
-        if (!loadedFromDb) {
-            m_store->saveContact(nc);
-        }
-        if (!avatarStd.empty()) m_store->saveContactAvatar(peerIdStd, avatarStd);
-    }
-
-    ensureUnreadSize();
-    m_unread.prepend(0);
-    if (m_currentChat >= 0) m_currentChat += 1;
-
-    rebuildChatList();
-
-    // Reciprocate with our own avatar so the peer also gets our display
-    // name / picture.  Only done on first-contact creation to avoid loops.
-    if (m_store) {
-        const std::string myName = m_store->loadSetting("displayName");
+    // Reciprocate first-contact only when we have an established
+    // conversation (i.e. the peer has actually messaged us).  Avoids
+    // sending our avatar to a random peer that just dropped a profile
+    // broadcast.
+    if (firstTime && idx >= 0 && m_store) {
+        const std::string myName   = m_store->loadSetting("displayName");
+        const std::string myAvatar = m_store->loadSetting("avatarData");
         if (!myName.empty()) {
-            const std::string myAvatar        = m_store->loadSetting("avatarData");
             const std::string myAvatarIsPhoto = m_store->loadSetting("avatarIsPhoto");
             const std::string broadcastAvatar = (myAvatarIsPhoto == "true") ? myAvatar : std::string();
             m_controller->sendAvatar(peerIdStd, myName, broadcastAvatar);
         }
     }
 
-    showToast("New contact: " + qtbridge::qstr(nc.name));
+    if (idx < 0) return;
+
+    // Rebuild the list so the avatar label updates immediately
+    rebuildChatList();
+
+    // Refresh the active chat header avatar if this contact is selected
+    if (m_currentChat == idx) {
+        const QString qName = displayNameFor(m_chats[idx]);
+        if (!avatarB64.isEmpty()) {
+            QPixmap px;
+            px.loadFromData(QByteArray::fromBase64(avatarB64.toUtf8()));
+            if (!px.isNull()) {
+                m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
+                m_ui->chatAvatarLabel->setText("");
+            }
+        } else {
+            const QString ch = qName.isEmpty() ? "?" : QString(qName[0]);
+            m_ui->chatAvatarLabel->setPixmap(
+                renderInitialsAvatar(ch, avatarColorForName(qName), 44));
+            m_ui->chatAvatarLabel->setText("");
+        }
+        m_ui->chatTitleLabel->setText(qName);
+    }
+
+    if (firstTime)
+        showToast(displayNameFor(m_chats[idx]) + "'s profile has been updated");
 }
 
 void ChatView::onGroupRenamed(const QString &groupId, const QString &newName)
 {
     const std::string groupIdStd = groupId.toStdString();
     for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-        if (!m_chats[i].isGroup || m_chats[i].groupId != groupIdStd) continue;
-        m_chats[i].name = newName.toStdString();
-        if (m_store) m_store->saveContact(m_chats[i]);
+        if (m_chats[i].kind != AppDataStore::ConversationKind::Group
+            || m_chats[i].id != groupIdStd) continue;
+        m_chats[i].groupName = newName.toStdString();
+        if (m_store) m_store->saveConversation(m_chats[i]);
         rebuildChatList();
         if (m_currentChat == i)
             m_ui->chatTitleLabel->setText(newName);
@@ -1015,17 +1012,19 @@ void ChatView::onGroupAvatarReceived(const QString &groupId, const QString &avat
     const std::string groupIdStd = groupId.toStdString();
     const std::string avatarStd  = avatarB64.toStdString();
     for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-        if (!m_chats[i].isGroup || m_chats[i].groupId != groupIdStd) continue;
+        if (m_chats[i].kind != AppDataStore::ConversationKind::Group
+            || m_chats[i].id != groupIdStd) continue;
 
         // Only relay and persist if this is actually new to us
-        if (m_chats[i].avatarB64 == avatarStd) return;
+        if (m_chats[i].groupAvatarB64 == avatarStd) return;
 
-        m_chats[i].avatarB64 = avatarStd;
-        if (m_store) m_store->saveContactAvatar(m_chats[i].peerIdB64u, avatarStd);
+        m_chats[i].groupAvatarB64 = avatarStd;
+        if (m_store) m_store->saveConversation(m_chats[i]);
 
         // Relay to all group members so stragglers receive it too
-        if (m_controller && !m_chats[i].keys.empty())
-            m_controller->sendGroupAvatar(groupIdStd, avatarStd, m_chats[i].keys);
+        const auto memIt = m_membersByConv.find(groupIdStd);
+        if (m_controller && memIt != m_membersByConv.end() && !memIt->second.empty())
+            m_controller->sendGroupAvatar(groupIdStd, avatarStd, memIt->second);
 
         rebuildChatList();
         if (m_currentChat == i) loadChat(i);
@@ -1039,11 +1038,20 @@ void ChatView::onAttachFile()
 {
     if (m_currentChat < 0) return;
 
-    const AppDataStore::Contact &chat = m_chats[m_currentChat];
+    const AppDataStore::Conversation &chat = m_chats[m_currentChat];
+    const bool isGroup = (chat.kind == AppDataStore::ConversationKind::Group);
 
-    if (chat.keys.empty()) {
-        QMessageBox::warning(m_ui->centralwidget, "No Keys",
-                             "This contact has no public keys — cannot send a file securely.");
+    // Recipient pre-flight: 1:1 needs a peer id; group needs at least
+    // one member.  Either being empty is a logic bug — bail with a
+    // user-visible warning rather than dispatching to nowhere.
+    const auto memIt = m_membersByConv.find(chat.id);
+    const bool hasMembers =
+        isGroup ? (memIt != m_membersByConv.end() && !memIt->second.empty())
+                : !chat.directPeerId.empty();
+    if (!hasMembers) {
+        QMessageBox::warning(m_ui->centralwidget, "No Recipient",
+                             isGroup ? "This group has no members yet — cannot send a file."
+                                     : "This contact has no public key — cannot send a file securely.");
         return;
     }
 
@@ -1069,39 +1077,25 @@ void ChatView::onAttachFile()
 
     const QString fileName = finfo.fileName();
 
-    // ── Send to all keys for this contact / group ──────────────────────────────
+    // ── Dispatch to controller ──────────────────────────────────────────────
     std::string localTransferId;
     int totalChunks = 0;
     constexpr qint64 kChunk = 240LL * 1024;
 
-    auto trimStd = [](const std::string& s) {
-        const auto first = s.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos) return std::string{};
-        const auto last = s.find_last_not_of(" \t\r\n");
-        return s.substr(first, last - first + 1);
-    };
-
-    if (chat.isGroup) {
+    if (isGroup) {
         localTransferId = m_controller->sendGroupFile(
-            chat.groupId, chat.name,
-            chat.keys, fileName.toStdString(), path.toStdString());
+            chat.id, chat.groupName,
+            memIt->second, fileName.toStdString(), path.toStdString());
         if (!localTransferId.empty())
             totalChunks = int((fileSize + kChunk - 1) / kChunk);
     } else {
-        // 1:1: send to every key belonging to this contact
-        for (const std::string &key : chat.keys) {
-            const std::string keyTrim = trimStd(key);
-            if (keyTrim.empty()) continue;
-            const std::string tid = m_controller->sendFile(
-                keyTrim, fileName.toStdString(), path.toStdString());
-            if (!tid.empty() && localTransferId.empty()) {
-                localTransferId = tid;
-                totalChunks = int((fileSize + kChunk - 1) / kChunk);
-            }
-        }
+        localTransferId = m_controller->sendFile(
+            chat.directPeerId, fileName.toStdString(), path.toStdString());
+        if (!localTransferId.empty())
+            totalChunks = int((fileSize + kChunk - 1) / kChunk);
     }
 
-    if (localTransferId.empty()) return; // all keys failed
+    if (localTransferId.empty()) return; // dispatch failed
 
     // Record the outbound transfer as IN-FLIGHT.  Chunks don't fly until
     // the receiver ack's the file_key announcement, so marking Complete
@@ -1109,22 +1103,21 @@ void ChatView::onAttachFile()
     // callbacks instead and flip to Complete on the last chunk.
     // savedPath = original path so the Download/Open button always
     // points at the still-local source file.
-    const QString key = chatKey(chat);
     AppDataStore::FileRecord rec;
     rec.transferId     = localTransferId;
-    rec.chatKey        = key.toStdString();
+    rec.chatKey        = chat.id;
     rec.fileName       = fileName.toStdString();
     rec.fileSize       = fileSize;
-    rec.peerIdB64u     = chat.peerIdB64u;
-    rec.peerName       = chat.name;
+    rec.peerIdB64u     = isGroup ? std::string{} : chat.directPeerId;
+    rec.peerName       = displayNameFor(chat).toStdString();
     rec.timestampSecs  = QDateTime::currentDateTime().toSecsSinceEpoch();
     rec.sent           = true;
     rec.status         = static_cast<int>(FileTransferStatus::Sending);
     rec.chunksTotal    = totalChunks;
     rec.chunksComplete = 0;
     rec.savedPath      = path.toStdString();
-    m_filesByKey[key].push_back(rec);
-    if (m_store) m_store->saveFileRecord(key.toStdString(), rec);
+    m_filesByConv[chat.id].push_back(rec);
+    if (m_store) m_store->saveFileRecord(chat.id, rec);
 
     rebuildFilesTab();
 
@@ -1152,7 +1145,7 @@ void ChatView::onChatSelected(int index)
         m_searchMatchIndices.clear();
         m_searchMatchCurrent = -1;
         const std::string queryStd = m_searchQuery.toLower().toStdString();
-        const auto &msgs = m_messagesByPeer[m_chats[m_currentChat].peerIdB64u];
+        const auto &msgs = m_messagesByConv[m_chats[m_currentChat].id];
         for (int i = 0; i < static_cast<int>(msgs.size()); ++i) {
             QString lowered = qtbridge::qstr(msgs[i].text).toLower();
             if (lowered.contains(m_searchQuery))
@@ -1169,63 +1162,55 @@ void ChatView::onSendMessage()
     QString text = m_ui->messageInput->text().trimmed();
     if (text.isEmpty()) return;
 
-    AppDataStore::Contact &cur = m_chats[m_currentChat];
-    if (cur.keys.empty()) {
-        addMessageBubble("No keys saved for this contact.", false);
+    AppDataStore::Conversation &cur = m_chats[m_currentChat];
+    const bool isGroup = (cur.kind == AppDataStore::ConversationKind::Group);
+
+    // Pre-flight: 1:1 needs a directPeerId, group needs at least one
+    // member.  The "no keys" path used to fire a system bubble; preserve
+    // that affordance so users get a visible cue rather than silent drop.
+    const auto memIt = m_membersByConv.find(cur.id);
+    const bool hasRecipient =
+        isGroup ? (memIt != m_membersByConv.end() && !memIt->second.empty())
+                : !cur.directPeerId.empty();
+    if (!hasRecipient) {
+        addMessageBubble(isGroup ? "Group has no members."
+                                  : "No public key for this conversation.", false);
         return;
     }
 
     const QDateTime now = QDateTime::currentDateTime();
     const int64_t nowSecs = now.toSecsSinceEpoch();
-    auto &msgs = m_messagesByPeer[cur.peerIdB64u];
+    auto &msgs = m_messagesByConv[cur.id];
     if (msgs.empty() || (nowSecs - msgs.back().timestampSecs) >= kDateSepSecs)
         addDateSeparator(now);
 
     const QString msgId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    AppDataStore::Message msg{true, text.toStdString(), nowSecs, msgId.toStdString(), ""};
+    // Outbound messages set senderId="" — caller is self by definition.
+    AppDataStore::Message msg{true, text.toStdString(), nowSecs,
+                               msgId.toStdString(), "", ""};
     msgs.push_back(msg);
 
-    auto trimStd = [](const std::string& s) {
-        const auto first = s.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos) return std::string{};
-        const auto last = s.find_last_not_of(" \t\r\n");
-        return s.substr(first, last - first + 1);
-    };
+    if (m_store) m_store->saveMessage(cur.id, msg);
 
-    if (m_store) {
-        const std::string dbKey = cur.isGroup
-                                  ? (cur.groupId.empty()
-                                         ? ("name:" + cur.name)
-                                         : cur.groupId)
-                                  : (cur.keys.empty()
-                                         ? ("name:" + cur.name)
-                                         : cur.keys.front());
-        m_store->saveMessage(dbKey, msg);
-    }
-
-    addMessageBubble(text, true, /*senderName=*/QString(), msgId, chatKey(cur));
+    addMessageBubble(text, true, /*senderName=*/QString(), msgId, qtbridge::qstr(cur.id));
     m_ui->messageInput->clear();
 
     // Promote the current chat to the top of the list so outbound
     // activity surfaces the thread the same way inbound does.
+    // saveMessage already bumped conversations.last_active inside its
+    // transaction; we mirror it on the in-memory copy.
     cur.lastActiveSecs = nowSecs;
-    if (m_store) m_store->saveContact(cur);
     if (m_currentChat > 0) {
         promoteChatToTop(m_currentChat);
         rebuildChatList();
         m_ui->chatList->setCurrentRow(0);
     }
 
-    if (cur.isGroup) {
-        const std::string gid = cur.groupId.empty() ? cur.name : cur.groupId;
+    if (isGroup) {
         m_controller->sendGroupMessageViaMailbox(
-            gid, cur.name, cur.keys, text.toStdString());
+            cur.id, cur.groupName, memIt->second, text.toStdString());
     } else {
-        for (const std::string &k : cur.keys) {
-            const std::string trimmed = trimStd(k);
-            if (!trimmed.empty())
-                m_controller->sendText(trimmed, text.toStdString());
-        }
+        m_controller->sendText(cur.directPeerId, text.toStdString());
     }
 }
 
@@ -1238,11 +1223,11 @@ void ChatView::onSearchChanged(const QString &text)
 
     // ── 1. Filter sidebar chats ──────────────────────────────────────────────
     for (int i = 0; i < m_ui->chatList->count(); ++i) {
-        const AppDataStore::Contact &c = m_chats[i];
-        bool match = q.isEmpty() || qtbridge::qstr(c.name).toLower().contains(q);
+        const AppDataStore::Conversation &c = m_chats[i];
+        bool match = q.isEmpty() || displayNameFor(c).toLower().contains(q);
         if (!match) {
-            const auto it = m_messagesByPeer.find(c.peerIdB64u);
-            if (it != m_messagesByPeer.end()) {
+            const auto it = m_messagesByConv.find(c.id);
+            if (it != m_messagesByConv.end()) {
                 for (const auto &m : it->second)
                     if (qtbridge::qstr(m.text).toLower().contains(q)) { match = true; break; }
             }
@@ -1256,7 +1241,7 @@ void ChatView::onSearchChanged(const QString &text)
 
     // ── 2. Highlight matching messages in current chat ────────────────────────
     if (m_currentChat >= 0 && m_currentChat < static_cast<int>(m_chats.size()) && !q.isEmpty()) {
-        const auto &msgs = m_messagesByPeer[m_chats[m_currentChat].peerIdB64u];
+        const auto &msgs = m_messagesByConv[m_chats[m_currentChat].id];
         for (int i = 0; i < static_cast<int>(msgs.size()); ++i)
             if (qtbridge::qstr(msgs[i].text).toLower().contains(q))
                 m_searchMatchIndices.append(i);
@@ -1384,115 +1369,92 @@ void ChatView::onEditProfile()
         m_store->saveSetting("avatarIsPhoto", out.usingPhoto ? "true" : "false");
     }
 
-    // Broadcast to all contacts. Empty avatar when using initials so the
-    // receiver falls back to initials derived from their own saved name for us.
+    // Broadcast to all 1:1 conversations. Empty avatar when using
+    // initials so the receiver falls back to initials derived from
+    // their own saved name for us.
     const std::string broadcastAvatar = out.usingPhoto ? out.newAvatarB64.toStdString() : std::string();
     for (const auto &chat : m_chats) {
-        if (!chat.isGroup && !chat.peerIdB64u.empty())
-            m_controller->sendAvatar(chat.peerIdB64u, displayName.toStdString(), broadcastAvatar);
+        if (chat.kind == AppDataStore::ConversationKind::Direct
+            && !chat.directPeerId.empty())
+            m_controller->sendAvatar(chat.directPeerId, displayName.toStdString(), broadcastAvatar);
     }
 }
 
 void ChatView::onEditContact(int index)
 {
     if (index < 0 || index >= static_cast<int>(m_chats.size())) return;
-    QString     name       = qtbridge::qstr(m_chats[index].name);
-    QStringList keys       = qtbridge::qstrList(m_chats[index].keys);
-    QString     avatar     = qtbridge::qstr(m_chats[index].avatarB64);
-    const bool  wasGroup   = m_chats[index].isGroup;
-    const QString oldName  = name;
-    const QString oldAvatar = avatar;
-    const QStringList oldKeys = keys;
-    bool        muted      = m_chats[index].muted;
-    const bool  oldMuted   = muted;
+    AppDataStore::Conversation &conv = m_chats[index];
+    const bool isGroup = (conv.kind == AppDataStore::ConversationKind::Group);
 
-    const ContactEditorResult result =
-        openContactEditor(m_ui->centralwidget,
-                          wasGroup ? "Edit Group" : "Edit Contact",
-                          name, keys, true,
-                          m_chats[index].isBlocked,
-                          wasGroup,
-                          &m_chats,
-                          [this](const AppDataStore::Contact &newContact) {
-                              m_chats.push_back(newContact);
-                              if (m_store) m_store->saveContact(newContact);
-                              rebuildChatList();
-                          },
-                          wasGroup ? &avatar : nullptr,
-                          m_controller,
-                          &muted);
+    if (isGroup) {
+        // ── Group editor ────────────────────────────────────────────────────
+        QString     name    = qtbridge::qstr(conv.groupName);
+        QString     avatar  = qtbridge::qstr(conv.groupAvatarB64);
+        bool        muted   = conv.muted;
+        QStringList members = qtbridge::qstrList(m_membersByConv[conv.id]);
 
-    if (result == ContactEditorResult::Saved && !name.isEmpty()) {
-        // Validate key format and prevent duplicate keys — 1:1 contacts only
-        if (!wasGroup) {
-            if (keys.isEmpty()) {
-                QMessageBox::warning(m_ui->centralwidget, "Missing Key",
-                                     "A public key is required.");
-                return;
-            }
-            if (!isValidPublicKey(keys.first())) {
-                QMessageBox::warning(m_ui->centralwidget, "Invalid Key",
-                                     "Public key must be exactly 43 base64url characters.");
-                return;
-            }
+        const QString oldName    = name;
+        const QString oldAvatar  = avatar;
+        const QStringList oldMembers = members;
 
-            // Prevent duplicate keys: check if any new key collides with another contact.
-            bool conflict = false;
-            for (const QString &k : std::as_const(keys)) {
-                const std::string kStd = k.toStdString();
-                for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-                    if (i == index || m_chats[i].isGroup) continue;
-                    if (m_chats[i].peerIdB64u == kStd ||
-                        std::find(m_chats[i].keys.begin(), m_chats[i].keys.end(), kStd) != m_chats[i].keys.end()) {
-                        QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
-                                             QString("Key already belongs to contact \"%1\".").arg(qtbridge::qstr(m_chats[i].name)));
-                        conflict = true; break;
-                    }
-                }
-                if (conflict) break;
-            }
-            if (conflict) return;
+        // Build the address-book snapshot the picker draws from.  The
+        // dialog keeps display-name lookup local rather than reaching
+        // back into ChatView state.
+        std::vector<dialogs::GroupAddressBookEntry> book;
+        const std::string myKey = m_controller->myIdB64u();
+        for (const auto &kv : m_contactsByPeer) {
+            if (kv.first == myKey) continue;     // never self-list
+            dialogs::GroupAddressBookEntry e;
+            e.peerId      = qtbridge::qstr(kv.first);
+            e.displayName = qtbridge::qstr(kv.second.name);
+            book.push_back(std::move(e));
         }
 
-        m_chats[index].name = name.toStdString();
-        m_chats[index].keys = qtbridge::stdstrList(keys);
-        m_chats[index].muted = muted;
-        if (wasGroup) m_chats[index].avatarB64 = avatar.toStdString();
-        if (m_chats[index].peerIdB64u.empty() && !keys.isEmpty())
-            m_chats[index].peerIdB64u = keys.first().toStdString();
-        if (m_store) m_store->saveContact(m_chats[index]);
-        if (wasGroup && !avatar.isEmpty())
-            m_store->saveContactAvatar(m_chats[index].peerIdB64u, avatar.toStdString());
-        rebuildChatList();
-        if (m_currentChat == index)
-            m_ui->chatTitleLabel->setText(name);
+        // Member double-click drills into the per-member contact
+        // editor.  Modal-on-modal: the group editor stays alive while
+        // the contact dialog runs, so the user can drill in, edit, and
+        // back out without losing in-progress group edits.
+        auto onMemberActivated = [this](const QString &peerId) {
+            openContactDialogForPeer(peerId);
+        };
 
-        // Broadcast group changes to all members
-        if (wasGroup) {
-            const std::vector<std::string> stdKeys = qtbridge::stdstrList(keys);
+        const GroupEditorResult result = openGroupEditor(
+            m_ui->centralwidget, "Edit Group",
+            name, avatar, muted, members, book,
+            /*showDestructiveActions=*/true,
+            std::move(onMemberActivated));
+
+        if (result == GroupEditorResult::Saved && !name.isEmpty()) {
+            conv.groupName       = name.toStdString();
+            conv.groupAvatarB64  = avatar.toStdString();
+            conv.muted           = muted;
+            const std::vector<std::string> stdMembers = qtbridge::stdstrList(members);
+            m_membersByConv[conv.id] = stdMembers;
+
+            if (m_store) {
+                m_store->saveConversation(conv);
+                m_store->setConversationMembers(conv.id, stdMembers);
+            }
+            rebuildChatList();
+            if (m_currentChat == index)
+                m_ui->chatTitleLabel->setText(name);
+
+            // Broadcast group changes to current member set
             if (name != oldName)
-                m_controller->sendGroupRename(m_chats[index].groupId,
-                                               name.toStdString(), stdKeys);
+                m_controller->sendGroupRename(conv.id, name.toStdString(), stdMembers);
             if (avatar != oldAvatar)
-                m_controller->sendGroupAvatar(m_chats[index].groupId,
-                                               avatar.toStdString(), stdKeys);
-            if (keys != oldKeys)
-                m_controller->sendGroupMemberUpdate(m_chats[index].groupId,
-                                                     m_chats[index].name, stdKeys);
-        }
-    } else if (result == ContactEditorResult::Removed) {
-        if (m_chats[index].isGroup) {
-            // "Delete Group" — the confirmation promised irreversible
-            // deletion.  Broadcast a group_leave so peers drop us from
-            // their rosters, then hard-delete the contacts row (the FK
-            // CASCADE wipes any residual messages/file_transfers).
-            const std::string groupId = m_chats[index].groupId;
-            m_controller->sendGroupLeaveNotification(
-                groupId, m_chats[index].name, m_chats[index].keys);
-            const std::string dbKey = m_chats[index].peerIdB64u.empty()
-                                      ? ("name:" + m_chats[index].name)
-                                      : m_chats[index].peerIdB64u;
-            if (m_store) m_store->deleteContact(dbKey);
+                m_controller->sendGroupAvatar(conv.id, avatar.toStdString(), stdMembers);
+            if (members != oldMembers)
+                m_controller->sendGroupMemberUpdate(conv.id, conv.groupName, stdMembers);
+        } else if (result == GroupEditorResult::Removed) {
+            // "Delete Group" is local-only — wipe the chat view, files,
+            // local message store via CASCADE.  No network broadcast:
+            // other members aren't told we deleted, only that we left
+            // (which is a separate user action).
+            if (m_store) m_store->deleteConversation(conv.id);
+            m_messagesByConv.erase(conv.id);
+            m_filesByConv.erase(conv.id);
+            m_membersByConv.erase(conv.id);
             m_chats.erase(m_chats.begin() + index);
             m_unread.remove(index);
             if (m_currentChat == index) m_currentChat = -1;
@@ -1500,51 +1462,247 @@ void ChatView::onEditContact(int index)
             rebuildChatList();
             if (!m_chats.empty() && m_currentChat < 0)
                 m_ui->chatList->setCurrentRow(0);
-        } else {
-            // "Remove Contact" on desktop = forget the address-book entry.
-            // iMessage-style: clear the nickname, flip the in-address-book
-            // flag, but never CASCADE-wipe the transcript.  The chat row
-            // stays visible (the rebuildChatList fallback shows a key-prefix
-            // label when name is empty).  Use right-click → "Delete
-            // Conversation" to wipe history separately.
-            m_chats[index].inAddressBook = false;
-            m_chats[index].name.clear();
-            if (m_store) m_store->saveContact(m_chats[index]);
+        } else if (result == GroupEditorResult::Left) {
+            // "Leave Group" is purely a network-side signal: broadcast
+            // group_leave so peers drop us from their rosters.  Local
+            // chat data stays put — to also wipe locally the user
+            // chooses Delete Group as a separate action.  We don't
+            // hide here either; archive is a separate user action.
+            const auto memSnapshot = m_membersByConv[conv.id];
+            m_controller->sendGroupLeaveNotification(
+                conv.id, conv.groupName, memSnapshot);
             rebuildChatList();
+            if (!m_chats.empty() && m_currentChat < 0)
+                m_ui->chatList->setCurrentRow(0);
+        } else if (result == GroupEditorResult::SessionsReset) {
+            // Causally-Linked Pairwise: there's no group-level session,
+            // only one DR session per (us, member) pair.  "Reset
+            // Sessions" iterates every member and wipes the pair.
+            // Each member's safety number changes; the user has to
+            // re-verify each one.  Self is excluded (we don't have a
+            // session with ourselves).
+            const std::string me = m_controller->myIdB64u();
+            for (const std::string &member : m_membersByConv[conv.id]) {
+                if (member.empty() || member == me) continue;
+                m_controller->resetSession(member);
+            }
         }
-    } else if (result == ContactEditorResult::Blocked) {
-        m_chats[index].isBlocked = !m_chats[index].isBlocked;
-        if (m_store) m_store->saveContact(m_chats[index]);
-        rebuildChatList();
-
-    } else if (result == ContactEditorResult::SessionReset) {
-        // Wipe ratchet state so next message triggers a fresh handshake.
-        const std::string peerId = m_chats[index].peerIdB64u;
-        if (!peerId.empty())
-            m_controller->resetSession(peerId);
-        if (m_store) m_store->saveContact(m_chats[index]);
-        rebuildChatList();
-    } else if (result == ContactEditorResult::Left) {
-        // iMessage-parity: "Leave Group" is a network-side signal only.
-        // Members see a leave marker; the user keeps their local
-        // transcript and can still scroll the history.  Wiping the
-        // messages is a separate action (right-click → Delete
-        // Conversation).  The in-address-book flag flips so the row
-        // can be filtered from a future contacts view if we add one.
-        const std::string groupId = m_chats[index].groupId;
-        m_controller->sendGroupLeaveNotification(
-            groupId, m_chats[index].name, m_chats[index].keys);
-        m_chats[index].inAddressBook = false;
-        if (m_store) m_store->saveContact(m_chats[index]);
-        rebuildChatList();
+        return;
     }
 
+    // ── 1:1 conversation editor ────────────────────────────────────────────
+    // Edits the conversation row itself: thread-mute, archive (in
+    // chat list), and Delete Chat.  The address-book entry for the
+    // peer is reached via a "View Contact" / "Add Contact" drill-in
+    // that pushes a nested modal openContactEditor.
+    const AppDataStore::Contact *contactPtr = nullptr;
+    auto it = m_contactsByPeer.find(conv.directPeerId);
+    if (it != m_contactsByPeer.end()) contactPtr = &it->second;
+
+    auto onViewContact = [this](const QString &peerId) {
+        openContactDialogForPeer(peerId);
+    };
+    auto onAddContact = [this](const QString &peerId) {
+        openAddContactPrefilled(peerId);
+    };
+
+    const std::string convId = conv.id;
+    const ConversationEditorResult result =
+        openConversationEditor(m_ui->centralwidget, conv, contactPtr,
+                               m_controller,
+                               std::move(onViewContact),
+                               std::move(onAddContact));
+
+    if (result == ConversationEditorResult::Saved) {
+        // openConversationEditor mutates conv.muted / conv.inChatList
+        // in place; persist via the dedicated per-field updaters so we
+        // don't round-trip the encrypted name/avatar columns.
+        if (m_store) {
+            m_store->setConversationMuted(conv.id, conv.muted);
+            m_store->setConversationInChatList(conv.id, conv.inChatList);
+        }
+
+        // Archived rows drop off the visible chat list immediately,
+        // mirroring the Leave Group pathway above.
+        if (!conv.inChatList) {
+            m_chats.erase(m_chats.begin() + index);
+            m_unread.remove(index);
+            if (m_currentChat == index) m_currentChat = -1;
+            else if (m_currentChat > index) m_currentChat -= 1;
+        }
+        rebuildChatList();
+        if (m_currentChat == index)
+            m_ui->chatTitleLabel->setText(displayNameFor(conv));
+    } else if (result == ConversationEditorResult::Deleted) {
+        // CASCADE-delete the conversation row (messages + files +
+        // members go with it via FK ON DELETE CASCADE).  The
+        // address-book contact stays put — that's the whole point of
+        // the v3 split.
+        if (m_store) m_store->deleteConversation(convId);
+        m_messagesByConv.erase(convId);
+        m_filesByConv.erase(convId);
+        m_membersByConv.erase(convId);
+        m_chats.erase(m_chats.begin() + index);
+        m_unread.remove(index);
+        if (m_currentChat == index) {
+            m_currentChat = -1;
+            clearMessages();
+        } else if (m_currentChat > index) {
+            m_currentChat -= 1;
+        }
+        rebuildChatList();
+        if (!m_chats.empty() && m_currentChat < 0)
+            m_ui->chatList->setCurrentRow(0);
+        emit unreadChanged(totalUnread());
+    } else if (result == ConversationEditorResult::SessionReset) {
+        // Wipe the pairwise DR session with this peer.  Next message
+        // (in either direction) triggers a fresh handshake; the safety
+        // number changes after that, so the user has to re-verify.
+        if (!conv.directPeerId.empty())
+            m_controller->resetSession(conv.directPeerId);
+    }
+}
+
+void ChatView::openContactDialogForPeer(const QString &peerIdB64u)
+{
+    if (peerIdB64u.isEmpty()) return;
+
+    // Hydrate from the address book if a row exists; otherwise present
+    // a blank Contact stub keyed by peer id so the editor can curate
+    // them in.  saveContact is upsert by PK so either path round-trips
+    // through the same path.
+    const std::string peerStd = peerIdB64u.toStdString();
+    AppDataStore::Contact contact;
+    bool hasContact = false;
+    auto it = m_contactsByPeer.find(peerStd);
+    if (it != m_contactsByPeer.end()) { contact = it->second; hasContact = true; }
+    else                              { contact.peerIdB64u = peerStd; }
+
+    // Block state lives in `blocked_keys` (Phase 3h) — round-tripped
+    // out-of-band so the dialog never has to know about a separate
+    // table.  On Blocked result we sync our in-memory mirror + persist
+    // via the dedicated CRUD without touching the contact row.
+    bool isBlockedInOut = m_blockedKeys.count(peerStd) > 0;
+    const ContactEditorResult result =
+        openContactEditor(m_ui->centralwidget, contact, isBlockedInOut,
+                          m_controller, /*showDestructiveActions=*/true);
+
+    if (result == ContactEditorResult::Saved
+        || result == ContactEditorResult::Blocked) {
+        if (m_store) m_store->saveContact(contact);
+        m_contactsByPeer[contact.peerIdB64u] = contact;
+        if (result == ContactEditorResult::Blocked && m_store) {
+            if (isBlockedInOut) {
+                m_store->addBlockedKey(peerStd,
+                    QDateTime::currentSecsSinceEpoch());
+                m_blockedKeys.insert(peerStd);
+            } else {
+                m_store->removeBlockedKey(peerStd);
+                m_blockedKeys.erase(peerStd);
+            }
+        }
+        rebuildChatList();
+        if (m_currentChat >= 0
+            && m_currentChat < static_cast<int>(m_chats.size())) {
+            m_ui->chatTitleLabel->setText(displayNameFor(m_chats[m_currentChat]));
+        }
+    } else if (result == ContactEditorResult::Removed) {
+        // "Remove from Address Book" = forget the contacts row only.
+        // Chat history with this peer stays — Delete Chat in the
+        // conversation editor wipes the transcript separately.
+        if (hasContact && m_store) m_store->deleteContact(contact.peerIdB64u);
+        m_contactsByPeer.erase(contact.peerIdB64u);
+        rebuildChatList();
+    } else if (result == ContactEditorResult::SessionReset) {
+        // Persist any name/avatar/etc. edits the user made before
+        // hitting Reset, then wipe the ratchet so the next message
+        // triggers a fresh handshake.
+        if (m_store) m_store->saveContact(contact);
+        m_contactsByPeer[contact.peerIdB64u] = contact;
+        if (!contact.peerIdB64u.empty())
+            m_controller->resetSession(contact.peerIdB64u);
+        rebuildChatList();
+    }
+}
+
+void ChatView::openAddContactPrefilled(const QString &peerIdB64u)
+{
+    if (peerIdB64u.isEmpty()) return;
+    if (!isValidPublicKey(peerIdB64u)) {
+        QMessageBox::warning(m_ui->centralwidget, "Invalid Key",
+            "The peer's key is not a valid 43-character public key.");
+        return;
+    }
+    const std::string peerStd = peerIdB64u.toStdString();
+    if (m_contactsByPeer.count(peerStd)) {
+        // Already a contact — nothing to do.  Drill straight into the
+        // address-book editor instead.
+        openContactDialogForPeer(peerIdB64u);
+        return;
+    }
+
+    // Lightweight inline dialog for naming a peer that's already
+    // talking to us but isn't yet in the address book.  We don't
+    // re-route to onAddContact() because that flow also offers the
+    // Create-Group path, which doesn't make sense in this context.
+    QDialog dlg(m_ui->centralwidget);
+    dlg.setWindowTitle("Add Contact");
+    dialogs::applyStyle(&dlg);
+    dlg.setMinimumWidth(420);
+    dlg.setModal(true);
+
+    auto *layout = new QVBoxLayout(&dlg);
+    layout->setSpacing(14); layout->setContentsMargins(24, 24, 24, 24);
+    auto *ttl = new QLabel("Add Contact", &dlg);
+    ttl->setObjectName("dlgTitle");
+    layout->addWidget(ttl);
+
+    auto *sp = new QFrame(&dlg);
+    sp->setFrameShape(QFrame::HLine);
+    sp->setStyleSheet("color:#2a2a2a;");
+    layout->addWidget(sp);
+
+    layout->addWidget(new QLabel("Display Name", &dlg));
+    auto *nameEdit = new QLineEdit(&dlg);
+    nameEdit->setPlaceholderText("Give this contact a nickname…");
+    layout->addWidget(nameEdit);
+
+    layout->addWidget(new QLabel("Public Key", &dlg));
+    auto *keyDisplay = new QLineEdit(peerIdB64u, &dlg);
+    keyDisplay->setReadOnly(true);
+    themeStyles::applyRole(keyDisplay, "keyDisplay",
+        themeStyles::keyDisplayCss(ThemeManager::instance().current()));
+    layout->addWidget(keyDisplay);
+
+    layout->addStretch();
+
+    auto *br  = new QHBoxLayout;
+    auto *can = new QPushButton("Cancel", &dlg); can->setObjectName("cancelBtn");
+    auto *sav = new QPushButton("Save",   &dlg); sav->setObjectName("saveBtn");
+    sav->setDefault(true);
+    br->setSpacing(10); br->addStretch();
+    br->addWidget(can); br->addWidget(sav);
+    layout->addLayout(br);
+
+    QObject::connect(can, &QPushButton::clicked, &dlg, &QDialog::reject);
+    QObject::connect(sav, &QPushButton::clicked, &dlg, &QDialog::accept);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const QString name = nameEdit->text().trimmed();
+    if (name.isEmpty()) return;
+
+    AppDataStore::Contact nc;
+    nc.peerIdB64u = peerStd;
+    nc.name       = name.toStdString();
+    nc.subtitle   = "Secure chat";
+    if (m_store) m_store->saveContact(nc);
+    m_contactsByPeer[peerStd] = nc;
+    rebuildChatList();
 }
 
 void ChatView::onAddContact()
 {
-    QString name; QStringList keys;
-
     QDialog dlg(m_ui->centralwidget);
     dlg.setWindowTitle("Add Contact"); dialogs::applyStyle(&dlg);
     dlg.setMinimumWidth(420); dlg.setModal(true);
@@ -1596,7 +1754,7 @@ void ChatView::onAddContact()
     if (dlg.exec() != QDialog::Accepted) return;
 
     if (createGroup) {
-        if (m_chats.empty()) {
+        if (m_contactsByPeer.empty()) {
             QMessageBox::information(m_ui->centralwidget,"No Contacts",
                                      "Add some contacts first before creating a group."); return; }
 
@@ -1609,9 +1767,18 @@ void ChatView::onAddContact()
         auto *gn = new QLineEdit(&gd); gn->setPlaceholderText("Enter group name…");
         gl->addWidget(gn); gl->addWidget(new QLabel("Select Members",&gd));
         auto *ml = new QListWidget(&gd); ml->setFixedHeight(160);
-        for (const auto &c : m_chats) {
-            if (c.isGroup) continue;
-            auto *it = new QListWidgetItem(qtbridge::qstr(c.name), ml); it->setCheckState(Qt::Unchecked);
+        const std::string myKey = m_controller->myIdB64u();
+        // Map address-book entries by display label so the post-pick
+        // lookup can find the peer id from the QListWidget row.
+        for (const auto &kv : m_contactsByPeer) {
+            const auto &c = kv.second;
+            if (c.peerIdB64u == myKey) continue;
+            const QString label = c.name.empty()
+                ? qtbridge::qstr(c.peerIdB64u).left(8) + "…"
+                : qtbridge::qstr(c.name);
+            auto *it = new QListWidgetItem(label, ml);
+            it->setCheckState(Qt::Unchecked);
+            it->setData(Qt::UserRole, qtbridge::qstr(c.peerIdB64u));
         }
         gl->addWidget(ml);
         auto *gbr = new QHBoxLayout;
@@ -1624,38 +1791,42 @@ void ChatView::onAddContact()
         if (gd.exec() != QDialog::Accepted) return;
 
         const QString gname = gn->text().trimmed(); if(gname.isEmpty()) return;
-        std::vector<std::string> gkeys;
-        QStringList mnames;
+        std::vector<std::string> gmembers;
         for(int i=0;i<ml->count();++i) {
             if(ml->item(i)->checkState()==Qt::Checked) {
-                const QString itemText = ml->item(i)->text();
-                const std::string itemTextStd = itemText.toStdString();
-                for(const auto &c : m_chats)
-                    if(c.name==itemTextStd && !c.isGroup){
-                        gkeys.insert(gkeys.end(), c.keys.begin(), c.keys.end());
-                        mnames<<itemText;
-                        break;
-                    }
+                const std::string peerId =
+                    ml->item(i)->data(Qt::UserRole).toString().toStdString();
+                if (!peerId.empty()) gmembers.push_back(peerId);
             }
         }
-        if(gkeys.empty()){ QMessageBox::warning(m_ui->centralwidget,"No Members",
+        if(gmembers.empty()){ QMessageBox::warning(m_ui->centralwidget,"No Members",
                                  "Select at least one member."); return; }
 
-        AppDataStore::Contact ng;
-        ng.name = gname.toStdString();
-        ng.subtitle = QString("Group · %1 member%2").arg(mnames.size())
-                          .arg(mnames.size()==1?"":"s").toStdString();
-        ng.isGroup = true; ng.keys = gkeys;
-        ng.groupId = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
-        ng.peerIdB64u = ng.groupId;
+        // Mint a fresh group conversation.  saveConversation persists
+        // the row; setConversationMembers attaches the roster.
+        AppDataStore::Conversation ng;
+        ng.id             = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+        ng.kind           = AppDataStore::ConversationKind::Group;
+        ng.groupName      = gname.toStdString();
+        ng.lastActiveSecs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+        ng.inChatList     = true;
+        if(m_store) {
+            m_store->saveConversation(ng);
+            m_store->setConversationMembers(ng.id, gmembers);
+        }
         m_chats.push_back(ng);
-        if(m_store) m_store->saveContact(ng);
+        m_membersByConv[ng.id] = gmembers;
+        // Tell ChatController so GroupProtocol's roster auth and group_*
+        // FK constraints both have the parent + members in place before
+        // the first send.
+        if (m_controller)
+            m_controller->setKnownGroupMembers(ng.id, gmembers);
         rebuildChatList();
         m_ui->chatList->setCurrentRow(static_cast<int>(m_chats.size())-1);
         return;
     }
 
-    name = nameEdit->text().trimmed(); if(name.isEmpty()) return;
+    const QString name = nameEdit->text().trimmed(); if(name.isEmpty()) return;
     const QString singleKey = keyInput->text().trimmed();
     if (singleKey.isEmpty()) return;
     if (!isValidPublicKey(singleKey)) {
@@ -1664,36 +1835,50 @@ void ChatView::onAddContact()
         return;
     }
     const std::string singleKeyStd = singleKey.toStdString();
-    // Prevent duplicate contacts
-    for (const auto &c : m_chats) {
-        if (c.isGroup) continue;
-        if (c.peerIdB64u == singleKeyStd ||
-            std::find(c.keys.begin(), c.keys.end(), singleKeyStd) != c.keys.end()) {
-            QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
-                QString("Key already belongs to contact \"%1\".").arg(qtbridge::qstr(c.name)));
-            return;
-        }
+    // Prevent duplicate contacts (address-book scoped — a duplicate
+    // peer id collides on the contacts table's PK anyway).
+    if (m_contactsByPeer.count(singleKeyStd)) {
+        QMessageBox::warning(m_ui->centralwidget, "Duplicate Key",
+            QString("Key already belongs to contact \"%1\".")
+                .arg(qtbridge::qstr(m_contactsByPeer[singleKeyStd].name)));
+        return;
     }
-    keys << singleKey;
 
+    // Persist contact + ensure a 1:1 conversation exists for them.
     AppDataStore::Contact nc;
     nc.name = name.toStdString();
     nc.subtitle = "Secure chat";
-    nc.keys = qtbridge::stdstrList(keys);
-    if(!nc.keys.empty()) nc.peerIdB64u = nc.keys.front();
-    m_chats.push_back(nc);
-    if(m_store) m_store->saveContact(nc);
+    nc.peerIdB64u = singleKeyStd;
+    if (m_store) m_store->saveContact(nc);
+    m_contactsByPeer[singleKeyStd] = nc;
 
-    // Send our avatar to the new contact
-    if (!nc.peerIdB64u.empty()) {
-        const std::string myName   = m_store ? m_store->loadSetting("displayName") : std::string();
-        const std::string myAvatar = m_store ? m_store->loadSetting("avatarData")  : std::string();
-        if (!myName.empty())
-            m_controller->sendAvatar(nc.peerIdB64u, myName, myAvatar);
+    if (m_store) {
+        const std::string convId = m_store->findOrCreateDirectConversation(singleKeyStd);
+        if (!convId.empty()) {
+            // Hydrate the in-memory state if this conversation isn't
+            // already there (it might be — peer may have messaged us
+            // first).  findChatForPeer is the source of truth.
+            int existing = findChatForPeer(singleKey);
+            if (existing < 0) {
+                AppDataStore::Conversation conv;
+                if (m_store->loadConversation(convId, conv)) {
+                    m_chats.push_back(conv);
+                    m_membersByConv[conv.id] = { singleKeyStd };
+                    ensureUnreadSize();
+                }
+            }
+        }
     }
 
+    // Send our avatar to the new contact
+    const std::string myName   = m_store ? m_store->loadSetting("displayName") : std::string();
+    const std::string myAvatar = m_store ? m_store->loadSetting("avatarData")  : std::string();
+    if (!myName.empty())
+        m_controller->sendAvatar(singleKeyStd, myName, myAvatar);
+
     rebuildChatList();
-    m_ui->chatList->setCurrentRow(static_cast<int>(m_chats.size())-1);
+    if (!m_chats.empty())
+        m_ui->chatList->setCurrentRow(static_cast<int>(m_chats.size())-1);
 }
 
 void ChatView::onOpenContactsPicker()
@@ -1716,23 +1901,22 @@ void ChatView::onOpenContactsPicker()
     if (picked.isEmpty()) return;
 
     // Mirror iOS's ContactsListView → ContactDetailView flow: selecting
-    // a contact opens their info (nickname, keys, safety number,
-    // block/verify actions), not a chat.  findOrCreateChatForPeer
-    // rehydrates the row into m_chats from the DB snapshot so
-    // onEditContact can operate on a real index — this may resurface
-    // the row in the chat list until the next relaunch filters it.
-    const int idx = findOrCreateChatForPeer(picked);
-    if (idx >= 0) onEditContact(idx);
+    // a contact opens their address-book entry (nickname, safety
+    // number, block / verify actions), NOT a chat.  Going through the
+    // dedicated contact editor — same one used by group-member tap
+    // and the conversation editor's "View Contact" drill-in — keeps
+    // the address-book and chat-list concepts cleanly separated.
+    openContactDialogForPeer(picked);
 }
 
-void ChatView::onDeleteSingleMessage(const QString &chatKey, const QString &msgId)
+void ChatView::onDeleteSingleMessage(const QString &convId, const QString &msgId)
 {
-    const std::string chatKeyStd = chatKey.toStdString();
-    const std::string msgIdStd   = msgId.toStdString();
-    if (m_store) m_store->deleteMessage(chatKeyStd, msgIdStd);
+    const std::string convIdStd = convId.toStdString();
+    const std::string msgIdStd  = msgId.toStdString();
+    if (m_store) m_store->deleteMessage(convIdStd, msgIdStd);
 
     // Drop from the in-memory cache then re-render the current chat.
-    auto &msgs = m_messagesByPeer[chatKeyStd];
+    auto &msgs = m_messagesByConv[convIdStd];
     msgs.erase(std::remove_if(msgs.begin(), msgs.end(),
         [&](const AppDataStore::Message &m) { return m.msgId == msgIdStd; }),
         msgs.end());
@@ -1756,7 +1940,7 @@ void ChatView::onDeleteConversation(int index)
 {
     if (index < 0 || index >= static_cast<int>(m_chats.size())) return;
 
-    const QString label = qtbridge::qstr(m_chats[index].name);
+    const QString label = displayNameFor(m_chats[index]);
     const QString prompt = label.isEmpty()
         ? QString("Delete this conversation?\n\nMessages and file records "
                   "are wiped; the contact stays in your address book.")
@@ -1768,30 +1952,28 @@ void ChatView::onDeleteConversation(int index)
                               prompt, QMessageBox::Yes | QMessageBox::No,
                               QMessageBox::No) != QMessageBox::Yes) return;
 
-    // Snapshot before we mutate m_chats.
-    AppDataStore::Contact c = m_chats[index];
-    const QString ck = chatKey(c);
-    const std::string ckStd = ck.toStdString();
+    // Snapshot the conversation id (and kind) before we mutate m_chats.
+    const std::string convId = m_chats[index].id;
+    const bool wasGroup = (m_chats[index].kind == AppDataStore::ConversationKind::Group);
 
     if (m_store) {
-        m_store->deleteMessages(c.peerIdB64u);
-        m_store->deleteFileRecordsForChat(ckStd);
-        // Contact row is NOT hard-deleted.  For 1:1s the filter hides
-        // message-less rows already; explicit contacts stay findable
-        // via the contacts picker.  For groups we flip in_address_book
-        // to false so initChats' filter also hides them on relaunch —
-        // a fresh group message would upsert the row back to true and
-        // revive the chat.  Without this flip a deleted group row
-        // would rematerialize empty because groups aren't message-
-        // gated the way 1:1 rows are.
-        if (c.isGroup) {
-            c.inAddressBook = false;
-            m_store->saveContact(c);
+        // For 1:1s we keep the conversation row + just wipe messages
+        // and files — the address-book contact persists, and a fresh
+        // inbound from this peer should resume into the same row.
+        // For groups we hide via in_chat_list=false so the row drops
+        // off the visible list but the membership / group_* state
+        // sticks around in case we re-join.  Hard-deleting (and
+        // CASCADE-wiping group_send_state etc.) would lock us out of
+        // future replays.
+        m_store->deleteMessages(convId);
+        m_store->deleteFileRecordsForChat(convId);
+        if (wasGroup) {
+            m_store->setConversationInChatList(convId, false);
         }
     }
 
-    m_messagesByPeer.erase(c.peerIdB64u);
-    m_filesByKey.remove(ck);
+    m_messagesByConv.erase(convId);
+    m_filesByConv.erase(convId);
     m_chats.erase(m_chats.begin() + index);
     m_unread.remove(index);
 
@@ -1812,44 +1994,32 @@ void ChatView::onDeleteConversation(int index)
 
 int ChatView::findChatForPeer(const QString &peerIdB64u) const
 {
-    const std::string peerStd = peerIdB64u.toStdString();
-    auto trimStd = [](const std::string& s) {
-        const auto first = s.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos) return std::string{};
-        const auto last = s.find_last_not_of(" \t\r\n");
-        return s.substr(first, last - first + 1);
-    };
+    const std::string peerStd = peerIdB64u.trimmed().toStdString();
     for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
-        if (m_chats[i].isGroup) continue;
-        if (trimStd(m_chats[i].peerIdB64u) == peerStd) return i;
-        for (const std::string &k : m_chats[i].keys)
-            if (trimStd(k) == peerStd) return i;
+        if (m_chats[i].kind != AppDataStore::ConversationKind::Direct) continue;
+        if (m_chats[i].directPeerId == peerStd) return i;
     }
     return -1;
 }
 
-int ChatView::findOrCreateChatForPeer(const QString &peerIdB64u)
+int ChatView::findOrCreateDirectChatForPeer(const QString &peerIdB64u)
 {
     const int existing = findChatForPeer(peerIdB64u);
     if (existing >= 0) return existing;
+    if (!m_store) return -1;
 
-    // If the DB already has a row for this peer (e.g. an explicit
-    // contact whose chat was deleted earlier), re-hydrate from it so
-    // we keep the nickname.  Otherwise create a nameless stub — the
-    // chat list falls back to the peer's key prefix for empty names,
-    // matching iOS's displayName() behavior.
-    AppDataStore::Contact nc;
-    bool loaded = false;
-    if (m_store) loaded = m_store->loadContact(peerIdB64u.toStdString(), nc);
-    if (!loaded) {
-        nc.subtitle = "Secure chat";
-        nc.peerIdB64u = peerIdB64u.toStdString();
-        nc.keys.push_back(peerIdB64u.toStdString());
-        // Strangers stay out of the address book until explicit add.
-        nc.inAddressBook = false;
-        if (m_store) m_store->saveContact(nc);
-    }
-    m_chats.insert(m_chats.begin(), nc);
+    const std::string peerStd = peerIdB64u.trimmed().toStdString();
+    // findOrCreateDirectConversation is idempotent + adds the peer as
+    // the sole member in one TX, so we don't need a follow-up
+    // setConversationMembers call.
+    const std::string convId = m_store->findOrCreateDirectConversation(peerStd);
+    if (convId.empty()) return -1;
+
+    AppDataStore::Conversation conv;
+    if (!m_store->loadConversation(convId, conv)) return -1;
+
+    m_chats.insert(m_chats.begin(), conv);
+    m_membersByConv[conv.id] = { peerStd };
     ensureUnreadSize();
     m_unread.prepend(0);
     if (m_currentChat >= 0) m_currentChat += 1;
@@ -1878,55 +2048,57 @@ void ChatView::initChats()
     }
 
     m_chats.clear();
-    m_messagesByPeer.clear();
-    m_filesByKey.clear();
+    m_messagesByConv.clear();
+    m_filesByConv.clear();
+    m_membersByConv.clear();
+    m_contactsByPeer.clear();
 
     if (m_store) {
+        // 0. Block state — independent of contacts (Phase 3h).  Hydrate
+        //    upfront so isBlockedFor / inbound dispatch can consult it
+        //    before any contact lookup runs.
+        m_blockedKeys.clear();
+        m_store->loadAllBlockedKeys(
+            [this](const std::string &p, int64_t /*blockedAt*/) {
+                m_blockedKeys.insert(p);
+            });
+
+        // 1. Address book — keyed by peer id; separate from chat list now.
         m_store->loadAllContacts([this](const AppDataStore::Contact &c) {
-            m_chats.push_back(c);
+            m_contactsByPeer[c.peerIdB64u] = c;
         });
 
-        // Load messages + file records per contact.  Done after the
-        // contacts finish streaming so we don't hit the store recursively.
+        // 2. Conversations = chat list.  In-chat-list filter is the
+        //    persisted "show me here" bit; rows hidden via "Leave Group"
+        //    or future archive UX skip the visible chat list.
+        m_store->loadAllConversations(
+            [this](const AppDataStore::Conversation &c) {
+                if (!c.inChatList) return;
+                m_chats.push_back(c);
+            });
+
+        // 3. Per-conversation: members, messages, files.  Streaming
+        //    independently keeps memory flat for large rosters.
         for (const auto &c : m_chats) {
-            auto &msgs = m_messagesByPeer[c.peerIdB64u];
-            m_store->loadMessages(c.peerIdB64u, [&msgs](const AppDataStore::Message &m) {
-                msgs.push_back(m);
-            });
+            std::vector<std::string> mem;
+            m_store->loadConversationMembers(c.id,
+                [&mem](const std::string &p) { mem.push_back(p); });
+            if (!mem.empty()) m_membersByConv[c.id] = std::move(mem);
 
-            const QString ck = chatKey(c);
+            auto &msgs = m_messagesByConv[c.id];
+            m_store->loadMessages(c.id,
+                [&msgs](const AppDataStore::Message &m) { msgs.push_back(m); });
+
             std::vector<AppDataStore::FileRecord> records;
-            m_store->loadFileRecords(ck.toStdString(), [&records](const AppDataStore::FileRecord &r) {
-                records.push_back(r);
-            });
+            m_store->loadFileRecords(c.id,
+                [&records](const AppDataStore::FileRecord &r) { records.push_back(r); });
             if (!records.empty())
-                m_filesByKey[ck] = std::move(records);
-        }
-
-        // Chat list is message-derived: we only show rows that have a
-        // transcript the user is likely to want to open.  Groups that
-        // are still in the address book stay visible even when empty
-        // (fresh group, no traffic yet) — but groups the user
-        // Deleted-Conversation'd are flagged inAddressBook=false and
-        // get filtered out here so they don't resurrect on relaunch.
-        // Fresh contacts (no messages yet) live in the contacts
-        // picker, not the chat list.  Rows stay in the DB so the FK
-        // holds and `findOrCreateChatForPeer` / `onIncomingGroupMessage`
-        // can re-hydrate them when traffic resumes.
-        for (size_t i = m_chats.size(); i-- > 0; ) {
-            const auto &c = m_chats[i];
-            const auto  it = m_messagesByPeer.find(c.peerIdB64u);
-            const bool  noMessages = (it == m_messagesByPeer.end() || it->second.empty());
-            const bool  hideFresh  = !c.isGroup || !c.inAddressBook;
-            if (hideFresh && noMessages) {
-                m_messagesByPeer.erase(c.peerIdB64u);
-                m_chats.erase(m_chats.begin() + i);
-            }
+                m_filesByConv[c.id] = std::move(records);
         }
     }
 
     m_ui->chatList->clear();
-    for (const auto &c : m_chats) m_ui->chatList->addItem(qtbridge::qstr(c.name));
+    for (const auto &c : m_chats) m_ui->chatList->addItem(displayNameFor(c));
 
     // Show first 8 chars of public key as handle
     const QString fullKey = QString::fromStdString(m_controller->myIdB64u());
@@ -1941,14 +2113,25 @@ void ChatView::rebuildChatList()
     // Re-subscribe presence when contact list changes
     subscribeAllPresence();
 
-    // Prune m_memberOnline: drop keys that no longer belong to any contact/group
+    // Prune m_memberOnline: drop keys that no longer belong to any
+    // active conversation.  Walk both 1:1 directPeerIds and group
+    // member rosters so a peer that's still reachable through any
+    // surface stays subscribed.
     {
         QSet<QString> activeKeys;
-        for (const auto &c : m_chats)
-            for (const std::string &k : c.keys) {
-                const QString t = qtbridge::qstr(k).trimmed();
+        for (const auto &c : m_chats) {
+            if (c.kind == AppDataStore::ConversationKind::Direct) {
+                const QString t = qtbridge::qstr(c.directPeerId).trimmed();
                 if (!t.isEmpty()) activeKeys.insert(t);
+            } else {
+                const auto it = m_membersByConv.find(c.id);
+                if (it == m_membersByConv.end()) continue;
+                for (const std::string &k : it->second) {
+                    const QString t = qtbridge::qstr(k).trimmed();
+                    if (!t.isEmpty()) activeKeys.insert(t);
+                }
             }
+        }
         for (auto it = m_memberOnline.begin(); it != m_memberOnline.end(); ) {
             if (!activeKeys.contains(it.key()))
                 it = m_memberOnline.erase(it);
@@ -1962,6 +2145,9 @@ void ChatView::rebuildChatList()
     m_ui->chatList->clear();
 
     for (int i = 0; i < static_cast<int>(m_chats.size()); ++i) {
+        const AppDataStore::Conversation &conv = m_chats[i];
+        const bool isGroup = (conv.kind == AppDataStore::ConversationKind::Group);
+
         auto *item = new QListWidgetItem(m_ui->chatList);
         item->setSizeHint(QSize(0, 64));
         auto *row = new QWidget;
@@ -1969,25 +2155,21 @@ void ChatView::rebuildChatList()
         auto *hl = new QHBoxLayout(row);
         hl->setContentsMargins(14,0,14,0); hl->setSpacing(6);
 
-        // "Remove Contact" clears the nickname — fall back to the first
-        // 8 chars of the peer ID so the row isn't blank.  Groups are
-        // always created with a name so this branch rarely runs for them.
-        QString label = qtbridge::qstr(m_chats[i].name);
-        if (label.isEmpty() && !m_chats[i].peerIdB64u.empty())
-            label = qtbridge::qstr(p2p::peerPrefix(m_chats[i].peerIdB64u)) + "…";
+        // displayNameFor handles the contact-removed / stranger case
+        // by falling back to a key-prefix label.  Group rows always
+        // carry a groupName at this point (saved at creation).
+        QString label = displayNameFor(conv);
         auto *nameLbl = new QLabel(label, row);
         nameLbl->setStyleSheet("color:#d0d0d0;font-size:14px;background:transparent;");
         hl->addWidget(nameLbl, 1);
 
-        // Safety-number verification indicator (1:1 contacts only — groups
-        // inherit verification per-member and are shown in the contact
-        // editor's member list).  Green check = Verified; orange "!" =
-        // Mismatch (peer's safety number changed vs stored); no indicator
-        // for Unverified (the default first-contact state).
-        if (!m_chats[i].isGroup && m_controller && !m_chats[i].keys.empty()) {
-            const std::string peerIdB64u =
-                qtbridge::qstr(m_chats[i].keys.front()).trimmed().toStdString();
-            const auto trust = m_controller->peerTrust(peerIdB64u);
+        // Safety-number verification indicator (1:1 contacts only —
+        // groups inherit verification per-member and are shown inside
+        // the group editor's member list).  Green check = Verified;
+        // orange "!" = Mismatch (peer's safety number changed); no
+        // indicator for Unverified (the default first-contact state).
+        if (!isGroup && m_controller && !conv.directPeerId.empty()) {
+            const auto trust = m_controller->peerTrust(conv.directPeerId);
             if (trust != ChatController::PeerTrust::Unverified) {
                 auto *badge = new QLabel(row);
                 badge->setFixedSize(16, 16);
@@ -2021,9 +2203,10 @@ void ChatView::rebuildChatList()
         auto *avatarLbl = new QLabel(row);
         avatarLbl->setFixedSize(34, 34);
         avatarLbl->setAlignment(Qt::AlignCenter);
-        if (!m_chats[i].avatarB64.empty()) {
+        const QString avB64 = avatarB64For(conv);
+        if (!avB64.isEmpty()) {
             QPixmap px;
-            px.loadFromData(QByteArray::fromBase64(QByteArray::fromStdString(m_chats[i].avatarB64)));
+            px.loadFromData(QByteArray::fromBase64(avB64.toUtf8()));
             if (!px.isNull())
                 avatarLbl->setPixmap(makeCircularPixmap(px, 34));
         } else {
@@ -2031,10 +2214,9 @@ void ChatView::rebuildChatList()
                 QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
                 QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
             };
-            const QString nm = qtbridge::qstr(m_chats[i].name);
-            const QString ch  = nm.isEmpty() ? (m_chats[i].isGroup ? "#" : "?") : QString(nm[0]);
-            const uint hash = qHash(nm);
-            const QColor bg = m_chats[i].isGroup
+            const QString ch = label.isEmpty() ? (isGroup ? "#" : "?") : QString(label[0]);
+            const uint hash = qHash(label);
+            const QColor bg = isGroup
                 ? QColor(0x2e, 0x8b, 0x3a)
                 : kPalette[hash % static_cast<uint>(kPalette.size())];
             avatarLbl->setPixmap(renderInitialsAvatar(ch, bg, 34));
@@ -2077,13 +2259,14 @@ void ChatView::rebuildChatList()
 
 void ChatView::loadChat(int index)
 {
-    const AppDataStore::Contact &chat = m_chats[index];
-    const QString chatName = qtbridge::qstr(chat.name);
+    const AppDataStore::Conversation &chat = m_chats[index];
+    const bool isGroup = (chat.kind == AppDataStore::ConversationKind::Group);
+    const QString chatName = displayNameFor(chat);
     m_ui->chatTitleLabel->setText(chatName);
 
     // Show online / last-seen for DM chats, group subtitle for groups
-    if (!chat.isGroup) {
-        const bool isOnline = m_memberOnline.value(qtbridge::qstr(chat.peerIdB64u), false);
+    if (!isGroup) {
+        const bool isOnline = m_memberOnline.value(qtbridge::qstr(chat.directPeerId), false);
         const QString statusText = isOnline
                                        ? "Online"
                                        : formatLastSeen(qtbridge::qdate(chat.lastActiveSecs));
@@ -2099,19 +2282,24 @@ void ChatView::loadChat(int index)
         const QString myKey = QString::fromStdString(m_controller->myIdB64u());
         int onlineCount = 0, totalMembers = 0;
         bool anyResolved = false;
-        for (const std::string &k : chat.keys) {
-            const QString trimmed = qtbridge::qstr(k).trimmed();
-            if (trimmed.isEmpty() || trimmed == myKey) continue;
-            ++totalMembers;
-            if (m_memberOnline.contains(trimmed)) {
-                anyResolved = true;
-                if (m_memberOnline.value(trimmed))
-                    ++onlineCount;
+        const auto memIt = m_membersByConv.find(chat.id);
+        if (memIt != m_membersByConv.end()) {
+            for (const std::string &k : memIt->second) {
+                const QString trimmed = qtbridge::qstr(k).trimmed();
+                if (trimmed.isEmpty() || trimmed == myKey) continue;
+                ++totalMembers;
+                if (m_memberOnline.contains(trimmed)) {
+                    anyResolved = true;
+                    if (m_memberOnline.value(trimmed))
+                        ++onlineCount;
+                }
             }
         }
         if (!anyResolved || totalMembers == 0) {
-            // No presence data yet — show the original subtitle
-            m_ui->chatSubLabel->setText(qtbridge::qstr(chat.subtitle));
+            // No presence data yet — show a neutral subtitle.  v3
+            // dropped the per-row stored subtitle; "Group chat" is the
+            // sensible static fallback.
+            m_ui->chatSubLabel->setText(QStringLiteral("Group chat"));
             m_ui->chatSubLabel->setStyleSheet(
                 "color: #888888; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;");
         } else {
@@ -2124,22 +2312,19 @@ void ChatView::loadChat(int index)
         }
     }
 
-    if (!chat.avatarB64.empty()) {
+    const QString avB64 = avatarB64For(chat);
+    if (!avB64.isEmpty()) {
         QPixmap px;
-        px.loadFromData(QByteArray::fromBase64(QByteArray::fromStdString(chat.avatarB64)));
+        px.loadFromData(QByteArray::fromBase64(avB64.toUtf8()));
         if (!px.isNull()) {
             m_ui->chatAvatarLabel->setPixmap(makeCircularPixmap(px, 44));
             m_ui->chatAvatarLabel->setText("");
         }
-    } else if (chat.isGroup) {
+    } else if (isGroup) {
         const QString ch = chatName.isEmpty() ? "#" : QString(chatName[0]);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, QColor(0x2e, 0x8b, 0x3a), 44));
         m_ui->chatAvatarLabel->setText("");
     } else {
-        static const QList<QColor> kPalette = {
-            QColor(0x2e, 0x8b, 0x3a), QColor(0x3a, 0x6b, 0xbf), QColor(0x7b, 0x3a, 0xbf),
-            QColor(0xbf, 0x7b, 0x3a), QColor(0xbf, 0x3a, 0x3a), QColor(0x1a, 0x4a, 0x6a),
-        };
         const QString ch = chatName.isEmpty() ? "?" : QString(chatName[0]);
         const QColor bg = avatarColorForName(chatName);
         m_ui->chatAvatarLabel->setPixmap(renderInitialsAvatar(ch, bg, 44));
@@ -2148,7 +2333,7 @@ void ChatView::loadChat(int index)
     clearMessages();
 
     QDateTime lastShown;
-    const auto &msgs = m_messagesByPeer[chat.peerIdB64u];
+    const auto &msgs = m_messagesByConv[chat.id];
     for (const auto &msg : msgs) {
         const QDateTime msgTs = qtbridge::qdate(msg.timestampSecs);
         if (!lastShown.isValid() || lastShown.secsTo(msgTs) >= kDateSepSecs) {
@@ -2157,22 +2342,23 @@ void ChatView::loadChat(int index)
         }
 
         QString senderName;
-        if (chat.isGroup && !msg.sent && !msg.senderName.empty()) {
+        if (isGroup && !msg.sent && !msg.senderName.empty()) {
             senderName = qtbridge::qstr(msg.senderName);
         }
         addMessageBubble(qtbridge::qstr(msg.text), msg.sent, senderName,
-                          qtbridge::qstr(msg.msgId), chatKey(chat));
+                          qtbridge::qstr(msg.msgId), qtbridge::qstr(chat.id));
     }
     rebuildFilesTab();
 }
 
 void ChatView::promoteChatToTop(int index)
 {
-    // promoteChatToTop does NOT remap m_filesByKey because that map is keyed by
-    // the stable peer ID — not by list index.  Only m_unread needs adjustment.
+    // promoteChatToTop does NOT remap m_filesByConv / m_messagesByConv:
+    // both are keyed by the stable conversation UUID, not by list
+    // index.  Only m_unread needs adjustment.
     if (index <= 0 || index >= static_cast<int>(m_chats.size())) return;
 
-    AppDataStore::Contact promoted = std::move(m_chats[index]);
+    AppDataStore::Conversation promoted = std::move(m_chats[index]);
     m_chats.erase(m_chats.begin() + index);
     m_chats.insert(m_chats.begin(), std::move(promoted));
 
@@ -2430,8 +2616,10 @@ void ChatView::rebuildFilesTab()
 
     if (m_currentChat < 0) return;
 
-    const QString key     = chatKey(m_chats[m_currentChat]);
-    const auto   &records = m_filesByKey.value(key);
+    const std::string convId = m_chats[m_currentChat].id;
+    static const std::vector<AppDataStore::FileRecord> kEmpty;
+    auto recIt = m_filesByConv.find(convId);
+    const auto &records = (recIt == m_filesByConv.end()) ? kEmpty : recIt->second;
 
     // ── Filter records by search query if active ───────────────────────────
     std::vector<AppDataStore::FileRecord> filtered;
@@ -2475,9 +2663,9 @@ void ChatView::rebuildFilesTab()
                 this, [this](const QString &transferId) {
                     if (m_store) m_store->deleteFileRecord(transferId.toStdString());
                     if (m_currentChat >= 0 && m_currentChat < static_cast<int>(m_chats.size())) {
-                        const QString ck = chatKey(m_chats[m_currentChat]);
+                        const std::string ck = m_chats[m_currentChat].id;
                         const std::string idStd = transferId.toStdString();
-                        auto &files = m_filesByKey[ck];
+                        auto &files = m_filesByConv[ck];
                         files.erase(std::remove_if(files.begin(), files.end(),
                             [&](const AppDataStore::FileRecord &r){ return r.transferId == idStd; }),
                             files.end());
@@ -2555,17 +2743,14 @@ void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
         }
     }
 
-    // Figure out which contact/chat this is so we can show a friendly name.
+    // Figure out which contact this is so we can show a friendly name.
     // Same prefix-fallback rule as the group-message handler: empty name
     // (un-added peer) stays on the key prefix.
     QString senderName = fromPeerIdB64u.left(8) + "...";
     const std::string fromStd = fromPeerIdB64u.toStdString();
-    for (const auto &c : m_chats) {
-        if (std::find(c.keys.begin(), c.keys.end(), fromStd) != c.keys.end()) {
-            if (!c.name.empty()) senderName = qtbridge::qstr(c.name);
-            break;
-        }
-    }
+    auto contactIt = m_contactsByPeer.find(fromStd);
+    if (contactIt != m_contactsByPeer.end() && !contactIt->second.name.empty())
+        senderName = qtbridge::qstr(contactIt->second.name);
 
     QMessageBox box(m_ui->centralwidget);
     box.setWindowTitle("Incoming File");
@@ -2593,14 +2778,14 @@ void ChatView::onFileAcceptRequested(const QString &fromPeerIdB64u,
 void ChatView::onFileTransferCanceled(const QString &transferId, bool byReceiver)
 {
     const std::string transferStd = transferId.toStdString();
-    // Walk every chat's file records and mark the matching transfer as failed.
-    for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
-        auto &records = it.value();
+    // Walk every conversation's file records and mark the matching transfer as failed.
+    for (auto &kv : m_filesByConv) {
+        auto &records = kv.second;
         for (auto &rec : records) {
             if (rec.transferId != transferStd) continue;
             if (static_cast<FileTransferStatus>(rec.status) == FileTransferStatus::Complete) return; // too late
             rec.status = static_cast<int>(FileTransferStatus::Failed);
-            if (m_store) m_store->saveFileRecord(it.key().toStdString(), rec);
+            if (m_store) m_store->saveFileRecord(kv.first, rec);
             rebuildFilesTab();
             break;
         }
@@ -2616,15 +2801,15 @@ void ChatView::onFileTransferDelivered(const QString &transferId)
 {
     const std::string transferStd = transferId.toStdString();
     // Sender-side: flip the record's status to Complete with a confirmation.
-    for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
-        auto &records = it.value();
+    for (auto &kv : m_filesByConv) {
+        auto &records = kv.second;
         for (auto &rec : records) {
             if (rec.transferId != transferStd) continue;
             if (!rec.sent) return; // only meaningful on sender side
             // Transfer landed + hash verified. Keep status Complete but reflect delivery.
             rec.chunksComplete = rec.chunksTotal;
             rec.status         = static_cast<int>(FileTransferStatus::Complete);
-            if (m_store) m_store->saveFileRecord(it.key().toStdString(), rec);
+            if (m_store) m_store->saveFileRecord(kv.first, rec);
             rebuildFilesTab();
             showToast(QString("Delivered: %1").arg(qtbridge::qstr(rec.fileName)));
             return;
@@ -2636,12 +2821,12 @@ void ChatView::onFileTransferBlocked(const QString &transferId, bool byReceiver)
 {
     const std::string transferStd = transferId.toStdString();
     // Mark as failed + toast explanation.
-    for (auto it = m_filesByKey.begin(); it != m_filesByKey.end(); ++it) {
-        auto &records = it.value();
+    for (auto &kv : m_filesByConv) {
+        auto &records = kv.second;
         for (auto &rec : records) {
             if (rec.transferId != transferStd) continue;
             rec.status = static_cast<int>(FileTransferStatus::Failed);
-            if (m_store) m_store->saveFileRecord(it.key().toStdString(), rec);
+            if (m_store) m_store->saveFileRecord(kv.first, rec);
             rebuildFilesTab();
             break;
         }

@@ -119,6 +119,11 @@ void GroupProtocol::sendTextV2(const std::string& groupId,
     const int64_t     ts    = nowSecs();
     const std::string msgId = p2p::makeUuid();
 
+    // v3: ensure the conversations row exists for groupId before any
+    // group_* CRUD fires.  Idempotent — no-op when the row's already
+    // there (e.g., setKnownGroupMembers ran earlier).
+    m_appData->ensureGroupConversation(groupId);
+
     // Phase 2: opaque, stable per-group wire identifier.  Mint on first
     // outbound, then reuse for the life of the group (rotation in 2.1).
     // Receivers map bundle → groupId; missing mapping = drop.

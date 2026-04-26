@@ -31,13 +31,20 @@ extension Peer2PearClient {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.groups[gid] = group
-            self.dbSaveContact(DBContact(
-                peerId:        gid,
-                name:          name,
-                keys:          memberPeerIds,
-                isGroup:       true,
-                groupId:       gid,
-                lastActiveSecs: Int64(group.lastActivity.timeIntervalSince1970)))
+            // v3: group state lives in the conversations table (kind
+            // = group), with the roster denormalized into
+            // conversation_members.  conv id == group_id by design,
+            // so existing call sites that pass a group_id keep working.
+            self.dbSaveConversation(DBConversation(
+                id:              gid,
+                kind:            .group,
+                groupName:       name,
+                groupAvatarB64:  "",
+                muted:           false,
+                lastActiveSecs:  Int64(group.lastActivity.timeIntervalSince1970),
+                inChatList:      true))
+            self.dbSetConversationMembers(conversationId: gid,
+                                           peerIds: memberPeerIds)
         }
         // Seed the core's roster with self + members so we'll accept
         // inbound rename/avatar/leave from any of them.
@@ -108,14 +115,14 @@ extension Peer2PearClient {
                 g.name = newName
                 g.lastActivity = Date()
                 self.groups[groupId] = g
-                self.dbSaveContact(DBContact(
-                    peerId:        groupId,
-                    name:          newName,
-                    keys:          g.memberIds,
-                    isGroup:       true,
-                    groupId:       groupId,
-                    avatarB64:     self.groupAvatars[groupId] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
+                self.dbSaveConversation(DBConversation(
+                    id:              groupId,
+                    kind:            .group,
+                    groupName:       newName,
+                    groupAvatarB64:  self.groupAvatars[groupId] ?? "",
+                    muted:           self.isMuted(peerId: groupId),
+                    lastActiveSecs:  Int64(g.lastActivity.timeIntervalSince1970),
+                    inChatList:      true))
             }
         }
         return rc == 0
@@ -135,7 +142,8 @@ extension Peer2PearClient {
         return rc == 0
     }
 
-    /// Publish a new group avatar.
+    /// Publish a new group avatar.  v3: group avatars live on the
+    /// conversation row, not on a contact (groups aren't contacts).
     @discardableResult
     func sendGroupAvatar(groupId: String, avatarB64: String,
                          memberPeerIds: [String]) -> Bool {
@@ -147,7 +155,15 @@ extension Peer2PearClient {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.groupAvatars[groupId] = avatarB64
-                self.dbSaveContactAvatar(peerId: groupId, avatarB64: avatarB64)
+                let g = self.groups[groupId]
+                self.dbSaveConversation(DBConversation(
+                    id:              groupId,
+                    kind:            .group,
+                    groupName:       g?.name ?? "",
+                    groupAvatarB64:  avatarB64,
+                    muted:           self.isMuted(peerId: groupId),
+                    lastActiveSecs:  Int64((g?.lastActivity ?? Date()).timeIntervalSince1970),
+                    inChatList:      true))
             }
         }
         return rc == 0
@@ -168,14 +184,16 @@ extension Peer2PearClient {
                 g.memberIds = memberPeerIds
                 g.lastActivity = Date()
                 self.groups[groupId] = g
-                self.dbSaveContact(DBContact(
-                    peerId:        groupId,
-                    name:          g.name,
-                    keys:          memberPeerIds,
-                    isGroup:       true,
-                    groupId:       groupId,
-                    avatarB64:     self.groupAvatars[groupId] ?? "",
-                    lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
+                self.dbSaveConversation(DBConversation(
+                    id:              groupId,
+                    kind:            .group,
+                    groupName:       g.name,
+                    groupAvatarB64:  self.groupAvatars[groupId] ?? "",
+                    muted:           self.isMuted(peerId: groupId),
+                    lastActiveSecs:  Int64(g.lastActivity.timeIntervalSince1970),
+                    inChatList:      true))
+                self.dbSetConversationMembers(conversationId: groupId,
+                                               peerIds: memberPeerIds)
             }
         }
         return rc == 0
