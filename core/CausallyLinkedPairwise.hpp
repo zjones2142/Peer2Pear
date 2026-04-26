@@ -37,7 +37,8 @@
  *   {
  *     "type":      "group_msg",
  *     "from":      "<sender peerId>",
- *     "groupId":   "<group uuid>",
+ *     "bundle":    "<16B base64url>",       // Phase 2; opaque wire id, see below
+ *     "groupId":   "<group uuid>",          // Phase 2.0 transition only; dropped in 2.1
  *     "groupName": "<encrypted-by-DR display name>",
  *     "members":   [ "<peerId>", ... ],     // group roster snapshot
  *     "session":   "<8B base64url>",        // session_id, see below
@@ -80,6 +81,22 @@
  *     is over the sealed envelope, NOT the plaintext, so a receiver
  *     can verify the chain without holding plaintext history.
  *
+ *   bundle (Phase 2):
+ *     16-byte opaque per-group identifier that replaces `groupId` on
+ *     the wire.  Generated locally at first outbound (or learned via
+ *     a peer's earlier message); persisted in `group_bundle_map`.
+ *     Stable for the life of the group (rotation is a Phase 2.1
+ *     follow-up).  Receivers MUST drop messages whose `bundle` does
+ *     not map to a known local group — even if `groupId` is present.
+ *
+ *     Phase 2.0 transition: senders emit BOTH `bundle` and `groupId`
+ *     so receivers that haven't yet learned this group's bundle
+ *     (e.g., joined via a pre-Phase-2 invite) can still dispatch the
+ *     message and back-fill the mapping.  Phase 2.1 removes
+ *     `groupId` from the wire entirely; from then on a receiver with
+ *     no `bundle` mapping has no way to know which group the message
+ *     belongs to and drops it.
+ *
  * ── Replay cache (sender side) ──────────────────────────────────────
  *
  * After successfully sealing each envelope, the sender stores the
@@ -115,7 +132,8 @@
  *   {
  *     "type":      "group_gap_request",
  *     "from":      "<requestor>",
- *     "groupId":   "<group uuid>",
+ *     "bundle":    "<16B base64url>",   // Phase 2; present iff sender has the mapping
+ *     "groupId":   "<group uuid>",      // Phase 2.0 transition only; dropped in 2.1
  *     "session":   "<8B base64url>",
  *     "from_ctr":  <integer>,           // inclusive
  *     "to_ctr":    <integer>            // inclusive

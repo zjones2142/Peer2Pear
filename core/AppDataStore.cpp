@@ -424,6 +424,30 @@ void AppDataStore::createTables()
         "  PRIMARY KEY (peer_id, group_id, session_id)"
         ");"
     );
+
+    // ── Phase 2: Invisible Groups (bundle_id ↔ group_id) ─────────────
+    //
+    // group_bundle_map: local-only mapping between the persistent
+    // group identifier (group_id, used in app state + chain_state) and
+    // an opaque on-wire bundle identifier (bundle_id, 16B random,
+    // generated at group creation).  The bundle_id replaces group_id
+    // on the wire so an attacker who later compromises a peer's DR
+    // session can't correlate their messages across other groups
+    // by reading the inner payload's group identifier — the bundle is
+    // per-group-instance and never reused.
+    //
+    // Mapping is bidirectional: PK(group_id) for sender lookup,
+    // UNIQUE(bundle_id) for receiver lookup.  Stable for the life of
+    // the group; rotation on member change is a Phase 2.1 follow-up.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS group_bundle_map ("
+        "  group_id   TEXT PRIMARY KEY NOT NULL,"
+        "  bundle_id  BLOB NOT NULL UNIQUE,"
+        "  created_at INTEGER NOT NULL"
+        ");"
+    );
+    q.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_group_bundle_map_bundle"
+           " ON group_bundle_map(bundle_id);");
 }
 
 void AppDataStore::updateLastActive(const std::string& peerIdB64u)
@@ -485,6 +509,15 @@ bool AppDataStore::saveContact(const Contact& c)
 bool AppDataStore::deleteContact(const std::string& peerIdB64u)
 {
     if (!m_db || peerIdB64u.empty()) return false;
+
+    // Phase 2: a group's contact row uses peer_id == groupId, so the
+    // same string is the bundle_map key.  Drop the wire-id mapping
+    // alongside the contact so a future re-create of the same groupId
+    // mints a fresh bundle (and the old bundle stops resolving on this
+    // device — defense in depth against post-leave replay).  Cheap
+    // no-op for 1:1 contacts where no row exists.
+    dropBundleMapping(peerIdB64u);
+
     SqlCipherQuery q(*m_db);
     q.prepare("DELETE FROM contacts WHERE peer_id=:peer_id;");
     q.bindValue(":peer_id", peerIdB64u);
@@ -1320,5 +1353,82 @@ bool AppDataStore::dropSendState(const std::string& peerIdB64u,
     q.bindValue(":peer", peerIdB64u);
     q.bindValue(":gid",  groupId);
     q.bindValue(":sid",  sessionId);
+    return q.exec();
+}
+
+// ── Group bundle map (Phase 2, Invisible Groups) ────────────────────────────
+
+Bytes AppDataStore::bundleIdForGroup(const std::string& groupId) const
+{
+    if (!m_db || groupId.empty()) return {};
+    SqlCipherQuery q(m_db->handle());
+    q.prepare("SELECT bundle_id FROM group_bundle_map WHERE group_id=:gid;");
+    q.bindValue(":gid", groupId);
+    if (q.exec() && q.next()) return q.valueBlob(0);
+    return {};
+}
+
+Bytes AppDataStore::ensureBundleIdForGroup(const std::string& groupId)
+{
+    if (!m_db || groupId.empty()) return {};
+
+    if (Bytes existing = bundleIdForGroup(groupId); !existing.empty())
+        return existing;
+
+    // Mint a fresh 16-byte bundle_id.  16 bytes is the same width as a
+    // UUID — large enough to make collisions astronomical, small enough
+    // not to bloat the per-message inner payload.
+    Bytes bundleId(16);
+    randombytes_buf(bundleId.data(), bundleId.size());
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT INTO group_bundle_map (group_id, bundle_id, created_at) "
+        "VALUES (:gid, :bid, :ts);"
+    );
+    q.bindValue(":gid", groupId);
+    q.bindValue(":bid", bundleId);
+    q.bindValue(":ts",  static_cast<int64_t>(time(nullptr)));
+    if (!q.exec()) {
+        // UNIQUE-violation race: another caller raced ahead.  Re-read
+        // the row so both callers converge on the same id.
+        return bundleIdForGroup(groupId);
+    }
+    return bundleId;
+}
+
+std::string AppDataStore::groupIdForBundle(const Bytes& bundleId) const
+{
+    if (!m_db || bundleId.empty()) return {};
+    SqlCipherQuery q(m_db->handle());
+    q.prepare("SELECT group_id FROM group_bundle_map WHERE bundle_id=:bid;");
+    q.bindValue(":bid", bundleId);
+    if (q.exec() && q.next()) return q.valueText(0);
+    return {};
+}
+
+bool AppDataStore::addBundleMapping(const std::string& groupId,
+                                       const Bytes& bundleId,
+                                       int64_t createdAt)
+{
+    if (!m_db || groupId.empty() || bundleId.empty()) return false;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT OR IGNORE INTO group_bundle_map "
+        "(group_id, bundle_id, created_at) VALUES (:gid, :bid, :ts);"
+    );
+    q.bindValue(":gid", groupId);
+    q.bindValue(":bid", bundleId);
+    q.bindValue(":ts",  createdAt);
+    return q.exec();
+}
+
+bool AppDataStore::dropBundleMapping(const std::string& groupId)
+{
+    if (!m_db || groupId.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare("DELETE FROM group_bundle_map WHERE group_id=:gid;");
+    q.bindValue(":gid", groupId);
     return q.exec();
 }

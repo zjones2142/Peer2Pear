@@ -340,6 +340,19 @@ Bytes SealedEnvelope::unwrapFromRelay(const Bytes& relayEnvelope,
                  relayEnvelope.begin() + kHeaderSize + innerLen);
 }
 
+Bytes SealedEnvelope::stripRoutingIfWrapped(const Bytes& relayEnvelope)
+{
+    // Same detection ChatController::onEnvelope uses to decide whether
+    // to call unwrapFromRelay — keep them in lockstep so callers don't
+    // hand-roll the byte-level check.
+    if (relayEnvelope.size() > kHeaderSize
+        && relayEnvelope[0] == kRoutingVersion) {
+        Bytes inner = unwrapFromRelay(relayEnvelope);
+        if (!inner.empty()) return inner;
+    }
+    return relayEnvelope;
+}
+
 // ── unseal ──────────────────────────────────────────────────────────────────
 
 UnsealResult SealedEnvelope::unseal(const Bytes& recipientCurvePriv,

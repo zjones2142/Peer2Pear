@@ -288,15 +288,11 @@ struct GroupConversationView: View {
         )
     }
 
-    /// Best display name for a peer ID.  Prefers a saved contact
-    /// nickname; falls back to the public-key prefix.  Same convention
-    /// as ChatRow / GroupRow.
+    /// Best display name for a peer ID.  Delegates to the single
+    /// source-of-truth helper on Peer2PearClient (nickname → peer-
+    /// published display name → key prefix).
     private func senderShortName(_ peerId: String) -> String {
-        if let contact = client.contacts.first(where: { $0.peerId == peerId }),
-           !contact.name.isEmpty {
-            return contact.name
-        }
-        return String(peerId.prefix(8)) + "…"
+        client.displayName(for: peerId)
     }
 
     @ViewBuilder private var messagesScroll: some View {

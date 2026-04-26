@@ -356,6 +356,17 @@ private:
                                 Bytes msgKey,
                                 const Bytes& outerSealed = Bytes{});
 
+    // Phase 2: resolve a wire `bundle` field (base64url 16B) to its
+    // local groupId via `group_bundle_map`.  When the mapping exists,
+    // overwrites `gid` with the locally-bound value (defends against
+    // a peer sending a forged groupId for a bundle we already know).
+    // When it doesn't and `allowBackfill` is true, accepts the
+    // (gid, bundle) binding from the inbound payload — caller has
+    // already authenticated the envelope so the binding is trusted.
+    void resolveBundleToGroupId(const std::string& bundleB64,
+                                 std::string& gid,
+                                 bool allowBackfill);
+
     // Decrypt a `group_rename` / `group_avatar` / `group_leave` /
     // `group_member_update` envelope and return the parsed inner JSON,
     // or an empty optional on any failure (malformed envelope,

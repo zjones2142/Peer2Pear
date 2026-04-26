@@ -2,6 +2,7 @@
 
 #include "AppDataStore.hpp"
 #include "CryptoEngine.hpp"
+#include "SealedEnvelope.hpp"
 #include "SessionManager.hpp"
 #include "SessionStore.hpp"
 #include "log.hpp"
@@ -118,6 +119,12 @@ void GroupProtocol::sendTextV2(const std::string& groupId,
     const int64_t     ts    = nowSecs();
     const std::string msgId = p2p::makeUuid();
 
+    // Phase 2: opaque, stable per-group wire identifier.  Mint on first
+    // outbound, then reuse for the life of the group (rotation in 2.1).
+    // Receivers map bundle → groupId; missing mapping = drop.
+    const Bytes bundleId   = m_appData->ensureBundleIdForGroup(groupId);
+    const std::string bundleB64 = CryptoEngine::toBase64Url(bundleId);
+
     for (const std::string& peerIdRaw : memberPeerIds) {
         const std::string peerId = trimmed(peerIdRaw);
         if (peerId.empty() || peerId == me) continue;
@@ -144,6 +151,11 @@ void GroupProtocol::sendTextV2(const std::string& groupId,
         payload["pv"]        = 2;
         payload["from"]      = me;
         payload["type"]      = "group_msg";
+        // Phase 2.0 transition: emit BOTH `bundle` (new wire id) and
+        // `groupId` (legacy, still consulted by pv=2 receivers that
+        // haven't learned this group's bundle yet).  Phase 2.1 drops
+        // `groupId` from the wire entirely.
+        payload["bundle"]    = bundleB64;
         payload["groupId"]   = groupId;
         payload["groupName"] = groupName;
         payload["members"]   = membersArray;
@@ -165,16 +177,21 @@ void GroupProtocol::sendTextV2(const std::string& groupId,
         }
 
         // Cache the sealed bytes for future gap_request replay.
+        // Wrapped form (with relay routing header) — that's what the
+        // relay client expects to forward byte-identically.
         m_appData->addReplayCacheEntry(peerId, groupId, sessionId,
                                          st.nextCounter, sealedEnv, ts);
 
-        // Compute the prev_hash for the next send: BLAKE2b-128 of
-        // these sealed bytes.  Receivers verify this against their
-        // stored last_hash to detect splice / drop attacks within
-        // a sender's stream.
+        // Compute the prev_hash for the next send: BLAKE2b-128 of the
+        // INNER sealed envelope (post-routing-strip).  Receiver-side
+        // dispatch hashes the post-strip form, so sender must too —
+        // hashing the wrapped form here would mismatch on every send
+        // after the first.
+        const Bytes innerForHash =
+            SealedEnvelope::stripRoutingIfWrapped(sealedEnv);
         Bytes nextHash(16);
         crypto_generichash(nextHash.data(), nextHash.size(),
-                            sealedEnv.data(), sealedEnv.size(),
+                            innerForHash.data(), innerForHash.size(),
                             nullptr, 0);
 
         // Advance and persist.  After the bump, the next send will
@@ -201,6 +218,14 @@ void GroupProtocol::sendGapRequest(const std::string& targetPeerId,
     payload["type"]     = "group_gap_request";
     payload["from"]     = myId();
     payload["groupId"]  = groupId;
+    // Phase 2.0 transition: include `bundle` when we know it, so the
+    // responder can resolve the request consistently with how it'll
+    // resolve the group_msg replies.  Mapping may be missing on a
+    // receiver that joined pre-Phase-2 — leave it empty in that case.
+    if (m_appData) {
+        const Bytes bid = m_appData->bundleIdForGroup(groupId);
+        if (!bid.empty()) payload["bundle"] = CryptoEngine::toBase64Url(bid);
+    }
     payload["session"]  = CryptoEngine::toBase64Url(sessionId);
     payload["from_ctr"] = fromCtr;
     payload["to_ctr"]   = toCtr;

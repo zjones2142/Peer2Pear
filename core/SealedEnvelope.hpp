@@ -96,6 +96,13 @@ public:
     static Bytes unwrapFromRelay(const Bytes& relayEnvelope,
                                  Bytes* recipientEdPub = nullptr);
 
+    // Strip the routing header IFF `relayEnvelope` carries one, otherwise
+    // return the input unchanged.  Useful for callers that need to hash or
+    // sign the same shape the receiver naturally sees (post-strip), without
+    // caring whether transport added the routing wrap.  Detection mirrors
+    // ChatController::onEnvelope and onP2PDataReceived.
+    static Bytes stripRoutingIfWrapped(const Bytes& relayEnvelope);
+
     // Pad a P2P QUIC-stream payload to the next fixed bucket so an
     // external network observer can't distinguish file chunks from
     // control frames by size alone.  Wire layout:

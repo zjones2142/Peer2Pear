@@ -359,6 +359,42 @@ public:
                         const std::string& groupId,
                         const Bytes& sessionId);
 
+    // ── Group bundle map (Phase 2, Invisible Groups) ─────────────────────
+    //
+    // Local groupId ↔ on-the-wire bundle_id (16-byte random) mapping.
+    // The bundle_id replaces groupId in transit so the relay sees only
+    // an opaque, unlinkable identifier per group.  Members learn each
+    // other's bundle_id via inner-payload distribution; receivers drop
+    // messages whose bundle_id has no local mapping.
+    //
+    // Stable per group for Phase 2.0; Phase 2.1 adds rotation.
+
+    /// Look up the bundle_id for a known local group.  Empty Bytes on
+    /// miss — caller decides whether to mint one (sender path) or drop
+    /// the inbound message (receiver path).
+    Bytes bundleIdForGroup(const std::string& groupId) const;
+
+    /// Return the existing bundle_id for `groupId` or generate +
+    /// persist a fresh 16-byte UUID-shaped value if none exists.
+    /// Idempotent — concurrent callers converge on the same id via
+    /// the UNIQUE INDEX on bundle_id.
+    Bytes ensureBundleIdForGroup(const std::string& groupId);
+
+    /// Reverse lookup: bundle_id → local groupId.  Empty string on
+    /// miss; callers MUST drop the message rather than guessing.
+    std::string groupIdForBundle(const Bytes& bundleId) const;
+
+    /// Explicit insert used when a peer's group_member_update tells us
+    /// the bundle_id for a group we already know about (e.g., we
+    /// joined via invite that predates Phase 2).  Returns false on DB
+    /// error or UNIQUE-constraint violation.
+    bool addBundleMapping(const std::string& groupId,
+                           const Bytes& bundleId,
+                           int64_t createdAt);
+
+    /// Drop the mapping when the user leaves / deletes the group.
+    bool dropBundleMapping(const std::string& groupId);
+
 private:
     void createTables();
     void updateLastActive(const std::string& peerIdB64u);

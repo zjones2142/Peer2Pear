@@ -772,3 +772,90 @@ TEST(AppDataStore, SendStateDropRemovesRow) {
     EXPECT_EQ(loaded.nextCounter, 1)
         << "drop should remove the row; subsequent load returns default";
 }
+
+// ── group_bundle_map (Phase 2, Invisible Groups) ────────────────────────────
+
+TEST(AppDataStore, BundleMapMissReturnsEmpty) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    EXPECT_TRUE(env.store->bundleIdForGroup("nope").empty());
+    EXPECT_TRUE(env.store->groupIdForBundle(Bytes(16, 0x42)).empty());
+}
+
+TEST(AppDataStore, BundleMapEnsureMintsStable16BId) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    Bytes b1 = env.store->ensureBundleIdForGroup("g1");
+    ASSERT_EQ(b1.size(), 16u) << "bundle_id is 16 random bytes";
+
+    // Idempotent: second call returns the same id.
+    Bytes b2 = env.store->ensureBundleIdForGroup("g1");
+    EXPECT_EQ(b1, b2);
+
+    // Round-trip via the reverse lookup.
+    EXPECT_EQ(env.store->groupIdForBundle(b1), "g1");
+}
+
+TEST(AppDataStore, BundleMapDistinctGroupsGetDistinctIds) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    Bytes a = env.store->ensureBundleIdForGroup("g1");
+    Bytes b = env.store->ensureBundleIdForGroup("g2");
+    EXPECT_NE(a, b);
+    EXPECT_EQ(env.store->groupIdForBundle(a), "g1");
+    EXPECT_EQ(env.store->groupIdForBundle(b), "g2");
+}
+
+TEST(AppDataStore, BundleMapAddMappingPreservesProvidedId) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    // Receiver path: a peer's group_member_update tells us the bundle_id
+    // for a group we already know about.
+    const Bytes provided = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10};
+    EXPECT_TRUE(env.store->addBundleMapping("g1", provided, 1700000000));
+    EXPECT_EQ(env.store->bundleIdForGroup("g1"), provided);
+    EXPECT_EQ(env.store->groupIdForBundle(provided), "g1");
+}
+
+TEST(AppDataStore, BundleMapAddIsIdempotent) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    const Bytes id1 = Bytes(16, 0xAA);
+    EXPECT_TRUE(env.store->addBundleMapping("g1", id1, 100));
+
+    // Second add for same group_id is a no-op (INSERT OR IGNORE) — the
+    // existing row wins so callers converge on a single id.
+    EXPECT_TRUE(env.store->addBundleMapping("g1", Bytes(16, 0xBB), 200));
+    EXPECT_EQ(env.store->bundleIdForGroup("g1"), id1);
+}
+
+TEST(AppDataStore, BundleMapDropRemovesBothDirections) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    Bytes b = env.store->ensureBundleIdForGroup("g1");
+    EXPECT_TRUE(env.store->dropBundleMapping("g1"));
+    EXPECT_TRUE(env.store->bundleIdForGroup("g1").empty());
+    EXPECT_TRUE(env.store->groupIdForBundle(b).empty());
+}
+
+TEST(AppDataStore, BundleMapEmptyGuards) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    EXPECT_TRUE(env.store->bundleIdForGroup("").empty());
+    EXPECT_TRUE(env.store->groupIdForBundle({}).empty());
+    EXPECT_TRUE(env.store->ensureBundleIdForGroup("").empty());
+    EXPECT_FALSE(env.store->addBundleMapping("",   Bytes(16, 1), 0));
+    EXPECT_FALSE(env.store->addBundleMapping("g1", Bytes{}, 0));
+    EXPECT_FALSE(env.store->dropBundleMapping(""));
+}
+
+TEST(AppDataStore, BundleMapBundleUniqueAcrossGroups) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    const Bytes shared = Bytes(16, 0xCD);
+    EXPECT_TRUE(env.store->addBundleMapping("g1", shared, 1));
+    // UNIQUE INDEX on bundle_id rejects the second insert; INSERT OR
+    // IGNORE returns true (no SQL error) but no row is added.
+    EXPECT_TRUE(env.store->addBundleMapping("g2", shared, 2));
+    EXPECT_EQ(env.store->groupIdForBundle(shared), "g1");
+    EXPECT_TRUE(env.store->bundleIdForGroup("g2").empty());
+}

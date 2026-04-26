@@ -1,4 +1,5 @@
 #include "ChatController.hpp"
+#include "AppDataStore.hpp"  // used by v2 group_msg + gap_request dispatch
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
 #ifdef PEER2PEAR_P2P
 // NiceConnection.hpp pulls in nice/agent.h, whose gio dependency uses
@@ -314,6 +315,22 @@ void ChatController::setAppDataStore(AppDataStore* appData)
 {
     m_appData = appData;
     m_groupProto.setAppDataStore(appData);
+}
+
+void ChatController::resolveBundleToGroupId(const std::string& bundleB64,
+                                              std::string& gid,
+                                              bool allowBackfill)
+{
+    if (bundleB64.empty() || !m_appData) return;
+    const Bytes bundleId = CryptoEngine::fromBase64Url(bundleB64);
+    if (bundleId.empty()) return;
+
+    if (std::string knownGid = m_appData->groupIdForBundle(bundleId);
+        !knownGid.empty()) {
+        gid = std::move(knownGid);
+    } else if (allowBackfill && !gid.empty()) {
+        m_appData->addBundleMapping(gid, bundleId, nowSecs());
+    }
 }
 
 void ChatController::setDatabase(SqlCipherDb& db)
@@ -1122,7 +1139,8 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             // legacy SenderChain path below.
             const int pv = o.value("pv", 1);
             if (pv >= 2) {
-                const std::string gid       = o.value("groupId", std::string());
+                std::string       gid       = o.value("groupId", std::string());
+                const std::string bundleB64 = o.value("bundle",  std::string());
                 const std::string sessionB64= o.value("session",  std::string());
                 const int64_t     ctr       = o.value("ctr",      int64_t(0));
                 const std::string prevB64   = o.value("prev",     std::string());
@@ -1134,6 +1152,14 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                         if (v.is_string()) memberKeys.push_back(v.get<std::string>());
                     }
                 }
+
+                // Phase 2: resolve `bundle` → local groupId.  Existing
+                // mapping wins; otherwise accept + persist the binding
+                // from this authenticated envelope.  Bundle-present /
+                // no-mapping / no-fallback-gid drops via the gid.empty()
+                // guard below — Phase 2.1 semantics.
+                resolveBundleToGroupId(bundleB64, gid, /*allowBackfill=*/true);
+
                 if (gid.empty() || sessionB64.empty() || ctr < 1) {
                     P2P_WARN("[GROUP v2] malformed pv=2 group_msg from "
                              << p2p::peerPrefix(senderId));
@@ -1254,10 +1280,18 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             // the sender; we just look up the cached bytes and
             // re-dispatch raw (no re-seal — see setReplayRelayFn).
             if (!msgId.empty() && !markSeen(msgId)) return;
-            const std::string gid        = o.value("groupId", std::string());
+            std::string       gid        = o.value("groupId", std::string());
+            const std::string bundleB64  = o.value("bundle",  std::string());
             const std::string sessionB64 = o.value("session",  std::string());
             const int64_t     fromCtr    = o.value("from_ctr", int64_t(0));
             const int64_t     toCtr      = o.value("to_ctr",   int64_t(0));
+
+            // Phase 2: bundle wins on the wire.  No back-fill — a
+            // gap_request is a peer asking US to replay, so the
+            // mapping should already exist locally (we minted the
+            // bundle on the original sends to this peer).
+            resolveBundleToGroupId(bundleB64, gid, /*allowBackfill=*/false);
+
             if (gid.empty() || sessionB64.empty()
                 || fromCtr < 1 || toCtr < fromCtr) {
                 P2P_WARN("[GROUP v2] malformed group_gap_request from "
