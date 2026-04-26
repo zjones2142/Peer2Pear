@@ -184,6 +184,181 @@ public:
     void loadFileRecords(const std::string& chatKey,
                          const std::function<void(const FileRecord&)>& cb) const;
 
+    // ── Group replay cache (Phase 1, sender side) ────────────────────────
+    //
+    // After a successful group-message send, the sealed envelope is
+    // cached for `kReplayCacheMaxAgeSecs` so a recipient that later
+    // reports a gap (gap_request) gets byte-identical replay rather
+    // than a fresh DR step (which would advance the chain past their
+    // expected counter).  Aligned with the relay mailbox TTL (7d) so
+    // replay coverage matches the primary delivery window.
+    static constexpr int64_t kReplayCacheMaxAgeSecs = 7LL * 24 * 60 * 60;
+
+    /// Cache a sealed envelope under (recipient, group, session, counter).
+    /// `sentAt` is the unix-epoch-secs the cache row was written; on a
+    /// later purgeReplayCacheOlderThan, rows older than the cutoff are
+    /// dropped.  Returns false on DB error or duplicate primary key.
+    bool addReplayCacheEntry(const std::string& peerIdB64u,
+                              const std::string& groupId,
+                              const Bytes& sessionId,
+                              int64_t counter,
+                              const Bytes& sealedEnvelope,
+                              int64_t sentAt);
+
+    /// Look up a single cached envelope.  Returns empty Bytes on miss.
+    Bytes loadReplayCacheEntry(const std::string& peerIdB64u,
+                                const std::string& groupId,
+                                const Bytes& sessionId,
+                                int64_t counter) const;
+
+    /// Stream every cached envelope in [fromCounter, toCounter] for a
+    /// (recipient, group, session) tuple, in counter-ascending order.
+    /// Used by the gap_request fulfillment path.
+    void loadReplayCacheRange(
+        const std::string& peerIdB64u,
+        const std::string& groupId,
+        const Bytes& sessionId,
+        int64_t fromCounter, int64_t toCounter,
+        const std::function<void(int64_t counter, const Bytes&)>& cb) const;
+
+    /// Drop a single cached envelope (e.g., on positive ack).
+    bool dropReplayCacheEntry(const std::string& peerIdB64u,
+                               const std::string& groupId,
+                               const Bytes& sessionId,
+                               int64_t counter);
+
+    /// Sweep rows whose `sent_at` is strictly less than `cutoffSecs`.
+    /// Returns the number of rows deleted.  Wired to a periodic timer
+    /// that runs `purgeReplayCacheOlderThan(now - kReplayCacheMaxAgeSecs)`.
+    int  purgeReplayCacheOlderThan(int64_t cutoffSecs);
+
+    // ── Group chain state (Phase 1, receiver side) ───────────────────────
+
+    /// Per-(group, sender) state machine.  One row per pair; on session
+    /// reset the row is updated in place + the buffer for the old
+    /// session_id is drained as a "K lost messages" UI event.
+    struct ChainState {
+        Bytes    sessionId;          // 8 bytes; empty on first row
+        int64_t  expectedNext   = 1; // next counter we expect to deliver
+        Bytes    lastHash;           // 16 bytes prev_hash, may be empty
+        int64_t  blockedSince   = 0; // unix-secs when stream blocked, 0 = active
+        int64_t  gapFrom        = 0; // missing range, [from, to] inclusive
+        int64_t  gapTo          = 0;
+        int64_t  lastRetryAt    = 0;
+        int      retryCount     = 0;
+    };
+
+    bool loadChainState(const std::string& groupId,
+                         const std::string& senderPeerId,
+                         ChainState& out) const;
+
+    /// Upsert the chain state row for (groupId, senderPeerId).
+    bool saveChainState(const std::string& groupId,
+                         const std::string& senderPeerId,
+                         const ChainState& state);
+
+    /// Drop the chain-state row (e.g., when leaving the group or the
+    /// sender is removed from the roster).
+    bool dropChainState(const std::string& groupId,
+                         const std::string& senderPeerId);
+
+    // ── Group message buffer (Phase 1, blocked-stream hold) ─────────────
+
+    struct BufferedMessage {
+        int64_t      counter;
+        Bytes        prevHash;        // 16B; what THIS message claimed as prev
+        Bytes        sealedEnvHash;   // 16B; hash of the sealed envelope —
+                                       // becomes lastHash when row drains, so
+                                       // the chain continues into the next
+                                       // delivered message
+        std::string  msgId;
+        std::string  body;
+        std::string  senderName;
+        int64_t      receivedAt;
+    };
+
+    /// Add a DR-decrypted-but-not-delivered group_msg to the buffer.
+    /// `sessionId` matches the chain_state row's session_id; on session
+    /// reset, dropBufferForSession sweeps everything tagged with the
+    /// old id.  Body + senderName are field-encrypted at rest the same
+    /// way `messages.text` is.  `sealedEnvHash` is the 16B hash of the
+    /// sealed envelope — receiver-side it's used to continue the
+    /// prev_hash chain when the buffered row eventually drains.
+    bool addBufferEntry(const std::string& groupId,
+                         const std::string& senderPeerId,
+                         const Bytes& sessionId,
+                         int64_t counter,
+                         const Bytes& prevHash,
+                         const Bytes& sealedEnvHash,
+                         const std::string& msgId,
+                         const std::string& body,
+                         const std::string& senderName,
+                         int64_t receivedAt);
+
+    /// Stream buffered messages in [fromCounter, toCounter] in counter
+    /// order — used to drain into `messages` once the gap fills.
+    void loadBufferRange(
+        const std::string& groupId,
+        const std::string& senderPeerId,
+        const Bytes& sessionId,
+        int64_t fromCounter, int64_t toCounter,
+        const std::function<void(const BufferedMessage&)>& cb) const;
+
+    /// Drop buffered rows in [fromCounter, toCounter].  Returns the
+    /// number of rows removed.  Called after successful drain into
+    /// the delivered messages table.
+    int  dropBufferRange(const std::string& groupId,
+                          const std::string& senderPeerId,
+                          const Bytes& sessionId,
+                          int64_t fromCounter, int64_t toCounter);
+
+    /// Drop every buffered row for an old session_id — used on session
+    /// reset to seal off the "K lost messages" cohort before resuming
+    /// at the new session's counter=1.  Returns the count for the UI.
+    int  dropBufferForSession(const std::string& groupId,
+                                const std::string& senderPeerId,
+                                const Bytes& sessionId);
+
+    // ── Group send state (Phase 1, sender side) ──────────────────────────
+    //
+    // Per (recipient, group, session_id) the sender tracks the
+    // monotonic counter to use on the next outbound and the
+    // 16-byte hash of the most recently sealed envelope (the next
+    // message's prev_hash).  Read+update happens once per send;
+    // independent of group_replay_cache so the chain advances past
+    // the cache's 7-day purge horizon.
+
+    struct SendState {
+        int64_t nextCounter = 1;  // counter for the NEXT outbound (1-based)
+        Bytes   lastHash;         // 16 bytes; empty for the first send
+    };
+
+    /// Load the per-(peer, group, session) send state.  Missing row
+    /// returns a default-constructed SendState (nextCounter = 1,
+    /// empty lastHash) — the first message of a fresh session.
+    /// Always returns true; the bool is reserved for future "DB
+    /// failed" signalling without changing the call site.
+    bool loadSendState(const std::string& peerIdB64u,
+                        const std::string& groupId,
+                        const Bytes& sessionId,
+                        SendState& out) const;
+
+    /// Upsert the send state.  Called immediately after a successful
+    /// seal+cache to pin the new counter/lastHash before the relay
+    /// dispatch fires (so a crash between cache and relay doesn't
+    /// reuse the counter on retry).
+    bool saveSendState(const std::string& peerIdB64u,
+                        const std::string& groupId,
+                        const Bytes& sessionId,
+                        const SendState& state);
+
+    /// Drop the send state for a (peer, group, session) tuple.  Used
+    /// when the recipient is removed from the group or the user
+    /// leaves the group.
+    bool dropSendState(const std::string& peerIdB64u,
+                        const std::string& groupId,
+                        const Bytes& sessionId);
+
 private:
     void createTables();
     void updateLastActive(const std::string& peerIdB64u);

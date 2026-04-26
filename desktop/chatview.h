@@ -72,6 +72,21 @@ public slots:
     void onGroupRenamed(const QString &groupId, const QString &newName);
     void onGroupAvatarReceived(const QString &groupId, const QString &avatarB64);
 
+    /// pv=2 Causally-Linked Pairwise: a sender's stream in `groupId`
+    /// is blocked at the gap [fromCtr, toCtr].  ChatController has
+    /// already fired a gap_request — this callback only updates the
+    /// in-memory map driving the chat-header banner.
+    void onGroupStreamBlocked(const QString& groupId,
+                               const QString& senderPeerId,
+                               qint64 fromCtr, qint64 toCtr);
+
+    /// pv=2: `count` buffered messages from `senderPeerId` in
+    /// `groupId` were dropped on a session reset.  Surfaced as a
+    /// status-line message in the conversation pane (toast-style).
+    void onGroupMessagesLost(const QString& groupId,
+                              const QString& senderPeerId,
+                              qint64 count);
+
     // Fired for every arriving chunk. Files are streamed to disk by
     // FileTransferManager — savedPath is the on-disk location of the final
     // file and is non-empty only when chunksReceived == chunksTotal.

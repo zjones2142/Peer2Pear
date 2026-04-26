@@ -97,6 +97,16 @@ extension Peer2PearClient {
             )
             DispatchQueue.main.async {
                 client.groupMessages.append(gm)
+                // Any in-order delivery clears the blocked-stream
+                // banner for this (group, sender) pair.  If the gap
+                // is only partially filled, the v2 dispatcher will
+                // re-fire onGroupStreamBlocked with the new range.
+                if gm.from != client.myPeerId {
+                    client.groupBlockedStreams[gm.groupId]?.removeValue(forKey: gm.from)
+                    if client.groupBlockedStreams[gm.groupId]?.isEmpty == true {
+                        client.groupBlockedStreams.removeValue(forKey: gm.groupId)
+                    }
+                }
                 // Skip the unread marker when it's our own echo — the
                 // sender sees their message immediately and doesn't
                 // need a "new" indicator.  Same behaviour as the
@@ -249,6 +259,38 @@ extension Peer2PearClient {
                     client.groupAvatars[gidStr] = avatarStr
                     client.dbSaveContactAvatar(peerId: gidStr, avatarB64: avatarStr)
                 }
+            }
+        }, selfPtr)
+
+        // ── pv=2 stream blocked: gap detected, gap_request fired ───────
+        p2p_set_on_group_stream_blocked(ctx, { gid, sender, fromCtr, toCtr, ud in
+            guard let client = Peer2PearClient.from(ud),
+                  let gid, let sender else { return }
+            let gidStr = String(cString: gid)
+            let senderStr = String(cString: sender)
+            DispatchQueue.main.async {
+                client.groupBlockedStreams[gidStr, default: [:]][senderStr] =
+                    Peer2PearClient.BlockedRange(from: fromCtr, to: toCtr)
+            }
+        }, selfPtr)
+
+        // ── pv=2 messages lost on session reset ────────────────────────
+        p2p_set_on_group_messages_lost(ctx, { gid, sender, count, ud in
+            guard let client = Peer2PearClient.from(ud),
+                  let gid, let sender else { return }
+            let gidStr = String(cString: gid)
+            let senderStr = String(cString: sender)
+            DispatchQueue.main.async {
+                client.groupLostMessages.append(
+                    Peer2PearClient.LostMessagesEvent(
+                        groupId: gidStr,
+                        senderPeerId: senderStr,
+                        count: count))
+                // Once a session reset surfaces lost messages, the
+                // gap that was blocking us is now closed (the buffer
+                // was drained for the OLD session).  Clear the
+                // banner state for this (group, sender) pair.
+                client.groupBlockedStreams[gidStr]?.removeValue(forKey: senderStr)
             }
         }, selfPtr)
 

@@ -284,12 +284,22 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
         (m_store->loadSetting("hardBlockOnKeyChange", "false") == "true");
     applyHardBlockKeyChangeState();
 
+    m_parallelFanOutEnabled =
+        (m_store->loadSetting("parallelFanOutEnabled", "false") == "true");
+    applyParallelFanOutState();
+
+    m_multiHopEnabled =
+        (m_store->loadSetting("multiHopEnabled", "false") == "true");
+    applyMultiHopState();
+
     // Emit initial values so MainWindow/ChatController sync up.
     emit fileAutoAcceptMaxChanged(softMB);
     emit fileHardMaxChanged(hardMB);
     emit fileRequireP2PToggled(m_requireP2PEnabled);
     emit fileRequireVerifiedToggled(m_requireVerifiedFilesEnabled);
     emit hardBlockOnKeyChangeToggled(m_hardBlockKeyChangeEnabled);
+    emit parallelFanOutToggled(m_parallelFanOutEnabled);
+    emit multiHopToggled(m_multiHopEnabled);
 
     // Relay URL — load whatever's stored (the mainwindow startup path is
     // the source of truth for the default; here we just reflect what's
@@ -1462,6 +1472,89 @@ QWidget *SettingsPanel::makePrivacySection()
         cardLayout->addWidget(row);
     }
 
+    // ── Advanced transport dials ──────────────────────────────────────────
+    //
+    // Two independent toggles surfaced separately from the privacy
+    // preset above.  Different threats, different costs:
+    //   parallel fan-out → REDUNDANCY (one relay down ≠ delivery loss)
+    //   multi-hop onion  → ANONYMITY  (no relay sees both ends)
+    // Help text below each toggle hammers the distinction so a user
+    // can't mistake redundancy for anonymity.
+
+    auto buildAdvancedToggle =
+        [&](const QString& title, const QString& sub,
+            QPushButton*& outBtn, QLabel*& outStatus,
+            void (SettingsPanel::*onClick)()) {
+        QFrame *div = new QFrame();
+        div->setFrameShape(QFrame::HLine);
+        div->setStyleSheet("color: #1e1e1e; background-color: #1e1e1e; border: none; max-height: 1px;");
+        cardLayout->addWidget(div);
+
+        QWidget *row = new QWidget();
+        row->setStyleSheet("background: transparent; border: none;");
+        QVBoxLayout *rv = new QVBoxLayout(row);
+        rv->setContentsMargins(16, 10, 16, 10);
+        rv->setSpacing(4);
+
+        QHBoxLayout *top = new QHBoxLayout();
+        top->setContentsMargins(0, 0, 0, 0);
+        top->setSpacing(8);
+
+        QLabel *label = new QLabel(title);
+        label->setStyleSheet(
+            "color: #cccccc; font-size: 13px; background: transparent; border: none;");
+
+        outStatus = new QLabel("Off");
+        outStatus->setStyleSheet(
+            "color: #888888; font-size: 13px; background: transparent; border: none;");
+        outStatus->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+        outBtn = new QPushButton("Enable");
+        outBtn->setFixedSize(76, 28);
+        outBtn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1a2a1a;"
+            "  color: #77cc77;"
+            "  border: 1px solid #2e5e2e;"
+            "  border-radius: 6px;"
+            "  font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: #203020; }");
+        connect(outBtn, &QPushButton::clicked, this, onClick);
+
+        top->addWidget(label);
+        top->addStretch();
+        top->addWidget(outStatus);
+        top->addSpacing(8);
+        top->addWidget(outBtn);
+        rv->addLayout(top);
+
+        QLabel *subLbl = new QLabel(sub);
+        subLbl->setStyleSheet(
+            "color: #777777; font-size: 11px; background: transparent; border: none;");
+        subLbl->setWordWrap(true);
+        rv->addWidget(subLbl);
+
+        cardLayout->addWidget(row);
+    };
+
+    buildAdvancedToggle(
+        "Send to multiple relays in parallel",
+        "Posts every message to all configured relays simultaneously. "
+        "If one relay is offline or blocks your traffic, others still "
+        "deliver. Improves reliability — does not improve anonymity.",
+        m_parallelFanOutToggleBtn, m_parallelFanOutStatusLbl,
+        &SettingsPanel::onToggleParallelFanOut);
+
+    buildAdvancedToggle(
+        "Onion-route through multiple relays",
+        "Routes each message through a chain of relays with layered "
+        "encryption. No single relay sees both sender and recipient. "
+        "Improves anonymity — does not improve reliability. Adds "
+        "latency. Requires at least one backup relay.",
+        m_multiHopToggleBtn, m_multiHopStatusLbl,
+        &SettingsPanel::onToggleMultiHop);
+
     return card;
 }
 
@@ -1472,6 +1565,58 @@ void SettingsPanel::onToggleHardBlockOnKeyChange()
                                       m_hardBlockKeyChangeEnabled ? "true" : "false");
     applyHardBlockKeyChangeState();
     emit hardBlockOnKeyChangeToggled(m_hardBlockKeyChangeEnabled);
+}
+
+void SettingsPanel::onToggleParallelFanOut()
+{
+    m_parallelFanOutEnabled = !m_parallelFanOutEnabled;
+    if (m_store) m_store->saveSetting("parallelFanOutEnabled",
+                                      m_parallelFanOutEnabled ? "true" : "false");
+    applyParallelFanOutState();
+    emit parallelFanOutToggled(m_parallelFanOutEnabled);
+}
+
+void SettingsPanel::onToggleMultiHop()
+{
+    m_multiHopEnabled = !m_multiHopEnabled;
+    if (m_store) m_store->saveSetting("multiHopEnabled",
+                                      m_multiHopEnabled ? "true" : "false");
+    applyMultiHopState();
+    emit multiHopToggled(m_multiHopEnabled);
+}
+
+void SettingsPanel::applyParallelFanOutState()
+{
+    if (!m_parallelFanOutStatusLbl || !m_parallelFanOutToggleBtn) return;
+    const Theme& t = ThemeManager::instance().current();
+    if (m_parallelFanOutEnabled) {
+        m_parallelFanOutStatusLbl->setText("On");
+        m_parallelFanOutStatusLbl->setStyleSheet(themeStyles::statusAccentCss(t));
+        m_parallelFanOutToggleBtn->setText("Disable");
+        m_parallelFanOutToggleBtn->setStyleSheet(themeStyles::toggleDangerCss(t));
+    } else {
+        m_parallelFanOutStatusLbl->setText("Off");
+        m_parallelFanOutStatusLbl->setStyleSheet(themeStyles::statusMutedCss(t));
+        m_parallelFanOutToggleBtn->setText("Enable");
+        m_parallelFanOutToggleBtn->setStyleSheet(themeStyles::toggleAccentCss(t));
+    }
+}
+
+void SettingsPanel::applyMultiHopState()
+{
+    if (!m_multiHopStatusLbl || !m_multiHopToggleBtn) return;
+    const Theme& t = ThemeManager::instance().current();
+    if (m_multiHopEnabled) {
+        m_multiHopStatusLbl->setText("On");
+        m_multiHopStatusLbl->setStyleSheet(themeStyles::statusAccentCss(t));
+        m_multiHopToggleBtn->setText("Disable");
+        m_multiHopToggleBtn->setStyleSheet(themeStyles::toggleDangerCss(t));
+    } else {
+        m_multiHopStatusLbl->setText("Off");
+        m_multiHopStatusLbl->setStyleSheet(themeStyles::statusMutedCss(t));
+        m_multiHopToggleBtn->setText("Enable");
+        m_multiHopToggleBtn->setStyleSheet(themeStyles::toggleAccentCss(t));
+    }
 }
 
 void SettingsPanel::applyHardBlockKeyChangeState()
@@ -1520,27 +1665,29 @@ void SettingsPanel::onPrivacyLevelChanged(int level)
             break;
         case 1:
             desc =
-                "<b style='color:#cccccc;'>Enhanced</b> &mdash; defends against a single "
-                "malicious relay doing timing analysis.<br>"
+                "<b style='color:#cccccc;'>Enhanced</b> &mdash; adds traffic shaping and "
+                "delivery redundancy.<br>"
                 "&bull; All Standard protections<br>"
                 "&bull; Send jitter (50&ndash;300&thinsp;ms random delay per message)<br>"
                 "&bull; Cover traffic (periodic indistinguishable dummy envelopes)<br>"
-                "&bull; Send and receive through different relays when configured<br>"
+                "&bull; Parallel relay fan-out: each message posted to all configured "
+                "relays so a single relay being down doesn't drop delivery<br>"
                 "<br>"
-                "Slight latency cost; small bandwidth overhead.";
+                "Slight latency cost; small bandwidth overhead. "
+                "<i>Improves reliability &mdash; not anonymity.</i>";
             break;
         case 2:
             desc =
                 "<b style='color:#cccccc;'>Maximum</b> &mdash; defends against colluding "
                 "relay operators.<br>"
                 "&bull; All Enhanced protections<br>"
-                "&bull; Multi-hop onion routing (no single relay learns both your "
-                "identity and your recipient)<br>"
+                "&bull; Multi-hop onion routing: no single relay learns both your "
+                "identity and your recipient<br>"
                 "&bull; Higher-frequency cover traffic<br>"
                 "&bull; Longer jitter (100&ndash;500&thinsp;ms)<br>"
                 "<br>"
-                "Highest latency; higher bandwidth. Use when privacy requirements "
-                "outweigh responsiveness.";
+                "Highest latency; higher bandwidth. <i>Improves anonymity, on top of "
+                "Enhanced's reliability.</i>";
             break;
         }
         m_privacyDescLabel->setText(desc);

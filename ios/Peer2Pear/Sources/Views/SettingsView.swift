@@ -415,12 +415,12 @@ private struct PrivacyLevelSection: View {
                     footer: "Recommended for most users.")
             case .enhanced:
                 privacyDescription(
-                    title: "Enhanced — adds traffic shaping.",
+                    title: "Enhanced — adds traffic shaping + redundancy.",
                     bullets: [
                         "Everything in Standard",
                         "Send jitter (randomized delays so timing patterns don't leak)",
                         "Cover traffic (decoy envelopes blend real activity into noise)",
-                        "Multi-relay rotation (no single relay sees the full picture)",
+                        "Parallel relay fan-out (each message posted to all configured relays — one being down doesn't drop delivery)",
                     ],
                     footer: "Higher latency, slightly more battery.")
             case .maximum:
@@ -428,7 +428,7 @@ private struct PrivacyLevelSection: View {
                     title: "Maximum — full anonymity posture.",
                     bullets: [
                         "Everything in Enhanced",
-                        "Multi-hop forwarding (envelopes route through several relays)",
+                        "Multi-hop onion forwarding (no single relay sees both sender and recipient)",
                         "High-frequency cover traffic (continuous decoys)",
                     ],
                     footer: "Slowest delivery + highest battery cost.  For high-risk users.")
@@ -439,6 +439,13 @@ private struct PrivacyLevelSection: View {
                         .padding(.top, 2)
                 }
             }
+
+            // Advanced — independent transport dials.  These let
+            // power users decouple redundancy from anonymity (the
+            // preset above bundles them).  Help text intentionally
+            // labors the distinguishment so a user can't confuse
+            // "redundancy" with "anonymity."
+            AdvancedTransportToggles(client: client)
         }
         .padding(12)
         .background(Color(.secondarySystemBackground))
@@ -461,6 +468,64 @@ private struct PrivacyLevelSection: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.top, 2)
+        }
+    }
+}
+
+// Advanced toggles for the two independent transport dials.
+// Hidden behind a DisclosureGroup so most users don't see them, but
+// available to power users who want to override the slider preset.
+//
+// The whole point of this section is the distinguishment: parallel
+// fan-out gives REDUNDANCY (delivery despite relay outages); multi-hop
+// gives ANONYMITY (no relay learns sender→recipient).  These solve
+// different problems, cost different resources, and should be opt-in
+// independently.  The help text under each toggle hammers this home.
+private struct AdvancedTransportToggles: View {
+    @ObservedObject var client: Peer2PearClient
+    @State private var expanded: Bool = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 14) {
+                // Parallel fan-out (REDUNDANCY)
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(isOn: Binding(
+                        get: { client.parallelFanOutEnabled },
+                        set: { client.parallelFanOutEnabled = $0 }
+                    )) {
+                        Text("Send to multiple relays in parallel")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    Text("Posts every message to all configured relays simultaneously. If one relay is offline or blocks your traffic, others still deliver. Improves reliability — does not improve anonymity (each relay still sees who sent to whom).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                // Multi-hop onion (ANONYMITY)
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(isOn: Binding(
+                        get: { client.multiHopEnabled },
+                        set: { client.multiHopEnabled = $0 }
+                    )) {
+                        Text("Onion-route through multiple relays")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    Text("Routes each message through a chain of relays with layered encryption. No single relay sees both sender and recipient. Improves anonymity — does not improve reliability. Adds ~50ms latency per hop and requires at least one backup relay.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if client.backupRelayUrls.isEmpty && client.multiHopEnabled {
+                        Text("Configure backup relays under Relay Servers to activate multi-hop.")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            Text("Advanced")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
         }
     }
 }

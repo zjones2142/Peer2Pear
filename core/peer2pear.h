@@ -43,7 +43,7 @@ typedef struct p2p_context p2p_context;
  */
 
 typedef struct {
-    /* WebSocket commands */
+    /* WebSocket commands (single-connection legacy path) */
     void (*ws_open)(const char* url, void* platform_ctx);
     void (*ws_close)(void* platform_ctx);
     void (*ws_send_text)(const char* message, void* platform_ctx);
@@ -60,6 +60,37 @@ typedef struct {
                       void* platform_ctx);
 
     void* platform_ctx;
+
+    /* ── Multi-connection WebSocket FFI (v2, optional) ──────────────────
+     *
+     * When `ws_alloc_connection` is non-null, the C++ core uses the v2
+     * callbacks to manage one or more independent WebSocket connections
+     * (primary subscribe + each addSubscribeRelay() slave).  Otherwise
+     * it falls back to the single-connection legacy path above and
+     * addSubscribeRelay logs a warn + skips.
+     *
+     * `conn_handle` is an opaque pointer the platform supplies on
+     * ws_alloc_connection (typically a pointer into a per-connection
+     * Swift/Kotlin object); the core passes it back on every
+     * subsequent per-connection call so the platform can route to the
+     * right underlying socket.  The core treats it as opaque — never
+     * dereferences, never modifies.
+     *
+     * The platform reciprocates with p2p_ws_on_*_v2 functions below,
+     * passing `conn_handle` so the core can find the IWebSocket whose
+     * callbacks should fire.
+     *
+     * Thread-safety: same as the v1 calls — the platform must serialise
+     * calls per `conn_handle`; the core serialises its receive-side
+     * callbacks via P2P_CTX_GUARD.
+     */
+    void* (*ws_alloc_connection)(void* platform_ctx);
+    void  (*ws_free_connection)(void* conn_handle, void* platform_ctx);
+    void  (*ws_open_v2)(void* conn_handle, const char* url, void* platform_ctx);
+    void  (*ws_close_v2)(void* conn_handle, void* platform_ctx);
+    void  (*ws_send_text_v2)(void* conn_handle, const char* message, void* platform_ctx);
+    int   (*ws_is_connected_v2)(void* conn_handle, void* platform_ctx);
+    int   (*ws_is_idle_v2)(void* conn_handle, void* platform_ctx);
 } p2p_platform;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -200,16 +231,79 @@ void p2p_connect(p2p_context* ctx);
 /** Disconnect from the relay. */
 void p2p_disconnect(p2p_context* ctx);
 
-/** Add a relay to the send pool (for multi-relay rotation). */
+/** Add a relay to the send pool (used by rotation, parallel fan-out, and multi-hop). */
 void p2p_add_send_relay(p2p_context* ctx, const char* url);
 
 /**
- * Set privacy level:
+ * Add a relay to the receive-side subscribe pool.  Causes the core to
+ * open an additional WebSocket connection to `url` so the recipient
+ * mailbox is subscribed to multiple relays simultaneously — completes
+ * the redundancy story alongside p2p_set_parallel_fan_out (sender side).
+ *
+ * Requires the platform layer to support multiple WS connections via
+ * the v2 multi-connection FFI (ws_alloc_connection et al).  When the
+ * platform shim is single-connection only, this call logs a warning
+ * and returns without effect.
+ *
+ * Inbound dedup (BLAKE2b-128 of envelope bytes) drops the same envelope
+ * arriving on multiple relays before reaching the on_message callback.
+ */
+void p2p_add_subscribe_relay(p2p_context* ctx, const char* url);
+
+/** Remove all extra subscribe relays (primary stays connected). */
+void p2p_clear_subscribe_relays(p2p_context* ctx);
+
+/**
+ * Set privacy level (preset for the four orthogonal transport dials):
  *   0 = Standard:  envelope padding only (default)
- *   1 = Enhanced:  + send jitter + cover traffic + multi-relay rotation
+ *   1 = Enhanced:  + jitter + cover traffic + parallel fan-out (all relays)
  *   2 = Maximum:   + multi-hop forwarding + high-frequency cover traffic
+ *
+ * Parallel fan-out and multi-hop are independently controllable via
+ * p2p_set_parallel_fan_out / p2p_set_multi_hop_enabled — the level
+ * is just a convenient preset.  Note: parallel fan-out (redundancy)
+ * and multi-hop (anonymity) target different threats.  See the
+ * functions below for their independent toggles.
  */
 void p2p_set_privacy_level(p2p_context* ctx, int level);
+
+/**
+ * Toggle parallel relay fan-out (redundancy, NOT anonymity).
+ *
+ * When enabled, every outbound message envelope is POSTed to multiple
+ * configured relays simultaneously (see p2p_add_send_relay).  Each
+ * relay holds a copy in the recipient's mailbox; the recipient dedups
+ * duplicate deliveries on receive by content hash.  File chunks are
+ * exempted (their bandwidth × N would defeat the redundancy benefit).
+ *
+ * `enabled` is treated as a C bool: 0 = off, non-zero = on.
+ *
+ * Distinct from p2p_set_multi_hop_enabled, which provides anonymity
+ * by chaining onion-encrypted hops through multiple relays.  Multi-hop
+ * wins in the dispatch path when both are enabled.
+ */
+void p2p_set_parallel_fan_out(p2p_context* ctx, int enabled);
+
+/**
+ * Number of relays to fan out to when parallel mode is enabled.
+ *   0       = all configured send relays (full broadcast)
+ *   K > 0   = pick K random relays per send (uniformly without replacement)
+ *   K >= configured-count collapses to "all".
+ */
+void p2p_set_parallel_fan_out_k(p2p_context* ctx, int k);
+
+/**
+ * Toggle multi-hop onion forwarding (anonymity, NOT redundancy).
+ *
+ * When enabled and at least 2 send relays are configured, each
+ * envelope is onion-wrapped: the entry relay can decrypt only its
+ * layer (revealing the next hop), and the exit relay sees only the
+ * sealed envelope addressed to the recipient.  No single relay sees
+ * both sender and recipient.  Adds latency proportional to hop count.
+ *
+ * `enabled` is treated as a C bool: 0 = off, non-zero = on.
+ */
+void p2p_set_multi_hop_enabled(p2p_context* ctx, int enabled);
 
 /**
  * Register a push-notification token with the relay.  Called by
@@ -412,6 +506,20 @@ void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len);
 /** Platform: Text frame received on WebSocket. */
 void p2p_ws_on_text(p2p_context* ctx, const char* message);
 
+/* ── Multi-connection WS event callbacks (v2) ─────────────────────────
+ * Used by platforms that implement ws_alloc_connection et al.  The
+ * `conn_handle` is the opaque pointer the platform supplied on
+ * ws_alloc_connection — the core uses it to dispatch the callback to
+ * the right IWebSocket.  Passing an unrecognised `conn_handle` is a
+ * silent no-op (defensive: a free + late event race shouldn't crash).
+ */
+void p2p_ws_on_connected_v2(p2p_context* ctx, void* conn_handle);
+void p2p_ws_on_disconnected_v2(p2p_context* ctx, void* conn_handle);
+void p2p_ws_on_binary_v2(p2p_context* ctx, void* conn_handle,
+                          const uint8_t* data, int len);
+void p2p_ws_on_text_v2(p2p_context* ctx, void* conn_handle,
+                        const char* message);
+
 /**
  * Platform: HTTP POST completed.
  * @param request_id  The ID returned by the platform's http_post() callback.
@@ -487,6 +595,39 @@ void p2p_set_on_group_renamed(p2p_context* ctx,
  */
 void p2p_set_on_group_avatar(p2p_context* ctx,
     void (*cb)(const char* group_id, const char* avatar_b64, void* ud),
+    void* ud);
+
+/**
+ * pv=2 (Causally-Linked Pairwise) — a sender's stream is currently
+ * blocked because messages [from_ctr, to_ctr] (inclusive) haven't
+ * arrived yet.  The core has already fired a gap_request to the
+ * sender; this callback is purely informational so the UI can show
+ * a "waiting for messages from X..." banner.  Fires every time the
+ * blocked range grows (e.g., later out-of-order arrivals push to_ctr
+ * higher).  When the gap finally fills, the next group_message
+ * callback fires for each drained message — clear the banner once
+ * the rate of group_message arrivals catches up.
+ */
+void p2p_set_on_group_stream_blocked(p2p_context* ctx,
+    void (*cb)(const char* group_id,
+                const char* sender_peer_id,
+                int64_t from_ctr,
+                int64_t to_ctr,
+                void* ud),
+    void* ud);
+
+/**
+ * pv=2 — `count` buffered messages from `sender_peer_id` in
+ * `group_id` were dropped during a session reset (the sender's DR
+ * session rolled over before the gap could close).  Surface as a
+ * "K messages lost during reconnection" UI event.  Fires once per
+ * reset event.
+ */
+void p2p_set_on_group_messages_lost(p2p_context* ctx,
+    void (*cb)(const char* group_id,
+                const char* sender_peer_id,
+                int64_t count,
+                void* ud),
     void* ud);
 
 /**

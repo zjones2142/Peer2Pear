@@ -1,6 +1,8 @@
 #include "GroupProtocol.hpp"
 
+#include "AppDataStore.hpp"
 #include "CryptoEngine.hpp"
+#include "SessionManager.hpp"
 #include "SessionStore.hpp"
 #include "log.hpp"
 #include "shared.hpp"
@@ -75,6 +77,378 @@ void GroupProtocol::sendText(const std::string& groupId,
 
         m_sendSealed(peerId, payload);
     }
+}
+
+// ── pv=2 Causally-Linked Pairwise sender ────────────────────────────────────
+//
+// Replaces the SenderChain encryption layer with a per-(recipient,
+// group, session_id) monotonic counter + prev_hash chain.  After
+// every successful seal, the sealed bytes are cached in
+// group_replay_cache so a later gap_request can replay them
+// byte-identical, and group_send_state is bumped so the next send
+// continues the chain.  See core/CausallyLinkedPairwise.hpp for the
+// full wire-format spec.
+
+void GroupProtocol::sendTextV2(const std::string& groupId,
+                                 const std::string& groupName,
+                                 const std::vector<std::string>& memberPeerIds,
+                                 const std::string& text)
+{
+    if (!m_sendSealed) return;
+    if (groupId.empty()) return;
+    if (!m_appData || !m_sessionMgr) {
+        P2P_WARN("[GroupProto v2] sendTextV2: missing AppDataStore "
+                  "or SessionManager — falling back to v1 sendText");
+        // Caller is expected to wire both before invoking the v2
+        // path; if not, take the safe degradation path so the
+        // user's message still goes out.
+        sendText(groupId, groupName, memberPeerIds, text);
+        return;
+    }
+
+    const std::string me = myId();
+
+    // Member roster excluding self — same shape as legacy sendText.
+    nlohmann::json membersArray = nlohmann::json::array();
+    for (const std::string& key : memberPeerIds) {
+        if (trimmed(key) == me) continue;
+        membersArray.push_back(key);
+    }
+
+    const int64_t     ts    = nowSecs();
+    const std::string msgId = p2p::makeUuid();
+
+    for (const std::string& peerIdRaw : memberPeerIds) {
+        const std::string peerId = trimmed(peerIdRaw);
+        if (peerId.empty() || peerId == me) continue;
+
+        // Resolve the DR session id for this recipient.  Empty means
+        // we have no session yet — skip; the caller's lazy-handshake
+        // path will pick it up on next send (after handshake completes).
+        const Bytes sessionId = m_sessionMgr->sessionIdFor(peerId);
+        if (sessionId.empty()) {
+            P2P_WARN("[GroupProto v2] no DR session with "
+                       << p2p::peerPrefix(peerId)
+                       << " — skipping (will retry once handshake settles)");
+            continue;
+        }
+
+        // Pull current chain state (counter + last_hash).  Missing row
+        // returns the default — counter=1, empty lastHash for the
+        // first message of the session.
+        AppDataStore::SendState st;
+        m_appData->loadSendState(peerId, groupId, sessionId, st);
+
+        // Build the v2 inner payload.  Field names match the spec.
+        nlohmann::json payload = nlohmann::json::object();
+        payload["pv"]        = 2;
+        payload["from"]      = me;
+        payload["type"]      = "group_msg";
+        payload["groupId"]   = groupId;
+        payload["groupName"] = groupName;
+        payload["members"]   = membersArray;
+        payload["session"]   = CryptoEngine::toBase64Url(sessionId);
+        payload["ctr"]       = st.nextCounter;
+        payload["prev"]      = CryptoEngine::toBase64Url(st.lastHash);
+        payload["text"]      = text;
+        payload["ts"]        = ts;
+        payload["msgId"]     = msgId;
+
+        // Hand to ChatController to seal + dispatch.  Returns the
+        // sealed envelope bytes (or empty on seal failure).
+        const Bytes sealedEnv = m_sendSealed(peerId, payload);
+        if (sealedEnv.empty()) {
+            // Don't advance the chain — the relay never saw this
+            // counter, so the next attempt should reuse it.  Replay
+            // cache stays untouched.
+            continue;
+        }
+
+        // Cache the sealed bytes for future gap_request replay.
+        m_appData->addReplayCacheEntry(peerId, groupId, sessionId,
+                                         st.nextCounter, sealedEnv, ts);
+
+        // Compute the prev_hash for the next send: BLAKE2b-128 of
+        // these sealed bytes.  Receivers verify this against their
+        // stored last_hash to detect splice / drop attacks within
+        // a sender's stream.
+        Bytes nextHash(16);
+        crypto_generichash(nextHash.data(), nextHash.size(),
+                            sealedEnv.data(), sealedEnv.size(),
+                            nullptr, 0);
+
+        // Advance and persist.  After the bump, the next send will
+        // pick up counter+1 + this hash as its prev.
+        st.nextCounter += 1;
+        st.lastHash     = std::move(nextHash);
+        m_appData->saveSendState(peerId, groupId, sessionId, st);
+    }
+}
+
+// ── gap_request: receiver asks sender for missed counters ──────────────────
+
+void GroupProtocol::sendGapRequest(const std::string& targetPeerId,
+                                    const std::string& groupId,
+                                    const Bytes& sessionId,
+                                    int64_t fromCtr,
+                                    int64_t toCtr)
+{
+    if (!m_sendSealed) return;
+    if (targetPeerId.empty() || groupId.empty() || sessionId.empty()) return;
+    if (toCtr < fromCtr || fromCtr < 1) return;
+
+    nlohmann::json payload = nlohmann::json::object();
+    payload["type"]     = "group_gap_request";
+    payload["from"]     = myId();
+    payload["groupId"]  = groupId;
+    payload["session"]  = CryptoEngine::toBase64Url(sessionId);
+    payload["from_ctr"] = fromCtr;
+    payload["to_ctr"]   = toCtr;
+    payload["ts"]       = nowSecs();
+    payload["msgId"]    = p2p::makeUuid();
+
+    // Discard the sealed-bytes return value — we don't need to chain
+    // the gap_request itself (it's a control message, not part of the
+    // group_msg counter chain).
+    m_sendSealed(targetPeerId, payload);
+}
+
+void GroupProtocol::handleGapRequest(const std::string& requestorPeerId,
+                                       const std::string& groupId,
+                                       const Bytes& sessionId,
+                                       int64_t fromCtr,
+                                       int64_t toCtr)
+{
+    if (!m_appData || !m_replayRelay) {
+        P2P_WARN("[GroupProto v2] handleGapRequest: missing AppDataStore "
+                  "or replay-relay callback; ignoring request");
+        return;
+    }
+    if (requestorPeerId.empty() || groupId.empty() || sessionId.empty()) return;
+    if (toCtr < fromCtr || fromCtr < 1) return;
+
+    // Load every cached envelope in [fromCtr, toCtr] (counter-ascending
+    // order) and re-dispatch raw to the relay.  Missing rows (cache TTL
+    // expired, or no such counter ever cached) are silently skipped —
+    // the requestor's retry timer eventually surfaces the unfilled gap
+    // as "K messages lost during reconnection" UI.
+    int replayed = 0;
+    m_appData->loadReplayCacheRange(
+        requestorPeerId, groupId, sessionId, fromCtr, toCtr,
+        [&](int64_t /*ctr*/, const Bytes& sealed) {
+            if (sealed.empty()) return;
+            m_replayRelay(sealed);
+            ++replayed;
+        });
+
+    P2P_LOG("[GroupProto v2] handleGapRequest replayed " << replayed
+              << " envelope(s) to " << p2p::peerPrefix(requestorPeerId)
+              << " for group " << groupId
+              << " range [" << fromCtr << "," << toCtr << "]");
+}
+
+// ── pv=2 receiver state machine ─────────────────────────────────────────────
+//
+// State per (group, sender):
+//   chain_state.session_id   — last session we processed for this sender
+//   chain_state.expected_next — the next counter we'll deliver
+//   chain_state.last_hash    — hash of the most-recently-delivered sealed env
+//   chain_state.blocked_*    — gap bookkeeping
+//
+// Transitions:
+//   - sessionChanged → drop old buffer (surface lostMessages), reset state,
+//                       fall through to in-order/out-of-order branch
+//   - counter < expected → drop (replay/dup)
+//   - counter > expected → buffer + mark blocked + return gap range
+//   - counter == expected → verify prev_hash chain, deliver, drain buffer
+
+GroupProtocol::ReceiveResult GroupProtocol::dispatchGroupMessageV2(
+    const std::string& groupId,
+    const std::string& senderPeerId,
+    const Bytes& sessionId,
+    int64_t counter,
+    const Bytes& prevHash,
+    const std::string& body,
+    const std::string& senderName,
+    int64_t ts,
+    const std::string& msgId,
+    const Bytes& sealedEnvelope)
+{
+    ReceiveResult r;
+    r.status = ReceiveStatus::Dropped;
+    if (!m_appData) {
+        P2P_WARN("[GroupProto v2] dispatchGroupMessageV2: no AppDataStore wired");
+        return r;
+    }
+    if (groupId.empty() || senderPeerId.empty() || sessionId.empty()
+        || sealedEnvelope.empty() || counter < 1) {
+        return r;
+    }
+
+    AppDataStore::ChainState st;
+    const bool hadState = m_appData->loadChainState(
+        groupId, senderPeerId, st);
+
+    // 16B BLAKE2b of the sealed envelope — becomes our lastHash on
+    // accept, and the next message's expected prev_hash.
+    Bytes thisHash(16);
+    crypto_generichash(thisHash.data(), thisHash.size(),
+                        sealedEnvelope.data(), sealedEnvelope.size(),
+                        nullptr, 0);
+
+    // ── Session reset detection ────────────────────────────────────
+    bool sessionChanged = false;
+    if (hadState && !st.sessionId.empty() && st.sessionId != sessionId) {
+        sessionChanged = true;
+        // Surface count of pre-reset buffered rows — these are
+        // messages we received but never delivered because the
+        // sender's session got destroyed before the gap closed.
+        r.lostMessages = m_appData->dropBufferForSession(
+            groupId, senderPeerId, st.sessionId);
+        // Reset state for the new session.  expectedNext starts at 1;
+        // the in-order/out-of-order branch below decides what to do
+        // with the incoming counter (typically 1, but could be > 1 if
+        // we missed messages from the new session before this arrived).
+        st = AppDataStore::ChainState{};
+        st.sessionId    = sessionId;
+        st.expectedNext = 1;
+    }
+    // First-ever message for this (group, sender) — stamp the session.
+    if (st.sessionId.empty()) {
+        st.sessionId    = sessionId;
+        st.expectedNext = 1;
+    }
+
+    // ── Replay / out-of-window ────────────────────────────────────
+    if (counter < st.expectedNext) {
+        // Already-delivered counter; silent drop.
+        return r;  // status stays Dropped
+    }
+
+    // ── Out-of-order: counter > expected → buffer + block ─────────
+    if (counter > st.expectedNext) {
+        m_appData->addBufferEntry(groupId, senderPeerId, sessionId,
+                                    counter, prevHash, thisHash, msgId,
+                                    body, senderName, ts);
+
+        // Mark/extend blocked range.  gapFrom is the first MISSING
+        // counter (still expectedNext); gapTo grows as later out-of-
+        // order rows arrive.
+        if (!st.blockedSince) {
+            st.blockedSince = ts;
+            st.gapFrom      = st.expectedNext;
+        }
+        st.gapTo = std::max<int64_t>(st.gapTo, counter - 1);
+        m_appData->saveChainState(groupId, senderPeerId, st);
+
+        r.status  = sessionChanged ? ReceiveStatus::SessionReset
+                                    : ReceiveStatus::Buffered;
+        r.blocked = true;
+        r.gapFrom = st.gapFrom;
+        r.gapTo   = st.gapTo;
+        return r;
+    }
+
+    // ── In-order: counter == expectedNext ─────────────────────────
+    //
+    // Verify the prev_hash chain.  Only enforced once we have a
+    // non-empty stored lastHash — first message of any session has
+    // empty prev (and our st.lastHash is also empty after reset).
+    if (!st.lastHash.empty() && st.lastHash != prevHash) {
+        P2P_WARN("[GroupProto v2] prev_hash chain mismatch from "
+                  << p2p::peerPrefix(senderPeerId)
+                  << " ctr=" << counter
+                  << " — possible splice attack; dropping");
+        return r;  // status stays Dropped
+    }
+
+    DeliveredGroupMessage delivered;
+    delivered.body       = body;
+    delivered.senderName = senderName;
+    delivered.counter    = counter;
+    delivered.ts         = ts;
+    delivered.msgId      = msgId;
+    r.deliver.push_back(std::move(delivered));
+
+    st.expectedNext = counter + 1;
+    st.lastHash     = thisHash;
+
+    // ── Drain consecutive buffered rows ───────────────────────────
+    //
+    // Each iteration: look up the row at expectedNext, verify its
+    // prev_hash against our just-updated lastHash, deliver, advance.
+    // sealedEnvHash from the buffered row becomes the new lastHash so
+    // the chain can extend transitively.
+    while (true) {
+        std::vector<AppDataStore::BufferedMessage> next;
+        m_appData->loadBufferRange(groupId, senderPeerId, sessionId,
+                                    st.expectedNext, st.expectedNext,
+                                    [&](const AppDataStore::BufferedMessage& m) {
+                                        next.push_back(m);
+                                    });
+        if (next.empty()) break;
+        const auto& m = next[0];
+
+        if (!st.lastHash.empty() && !m.prevHash.empty()
+            && st.lastHash != m.prevHash) {
+            P2P_WARN("[GroupProto v2] buffered drain hash mismatch ctr="
+                      << m.counter << " — chain broke; dropping row");
+            m_appData->dropBufferRange(groupId, senderPeerId, sessionId,
+                                         m.counter, m.counter);
+            // Stop draining — leave subsequent buffered rows alone;
+            // they'll never deliver via this path because the chain is
+            // severed.  In practice gap_request retry will eventually
+            // resolve it (or the user explicit-skips after timeout).
+            break;
+        }
+
+        DeliveredGroupMessage drained;
+        drained.body       = m.body;
+        drained.senderName = m.senderName;
+        drained.counter    = m.counter;
+        drained.ts         = m.receivedAt;
+        drained.msgId      = m.msgId;
+        r.deliver.push_back(std::move(drained));
+
+        st.expectedNext = m.counter + 1;
+        // sealedEnvHash from the buffered row continues the chain
+        // (empty in legacy rows pre-schema-bump → we accept the gap).
+        if (!m.sealedEnvHash.empty()) {
+            st.lastHash = m.sealedEnvHash;
+        }
+
+        m_appData->dropBufferRange(groupId, senderPeerId, sessionId,
+                                     m.counter, m.counter);
+    }
+
+    // ── Did we close the gap? ─────────────────────────────────────
+    //
+    // If the buffer for (group, sender, session) is now empty, clear
+    // the blocked state so further delivers go straight through.
+    if (st.blockedSince) {
+        bool stillBuffered = false;
+        m_appData->loadBufferRange(groupId, senderPeerId, sessionId,
+                                     0, INT64_MAX,
+                                     [&](const AppDataStore::BufferedMessage&) {
+                                         stillBuffered = true;
+                                     });
+        if (!stillBuffered) {
+            st.blockedSince = 0;
+            st.gapFrom      = 0;
+            st.gapTo        = 0;
+            st.retryCount   = 0;
+            st.lastRetryAt  = 0;
+        }
+    }
+
+    m_appData->saveChainState(groupId, senderPeerId, st);
+
+    r.status  = sessionChanged ? ReceiveStatus::SessionReset
+                                : ReceiveStatus::Delivered;
+    r.blocked = (st.blockedSince != 0);
+    r.gapFrom = st.gapFrom;
+    r.gapTo   = st.gapTo;
+    return r;
 }
 
 void GroupProtocol::sendLeave(const std::string& groupId,

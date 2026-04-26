@@ -24,8 +24,14 @@ import (
 )
 
 const (
-	defaultTTLMs  = 7 * 24 * 60 * 60 * 1000 // 7 days
-	maxTTLMs      = 7 * 24 * 60 * 60 * 1000
+	// Mailbox retention.  Bumped from 7d to 14d alongside Phase 1 of
+	// the Causally-Linked Pairwise group-messaging design — the relay
+	// is the primary delivery path; the sender-side replay cache (7d)
+	// is a fallback for narrower edge cases.  At 14d the recipient
+	// can be offline up to two weeks and miss nothing.  See
+	// docs/PROTOCOL.md and the design discussion attached to PR #X.
+	defaultTTLMs  = 14 * 24 * 60 * 60 * 1000 // 14 days
+	maxTTLMs      = 14 * 24 * 60 * 60 * 1000
 	maxQueueItems = 5000
 	// Two-phase delivery: FetchAll marks rows as in-flight (delivered_at =
 	// now) instead of deleting; the caller DELETEs each row only after the

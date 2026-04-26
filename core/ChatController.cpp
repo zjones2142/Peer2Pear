@@ -53,9 +53,9 @@ static Bytes bytesAfterPrefix(const Bytes& data, const char* prefix) {
 
 // ── ChatController ────────────────────────────────────────────────────────────
 
-ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
+ChatController::ChatController(IWebSocketFactory& wsFactory, IHttpClient& http,
                                 ITimerFactory& timers)
-    : m_relay(ws, http, timers, &m_crypto)
+    : m_relay(wsFactory, http, timers, &m_crypto)
     , m_fileMgr(m_crypto)
     , m_timerFactory(&timers)
     , m_maintenanceTimer(timers.create())
@@ -82,9 +82,27 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     // invariant: every outbound group byte still passes through
     // SessionSealer.sealForPeer.
     m_groupProto.setSendSealedFn(
-        [this](const std::string& peerId, const nlohmann::json& payload) {
-            sendSealedPayload(peerId, payload);
+        [this](const std::string& peerId, const nlohmann::json& payload) -> Bytes {
+            return sendSealedPayload(peerId, payload);
         });
+    // Wire the v2 sender path's required dependencies.  AppDataStore
+    // pointer comes from p2p_context via setAppDataStore() (see below);
+    // SessionManager is owned by ChatController so we forward it now.
+    // GroupProtocol uses these only in sendTextV2; the legacy v1 path
+    // (sendText / sendRename / etc.) ignores them.
+    // m_sessionMgr is owned by ChatController but created lazily in
+    // setDatabase().  Wire it here too so the legacy callers see a
+    // consistent surface; setDatabase() re-wires once it has built
+    // the actual SessionManager instance (see below).
+
+    // Raw-relay callback for handleGapRequest: replays cached sealed
+    // envelopes byte-identically.  Bypasses SessionSealer because the
+    // bytes are already sealed for the requestor — re-sealing would
+    // produce a fresh DR step and shift the chain past their
+    // expected counter.
+    m_groupProto.setReplayRelayFn([this](const Bytes& env) {
+        m_relay.sendEnvelope(env);
+    });
 
     // FileProtocol needs a raw relay-send callback because sendFile
     // builds the file_key envelope + reads the ratchet's
@@ -128,9 +146,13 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     m_relay.onConnected = [this]() { handleRelayConnected(); };
 
     // FileTransferManager callbacks — plain class; direct assignment.
+    // Tagged FileChunk so the transport skips parallel fan-out for
+    // chunk-shaped payloads (240 KB × hundreds-of-chunks per file
+    // would multiply egress out of proportion to the redundancy gain).
+    // Multi-hop / rotation still apply normally.
     m_fileMgr.setSendFn([this](const std::string& /*peerId*/,
                                const Bytes& env) {
-        m_relay.sendEnvelope(env);
+        m_relay.sendEnvelope(env, RelayClient::TrafficClass::FileChunk);
     });
     m_fileMgr.onStatus = [this](const std::string& s) {
         if (onStatus) onStatus(s);
@@ -288,6 +310,12 @@ void ChatController::setRelayUrl(const std::string& url)
     m_relay.setRelayUrl(url);
 }
 
+void ChatController::setAppDataStore(AppDataStore* appData)
+{
+    m_appData = appData;
+    m_groupProto.setAppDataStore(appData);
+}
+
 void ChatController::setDatabase(SqlCipherDb& db)
 {
     // Guard against double-call: reset previous instances before reinitializing
@@ -318,6 +346,11 @@ void ChatController::setDatabase(SqlCipherDb& db)
     }
 
     m_sessionMgr = std::make_unique<SessionManager>(m_crypto, *m_sessionStore);
+
+    // Wire the session manager into GroupProtocol now that it exists.
+    // The v2 group sender path uses sessionIdFor() to namespace its
+    // counter on the wire — see CausallyLinkedPairwise.hpp.
+    m_groupProto.setSessionManager(m_sessionMgr.get());
 
     // Hand the store to GroupProtocol so sender chains get persisted
     // on every advance and restored after restart.  Restore happens
@@ -557,7 +590,11 @@ void ChatController::sendGroupMessageViaMailbox(const std::string& groupId,
                                                 const std::vector<std::string>& memberPeerIds,
                                                 const std::string& text)
 {
-    m_groupProto.sendText(groupId, groupName, memberPeerIds, text);
+    // Default to the pv=2 path.  sendTextV2 internally falls back to
+    // the legacy sendText when its deps (AppDataStore + SessionManager)
+    // aren't wired — protects boot-up windows where the DB key hasn't
+    // been derived yet.
+    m_groupProto.sendTextV2(groupId, groupName, memberPeerIds, text);
 }
 
 void ChatController::sendGroupLeaveNotification(const std::string& groupId,
@@ -660,7 +697,7 @@ void ChatController::pruneSeenEnvelopes()
 // on failure.  Every outbound path should call this instead of inlining the
 // encrypt→convert→seal→prefix logic.
 // ── Sealed payload via mailbox, fail-closed ───────────────────────────────
-void ChatController::sendSealedPayload(const std::string& peerIdB64u,
+Bytes ChatController::sendSealedPayload(const std::string& peerIdB64u,
                                        const nlohmann::json& payload,
                                        SendMode mode)
 {
@@ -690,7 +727,7 @@ void ChatController::sendSealedPayload(const std::string& peerIdB64u,
             // stay quiet — they're chatty per connect and would flood
             // the toast channel.
         }
-        return;
+        return {};
     }
 
 #ifdef PEER2PEAR_P2P
@@ -703,7 +740,7 @@ void ChatController::sendSealedPayload(const std::string& peerIdB64u,
         if (itConn != m_p2pConnections.end() && itConn->second->isReady()) {
             P2P_LOG("[SEND P2P] " << type << " to " << p2p::peerPrefix(peerIdB64u) << "...");
             itConn->second->sendData(env);
-            return;
+            return env;
         }
     }
 #endif
@@ -718,6 +755,7 @@ void ChatController::sendSealedPayload(const std::string& peerIdB64u,
         initiateP2PConnection(peerIdB64u);
     }
 #endif
+    return env;
 }
 
 #ifdef PEER2PEAR_P2P
@@ -976,7 +1014,12 @@ void ChatController::onEnvelope(const Bytes& body)
             return;
         }
 
-        dispatchSealedPayload(o, senderId, tsSecs, msgId, via, std::move(msgKey));
+        // Pass the post-routing-strip bytes (`data`) as the outer
+        // sealed envelope so the v2 group_msg dispatch can hash it
+        // for the prev_hash chain.  This is the same byte-stream the
+        // sender hashed when caching the envelope in group_replay_cache.
+        dispatchSealedPayload(o, senderId, tsSecs, msgId, via,
+                              std::move(msgKey), data);
         return;
     }
 
@@ -1039,7 +1082,8 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                                             int64_t tsSecs,
                                             const std::string& msgId,
                                             const std::string& via,
-                                            Bytes msgKey)
+                                            Bytes msgKey,
+                                            const Bytes& outerSealed)
 {
         const std::string type = o.value("type", std::string());
 
@@ -1072,6 +1116,73 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
         } else if (type == "group_msg") {
             if (!msgId.empty() && !markSeen(msgId)) return;
 
+            // ── pv=2 (Causally-Linked Pairwise) branch ────────────────────
+            // The pv field is absent on legacy v1 envelopes and equals
+            // 2 on the new format.  Default of 1 means we route to the
+            // legacy SenderChain path below.
+            const int pv = o.value("pv", 1);
+            if (pv >= 2) {
+                const std::string gid       = o.value("groupId", std::string());
+                const std::string sessionB64= o.value("session",  std::string());
+                const int64_t     ctr       = o.value("ctr",      int64_t(0));
+                const std::string prevB64   = o.value("prev",     std::string());
+                const std::string text      = o.value("text",     std::string());
+                const std::string innerName = o.value("groupName", std::string());
+                std::vector<std::string> memberKeys;
+                if (o.contains("members") && o["members"].is_array()) {
+                    for (const auto& v : o["members"]) {
+                        if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+                    }
+                }
+                if (gid.empty() || sessionB64.empty() || ctr < 1) {
+                    P2P_WARN("[GROUP v2] malformed pv=2 group_msg from "
+                             << p2p::peerPrefix(senderId));
+                    return;
+                }
+                const Bytes sessionId = CryptoEngine::fromBase64Url(sessionB64);
+                Bytes prevHash;
+                if (!prevB64.empty()) prevHash = CryptoEngine::fromBase64Url(prevB64);
+
+                // Trust-bootstrap the roster from the (now decrypted)
+                // envelope — same model as v1: a peer claiming
+                // membership can update our view because the outer
+                // 1:1 ratchet already authenticated them.
+                m_groupProto.upsertMembersFromTrustedMessage(
+                    gid, senderId, memberKeys);
+
+                auto result = m_groupProto.dispatchGroupMessageV2(
+                    gid, senderId, sessionId, ctr, prevHash,
+                    text, /*senderName=*/innerName, tsSecs, msgId,
+                    outerSealed);
+
+                // Surface every delivered message (current + drained
+                // buffer entries, in counter order).
+                if (onGroupMessageReceived) {
+                    for (const auto& m : result.deliver) {
+                        onGroupMessageReceived(senderId, gid, innerName,
+                                                memberKeys, m.body,
+                                                m.ts, m.msgId);
+                    }
+                }
+                if (result.lostMessages > 0 && onGroupMessagesLost) {
+                    onGroupMessagesLost(gid, senderId, result.lostMessages);
+                }
+                if (result.blocked) {
+                    if (onGroupStreamBlocked) {
+                        onGroupStreamBlocked(gid, senderId,
+                                              result.gapFrom, result.gapTo);
+                    }
+                    // Auto-fire a gap_request to the sender for the
+                    // missing range.  Receiver-side retry/backoff is a
+                    // future increment; for now one-shot per blocked
+                    // event is enough to recover from typical drops.
+                    m_groupProto.sendGapRequest(senderId, gid, sessionId,
+                                                  result.gapFrom, result.gapTo);
+                }
+                return;
+            }
+
+            // ── pv=1 legacy SenderChain branch ────────────────────────────
             // Wire format: ciphertext + skey_epoch + skey_idx.
             // Replay protection lives in the AAD binding
             // (from || gid || epoch || idx) — tampering any field
@@ -1136,6 +1247,26 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                                        innerGroupName,
                                        memberKeys,
                                        text, tsSecs, msgId);
+        } else if (type == "group_gap_request") {
+            // pv=2 control message: peer is asking us to replay
+            // sealed envelopes from our group_replay_cache so they
+            // can fill a gap.  Outer 1:1 ratchet already authenticated
+            // the sender; we just look up the cached bytes and
+            // re-dispatch raw (no re-seal — see setReplayRelayFn).
+            if (!msgId.empty() && !markSeen(msgId)) return;
+            const std::string gid        = o.value("groupId", std::string());
+            const std::string sessionB64 = o.value("session",  std::string());
+            const int64_t     fromCtr    = o.value("from_ctr", int64_t(0));
+            const int64_t     toCtr      = o.value("to_ctr",   int64_t(0));
+            if (gid.empty() || sessionB64.empty()
+                || fromCtr < 1 || toCtr < fromCtr) {
+                P2P_WARN("[GROUP v2] malformed group_gap_request from "
+                         << p2p::peerPrefix(senderId));
+                return;
+            }
+            const Bytes sessionId = CryptoEngine::fromBase64Url(sessionB64);
+            m_groupProto.handleGapRequest(senderId, gid, sessionId,
+                                            fromCtr, toCtr);
         } else if (type == "group_leave") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
             // groupName + members live inside the sender-chain

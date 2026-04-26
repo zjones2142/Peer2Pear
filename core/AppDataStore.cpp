@@ -328,6 +328,102 @@ void AppDataStore::createTables()
     );
     q.exec("CREATE INDEX IF NOT EXISTS idx_file_transfers_chat_ts"
            " ON file_transfers(chat_key, timestamp);");
+
+    // ── Phase 1: Causally-Linked Pairwise group messaging schema ──────
+    //
+    // group_replay_cache: sender's already-sent sealed envelopes,
+    // retained for kReplayCacheMaxAgeSecs (7 days) so a recipient that
+    // detects a gap can ask via gap_request and we replay byte-identical
+    // (no re-encryption, no key reuse).  See PROTOCOL.md §X (TBD) for
+    // the wire-format contract; the table just stores the sealed bytes.
+    //
+    // peer_id is the recipient (the per-recipient envelope of a group
+    // fan-out).  PRIMARY KEY allows efficient replay-range queries
+    // bound by (peer_id, group_id, session_id) and a counter range.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS group_replay_cache ("
+        "  peer_id          TEXT NOT NULL,"
+        "  group_id         TEXT NOT NULL,"
+        "  session_id       BLOB NOT NULL,"
+        "  counter          INTEGER NOT NULL,"
+        "  sealed_envelope  BLOB NOT NULL,"
+        "  sent_at          INTEGER NOT NULL,"
+        "  PRIMARY KEY (peer_id, group_id, session_id, counter)"
+        ");"
+    );
+    // Index used by the periodic TTL purge — scans rows where
+    // sent_at < (now - 7d) without touching the rest of the table.
+    q.exec("CREATE INDEX IF NOT EXISTS idx_group_replay_cache_sent_at"
+           " ON group_replay_cache(sent_at);");
+
+    // group_chain_state: receiver's per-(group, sender) state machine
+    // for the Causally-Linked Pairwise protocol.  One row per (group,
+    // sender) — only the CURRENT session_id is tracked; on session
+    // reset the row is updated in place and any in-flight buffer for
+    // the old session is drained as "K messages lost during reconnect".
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS group_chain_state ("
+        "  group_id          TEXT NOT NULL,"
+        "  sender_peer_id    TEXT NOT NULL,"
+        "  session_id        BLOB NOT NULL,"
+        "  expected_next     INTEGER NOT NULL DEFAULT 1,"
+        "  last_hash         BLOB,"
+        "  blocked_since     INTEGER NOT NULL DEFAULT 0,"
+        "  gap_from          INTEGER NOT NULL DEFAULT 0,"
+        "  gap_to            INTEGER NOT NULL DEFAULT 0,"
+        "  last_retry_at     INTEGER NOT NULL DEFAULT 0,"
+        "  retry_count       INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY (group_id, sender_peer_id)"
+        ");"
+    );
+
+    // group_msg_buffer: receiver's hold table for out-of-order
+    // group_msgs that arrived while the stream was blocked at a gap.
+    // Body + sender_name are encrypted at field level via encryptField
+    // (same XChaCha20-Poly1305-with-AAD pattern as messages.text), so
+    // the buffer is no weaker at rest than the delivered messages
+    // table.  Drained into `messages` once the gap fills.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS group_msg_buffer ("
+        "  group_id          TEXT NOT NULL,"
+        "  sender_peer_id    TEXT NOT NULL,"
+        "  session_id        BLOB NOT NULL,"
+        "  counter           INTEGER NOT NULL,"
+        "  prev_hash         BLOB,"
+        "  sealed_env_hash   BLOB,"     // 16B hash of the sealed envelope —
+                                          // becomes lastHash when this row drains
+        "  msg_id            TEXT NOT NULL DEFAULT '',"
+        "  body              TEXT NOT NULL DEFAULT '',"
+        "  sender_name       TEXT NOT NULL DEFAULT '',"
+        "  received_at       INTEGER NOT NULL,"
+        "  PRIMARY KEY (group_id, sender_peer_id, session_id, counter)"
+        ");"
+    );
+    // Idempotent migration for installs that created the buffer table
+    // before sealed_env_hash + msg_id were added.  SQLite errors with
+    // "duplicate column" if the column exists; q.exec just returns false
+    // — same swallow pattern as the contacts table above.
+    q.exec("ALTER TABLE group_msg_buffer ADD COLUMN sealed_env_hash BLOB;");
+    q.exec("ALTER TABLE group_msg_buffer ADD COLUMN msg_id TEXT NOT NULL DEFAULT '';");
+
+    // group_send_state: sender's per-(recipient, group, session)
+    // monotonic counter + last sealed-envelope hash.  Updated
+    // atomically with every successful enqueue so the next send
+    // continues the chain even after a process restart.
+    //
+    // Independent of group_replay_cache so the chain can advance past
+    // the cache TTL — purging old replay rows must not reset the
+    // counter (counter monotonicity is what guards against replay).
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS group_send_state ("
+        "  peer_id      TEXT NOT NULL,"
+        "  group_id     TEXT NOT NULL,"
+        "  session_id   BLOB NOT NULL,"
+        "  next_counter INTEGER NOT NULL DEFAULT 1,"
+        "  last_hash    BLOB,"
+        "  PRIMARY KEY (peer_id, group_id, session_id)"
+        ");"
+    );
 }
 
 void AppDataStore::updateLastActive(const std::string& peerIdB64u)
@@ -826,4 +922,403 @@ void AppDataStore::loadFileRecords(const std::string& chatKey,
         r.chatKey         = chatKey;
         cb(r);
     }
+}
+
+// ── Group replay cache ──────────────────────────────────────────────────────
+
+bool AppDataStore::addReplayCacheEntry(const std::string& peerIdB64u,
+                                         const std::string& groupId,
+                                         const Bytes& sessionId,
+                                         int64_t counter,
+                                         const Bytes& sealedEnvelope,
+                                         int64_t sentAt)
+{
+    if (!m_db || peerIdB64u.empty() || groupId.empty()
+        || sessionId.empty() || sealedEnvelope.empty()) return false;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT OR REPLACE INTO group_replay_cache "
+        "(peer_id, group_id, session_id, counter, sealed_envelope, sent_at) "
+        "VALUES (:peer, :gid, :sid, :ctr, :env, :ts);"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":gid",  groupId);
+    q.bindValue(":sid",  sessionId);
+    q.bindValue(":ctr",  counter);
+    q.bindValue(":env",  sealedEnvelope);
+    q.bindValue(":ts",   sentAt);
+    return q.exec();
+}
+
+Bytes AppDataStore::loadReplayCacheEntry(const std::string& peerIdB64u,
+                                           const std::string& groupId,
+                                           const Bytes& sessionId,
+                                           int64_t counter) const
+{
+    if (!m_db || peerIdB64u.empty() || groupId.empty()
+        || sessionId.empty()) return {};
+
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT sealed_envelope FROM group_replay_cache "
+        "WHERE peer_id=:peer AND group_id=:gid "
+        "AND session_id=:sid AND counter=:ctr;"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":gid",  groupId);
+    q.bindValue(":sid",  sessionId);
+    q.bindValue(":ctr",  counter);
+    if (q.exec() && q.next()) return q.valueBlob(0);
+    return {};
+}
+
+void AppDataStore::loadReplayCacheRange(
+    const std::string& peerIdB64u,
+    const std::string& groupId,
+    const Bytes& sessionId,
+    int64_t fromCounter, int64_t toCounter,
+    const std::function<void(int64_t, const Bytes&)>& cb) const
+{
+    if (!m_db || !cb || peerIdB64u.empty() || groupId.empty()
+        || sessionId.empty() || toCounter < fromCounter) return;
+
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT counter, sealed_envelope FROM group_replay_cache "
+        "WHERE peer_id=:peer AND group_id=:gid AND session_id=:sid "
+        "AND counter BETWEEN :lo AND :hi "
+        "ORDER BY counter ASC;"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":gid",  groupId);
+    q.bindValue(":sid",  sessionId);
+    q.bindValue(":lo",   fromCounter);
+    q.bindValue(":hi",   toCounter);
+    if (!q.exec()) return;
+    while (q.next()) {
+        cb(q.valueInt64(0), q.valueBlob(1));
+    }
+}
+
+bool AppDataStore::dropReplayCacheEntry(const std::string& peerIdB64u,
+                                          const std::string& groupId,
+                                          const Bytes& sessionId,
+                                          int64_t counter)
+{
+    if (!m_db || peerIdB64u.empty() || groupId.empty()
+        || sessionId.empty()) return false;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "DELETE FROM group_replay_cache "
+        "WHERE peer_id=:peer AND group_id=:gid "
+        "AND session_id=:sid AND counter=:ctr;"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":gid",  groupId);
+    q.bindValue(":sid",  sessionId);
+    q.bindValue(":ctr",  counter);
+    return q.exec();
+}
+
+int AppDataStore::purgeReplayCacheOlderThan(int64_t cutoffSecs)
+{
+    if (!m_db) return 0;
+    SqlCipherQuery q(*m_db);
+    q.prepare("DELETE FROM group_replay_cache WHERE sent_at < :cutoff;");
+    q.bindValue(":cutoff", cutoffSecs);
+    if (!q.exec()) return 0;
+    return q.numRowsAffected();
+}
+
+// ── Group chain state ───────────────────────────────────────────────────────
+
+bool AppDataStore::loadChainState(const std::string& groupId,
+                                    const std::string& senderPeerId,
+                                    ChainState& out) const
+{
+    if (!m_db || groupId.empty() || senderPeerId.empty()) return false;
+
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT session_id, expected_next, last_hash, blocked_since, "
+        "       gap_from, gap_to, last_retry_at, retry_count "
+        "FROM group_chain_state "
+        "WHERE group_id=:gid AND sender_peer_id=:sender;"
+    );
+    q.bindValue(":gid",    groupId);
+    q.bindValue(":sender", senderPeerId);
+    if (!q.exec() || !q.next()) return false;
+
+    out.sessionId    = q.valueBlob(0);
+    out.expectedNext = q.valueInt64(1);
+    out.lastHash     = q.valueBlob(2);
+    out.blockedSince = q.valueInt64(3);
+    out.gapFrom      = q.valueInt64(4);
+    out.gapTo        = q.valueInt64(5);
+    out.lastRetryAt  = q.valueInt64(6);
+    out.retryCount   = q.valueInt(7);
+    return true;
+}
+
+bool AppDataStore::saveChainState(const std::string& groupId,
+                                    const std::string& senderPeerId,
+                                    const ChainState& s)
+{
+    if (!m_db || groupId.empty() || senderPeerId.empty()) return false;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT OR REPLACE INTO group_chain_state "
+        "(group_id, sender_peer_id, session_id, expected_next, last_hash, "
+        " blocked_since, gap_from, gap_to, last_retry_at, retry_count) "
+        "VALUES (:gid, :sender, :sid, :next, :hash, "
+        "        :blocked, :gfrom, :gto, :lretry, :rcount);"
+    );
+    q.bindValue(":gid",     groupId);
+    q.bindValue(":sender",  senderPeerId);
+    q.bindValue(":sid",     s.sessionId);
+    q.bindValue(":next",    s.expectedNext);
+    q.bindValue(":hash",    s.lastHash);
+    q.bindValue(":blocked", s.blockedSince);
+    q.bindValue(":gfrom",   s.gapFrom);
+    q.bindValue(":gto",     s.gapTo);
+    q.bindValue(":lretry",  s.lastRetryAt);
+    q.bindValue(":rcount",  static_cast<int64_t>(s.retryCount));
+    return q.exec();
+}
+
+bool AppDataStore::dropChainState(const std::string& groupId,
+                                    const std::string& senderPeerId)
+{
+    if (!m_db || groupId.empty() || senderPeerId.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "DELETE FROM group_chain_state "
+        "WHERE group_id=:gid AND sender_peer_id=:sender;"
+    );
+    q.bindValue(":gid",    groupId);
+    q.bindValue(":sender", senderPeerId);
+    return q.exec();
+}
+
+// ── Group message buffer ────────────────────────────────────────────────────
+
+namespace {
+
+// AAD scope for group_msg_buffer field encryption.  Mirrors the
+// `messages.text` convention but adds session_id (hex) to the row
+// key — the buffer can hold rows from multiple sessions briefly
+// (during a session-reset transition) and the AAD must distinguish.
+// Uses hex (not base64url) so we don't depend on CryptoEngine here.
+std::string bufferRowKey(const std::string& groupId,
+                          const std::string& senderPeerId,
+                          const Bytes& sessionId,
+                          int64_t counter) {
+    std::string sidHex;
+    sidHex.reserve(sessionId.size() * 2);
+    static constexpr char kHex[] = "0123456789abcdef";
+    for (uint8_t b : sessionId) {
+        sidHex.push_back(kHex[b >> 4]);
+        sidHex.push_back(kHex[b & 0xF]);
+    }
+    return groupId + "|" + senderPeerId + "|" + sidHex
+         + "|" + std::to_string(counter);
+}
+
+}  // namespace
+
+bool AppDataStore::addBufferEntry(const std::string& groupId,
+                                    const std::string& senderPeerId,
+                                    const Bytes& sessionId,
+                                    int64_t counter,
+                                    const Bytes& prevHash,
+                                    const Bytes& sealedEnvHash,
+                                    const std::string& msgId,
+                                    const std::string& body,
+                                    const std::string& senderName,
+                                    int64_t receivedAt)
+{
+    if (!m_db || groupId.empty() || senderPeerId.empty()
+        || sessionId.empty()) return false;
+
+    const std::string rowKey = bufferRowKey(groupId, senderPeerId,
+                                              sessionId, counter);
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT OR REPLACE INTO group_msg_buffer "
+        "(group_id, sender_peer_id, session_id, counter, prev_hash, "
+        " sealed_env_hash, msg_id, body, sender_name, received_at) "
+        "VALUES (:gid, :sender, :sid, :ctr, :hash, "
+        "        :envh, :mid, :body, :sname, :ts);"
+    );
+    q.bindValue(":gid",    groupId);
+    q.bindValue(":sender", senderPeerId);
+    q.bindValue(":sid",    sessionId);
+    q.bindValue(":ctr",    counter);
+    q.bindValue(":hash",   prevHash);
+    q.bindValue(":envh",   sealedEnvHash);
+    q.bindValue(":mid",    msgId);
+    q.bindValue(":body",   encryptField(body,
+                              fieldAad("group_msg_buffer", "body", rowKey)));
+    q.bindValue(":sname",  encryptField(senderName,
+                              fieldAad("group_msg_buffer", "sender_name", rowKey)));
+    q.bindValue(":ts",     receivedAt);
+    return q.exec();
+}
+
+void AppDataStore::loadBufferRange(
+    const std::string& groupId,
+    const std::string& senderPeerId,
+    const Bytes& sessionId,
+    int64_t fromCounter, int64_t toCounter,
+    const std::function<void(const BufferedMessage&)>& cb) const
+{
+    if (!m_db || !cb || groupId.empty() || senderPeerId.empty()
+        || sessionId.empty() || toCounter < fromCounter) return;
+
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT counter, prev_hash, sealed_env_hash, msg_id, "
+        "       body, sender_name, received_at "
+        "FROM group_msg_buffer "
+        "WHERE group_id=:gid AND sender_peer_id=:sender "
+        "AND session_id=:sid "
+        "AND counter BETWEEN :lo AND :hi "
+        "ORDER BY counter ASC;"
+    );
+    q.bindValue(":gid",    groupId);
+    q.bindValue(":sender", senderPeerId);
+    q.bindValue(":sid",    sessionId);
+    q.bindValue(":lo",     fromCounter);
+    q.bindValue(":hi",     toCounter);
+    if (!q.exec()) return;
+
+    while (q.next()) {
+        BufferedMessage m;
+        m.counter         = q.valueInt64(0);
+        m.prevHash        = q.valueBlob(1);
+        m.sealedEnvHash   = q.valueBlob(2);
+        m.msgId           = q.valueText(3);
+        const std::string rowKey = bufferRowKey(groupId, senderPeerId,
+                                                  sessionId, m.counter);
+        m.body         = decryptField(q.valueText(4),
+                            fieldAad("group_msg_buffer", "body", rowKey));
+        m.senderName   = decryptField(q.valueText(5),
+                            fieldAad("group_msg_buffer", "sender_name", rowKey));
+        m.receivedAt   = q.valueInt64(6);
+        cb(m);
+    }
+}
+
+int AppDataStore::dropBufferRange(const std::string& groupId,
+                                    const std::string& senderPeerId,
+                                    const Bytes& sessionId,
+                                    int64_t fromCounter, int64_t toCounter)
+{
+    if (!m_db || groupId.empty() || senderPeerId.empty()
+        || sessionId.empty() || toCounter < fromCounter) return 0;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "DELETE FROM group_msg_buffer "
+        "WHERE group_id=:gid AND sender_peer_id=:sender "
+        "AND session_id=:sid "
+        "AND counter BETWEEN :lo AND :hi;"
+    );
+    q.bindValue(":gid",    groupId);
+    q.bindValue(":sender", senderPeerId);
+    q.bindValue(":sid",    sessionId);
+    q.bindValue(":lo",     fromCounter);
+    q.bindValue(":hi",     toCounter);
+    if (!q.exec()) return 0;
+    return q.numRowsAffected();
+}
+
+int AppDataStore::dropBufferForSession(const std::string& groupId,
+                                         const std::string& senderPeerId,
+                                         const Bytes& sessionId)
+{
+    if (!m_db || groupId.empty() || senderPeerId.empty()
+        || sessionId.empty()) return 0;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "DELETE FROM group_msg_buffer "
+        "WHERE group_id=:gid AND sender_peer_id=:sender "
+        "AND session_id=:sid;"
+    );
+    q.bindValue(":gid",    groupId);
+    q.bindValue(":sender", senderPeerId);
+    q.bindValue(":sid",    sessionId);
+    if (!q.exec()) return 0;
+    return q.numRowsAffected();
+}
+
+// ── Group send state ────────────────────────────────────────────────────────
+
+bool AppDataStore::loadSendState(const std::string& peerIdB64u,
+                                   const std::string& groupId,
+                                   const Bytes& sessionId,
+                                   SendState& out) const
+{
+    out = SendState{};  // default for missing row
+    if (!m_db || peerIdB64u.empty() || groupId.empty()
+        || sessionId.empty()) return true;
+
+    SqlCipherQuery q(m_db->handle());
+    q.prepare(
+        "SELECT next_counter, last_hash FROM group_send_state "
+        "WHERE peer_id=:peer AND group_id=:gid AND session_id=:sid;"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":gid",  groupId);
+    q.bindValue(":sid",  sessionId);
+    if (q.exec() && q.next()) {
+        out.nextCounter = q.valueInt64(0);
+        out.lastHash    = q.valueBlob(1);
+    }
+    return true;
+}
+
+bool AppDataStore::saveSendState(const std::string& peerIdB64u,
+                                   const std::string& groupId,
+                                   const Bytes& sessionId,
+                                   const SendState& s)
+{
+    if (!m_db || peerIdB64u.empty() || groupId.empty()
+        || sessionId.empty()) return false;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "INSERT OR REPLACE INTO group_send_state "
+        "(peer_id, group_id, session_id, next_counter, last_hash) "
+        "VALUES (:peer, :gid, :sid, :next, :hash);"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":gid",  groupId);
+    q.bindValue(":sid",  sessionId);
+    q.bindValue(":next", s.nextCounter);
+    q.bindValue(":hash", s.lastHash);
+    return q.exec();
+}
+
+bool AppDataStore::dropSendState(const std::string& peerIdB64u,
+                                   const std::string& groupId,
+                                   const Bytes& sessionId)
+{
+    if (!m_db || peerIdB64u.empty() || groupId.empty()
+        || sessionId.empty()) return false;
+
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "DELETE FROM group_send_state "
+        "WHERE peer_id=:peer AND group_id=:gid AND session_id=:sid;"
+    );
+    q.bindValue(":peer", peerIdB64u);
+    q.bindValue(":gid",  groupId);
+    q.bindValue(":sid",  sessionId);
+    return q.exec();
 }

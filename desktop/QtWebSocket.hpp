@@ -6,6 +6,8 @@
 #include <QUrl>
 #include <QString>
 
+#include <memory>
+
 /*
  * QtWebSocket — IWebSocket implementation using Qt WebSockets.
  *
@@ -68,4 +70,28 @@ public:
 
 private:
     QWebSocket m_ws;
+};
+
+// QtWebSocketFactory — produces fresh QtWebSocket instances on demand.
+//
+// Each create() allocates a new QtWebSocket parented to `m_parent`
+// for proper Qt object-tree ownership (parent dictates thread
+// affinity + dictates teardown when the parent QObject is destroyed
+// in case unique_ptr release is missed).
+//
+// Real multi-WS support comes for free here because each QWebSocket
+// is independent at the Qt layer — pair this factory with
+// RelayClient::addSubscribeRelay() and the desktop receives on every
+// configured relay simultaneously.
+class QtWebSocketFactory : public IWebSocketFactory {
+public:
+    explicit QtWebSocketFactory(QObject* parent = nullptr)
+        : m_parent(parent) {}
+
+    std::unique_ptr<IWebSocket> create() override {
+        return std::make_unique<QtWebSocket>(m_parent);
+    }
+
+private:
+    QObject* m_parent = nullptr;
 };

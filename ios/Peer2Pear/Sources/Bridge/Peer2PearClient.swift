@@ -275,6 +275,32 @@ final class Peer2PearClient: ObservableObject {
     /// locally after a successful sendGroupAvatar.
     @Published var groupAvatars: [String: String] = [:]
 
+    /// pv=2 (Causally-Linked Pairwise) UX state.
+
+    /// One sender's missing range inside a group.  Surfaced as
+    /// "waiting for messages from X..." banner in ConversationView.
+    /// Cleared once the gap fills (next in-order group_message
+    /// arrival from this sender) or on session reset.
+    struct BlockedRange: Equatable {
+        var from: Int64
+        var to:   Int64
+    }
+    /// groupId → senderPeerId → BlockedRange.  Per-(group, sender)
+    /// because the same group may have multiple senders blocked
+    /// independently (one peer's stream stalled while another's flows).
+    @Published var groupBlockedStreams: [String: [String: BlockedRange]] = [:]
+
+    /// One "K messages lost during reconnection" event.  Appended on
+    /// session reset; the UI surfaces a one-shot alert and removes
+    /// (or marks-seen) the entry after dismissal.
+    struct LostMessagesEvent: Equatable, Identifiable {
+        let id = UUID()
+        let groupId:      String
+        let senderPeerId: String
+        let count:        Int64
+    }
+    @Published var groupLostMessages: [LostMessagesEvent] = []
+
     /// peerId → online.  Updated by `on_presence` pushes.
     @Published var peerPresence: [String: Bool] = [:]
 
@@ -647,13 +673,16 @@ final class Peer2PearClient: ObservableObject {
     /// Raw C context pointer — accessed by platform adapters
     private(set) var rawContext: OpaquePointer?
 
-    private var ws: WebSocketAdapter!
+    // v2 multi-WS pool.  Each connection (primary + each
+    // addSubscribeRelay) is its own WebSocketAdapter; the pool maps
+    // C-side conn_handle pointers to Swift adapters.
+    private var wsPool: WebSocketPool!
     private var http: HttpAdapter!
 
     // MARK: - Lifecycle
 
     init() {
-        ws = WebSocketAdapter(client: self)
+        wsPool = WebSocketPool(client: self)
         http = HttpAdapter(client: self)
         // Wipe any cached unlock passphrase as soon as the app
         // backgrounds — UIKit posts this synchronously before the
@@ -735,27 +764,50 @@ final class Peer2PearClient: ObservableObject {
         var platform = p2p_platform()
         platform.platform_ctx = selfPtr
 
-        // WebSocket callbacks
-        platform.ws_open = { urlCStr, ctx in
-            guard let client = Peer2PearClient.from(ctx), let urlCStr,
+        // v2 multi-connection WebSocket callbacks.  Each connection
+        // (primary + each addSubscribeRelay-spawned slave) is its own
+        // WebSocketAdapter; the pool maps conn_handle pointers to
+        // adapters.  When wired, the C++ core uses MultiCWebSocketFactory
+        // and addSubscribeRelay() works end-to-end.
+        platform.ws_alloc_connection = { ctx in
+            guard let client = Peer2PearClient.from(ctx) else { return nil }
+            return UnsafeMutableRawPointer(client.wsPool.allocate())
+        }
+        platform.ws_free_connection = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return }
+            client.wsPool.free(handle)
+        }
+        // v2 per-connection callbacks: each receives the conn_handle
+        // (returned from ws_alloc_connection) plus platform_ctx (the
+        // Peer2PearClient).  We look up the adapter via the pool —
+        // safe against late callbacks that arrive after free()
+        // because find() returns nil for unknown handles.
+        platform.ws_open_v2 = { handle, urlCStr, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle, let urlCStr,
                   let url = URL(string: String(cString: urlCStr)) else { return }
-            client.ws.open(url: url)
+            client.wsPool.find(handle)?.open(url: url)
         }
-        platform.ws_close = { ctx in
-            guard let client = Peer2PearClient.from(ctx) else { return }
-            client.ws.close()
+        platform.ws_close_v2 = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return }
+            client.wsPool.find(handle)?.close()
         }
-        platform.ws_send_text = { msgCStr, ctx in
-            guard let client = Peer2PearClient.from(ctx), let msgCStr else { return }
-            client.ws.sendText(String(cString: msgCStr))
+        platform.ws_send_text_v2 = { handle, msgCStr, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle, let msgCStr else { return }
+            client.wsPool.find(handle)?.sendText(String(cString: msgCStr))
         }
-        platform.ws_is_connected = { ctx in
-            guard let client = Peer2PearClient.from(ctx) else { return 0 }
-            return client.ws.isConnected ? 1 : 0
+        platform.ws_is_connected_v2 = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return 0 }
+            return (client.wsPool.find(handle)?.isConnected ?? false) ? 1 : 0
         }
-        platform.ws_is_idle = { ctx in
-            guard let client = Peer2PearClient.from(ctx) else { return 1 }
-            return client.ws.isIdle ? 1 : 0
+        platform.ws_is_idle_v2 = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return 1 }
+            return (client.wsPool.find(handle)?.isIdle ?? true) ? 1 : 0
         }
 
         // HTTP callback
@@ -806,7 +858,14 @@ final class Peer2PearClient: ObservableObject {
         setFileHardMaxMB(fileHardMaxMB)
         setFileRequireP2P(fileRequireP2P)
         setHardBlockOnKeyChange(hardBlockOnKeyChange)
+        // Apply the slider preset first, then re-push the explicit
+        // transport toggles so a user who has overridden parallel
+        // fan-out / multi-hop independently of the slider keeps that
+        // override across relaunches.
         setPrivacyLevel(privacyLevel.rawValue)
+        setParallelFanOut(parallelFanOutEnabled)
+        setParallelFanOutK(parallelFanOutK)
+        setMultiHopEnabled(multiHopEnabled)
         applyEffectiveAutoAcceptThreshold()
 
         p2p_set_relay_url(rawContext, relayUrl)
@@ -818,6 +877,11 @@ final class Peer2PearClient: ObservableObject {
         // relaunches — keeps forwarder selection consistent.
         for backup in backupRelayUrls {
             addSendRelay(url: backup)
+            // Also subscribe to the backup so the recipient mailbox is
+            // replicated end-to-end: sender posts to all relays via
+            // parallel fan-out, receiver listens on all of them via
+            // multi-WS subscribe, dedup catches duplicates.
+            addSubscribeRelay(url: backup)
         }
         p2p_connect(rawContext)
 
@@ -833,6 +897,11 @@ final class Peer2PearClient: ObservableObject {
             p2p_destroy(ctx)
             rawContext = nil
         }
+        // Drop every WebSocket the pool was holding — the C core is
+        // gone, so its ws_free_connection callbacks have already
+        // fired for each (in p2p_destroy).  reset() is defensive in
+        // case any straggler escaped that path.
+        wsPool.reset()
         isConnected = false
     }
 
@@ -976,12 +1045,17 @@ final class Peer2PearClient: ObservableObject {
         }
     }
 
-    /// Three-tier privacy posture for the relay protocol.  Mirrors the
-    /// desktop "Privacy" picker — every level subsumes the previous.
-    /// Stored as the int the C API expects (0/1/2).
+    /// Three-tier privacy posture preset.  Maps onto the four
+    /// orthogonal transport dials (jitter, cover traffic, parallel
+    /// fan-out, multi-hop) in the C core's setPrivacyLevel().  Users
+    /// who want fine-grained control can also flip the parallelFanOut /
+    /// multiHopEnabled toggles directly — they're independent dials
+    /// that target different threats:
+    ///   parallel fan-out  = redundancy (one relay down ≠ delivery loss)
+    ///   multi-hop onion   = anonymity (no relay sees both sender + recipient)
     enum PrivacyLevel: Int, CaseIterable, Identifiable {
         case standard = 0   // envelope padding + sealed sender + E2EE
-        case enhanced = 1   // + send jitter + cover traffic + multi-relay rotation
+        case enhanced = 1   // + jitter + cover traffic + parallel fan-out (all relays)
         case maximum  = 2   // + multi-hop forwarding + high-frequency cover traffic
         var id: Int { rawValue }
     }
@@ -996,6 +1070,73 @@ final class Peer2PearClient: ObservableObject {
             UserDefaults.standard.set(privacyLevel.rawValue,
                                        forKey: Self.kPrivacyLevelKey)
             setPrivacyLevel(privacyLevel.rawValue)
+            // Sync the independent toggle state so the slider and the
+            // advanced toggles stay coherent.  Each assignment fires
+            // its own didSet which re-pushes to the core — harmless,
+            // since setPrivacyLevel already configured the same values
+            // in the same call.
+            switch privacyLevel {
+            case .standard:
+                parallelFanOutEnabled = false
+                multiHopEnabled       = false
+            case .enhanced:
+                parallelFanOutEnabled = true
+                multiHopEnabled       = false
+            case .maximum:
+                parallelFanOutEnabled = true
+                multiHopEnabled       = true
+            }
+        }
+    }
+
+    // MARK: - Independent transport dials
+    //
+    // These are settable orthogonally to privacyLevel — flipping
+    // either toggle here applies on top of (and overrides) whatever
+    // the preset configured.  Persisted in UserDefaults so the user's
+    // explicit choice survives relaunches even if they later move the
+    // privacy slider.
+
+    static let kParallelFanOutKey  = "p2p.parallelFanOutEnabled"
+    static let kParallelFanOutKKey = "p2p.parallelFanOutK"
+    static let kMultiHopKey        = "p2p.multiHopEnabled"
+
+    /// Send each outbound message envelope to multiple configured
+    /// relays simultaneously.  File chunks are exempt (handled in
+    /// core).  Improves reliability — does not improve anonymity.
+    @Published var parallelFanOutEnabled: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kParallelFanOutKey) {
+        didSet {
+            UserDefaults.standard.set(parallelFanOutEnabled,
+                                       forKey: Self.kParallelFanOutKey)
+            setParallelFanOut(parallelFanOutEnabled)
+        }
+    }
+
+    /// 0 = all configured send relays.  K > 0 picks K random relays
+    /// per send.  Ignored when parallelFanOutEnabled is false.
+    @Published var parallelFanOutK: Int = {
+        let raw = UserDefaults.standard.object(
+            forKey: Peer2PearClient.kParallelFanOutKKey) as? Int
+        return raw ?? 0
+    }() {
+        didSet {
+            UserDefaults.standard.set(parallelFanOutK,
+                                       forKey: Self.kParallelFanOutKKey)
+            setParallelFanOutK(parallelFanOutK)
+        }
+    }
+
+    /// Onion-route each envelope through a chain of relays.  No
+    /// single relay sees both sender and recipient.  Improves
+    /// anonymity — does not improve reliability.  Adds latency
+    /// per hop.  Wins over parallel fan-out in the dispatch path.
+    @Published var multiHopEnabled: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kMultiHopKey) {
+        didSet {
+            UserDefaults.standard.set(multiHopEnabled,
+                                       forKey: Self.kMultiHopKey)
+            setMultiHopEnabled(multiHopEnabled)
         }
     }
 
@@ -1122,6 +1263,21 @@ final class Peer2PearClient: ObservableObject {
         p2p_set_privacy_level(ctx, Int32(level))
     }
 
+    func setParallelFanOut(_ enabled: Bool) {
+        guard let ctx = rawContext else { return }
+        p2p_set_parallel_fan_out(ctx, enabled ? 1 : 0)
+    }
+
+    func setParallelFanOutK(_ k: Int) {
+        guard let ctx = rawContext else { return }
+        p2p_set_parallel_fan_out_k(ctx, Int32(k))
+    }
+
+    func setMultiHopEnabled(_ enabled: Bool) {
+        guard let ctx = rawContext else { return }
+        p2p_set_multi_hop_enabled(ctx, enabled ? 1 : 0)
+    }
+
     /// Append a relay URL to the core's send pool for multi-hop
     /// forwarding.  Safe to call before start() — becomes a no-op when
     /// rawContext is nil, and the persisted list is replayed on every
@@ -1129,6 +1285,25 @@ final class Peer2PearClient: ObservableObject {
     func addSendRelay(url: String) {
         guard let ctx = rawContext else { return }
         p2p_add_send_relay(ctx, url)
+    }
+
+    /// Add an additional relay URL to the receive-side subscribe pool.
+    /// Spawns a parallel WebSocket connection so the recipient mailbox
+    /// is replicated across multiple relays.  Pairs with parallel
+    /// send fan-out for end-to-end redundancy.
+    ///
+    /// Requires the platform layer to expose the multi-connection FFI
+    /// (ws_alloc_connection et al).  The core silently skips with a
+    /// warning when the platform is single-connection only.
+    func addSubscribeRelay(url: String) {
+        guard let ctx = rawContext else { return }
+        p2p_add_subscribe_relay(ctx, url)
+    }
+
+    /// Drop every extra subscribe relay; the primary stays connected.
+    func clearSubscribeRelays() {
+        guard let ctx = rawContext else { return }
+        p2p_clear_subscribe_relays(ctx)
     }
 
     // MARK: - Safety numbers (key verification)

@@ -18,6 +18,7 @@
 #include "SqlCipherDb.hpp"
 #include "SessionStore.hpp"
 #include "AppDataStore.hpp"
+#include "log.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -37,9 +38,14 @@
 
 // ── CWebSocket: IWebSocket backed by C function pointers ────────────────────
 
+class SingleWebSocketFactory;  // fwd
+
 class CWebSocket : public IWebSocket {
 public:
-    explicit CWebSocket(p2p_platform platform) : m_p(platform) {}
+    explicit CWebSocket(p2p_platform platform,
+                        SingleWebSocketFactory* factory = nullptr)
+        : m_p(platform), m_factory(factory) {}
+    ~CWebSocket() override;  // notifies factory (defined below)
 
     void open(const std::string& url) override {
         if (m_p.ws_open)
@@ -69,8 +75,173 @@ public:
     }
 
 private:
-    p2p_platform m_p;
+    p2p_platform            m_p;
+    SingleWebSocketFactory* m_factory = nullptr;  // non-owning
 };
+
+// SingleWebSocketFactory — adapter that satisfies IWebSocketFactory's
+// contract on top of today's single-WS-per-platform FFI.  The first
+// create() returns a CWebSocket bound to the platform; subsequent
+// calls return nullptr (because the FFI doesn't yet support multiple
+// independent connections per platform_ctx).
+//
+// `active()` returns a non-owning pointer to the currently live
+// CWebSocket so the p2p_ws_on_* platform callbacks can dispatch
+// callbacks (onConnected / onBinaryMessage / etc.) without going
+// through the controller.  The pointer is automatically cleared in
+// CWebSocket's destructor — so a stale call after the controller is
+// torn down is a safe no-op rather than a use-after-free.
+//
+// RelayClient::addSubscribeRelay handles a nullptr create() by logging
+// and skipping — no crash, just "multi-WS subscribe not available
+// here yet."  When the platform layer ships multi-connection support,
+// replace this adapter with a real factory that creates fresh CWebSocket
+// instances each call (each tied to its own per-connection platform_ctx).
+class SingleWebSocketFactory : public IWebSocketFactory {
+public:
+    explicit SingleWebSocketFactory(p2p_platform platform) : m_p(platform) {}
+
+    std::unique_ptr<IWebSocket> create() override {
+        if (m_consumed) {
+            P2P_WARN("[CWS] SingleWebSocketFactory::create() called "
+                     "more than once — platform shim does not yet "
+                     "support multiple WS connections; returning null");
+            return nullptr;
+        }
+        m_consumed = true;
+        auto ws = std::make_unique<CWebSocket>(m_p, this);
+        m_active = ws.get();
+        return ws;  // ownership transfers to RelayClient
+    }
+
+    // Pointer to the WS this factory created on its single-shot call.
+    // Valid while RelayClient (and therefore the unique_ptr) is alive;
+    // the CWebSocket destructor clears it back to nullptr.  Used by
+    // the p2p_ws_on_* platform callbacks to find the IWebSocket whose
+    // onConnected / onBinaryMessage / onTextMessage / onDisconnected
+    // they should dispatch.
+    CWebSocket* active() const { return m_active; }
+
+    void clearActive(CWebSocket* ws) {
+        if (m_active == ws) m_active = nullptr;
+    }
+
+private:
+    p2p_platform m_p;
+    bool         m_consumed = false;
+    CWebSocket*  m_active   = nullptr;
+};
+
+inline CWebSocket::~CWebSocket() {
+    if (m_factory) m_factory->clearActive(this);
+}
+
+// ── Multi-connection variants (v2 FFI) ──────────────────────────────────────
+
+class MultiCWebSocketFactory;  // fwd
+
+// MultiCWebSocket — IWebSocket bound to a per-connection opaque handle
+// supplied by the platform layer's ws_alloc_connection callback.  The
+// factory owns the platform `conn_handle` and frees it via
+// ws_free_connection on this object's destruction.
+//
+// Registers itself in the factory's `byHandle` map so the v2 platform
+// callbacks (p2p_ws_on_connected_v2 etc.) can locate it without a
+// linear scan.
+class MultiCWebSocket : public IWebSocket {
+public:
+    MultiCWebSocket(p2p_platform platform,
+                    void* connHandle,
+                    MultiCWebSocketFactory* factory);
+    ~MultiCWebSocket() override;
+
+    void open(const std::string& url) override {
+        if (m_p.ws_open_v2)
+            m_p.ws_open_v2(m_connHandle, url.c_str(), m_p.platform_ctx);
+    }
+    void close() override {
+        if (m_p.ws_close_v2) m_p.ws_close_v2(m_connHandle, m_p.platform_ctx);
+    }
+    bool isConnected() const override {
+        return m_p.ws_is_connected_v2
+            ? m_p.ws_is_connected_v2(m_connHandle, m_p.platform_ctx) != 0
+            : false;
+    }
+    bool isIdle() const override {
+        return m_p.ws_is_idle_v2
+            ? m_p.ws_is_idle_v2(m_connHandle, m_p.platform_ctx) != 0
+            : true;
+    }
+    void sendTextMessage(const std::string& message) override {
+        if (m_p.ws_send_text_v2)
+            m_p.ws_send_text_v2(m_connHandle, message.c_str(), m_p.platform_ctx);
+    }
+
+    void* connHandle() const { return m_connHandle; }
+
+private:
+    p2p_platform               m_p;
+    void*                      m_connHandle = nullptr;
+    MultiCWebSocketFactory*    m_factory    = nullptr;
+};
+
+// Factory that allocates a fresh per-connection handle from the
+// platform on every create().  Tracks live MultiCWebSockets by their
+// handle so the v2 platform callbacks can dispatch back to them.
+//
+// Lifecycle:
+//   create() → ws_alloc_connection → MultiCWebSocket{handle} → registered
+//   ~MultiCWebSocket() → unregistered → ws_free_connection
+class MultiCWebSocketFactory : public IWebSocketFactory {
+public:
+    explicit MultiCWebSocketFactory(p2p_platform platform) : m_p(platform) {}
+
+    std::unique_ptr<IWebSocket> create() override {
+        if (!m_p.ws_alloc_connection || !m_p.ws_free_connection) {
+            P2P_WARN("[CWS-v2] ws_alloc_connection / ws_free_connection "
+                     "missing — multi-WS unavailable");
+            return nullptr;
+        }
+        void* handle = m_p.ws_alloc_connection(m_p.platform_ctx);
+        if (!handle) {
+            P2P_WARN("[CWS-v2] ws_alloc_connection returned null");
+            return nullptr;
+        }
+        auto ws = std::make_unique<MultiCWebSocket>(m_p, handle, this);
+        m_byHandle[handle] = ws.get();
+        return ws;
+    }
+
+    // Looked up by p2p_ws_on_*_v2 callbacks to dispatch to the right
+    // IWebSocket.  Returns nullptr for an unknown handle (e.g., a
+    // late-arriving event for a connection we already freed).
+    MultiCWebSocket* find(void* connHandle) const {
+        auto it = m_byHandle.find(connHandle);
+        return (it == m_byHandle.end()) ? nullptr : it->second;
+    }
+
+    void unregister(MultiCWebSocket* ws) {
+        if (!ws) return;
+        m_byHandle.erase(ws->connHandle());
+    }
+
+    p2p_platform platform() const { return m_p; }
+
+private:
+    p2p_platform                                  m_p;
+    std::map<void*, MultiCWebSocket*>             m_byHandle;
+};
+
+inline MultiCWebSocket::MultiCWebSocket(p2p_platform platform,
+                                          void* connHandle,
+                                          MultiCWebSocketFactory* factory)
+    : m_p(platform), m_connHandle(connHandle), m_factory(factory) {}
+
+inline MultiCWebSocket::~MultiCWebSocket() {
+    if (m_factory) m_factory->unregister(this);
+    if (m_p.ws_free_connection && m_connHandle)
+        m_p.ws_free_connection(m_connHandle, m_p.platform_ctx);
+}
 
 // ── CHttpClient: IHttpClient backed by C function pointers ──────────────────
 
@@ -193,9 +364,18 @@ struct p2p_context {
     // join while ctrlMu is still alive.
     std::mutex        ctrlMu;
 
-    CWebSocket        ws;
-    CHttpClient       http;
-    StdTimerFactory   timers;
+    // The factory adapter is the WS provider for the C++ core.  When
+    // the platform provides ws_alloc_connection (v2 FFI), we use a
+    // MultiCWebSocketFactory that allocates a fresh per-connection
+    // handle on every create().  Otherwise we fall back to
+    // SingleWebSocketFactory which honors only the first create()
+    // (legacy single-connection FFI).
+    //
+    // Polymorphic via unique_ptr so the choice is made at construction
+    // time and the rest of the core sees IWebSocketFactory uniformly.
+    std::unique_ptr<IWebSocketFactory> wsFactory;
+    CHttpClient            http;
+    StdTimerFactory        timers;
 
     // Arch-review #7: db / appData / controller used to be value
     // members with carefully-ordered declarations.  The controller's
@@ -255,6 +435,17 @@ struct p2p_context {
         void (*on_group_avatar)(const char*, const char*, void*) = nullptr;
         void* group_avatar_ud = nullptr;
 
+        // pv=2 (Causally-Linked Pairwise) UX events — fire from
+        // ChatController's dispatchGroupMessageV2 path when the
+        // receiver hits a gap or surfaces lost messages on a
+        // session reset.
+        void (*on_group_stream_blocked)(const char*, const char*,
+                                          int64_t, int64_t, void*) = nullptr;
+        void* group_stream_blocked_ud = nullptr;
+        void (*on_group_messages_lost)(const char*, const char*,
+                                          int64_t, void*) = nullptr;
+        void* group_messages_lost_ud = nullptr;
+
         void (*on_presence)(const char*, int, void*) = nullptr;
         void* presence_ud = nullptr;
 
@@ -294,13 +485,30 @@ struct p2p_context {
     std::string dataDir;
 
     p2p_context(p2p_platform platform)
-        : ws(platform)
+        : wsFactory(makeWsFactory(platform))
         , http(platform)
         , timers(&ctrlMu)
         , db(std::make_unique<SqlCipherDb>())
         , appData(std::make_unique<AppDataStore>())
-        , controller(std::make_unique<ChatController>(ws, http, timers))
+        , controller(std::make_unique<ChatController>(*wsFactory, http, timers))
     {}
+
+private:
+    // Pick the right factory at construction.  Single-connection
+    // platforms get the legacy SingleWebSocketFactory (returns one
+    // CWebSocket then nullptr); platforms that wired the v2 callbacks
+    // get the MultiCWebSocketFactory which scales out properly.
+    static std::unique_ptr<IWebSocketFactory>
+    makeWsFactory(const p2p_platform& platform) {
+        if (platform.ws_alloc_connection &&
+            platform.ws_free_connection &&
+            platform.ws_open_v2) {
+            return std::make_unique<MultiCWebSocketFactory>(platform);
+        }
+        return std::make_unique<SingleWebSocketFactory>(platform);
+    }
+
+public:
 };
 
 // Scope guard: serializes every public p2p_* entry point.
@@ -391,6 +599,27 @@ static void wire_signals(p2p_context* ctx)
         if (ctx->cb.on_group_avatar) {
             ctx->cb.on_group_avatar(
                 groupId.c_str(), avatarB64.c_str(), ctx->cb.group_avatar_ud);
+        }
+    };
+
+    c.onGroupStreamBlocked = [ctx](const std::string& groupId,
+                                     const std::string& senderPeerId,
+                                     int64_t fromCtr, int64_t toCtr) {
+        if (ctx->cb.on_group_stream_blocked) {
+            ctx->cb.on_group_stream_blocked(
+                groupId.c_str(), senderPeerId.c_str(),
+                fromCtr, toCtr,
+                ctx->cb.group_stream_blocked_ud);
+        }
+    };
+
+    c.onGroupMessagesLost = [ctx](const std::string& groupId,
+                                     const std::string& senderPeerId,
+                                     int64_t count) {
+        if (ctx->cb.on_group_messages_lost) {
+            ctx->cb.on_group_messages_lost(
+                groupId.c_str(), senderPeerId.c_str(), count,
+                ctx->cb.group_messages_lost_ud);
         }
     };
 
@@ -593,6 +822,10 @@ int p2p_set_passphrase_v2(p2p_context* ctx, const char* passphrase)
             // key is also recovered.
             ctx->appData->bind(*ctx->db);
             ctx->appData->setEncryptionKey(dbKey);
+            // Hand the appData pointer to ChatController so the v2
+            // group sender path can persist its monotonic counter +
+            // sealed-envelope replay cache.
+            ctx->controller->setAppDataStore(ctx->appData.get());
         } else {
             rc = -1;
         }
@@ -883,6 +1116,41 @@ void p2p_add_send_relay(p2p_context* ctx, const char* url)
     ctx->controller->relay().addSendRelay(url ? std::string(url) : std::string());
 }
 
+void p2p_add_subscribe_relay(p2p_context* ctx, const char* url)
+{
+    if (!ctx || !url) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller->relay().addSubscribeRelay(std::string(url));
+}
+
+void p2p_clear_subscribe_relays(p2p_context* ctx)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller->relay().clearSubscribeRelays();
+}
+
+void p2p_set_parallel_fan_out(p2p_context* ctx, int enabled)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller->relay().setParallelFanOut(enabled != 0);
+}
+
+void p2p_set_parallel_fan_out_k(p2p_context* ctx, int k)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller->relay().setParallelFanOutK(k);
+}
+
+void p2p_set_multi_hop_enabled(p2p_context* ctx, int enabled)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller->relay().setMultiHopEnabled(enabled != 0);
+}
+
 void p2p_set_privacy_level(p2p_context* ctx, int level)
 {
     if (!ctx) return;
@@ -916,18 +1184,44 @@ void p2p_wake_for_push(p2p_context* ctx)
 
 // ── Platform → Core events ──────────────────────────────────────────────────
 
+namespace {
+
+// Find the IWebSocket the legacy v1 callbacks should dispatch to.
+// Only meaningful when ctx is using the SingleWebSocketFactory; the
+// multi-WS path uses p2p_ws_on_*_v2 with explicit conn_handle.
+inline IWebSocket* primaryWsForLegacyCallback(p2p_context* ctx) {
+    if (!ctx || !ctx->wsFactory) return nullptr;
+    auto* single = dynamic_cast<SingleWebSocketFactory*>(ctx->wsFactory.get());
+    return single ? static_cast<IWebSocket*>(single->active()) : nullptr;
+}
+
+// Find the IWebSocket for a v2 callback by conn_handle.  Returns null
+// for unknown handles (defensive: a free + late event race shouldn't
+// crash).  Only meaningful when ctx is using the MultiCWebSocketFactory.
+inline IWebSocket* wsByHandle(p2p_context* ctx, void* connHandle) {
+    if (!ctx || !ctx->wsFactory || !connHandle) return nullptr;
+    auto* multi = dynamic_cast<MultiCWebSocketFactory*>(ctx->wsFactory.get());
+    return multi ? static_cast<IWebSocket*>(multi->find(connHandle)) : nullptr;
+}
+
+}  // namespace
+
 void p2p_ws_on_connected(p2p_context* ctx)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    if (ctx->ws.onConnected) ctx->ws.onConnected();
+    if (auto* ws = primaryWsForLegacyCallback(ctx); ws && ws->onConnected) {
+        ws->onConnected();
+    }
 }
 
 void p2p_ws_on_disconnected(p2p_context* ctx)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    if (ctx->ws.onDisconnected) ctx->ws.onDisconnected();
+    if (auto* ws = primaryWsForLegacyCallback(ctx); ws && ws->onDisconnected) {
+        ws->onDisconnected();
+    }
 }
 
 void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len)
@@ -942,10 +1236,10 @@ void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len)
     if (len < 0) return;
     if (!data && len > 0) return;
     P2P_CTX_GUARD(ctx);
-    if (ctx->ws.onBinaryMessage) {
+    if (auto* ws = primaryWsForLegacyCallback(ctx); ws && ws->onBinaryMessage) {
         Bytes buf;
         if (data && len > 0) buf.assign(data, data + len);
-        ctx->ws.onBinaryMessage(buf);
+        ws->onBinaryMessage(buf);
     }
 }
 
@@ -953,8 +1247,52 @@ void p2p_ws_on_text(p2p_context* ctx, const char* message)
 {
     if (!ctx) return;
     P2P_CTX_GUARD(ctx);
-    if (ctx->ws.onTextMessage)
-        ctx->ws.onTextMessage(message ? std::string(message) : std::string());
+    if (auto* ws = primaryWsForLegacyCallback(ctx); ws && ws->onTextMessage) {
+        ws->onTextMessage(message ? std::string(message) : std::string());
+    }
+}
+
+// ── v2 multi-connection event callbacks ─────────────────────────────────────
+
+void p2p_ws_on_connected_v2(p2p_context* ctx, void* conn_handle)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    if (auto* ws = wsByHandle(ctx, conn_handle); ws && ws->onConnected) {
+        ws->onConnected();
+    }
+}
+
+void p2p_ws_on_disconnected_v2(p2p_context* ctx, void* conn_handle)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    if (auto* ws = wsByHandle(ctx, conn_handle); ws && ws->onDisconnected) {
+        ws->onDisconnected();
+    }
+}
+
+void p2p_ws_on_binary_v2(p2p_context* ctx, void* conn_handle,
+                          const uint8_t* data, int len)
+{
+    if (!ctx) return;
+    if (len < 0) return;
+    if (!data && len > 0) return;
+    P2P_CTX_GUARD(ctx);
+    if (auto* ws = wsByHandle(ctx, conn_handle); ws && ws->onBinaryMessage) {
+        Bytes buf;
+        if (data && len > 0) buf.assign(data, data + len);
+        ws->onBinaryMessage(buf);
+    }
+}
+
+void p2p_ws_on_text_v2(p2p_context* ctx, void* conn_handle, const char* message)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    if (auto* ws = wsByHandle(ctx, conn_handle); ws && ws->onTextMessage) {
+        ws->onTextMessage(message ? std::string(message) : std::string());
+    }
 }
 
 void p2p_http_response(p2p_context* ctx, int request_id,
@@ -1050,6 +1388,24 @@ void p2p_set_on_group_avatar(p2p_context* ctx,
     P2P_CTX_GUARD(ctx);
     ctx->cb.on_group_avatar = cb;
     ctx->cb.group_avatar_ud = ud;
+}
+
+void p2p_set_on_group_stream_blocked(p2p_context* ctx,
+    void (*cb)(const char*, const char*, int64_t, int64_t, void*), void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_group_stream_blocked = cb;
+    ctx->cb.group_stream_blocked_ud = ud;
+}
+
+void p2p_set_on_group_messages_lost(p2p_context* ctx,
+    void (*cb)(const char*, const char*, int64_t, void*), void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_group_messages_lost = cb;
+    ctx->cb.group_messages_lost_ud = ud;
 }
 
 void p2p_set_on_file_progress(p2p_context* ctx,

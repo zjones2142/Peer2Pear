@@ -430,3 +430,345 @@ TEST(AppDataStore, EmptyPeerIdGuards) {
     EXPECT_FALSE(env.store->deleteMessages(""));
     EXPECT_FALSE(env.store->deleteContact(""));
 }
+
+// ── Phase 1: Causally-Linked Pairwise schema ────────────────────────────────
+//
+// These tests pin the CRUD surface for the three new tables that
+// back the redesigned group-messaging protocol:
+//   group_replay_cache  — sender's already-sent envelopes (7d TTL)
+//   group_chain_state   — receiver's per-(group, sender) state machine
+//   group_msg_buffer    — out-of-order msgs held during a gap
+
+namespace {
+
+Bytes makeSessionId(uint8_t marker) {
+    return Bytes(8, marker);
+}
+Bytes makePrevHash(uint8_t marker) {
+    return Bytes(16, marker);
+}
+
+}  // namespace
+
+TEST(AppDataStore, ReplayCacheRoundTrip) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    const std::string peer = "bob";
+    const std::string gid  = "group1";
+    const Bytes sid = makeSessionId(0xA1);
+    const Bytes env5 = {0x01, 0x02, 0x03, 0x04, 0x05};
+
+    ASSERT_TRUE(env.store->addReplayCacheEntry(peer, gid, sid, 5, env5, 1000));
+    EXPECT_EQ(env.store->loadReplayCacheEntry(peer, gid, sid, 5), env5);
+    EXPECT_TRUE(env.store->loadReplayCacheEntry(peer, gid, sid, 999).empty())
+        << "miss returns empty Bytes, never throws";
+
+    EXPECT_TRUE(env.store->dropReplayCacheEntry(peer, gid, sid, 5));
+    EXPECT_TRUE(env.store->loadReplayCacheEntry(peer, gid, sid, 5).empty())
+        << "drop should remove the cached envelope";
+}
+
+TEST(AppDataStore, ReplayCacheRangeStreamsInCounterOrder) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const std::string peer = "bob";
+    const std::string gid  = "group1";
+    const Bytes sid = makeSessionId(0xB2);
+
+    // Insert out-of-order, expect ascending iteration.
+    env.store->addReplayCacheEntry(peer, gid, sid, 7, {0x07}, 1000);
+    env.store->addReplayCacheEntry(peer, gid, sid, 5, {0x05}, 1000);
+    env.store->addReplayCacheEntry(peer, gid, sid, 6, {0x06}, 1000);
+    env.store->addReplayCacheEntry(peer, gid, sid, 9, {0x09}, 1000);  // outside range
+
+    std::vector<int64_t> seenCounters;
+    std::vector<Bytes> seenBytes;
+    env.store->loadReplayCacheRange(peer, gid, sid, 5, 7,
+        [&](int64_t c, const Bytes& b) {
+            seenCounters.push_back(c);
+            seenBytes.push_back(b);
+        });
+
+    ASSERT_EQ(seenCounters.size(), 3u);
+    EXPECT_EQ(seenCounters[0], 5);
+    EXPECT_EQ(seenCounters[1], 6);
+    EXPECT_EQ(seenCounters[2], 7);
+    EXPECT_EQ(seenBytes[0], (Bytes{0x05}));
+    EXPECT_EQ(seenBytes[2], (Bytes{0x07}));
+}
+
+TEST(AppDataStore, ReplayCacheIsolatedByPeerAndSession) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid1 = makeSessionId(0xC3);
+    const Bytes sid2 = makeSessionId(0xD4);
+
+    env.store->addReplayCacheEntry("bob",   "g", sid1, 5, {0x10}, 1000);
+    env.store->addReplayCacheEntry("carol", "g", sid1, 5, {0x20}, 1000);
+    env.store->addReplayCacheEntry("bob",   "g", sid2, 5, {0x30}, 1000);
+
+    EXPECT_EQ(env.store->loadReplayCacheEntry("bob",   "g", sid1, 5), (Bytes{0x10}));
+    EXPECT_EQ(env.store->loadReplayCacheEntry("carol", "g", sid1, 5), (Bytes{0x20}));
+    EXPECT_EQ(env.store->loadReplayCacheEntry("bob",   "g", sid2, 5), (Bytes{0x30}))
+        << "different session_id is a different cache slot";
+}
+
+TEST(AppDataStore, ReplayCachePurgeOlderThanCutoff) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0xE5);
+
+    // Three rows at increasing ages.
+    env.store->addReplayCacheEntry("p", "g", sid, 1, {0x01}, /*sent_at=*/100);
+    env.store->addReplayCacheEntry("p", "g", sid, 2, {0x02}, /*sent_at=*/200);
+    env.store->addReplayCacheEntry("p", "g", sid, 3, {0x03}, /*sent_at=*/300);
+
+    // Cutoff at 250 should remove rows with sent_at < 250 (rows 1 and 2).
+    const int dropped = env.store->purgeReplayCacheOlderThan(250);
+    EXPECT_EQ(dropped, 2);
+    EXPECT_TRUE(env.store->loadReplayCacheEntry("p", "g", sid, 1).empty());
+    EXPECT_TRUE(env.store->loadReplayCacheEntry("p", "g", sid, 2).empty());
+    EXPECT_FALSE(env.store->loadReplayCacheEntry("p", "g", sid, 3).empty());
+}
+
+TEST(AppDataStore, ChainStateRoundTrip) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::ChainState s;
+    s.sessionId    = makeSessionId(0xF6);
+    s.expectedNext = 47;
+    s.lastHash     = makePrevHash(0x42);
+    s.blockedSince = 1700000000;
+    s.gapFrom      = 5;
+    s.gapTo        = 10;
+    s.lastRetryAt  = 1700000010;
+    s.retryCount   = 3;
+
+    ASSERT_TRUE(env.store->saveChainState("group1", "alice", s));
+
+    AppDataStore::ChainState loaded;
+    ASSERT_TRUE(env.store->loadChainState("group1", "alice", loaded));
+    EXPECT_EQ(loaded.sessionId,    s.sessionId);
+    EXPECT_EQ(loaded.expectedNext, 47);
+    EXPECT_EQ(loaded.lastHash,     s.lastHash);
+    EXPECT_EQ(loaded.blockedSince, 1700000000);
+    EXPECT_EQ(loaded.gapFrom,      5);
+    EXPECT_EQ(loaded.gapTo,        10);
+    EXPECT_EQ(loaded.lastRetryAt,  1700000010);
+    EXPECT_EQ(loaded.retryCount,   3);
+}
+
+TEST(AppDataStore, ChainStateUpsertsInPlace) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+
+    AppDataStore::ChainState s;
+    s.sessionId = makeSessionId(0x07);
+    s.expectedNext = 1;
+    env.store->saveChainState("g", "alice", s);
+
+    s.expectedNext = 5;  // simulate after delivering 4 messages
+    s.lastHash     = makePrevHash(0x88);
+    env.store->saveChainState("g", "alice", s);
+
+    AppDataStore::ChainState loaded;
+    ASSERT_TRUE(env.store->loadChainState("g", "alice", loaded));
+    EXPECT_EQ(loaded.expectedNext, 5);
+    EXPECT_EQ(loaded.lastHash,     makePrevHash(0x88));
+}
+
+TEST(AppDataStore, ChainStateMissReturnsFalse) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    AppDataStore::ChainState loaded;
+    EXPECT_FALSE(env.store->loadChainState("never", "anyone", loaded));
+}
+
+TEST(AppDataStore, ChainStateDropRemovesRow) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    AppDataStore::ChainState s;
+    s.sessionId = makeSessionId(0x09);
+    env.store->saveChainState("g", "alice", s);
+
+    EXPECT_TRUE(env.store->dropChainState("g", "alice"));
+
+    AppDataStore::ChainState loaded;
+    EXPECT_FALSE(env.store->loadChainState("g", "alice", loaded))
+        << "dropChainState must remove the row";
+}
+
+TEST(AppDataStore, BufferRoundTripPreservesContent) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0x11);
+    const Bytes ph  = makePrevHash(0x22);
+
+    const Bytes envHash = makePrevHash(0xEE);
+    ASSERT_TRUE(env.store->addBufferEntry(
+        "g", "alice", sid, /*counter=*/7, ph, envHash, /*msgId=*/"abc-uuid",
+        /*body=*/"hello world", /*senderName=*/"Alice", /*receivedAt=*/1234));
+
+    std::vector<AppDataStore::BufferedMessage> rows;
+    env.store->loadBufferRange("g", "alice", sid, 7, 7,
+        [&](const AppDataStore::BufferedMessage& m) { rows.push_back(m); });
+
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].counter,        7);
+    EXPECT_EQ(rows[0].prevHash,       ph);
+    EXPECT_EQ(rows[0].sealedEnvHash,  envHash);
+    EXPECT_EQ(rows[0].msgId,          "abc-uuid");
+    EXPECT_EQ(rows[0].body,           "hello world");
+    EXPECT_EQ(rows[0].senderName,     "Alice");
+    EXPECT_EQ(rows[0].receivedAt,     1234);
+}
+
+TEST(AppDataStore, BufferRangeIsCounterAscending) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0x33);
+
+    env.store->addBufferEntry("g", "a", sid, 9, {}, {}, "m9", "i", "Alice", 0);
+    env.store->addBufferEntry("g", "a", sid, 6, {}, {}, "m6", "f", "Alice", 0);
+    env.store->addBufferEntry("g", "a", sid, 7, {}, {}, "m7", "g", "Alice", 0);
+
+    std::vector<int64_t> seen;
+    env.store->loadBufferRange("g", "a", sid, 5, 10,
+        [&](const AppDataStore::BufferedMessage& m) { seen.push_back(m.counter); });
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_EQ(seen[0], 6);
+    EXPECT_EQ(seen[1], 7);
+    EXPECT_EQ(seen[2], 9);
+}
+
+TEST(AppDataStore, BufferDropRangeRemovesOnlyRequestedCounters) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0x44);
+
+    env.store->addBufferEntry("g", "a", sid, 5, {}, {}, "m5", "five",  "A", 0);
+    env.store->addBufferEntry("g", "a", sid, 6, {}, {}, "m6", "six",   "A", 0);
+    env.store->addBufferEntry("g", "a", sid, 7, {}, {}, "m7", "seven", "A", 0);
+
+    EXPECT_EQ(env.store->dropBufferRange("g", "a", sid, 5, 6), 2);
+
+    std::vector<AppDataStore::BufferedMessage> remaining;
+    env.store->loadBufferRange("g", "a", sid, 0, 100,
+        [&](const AppDataStore::BufferedMessage& m) { remaining.push_back(m); });
+    ASSERT_EQ(remaining.size(), 1u);
+    EXPECT_EQ(remaining[0].counter, 7);
+}
+
+TEST(AppDataStore, BufferDropForSessionWipesOnlyOldSession) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sidOld = makeSessionId(0x55);
+    const Bytes sidNew = makeSessionId(0x66);
+
+    env.store->addBufferEntry("g", "a", sidOld, 1, {}, {}, "mo1", "old1", "A", 0);
+    env.store->addBufferEntry("g", "a", sidOld, 2, {}, {}, "mo2", "old2", "A", 0);
+    env.store->addBufferEntry("g", "a", sidNew, 1, {}, {}, "mn1", "new1", "A", 0);
+
+    const int wiped = env.store->dropBufferForSession("g", "a", sidOld);
+    EXPECT_EQ(wiped, 2);
+
+    // sidNew rows should survive.
+    std::vector<AppDataStore::BufferedMessage> survivors;
+    env.store->loadBufferRange("g", "a", sidNew, 0, 100,
+        [&](const AppDataStore::BufferedMessage& m) { survivors.push_back(m); });
+    ASSERT_EQ(survivors.size(), 1u);
+    EXPECT_EQ(survivors[0].body, "new1");
+}
+
+TEST(AppDataStore, BufferBodyIsEncryptedAtRest) {
+    // The buffer's `body` column must use field-level encryption so a
+    // raw SQLCipher dump (page-level decrypted) doesn't leak plaintext.
+    // Same defense the messages.text column already passes.
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0x77);
+    const std::string secret = "diary entry: I love peer2pear";
+
+    env.store->addBufferEntry("g", "a", sid, 1, {}, {}, "m1", secret, "Alice", 0);
+
+    SqlCipherQuery raw(env.db->handle());
+    raw.prepare("SELECT body FROM group_msg_buffer WHERE group_id='g';");
+    ASSERT_TRUE(raw.exec());
+    ASSERT_TRUE(raw.next());
+    const std::string stored = raw.valueText(0);
+    EXPECT_NE(stored, secret) << "body must not appear plaintext at rest";
+    EXPECT_EQ(stored.rfind("ENC", 0), 0u)
+        << "body should carry the ENC: encryption-tag prefix";
+}
+
+// ── group_send_state ────────────────────────────────────────────────────────
+
+TEST(AppDataStore, SendStateMissReturnsDefault) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    AppDataStore::SendState s{42, makePrevHash(0xFF)};  // dirty initial
+    EXPECT_TRUE(env.store->loadSendState(
+        "bob", "g", makeSessionId(0x01), s));
+    EXPECT_EQ(s.nextCounter, 1) << "missing row defaults to nextCounter=1";
+    EXPECT_TRUE(s.lastHash.empty()) << "missing row defaults to empty lastHash";
+}
+
+TEST(AppDataStore, SendStateRoundTrip) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0x88);
+    const Bytes hash = makePrevHash(0xAB);
+
+    AppDataStore::SendState s;
+    s.nextCounter = 47;
+    s.lastHash    = hash;
+    ASSERT_TRUE(env.store->saveSendState("bob", "g", sid, s));
+
+    AppDataStore::SendState loaded;
+    ASSERT_TRUE(env.store->loadSendState("bob", "g", sid, loaded));
+    EXPECT_EQ(loaded.nextCounter, 47);
+    EXPECT_EQ(loaded.lastHash,    hash);
+}
+
+TEST(AppDataStore, SendStateUpsertsInPlace) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0x99);
+
+    AppDataStore::SendState s;
+    s.nextCounter = 1;
+    env.store->saveSendState("bob", "g", sid, s);
+
+    s.nextCounter = 2;
+    s.lastHash    = makePrevHash(0xCC);
+    env.store->saveSendState("bob", "g", sid, s);
+
+    AppDataStore::SendState loaded;
+    env.store->loadSendState("bob", "g", sid, loaded);
+    EXPECT_EQ(loaded.nextCounter, 2);
+    EXPECT_EQ(loaded.lastHash,    makePrevHash(0xCC));
+}
+
+TEST(AppDataStore, SendStateIsolatedByPeerAndSession) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid1 = makeSessionId(0x10);
+    const Bytes sid2 = makeSessionId(0x20);
+
+    AppDataStore::SendState s;
+    s.nextCounter = 5;
+    env.store->saveSendState("bob",   "g", sid1, s);
+    s.nextCounter = 10;
+    env.store->saveSendState("carol", "g", sid1, s);
+    s.nextCounter = 99;
+    env.store->saveSendState("bob",   "g", sid2, s);
+
+    AppDataStore::SendState a, b, c;
+    env.store->loadSendState("bob",   "g", sid1, a);
+    env.store->loadSendState("carol", "g", sid1, b);
+    env.store->loadSendState("bob",   "g", sid2, c);
+    EXPECT_EQ(a.nextCounter, 5);
+    EXPECT_EQ(b.nextCounter, 10);
+    EXPECT_EQ(c.nextCounter, 99) << "different session_id is a different row";
+}
+
+TEST(AppDataStore, SendStateDropRemovesRow) {
+    auto env = makeEnv(randomKey32(), randomKey32());
+    const Bytes sid = makeSessionId(0x11);
+
+    AppDataStore::SendState s;
+    s.nextCounter = 7;
+    env.store->saveSendState("bob", "g", sid, s);
+
+    EXPECT_TRUE(env.store->dropSendState("bob", "g", sid));
+
+    AppDataStore::SendState loaded;
+    env.store->loadSendState("bob", "g", sid, loaded);
+    EXPECT_EQ(loaded.nextCounter, 1)
+        << "drop should remove the row; subsequent load returns default";
+}

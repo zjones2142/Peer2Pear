@@ -84,6 +84,12 @@ bool SessionManager::hasSession(const std::string& peerIdB64u) const {
     return !m_store.loadSession(peerIdB64u).empty();
 }
 
+Bytes SessionManager::sessionIdFor(const std::string& peerIdB64u) {
+    RatchetSession* s = getSession(peerIdB64u);
+    if (!s || !s->isValid()) return {};
+    return s->sessionId();
+}
+
 void SessionManager::deleteSession(const std::string& peerIdB64u) {
     m_sessions.erase(peerIdB64u);
     m_store.deleteSession(peerIdB64u);

@@ -165,6 +165,7 @@ struct GroupConversationView: View {
     @State private var messageText = ""
     @State private var showRoster = false
     @State private var showFilePicker = false
+    @State private var dismissedLostEventId: UUID?
 
     private var group: P2PGroup? { client.groups[groupId] }
 
@@ -172,11 +173,50 @@ struct GroupConversationView: View {
         client.groupMessages.filter { $0.groupId == groupId }
     }
 
+    /// pv=2: any blocked senders for this group → banner state.
+    /// We dedupe by senderPeerId; multiple stalls on the same sender
+    /// just update the range in place via the @Published map.
+    private var blockedSenders: [(sender: String, range: Peer2PearClient.BlockedRange)] {
+        guard let map = client.groupBlockedStreams[groupId] else { return [] }
+        return map.map { (sender: $0.key, range: $0.value) }
+                  .sorted { $0.sender < $1.sender }
+    }
+
+    /// pv=2: oldest unhandled lost-messages event for this group, if any.
+    private var pendingLostEvent: Peer2PearClient.LostMessagesEvent? {
+        client.groupLostMessages
+            .first { $0.groupId == groupId && $0.id != dismissedLostEventId }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
+            // Per-sender blocked banner.  Surfaces the gap range so
+            // power users can see "waiting for messages 47–52 from X."
+            // ChatController already fired a gap_request to the
+            // sender; this is purely informational.
+            if !blockedSenders.isEmpty {
+                blockedBanner
+            }
             messagesScroll
             Divider()
             inputBar
+        }
+        .alert(
+            "Some messages were lost",
+            isPresented: Binding(
+                get: { pendingLostEvent != nil },
+                set: { if !$0 { dismissedLostEventId = pendingLostEvent?.id } }
+            ),
+            presenting: pendingLostEvent
+        ) { _ in
+            Button("OK", role: .cancel) {
+                if let ev = pendingLostEvent {
+                    dismissedLostEventId = ev.id
+                    client.groupLostMessages.removeAll { $0.id == ev.id }
+                }
+            }
+        } message: { ev in
+            Text("\(ev.count) message\(ev.count == 1 ? "" : "s") from this group could not be delivered. They were sent before the encrypted session was reset and can no longer be recovered.")
         }
         .navigationTitle(group?.name ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
@@ -212,6 +252,51 @@ struct GroupConversationView: View {
                       allowsMultipleSelection: false) { result in
             handleFilePick(result: result)
         }
+    }
+
+    /// Banner surfaced at the top of the conversation while ANY
+    /// sender's stream is blocked at a gap.  ChatController has
+    /// already fired gap_request(s); the banner is purely
+    /// informational ("waiting for X's missing messages...").  Once
+    /// each gap fills, the v2 dispatcher delivers the drained
+    /// messages and the on_group_message handler clears the entry —
+    /// the banner shrinks / disappears automatically.
+    @ViewBuilder private var blockedBanner: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(blockedSenders, id: \.sender) { entry in
+                HStack(spacing: 8) {
+                    Image(systemName: "hourglass")
+                        .foregroundStyle(.orange)
+                    let label = entry.range.from == entry.range.to
+                        ? "Waiting for message \(entry.range.from)"
+                        : "Waiting for messages \(entry.range.from)–\(entry.range.to)"
+                    Text("\(label) from \(senderShortName(entry.sender))…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .background(Color(.systemBackground).opacity(0.95))
+        .overlay(
+            Rectangle()
+                .frame(height: 0.5)
+                .foregroundStyle(Color(.separator)),
+            alignment: .bottom
+        )
+    }
+
+    /// Best display name for a peer ID.  Prefers a saved contact
+    /// nickname; falls back to the public-key prefix.  Same convention
+    /// as ChatRow / GroupRow.
+    private func senderShortName(_ peerId: String) -> String {
+        if let contact = client.contacts.first(where: { $0.peerId == peerId }),
+           !contact.name.isEmpty {
+            return contact.name
+        }
+        return String(peerId.prefix(8)) + "…"
     }
 
     @ViewBuilder private var messagesScroll: some View {

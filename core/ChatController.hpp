@@ -4,6 +4,8 @@
 class QuicConnection;  // forward declaration — full include in .cpp
 #endif
 
+class AppDataStore;
+
 // Qt is not part of ChatController's public surface.  All types are std::*
 // (string / vector / map / set) or Bytes (std::vector<uint8_t>).  desktop/
 // still uses Qt for UI but calls the std-typed surface with
@@ -34,7 +36,7 @@ class QuicConnection;  // forward declaration — full include in .cpp
 
 class ChatController {
 public:
-    explicit ChatController(IWebSocket& ws, IHttpClient& http,
+    explicit ChatController(IWebSocketFactory& wsFactory, IHttpClient& http,
                             ITimerFactory& timers);
 
     // Zero TURN creds + key material on destruction.
@@ -51,6 +53,14 @@ public:
     void setPassphrase(const std::string& pass, const Bytes& identityKey);
     void setRelayUrl(const std::string& url);
     void setDatabase(SqlCipherDb& db);
+
+    /// Wire the per-user app data store so the v2 group sender path
+    /// can persist its monotonic counter (group_send_state) and cache
+    /// sealed envelopes for replay (group_replay_cache).  Pointer is
+    /// not owned; the caller (p2p_context) keeps it alive for the
+    /// life of the ChatController.  Optional — the legacy v1 group
+    /// path works without it.
+    void setAppDataStore(AppDataStore* appData);
     std::string myIdB64u() const;
     const Bytes& identityPub() const { return m_crypto.identityPub(); }
 
@@ -246,6 +256,27 @@ public:
                        const std::string& msgId)>
         onGroupMessageReceived;
 
+    /// pv=2 only: a stream from `senderPeerId` in `groupId` is blocked
+    /// because messages [gapFrom, gapTo] are missing.  UI surfaces
+    /// "waiting for messages from X..." banner; ChatController has
+    /// already fired a gap_request, so the caller doesn't need to
+    /// (callback is purely informational).  Fires every time the
+    /// blocked range grows (additional out-of-order arrivals).
+    std::function<void(const std::string& groupId,
+                       const std::string& senderPeerId,
+                       int64_t gapFrom, int64_t gapTo)>
+        onGroupStreamBlocked;
+
+    /// pv=2 only: `count` buffered messages from `senderPeerId` in
+    /// `groupId` were dropped during a session reset (they came in
+    /// after a gap that never closed before the sender's session
+    /// rolled over).  UI surfaces "K messages lost during reconnection"
+    /// once per reset event.
+    std::function<void(const std::string& groupId,
+                       const std::string& senderPeerId,
+                       int64_t count)>
+        onGroupMessagesLost;
+
     std::function<void(const std::string& from, const std::string& groupId,
                        const std::string& groupName, const std::vector<std::string>& members,
                        int64_t tsSecs, const std::string& msgId)>
@@ -314,12 +345,16 @@ private:
     // session decrypt.  The file_key handler installs it as the file's
     // AEAD key; other handlers ignore it.  Passed by value so the handler
     // can zero it on exit.
+    /// `outerSealed` is the sender's sealed-envelope bytes
+    /// (post-routing-strip).  Used by the pv=2 group_msg branch to
+    /// chain the prev_hash; ignored by every other type.
     void dispatchSealedPayload(const nlohmann::json& o,
                                 const std::string& senderId,
                                 int64_t tsSecs,
                                 const std::string& msgId,
                                 const std::string& via,
-                                Bytes msgKey);
+                                Bytes msgKey,
+                                const Bytes& outerSealed = Bytes{});
 
     // Decrypt a `group_rename` / `group_avatar` / `group_leave` /
     // `group_member_update` envelope and return the parsed inner JSON,
@@ -358,7 +393,12 @@ private:
     // open-code its own seal-then-dispatch inline; sendSealedPayload
     // is now the single outbound code path for everything that goes
     // through the ratchet.
-    void sendSealedPayload(const std::string& peerIdB64u,
+    /// Returns the sealed envelope bytes that were dispatched (or
+    /// empty Bytes when sealing failed and nothing went on the wire).
+    /// The pv=2 group sender uses the return value to compute the
+    /// prev_hash chain and populate the group_replay_cache; legacy
+    /// callers ignore it.
+    Bytes sendSealedPayload(const std::string& peerIdB64u,
                             const nlohmann::json& payload,
                             SendMode mode = SendMode::RelayOnly);
 
@@ -417,6 +457,7 @@ private:
     std::unique_ptr<SessionStore>   m_sessionStore;
     std::unique_ptr<SessionManager> m_sessionMgr;
     SqlCipherDb* m_dbPtr = nullptr;  // kept for group / file / seen-envelopes tables
+    AppDataStore* m_appData = nullptr;  // optional, for v2 group send path
 
     std::vector<std::string> m_selfKeys;
 

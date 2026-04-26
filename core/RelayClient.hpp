@@ -6,12 +6,15 @@
 #include "ITimer.hpp"
 #include "IWebSocket.hpp"
 
+#include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 class CryptoEngine;
@@ -33,7 +36,13 @@ class CryptoEngine;
 class RelayClient {
 public:
 
-    RelayClient(IWebSocket& ws, IHttpClient& http,
+    // Constructed with an IWebSocketFactory: the primary subscribe
+    // connection is created via wsFactory.create() at construction
+    // time, and additional subscribe relays (added via
+    // addSubscribeRelay) come from the same factory.  This unifies WS
+    // ownership in the C++ core — platform layers provide a factory
+    // implementation instead of a single IWebSocket reference.
+    RelayClient(IWebSocketFactory& wsFactory, IHttpClient& http,
                 ITimerFactory& timers, CryptoEngine* crypto);
     ~RelayClient();
 
@@ -48,9 +57,19 @@ public:
     void disconnectFromRelay();
     bool isConnected() const;
 
+    // Tags an envelope's logical payload class so the transport can
+    // apply per-class policy.  Today only parallel fan-out cares about
+    // this — file chunks are large enough that broadcasting each one
+    // to multiple relays burns bandwidth disproportionate to the
+    // redundancy gain, so chunks stay on the single-relay path even
+    // when fan-out is enabled for messages.
+    enum class TrafficClass { Message, FileChunk };
+
     // Send a sealed envelope anonymously via HTTP POST /v1/send.
     // The recipient is parsed from the envelope header (bytes 1-32).
-    void sendEnvelope(const Bytes& sealedEnvelope);
+    // `cls` selects per-class transport policy; defaults to Message.
+    void sendEnvelope(const Bytes& sealedEnvelope,
+                      TrafficClass cls = TrafficClass::Message);
 
     // Presence: subscribe to online/offline updates for a set of peers.
     void subscribePresence(const std::vector<std::string>& peerIds);
@@ -77,10 +96,61 @@ public:
     void setMultiHopEnabled(bool enabled);
     void refreshRelayInfo();
 
-    /// Set the privacy level:
-    ///   0 = Standard:  padding only (default)
-    ///   1 = Enhanced:  + jitter (50-300ms) + cover traffic (30s) + multi-relay rotation
-    ///   2 = Maximum:   + multi-hop forwarding + high-frequency cover traffic (10s)
+    // ── Multi-relay subscribe (Phase 0a Milestone 2 — receive-side redundancy)
+    //
+    // Wire a factory before the first connectToRelay() call so RelayClient
+    // can spawn additional WS instances ("slaves") that each subscribe to
+    // a different relay URL.  Together with parallel send fan-out, this
+    // delivers true redundancy: a sender can post to N relays, and a
+    // receiver can listen on those same N relays — one being down doesn't
+    // drop delivery.
+    //
+    // The primary IWebSocket passed to the constructor handles m_relayUrl
+    // (existing behavior).  Slaves handle every URL added via
+    // addSubscribeRelay().  All inbound binary frames flow through the
+    // same dedup-filtered onWsBinaryMessage path, so duplicate envelopes
+    // delivered through multiple relays are dropped before reaching UI.
+    //
+    // Slaves are created via the same IWebSocketFactory that produced
+    // the primary.  When the factory's create() returns nullptr (e.g.,
+    // a platform shim that doesn't yet support multi-WS), addSubscribeRelay
+    // logs a warn and returns — keeps platform layers that haven't
+    // shipped multi-WS support yet from silently breaking.
+    void addSubscribeRelay(const std::string& url);
+    void clearSubscribeRelays();
+
+    // ── Parallel fan-out (redundancy, NOT anonymity) ────────────────────────
+    //
+    // Distinct from `setMultiHopEnabled` (which onion-routes one envelope
+    // through a chain of relays for unlinkability).  Parallel fan-out
+    // posts the SAME sealed envelope to multiple configured relays
+    // simultaneously so a recipient's mailbox is replicated across them
+    // and one relay being unreachable / blocked doesn't drop the message.
+    //
+    // Per-class policy: file chunks (TrafficClass::FileChunk) skip the
+    // fan-out branch even when enabled — at 240 KB/chunk × hundreds of
+    // chunks per file, the bandwidth multiplier defeats the redundancy
+    // benefit.  Messages and control envelopes pay the small N× cost.
+    //
+    // Receive-side dedup (BLAKE2b-128 of the sealed bytes) drops
+    // duplicates that arrive when the recipient subscribes to multiple
+    // of the same relays — guards against double-delivery to UI
+    // regardless of which side configured the redundancy.
+    void setParallelFanOut(bool enabled);
+
+    // K = 0 means "all configured send relays" (full broadcast).
+    // K > 0 picks K random relays uniformly without replacement;
+    // values >= m_sendRelays.size() collapse to "all".
+    void setParallelFanOutK(int k);
+
+    /// Set the privacy level (preset matrix over the four orthogonal
+    /// dials: jitter, cover traffic, parallel fan-out, multi-hop).
+    ///   0 = Standard:  padding only — no jitter, no cover, no multi-relay
+    ///   1 = Enhanced:  jitter (50-300ms) + cover (30s) + parallel fan-out (all configured)
+    ///   2 = Maximum:   jitter (100-500ms) + cover (10s) + parallel fan-out + multi-hop
+    /// Parallel fan-out and multi-hop are independent in spec but
+    /// multi-hop wins in the send dispatcher when both are enabled
+    /// (see sendEnvelope).
     void setPrivacyLevel(int level);
 
     // ── Event callbacks — set from outside before connecting ─────────────
@@ -106,11 +176,45 @@ private:
     void scheduleReconnect();
     void processRetryQueue();
 
+    // ── Slave subscribe state ──────────────────────────────────────────────
+    // A Slave is a secondary WS subscribe connection separate from the
+    // primary m_ws.  Same auth lifecycle, same reconnect-with-backoff,
+    // but binary frames feed into onWsBinaryMessage so dedup catches
+    // any duplicates delivered through multiple relays.
+    struct Slave {
+        std::string             url;
+        std::unique_ptr<IWebSocket> ws;
+        std::unique_ptr<ITimer> reconnectTimer;
+        bool                    authenticated         = false;
+        bool                    intentionalDisconnect = false;
+        int                     reconnectAttempt      = 0;
+    };
+
+    void connectSlave(Slave& s);
+    void onSlaveConnected(Slave& s);
+    void onSlaveDisconnected(Slave& s);
+    void onSlaveTextMessage(Slave& s, const std::string& message);
+    void scheduleSlaveReconnect(Slave& s);
+    void authenticateOnSlave(Slave& s);
+
     void sendCoverEnvelope();
     void scheduleCoverTimer();
     void onRealActivity();
 
     std::string pickSendRelay();
+
+    // Pick K relays from m_sendRelays without replacement.  K==0 or
+    // K >= size() returns the full list.  Used by parallel fan-out.
+    std::vector<std::string> pickKSendRelays(int k) const;
+
+    // BLAKE2b-128 of the sealed envelope bytes.  Stable across relays
+    // (content hash, not relay-assigned ID), so a single envelope
+    // posted to multiple relays + delivered through multiple WS
+    // subscriptions hashes identically and the second delivery is
+    // dropped before reaching onEnvelopeReceived.  Returns true iff
+    // the hash was already in the LRU; inserts otherwise.
+    bool isDuplicateEnvelope(const Bytes& sealed);
+
     int         pickJitterMs() const;
     void postEnvelope(const std::string& relayUrl, const Bytes& envelope,
                       IHttpClient::Callback cb);
@@ -122,10 +226,15 @@ private:
 
     void emitStatus(const std::string& s) { if (onStatus) onStatus(s); }
 
-    CryptoEngine*   m_crypto   = nullptr;
-    IWebSocket&     m_ws;
-    IHttpClient&    m_http;
-    ITimerFactory&  m_timers;
+    CryptoEngine*       m_crypto   = nullptr;
+    IWebSocketFactory&  m_wsFactory;
+    // Primary subscribe WS, created by factory at construction.  May
+    // be null if the factory rejected the request — RelayClient
+    // continues to function for sends but cannot receive; logged as
+    // critical at construction.
+    std::unique_ptr<IWebSocket> m_ws;
+    IHttpClient&        m_http;
+    ITimerFactory&      m_timers;
     std::string     m_relayUrl;
     bool            m_authenticated         = false;
     bool            m_intentionalDisconnect = false;
@@ -185,7 +294,23 @@ private:
     size_t                   m_sendRelayIdx = 0;
     bool                     m_multiHop     = false;
 
+    // Parallel fan-out.  See setParallelFanOut() for semantics.
+    bool                     m_parallelFanOut  = false;
+    int                      m_parallelFanOutK = 0;  // 0 = all
+
+    // Receive-side dedup.  std::array hashes can't be the
+    // unordered_set key directly without a custom hasher, so we key by
+    // string-of-bytes + keep an order-preserving deque for LRU eviction.
+    static constexpr size_t kDedupLruMax = 10000;
+    using EnvHash = std::array<uint8_t, 16>;
+    std::deque<EnvHash>            m_seenEnvOrder;
+    std::unordered_set<std::string> m_seenEnvSet;
+
     std::map<std::string, Bytes> m_relayX25519Pubs;
+
+    // Slave subscribers (multi-relay receive).  Created via
+    // m_wsFactory; managed wholly by RelayClient.
+    std::vector<std::unique_ptr<Slave>> m_slaves;
 
     // Push-token registration state.  Stored after the first
     // registerPushToken call so we can replay on reconnect.  Empty

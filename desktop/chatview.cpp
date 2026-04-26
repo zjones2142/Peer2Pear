@@ -486,6 +486,50 @@ void ChatView::onStatus(const QString &s)
     if (!s.isEmpty()) showToast(s);
 }
 
+void ChatView::onGroupStreamBlocked(const QString& groupId,
+                                       const QString& senderPeerId,
+                                       qint64 fromCtr, qint64 toCtr)
+{
+    // pv=2 receiver hit a gap — ChatController already fired a
+    // gap_request to the sender.  Surface a status toast so the user
+    // knows recent messages from this peer are still in transit.
+    // Once the gap fills, drained messages flow through
+    // onIncomingGroupMessage as normal.
+    Q_UNUSED(groupId);
+    const QString senderShort = senderPeerId.left(8) + QStringLiteral("…");
+    QString msg;
+    if (fromCtr == toCtr) {
+        msg = QString::fromUtf8("Waiting for message %1 from %2…")
+                  .arg(fromCtr).arg(senderShort);
+    } else {
+        msg = QString::fromUtf8("Waiting for messages %1–%2 from %3…")
+                  .arg(fromCtr).arg(toCtr).arg(senderShort);
+    }
+    qDebug() << "[group v2 blocked]" << groupId << senderPeerId
+              << fromCtr << "-" << toCtr;
+    showToast(msg);
+}
+
+void ChatView::onGroupMessagesLost(const QString& groupId,
+                                      const QString& senderPeerId,
+                                      qint64 count)
+{
+    // pv=2 session reset on the sender side dropped `count` buffered
+    // messages from this peer.  Surface as a toast — same mechanism
+    // as the blocked-stream banner.  Mobile (iOS) shows a one-shot
+    // alert dialog; desktop opts for the lighter toast pattern that
+    // matches the rest of the chatview.
+    Q_UNUSED(groupId);
+    const QString senderShort = senderPeerId.left(8) + QStringLiteral("…");
+    const QString msg = count == 1
+        ? QString::fromUtf8("1 message from %1 was lost during reconnection.")
+              .arg(senderShort)
+        : QString::fromUtf8("%1 messages from %2 were lost during reconnection.")
+              .arg(count).arg(senderShort);
+    qDebug() << "[group v2 lost]" << groupId << senderPeerId << count;
+    showToast(msg);
+}
+
 void ChatView::onIncomingGroupMessage(const QString &fromPeerIdB64u,
                                       const QString &groupId,
                                       const QString &groupName,
