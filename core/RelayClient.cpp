@@ -94,14 +94,21 @@ std::string peerPrefix(const std::string& id) {
 
 }  // anonymous namespace
 
-RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http,
+RelayClient::RelayClient(IWebSocketFactory& wsFactory, IHttpClient& http,
                           ITimerFactory& timers, CryptoEngine* crypto)
-    : m_crypto(crypto), m_ws(ws), m_http(http), m_timers(timers)
+    : m_crypto(crypto), m_wsFactory(wsFactory), m_http(http), m_timers(timers)
 {
-    m_ws.onConnected     = [this]()                           { onWsConnected(); };
-    m_ws.onDisconnected  = [this]()                           { onWsDisconnected(); };
-    m_ws.onBinaryMessage = [this](const Bytes& d) { onWsBinaryMessage(d); };
-    m_ws.onTextMessage   = [this](const std::string& m)       { onWsTextMessage(m); };
+    m_ws = m_wsFactory.create();
+    if (m_ws) {
+        m_ws->onConnected     = [this]()                       { onWsConnected(); };
+        m_ws->onDisconnected  = [this]()                       { onWsDisconnected(); };
+        m_ws->onBinaryMessage = [this](const Bytes& d)         { onWsBinaryMessage(d); };
+        m_ws->onTextMessage   = [this](const std::string& m)   { onWsTextMessage(m); };
+    } else {
+        P2P_CRITICAL("[Relay] IWebSocketFactory::create() returned null for "
+                     "primary connection — receive path is dead until "
+                     "the factory recovers");
+    }
 
     m_reconnectTimer = m_timers.create();
     m_retryTimer     = m_timers.create();
@@ -111,7 +118,18 @@ RelayClient::RelayClient(IWebSocket& ws, IHttpClient& http,
 RelayClient::~RelayClient()
 {
     m_intentionalDisconnect = true;
-    m_ws.close();
+    if (m_ws) m_ws->close();
+    // Slave subscribers must be torn down before m_timers (timer
+    // factory) and m_wsFactory (which may release platform
+    // resources): unique_ptr deletion order is reverse declaration,
+    // and Slave holds its own ITimer + IWebSocket from those factories.
+    for (auto& s : m_slaves) {
+        if (!s) continue;
+        s->intentionalDisconnect = true;
+        if (s->reconnectTimer) s->reconnectTimer->stop();
+        if (s->ws) s->ws->close();
+    }
+    m_slaves.clear();
 }
 
 void RelayClient::setRelayUrl(const std::string& url) {
@@ -140,28 +158,41 @@ void RelayClient::setRelayUrl(const std::string& url) {
 
 bool RelayClient::isConnected() const
 {
-    return m_ws.isConnected() && m_authenticated;
+    return m_ws && m_ws->isConnected() && m_authenticated;
 }
 
 // ── WebSocket receive channel ────────────────────────────────────────────────
 
 void RelayClient::connectToRelay()
 {
-    if (!m_ws.isIdle()) return;
+    if (!m_ws || !m_ws->isIdle()) return;
 
     m_intentionalDisconnect = false;
     m_authenticated = false;
 
     const std::string wsU = wsUrl(m_relayUrl, "/v1/receive");
     P2P_LOG("[Relay] Connecting to " << wsU);
-    m_ws.open(wsU);
+    m_ws->open(wsU);
+
+    // Drive every configured slave to connect alongside the primary.
+    // No-op when the slave list is empty (single-WS path).
+    for (auto& s : m_slaves) {
+        if (s) connectSlave(*s);
+    }
 }
 
 void RelayClient::disconnectFromRelay()
 {
     m_intentionalDisconnect = true;
     m_reconnectTimer->stop();
-    m_ws.close();
+    if (m_ws) m_ws->close();
+
+    for (auto& s : m_slaves) {
+        if (!s) continue;
+        s->intentionalDisconnect = true;
+        if (s->reconnectTimer) s->reconnectTimer->stop();
+        if (s->ws) s->ws->close();
+    }
 }
 
 void RelayClient::onWsConnected()
@@ -186,7 +217,7 @@ void RelayClient::authenticate()
     auth["ts"]      = ts;
     auth["sig"]     = sig;
 
-    m_ws.sendTextMessage(auth.dump());
+    m_ws->sendTextMessage(auth.dump());
 }
 
 void RelayClient::onWsDisconnected()
@@ -225,6 +256,17 @@ void RelayClient::onWsBinaryMessage(const Bytes& data)
     if (!data.empty() && data[0] == kDummyVersion)
         return;
 
+    // Receive-side dedup: when parallel fan-out (or any future
+    // multi-WS subscribe) results in the same sealed envelope arriving
+    // twice, drop the second delivery before it reaches UI.  Hash is
+    // over the full sealed bytes so the identity is content-based and
+    // doesn't depend on which relay assigned the envelope_id.
+    if (isDuplicateEnvelope(data)) {
+        P2P_LOG("[Relay] dedup: dropping duplicate envelope ("
+                << data.size() << "B)");
+        return;
+    }
+
     onRealActivity();
 
     if (onEnvelopeReceived) onEnvelopeReceived(data);
@@ -253,7 +295,7 @@ void RelayClient::onWsTextMessage(const std::string& message)
             msg["type"]     = "push_register";
             msg["platform"] = m_pushPlatform;
             msg["token"]    = m_pushToken;
-            m_ws.sendTextMessage(msg.dump());
+            m_ws->sendTextMessage(msg.dump());
             m_pushPending = false;
         }
 
@@ -287,7 +329,7 @@ void RelayClient::onWsTextMessage(const std::string& message)
 
 // ── Sending envelopes ────────────────────────────────────────────────────────
 
-void RelayClient::sendEnvelope(const Bytes& sealedEnvelope)
+void RelayClient::sendEnvelope(const Bytes& sealedEnvelope, TrafficClass cls)
 {
     if (m_coverIntervalSec > 0 && m_burstRemaining <= 0 && isConnected()) {
         const int precover = 1 + int(randombytes_uniform(2));
@@ -295,8 +337,6 @@ void RelayClient::sendEnvelope(const Bytes& sealedEnvelope)
             sendCoverEnvelope();
     }
     onRealActivity();
-
-    const std::string relay = pickSendRelay();
 
     auto retryCb = [this, sealedEnvelope](const IHttpClient::Response& r) {
         if (r.error.empty()) return;
@@ -315,13 +355,32 @@ void RelayClient::sendEnvelope(const Bytes& sealedEnvelope)
             emitStatus("relay send error: " + r.error + " — will retry");
     };
 
+    // Routing priority:
+    //   1. Multi-hop (anonymity) wins — onion-routes through 2 relays.
+    //      Parallel fan-out is incompatible: each onion ciphertext is
+    //      addressed to one specific entry relay, broadcasting it to
+    //      others would leak the routing structure.
+    //   2. Parallel fan-out (redundancy) — only for Message class.
+    //      File chunks are too large to multiply across relays.
+    //   3. Single-relay rotation — existing behaviour.
     if (m_multiHop && m_sendRelays.size() >= 2) {
         const std::string via = pickSendRelay();
         std::string to        = pickSendRelay();
         if (to == via) to = m_relayUrl;
         forwardEnvelope(via, to, sealedEnvelope, std::move(retryCb));
+    } else if (m_parallelFanOut
+               && cls == TrafficClass::Message
+               && m_sendRelays.size() >= 2) {
+        const auto relays = pickKSendRelays(m_parallelFanOutK);
+        // Share retryCb across copies — only the first failure enqueues
+        // a retry.  postEnvelope copies the cb into its own closure so
+        // each call gets an independent one; retry-queue dedup is
+        // bounded by kMaxRetryQueue so worst-case duplication is small.
+        for (const std::string& r : relays) {
+            postEnvelope(r, sealedEnvelope, retryCb);
+        }
     } else {
-        postEnvelope(relay, sealedEnvelope, std::move(retryCb));
+        postEnvelope(pickSendRelay(), sealedEnvelope, std::move(retryCb));
     }
 }
 
@@ -343,7 +402,7 @@ void RelayClient::subscribePresence(const std::vector<std::string>& peerIds)
     json msg;
     msg["type"]     = "presence_subscribe";
     msg["peer_ids"] = std::move(ids);
-    m_ws.sendTextMessage(msg.dump());
+    m_ws->sendTextMessage(msg.dump());
 }
 
 void RelayClient::queryPresence(const std::vector<std::string>& peerIds)
@@ -361,7 +420,7 @@ void RelayClient::queryPresence(const std::vector<std::string>& peerIds)
     json msg;
     msg["type"]     = "presence_query";
     msg["peer_ids"] = std::move(ids);
-    m_ws.sendTextMessage(msg.dump());
+    m_ws->sendTextMessage(msg.dump());
 }
 
 void RelayClient::registerPushToken(const std::string& platform,
@@ -381,7 +440,7 @@ void RelayClient::registerPushToken(const std::string& platform,
     msg["type"]     = "push_register";
     msg["platform"] = platform;
     msg["token"]    = token;
-    m_ws.sendTextMessage(msg.dump());
+    m_ws->sendTextMessage(msg.dump());
     m_pushPending = false;
 }
 
@@ -602,6 +661,186 @@ void RelayClient::addSendRelay(const std::string& url)
 
 void RelayClient::setMultiHopEnabled(bool enabled) { m_multiHop = enabled; }
 
+// ── Slave subscribe (receive-side multi-relay redundancy) ───────────────────
+
+void RelayClient::addSubscribeRelay(const std::string& url)
+{
+    if (url.empty()) return;
+
+    // Refuse non-TLS URLs (same policy as primary setRelayUrl).  Localhost
+    // dev exception for tests + local relay loops.
+    auto parsed = parseUrl(url);
+    const std::string& s = parsed.scheme;
+    const bool isTls = (s == "https" || s == "wss");
+    const bool isDev = (s == "http" || s == "ws") &&
+                       (parsed.host == "localhost" ||
+                        parsed.host == "127.0.0.1" ||
+                        parsed.host == "::1");
+    if (!isTls && !isDev) {
+        P2P_WARN("[Relay] addSubscribeRelay rejected non-TLS url: " << url);
+        return;
+    }
+    // Dedup: if already in the slave list, skip.
+    for (const auto& existing : m_slaves) {
+        if (existing && existing->url == url) return;
+    }
+    auto slave = std::make_unique<Slave>();
+    slave->url = url;
+    slave->ws = m_wsFactory.create();
+    slave->reconnectTimer = m_timers.create();
+    if (!slave->ws || !slave->reconnectTimer) {
+        P2P_WARN("[Relay] addSubscribeRelay(" << url
+                  << ") — IWebSocketFactory returned null (platform "
+                  "shim doesn't yet support multi-WS), skipping");
+        return;
+    }
+    m_slaves.push_back(std::move(slave));
+    // If the primary is already connected, eagerly connect the new
+    // slave too — caller likely added this mid-session.  When still
+    // idle, connectToRelay() drives connection of every slave at once.
+    if (isConnected()) connectSlave(*m_slaves.back());
+}
+
+void RelayClient::clearSubscribeRelays()
+{
+    for (auto& s : m_slaves) {
+        if (!s) continue;
+        s->intentionalDisconnect = true;
+        if (s->reconnectTimer) s->reconnectTimer->stop();
+        if (s->ws) s->ws->close();
+    }
+    m_slaves.clear();
+}
+
+void RelayClient::connectSlave(Slave& s)
+{
+    if (!s.ws || !s.ws->isIdle()) return;
+    s.intentionalDisconnect = false;
+    s.authenticated = false;
+
+    // Wire callbacks just before open() so the platform shim sees fresh
+    // handlers (some implementations dispatch the auth-ok response on
+    // open()).  Lambda captures &s by reference — Slave instances are
+    // stored as unique_ptr in m_slaves so their addresses are stable.
+    s.ws->onConnected     = [this, &s]()                      { onSlaveConnected(s); };
+    s.ws->onDisconnected  = [this, &s]()                      { onSlaveDisconnected(s); };
+    s.ws->onBinaryMessage = [this](const Bytes& d)            { onWsBinaryMessage(d); };
+    s.ws->onTextMessage   = [this, &s](const std::string& m)  { onSlaveTextMessage(s, m); };
+
+    const std::string wsU = wsUrl(s.url, "/v1/receive");
+    P2P_LOG("[Relay] slave connect → " << wsU);
+    s.ws->open(wsU);
+}
+
+void RelayClient::onSlaveConnected(Slave& s)
+{
+    P2P_LOG("[Relay] slave WS connected (" << s.url << "), authenticating...");
+    s.reconnectAttempt = 0;
+    authenticateOnSlave(s);
+}
+
+void RelayClient::authenticateOnSlave(Slave& s)
+{
+    if (!m_crypto || !s.ws) return;
+
+    const std::string peerId  = CryptoEngine::toBase64Url(m_crypto->identityPub());
+    const int64_t     ts      = nowMs();
+    const std::string message = "RELAY1|" + peerId + "|" + std::to_string(ts);
+    const Bytes       msgBytes(message.begin(), message.end());
+    const std::string sig     = m_crypto->signB64u(msgBytes);
+
+    json auth;
+    auth["peer_id"] = peerId;
+    auth["ts"]      = ts;
+    auth["sig"]     = sig;
+
+    s.ws->sendTextMessage(auth.dump());
+}
+
+void RelayClient::onSlaveDisconnected(Slave& s)
+{
+    s.authenticated = false;
+    P2P_LOG("[Relay] slave WS disconnected (" << s.url << ")");
+    if (!s.intentionalDisconnect) scheduleSlaveReconnect(s);
+}
+
+void RelayClient::scheduleSlaveReconnect(Slave& s)
+{
+    const int delaySec = std::min(1 << s.reconnectAttempt, kMaxReconnectDelaySec);
+    s.reconnectAttempt++;
+    P2P_LOG("[Relay] slave reconnect (" << s.url
+             << ") in " << delaySec << "s");
+    s.reconnectTimer->startSingleShot(delaySec * 1000,
+                                       [this, &s] { connectSlave(s); });
+}
+
+void RelayClient::onSlaveTextMessage(Slave& s, const std::string& message)
+{
+    json obj;
+    try { obj = json::parse(message); } catch (...) { return; }
+    if (!obj.is_object()) return;
+    const std::string type = obj.value("type", "");
+
+    if (type == "auth_ok") {
+        s.authenticated = true;
+        P2P_LOG("[Relay] slave authenticated (" << s.url << ")");
+        return;
+    }
+    // Slaves don't track presence or push-token state — those flow
+    // through the primary connection only.  Drop other text frames.
+}
+
+void RelayClient::setParallelFanOut(bool enabled) { m_parallelFanOut = enabled; }
+
+void RelayClient::setParallelFanOutK(int k) { m_parallelFanOutK = std::max(0, k); }
+
+std::vector<std::string> RelayClient::pickKSendRelays(int k) const
+{
+    if (m_sendRelays.empty()) return {};
+
+    const int total = static_cast<int>(m_sendRelays.size());
+    if (k <= 0 || k >= total) return m_sendRelays;
+
+    // Fisher-Yates partial shuffle: pick K unique without replacement.
+    // Crypto-grade RNG (libsodium) — same rationale as pickSendRelay:
+    // observers can't predict future fan-out targets from past ones.
+    std::vector<std::string> pool = m_sendRelays;
+    std::vector<std::string> picked;
+    picked.reserve(static_cast<size_t>(k));
+    for (int i = 0; i < k; ++i) {
+        const uint32_t span = static_cast<uint32_t>(pool.size());
+        const uint32_t idx  = randombytes_uniform(span);
+        picked.push_back(std::move(pool[idx]));
+        pool[idx] = std::move(pool.back());
+        pool.pop_back();
+    }
+    return picked;
+}
+
+bool RelayClient::isDuplicateEnvelope(const Bytes& sealed)
+{
+    EnvHash hash{};
+    crypto_generichash(hash.data(), hash.size(),
+                       sealed.data(), sealed.size(),
+                       nullptr, 0);
+    const std::string key(reinterpret_cast<const char*>(hash.data()),
+                          hash.size());
+
+    if (m_seenEnvSet.count(key)) return true;
+
+    m_seenEnvSet.insert(key);
+    m_seenEnvOrder.push_back(hash);
+
+    while (m_seenEnvOrder.size() > kDedupLruMax) {
+        const EnvHash& oldest = m_seenEnvOrder.front();
+        const std::string oldKey(
+            reinterpret_cast<const char*>(oldest.data()), oldest.size());
+        m_seenEnvSet.erase(oldKey);
+        m_seenEnvOrder.pop_front();
+    }
+    return false;
+}
+
 std::string RelayClient::pickSendRelay()
 {
     // Pick uniformly at random rather than strict round-robin.
@@ -717,27 +956,44 @@ void RelayClient::refreshRelayInfo()
 
 void RelayClient::setPrivacyLevel(int level)
 {
+    // Preset matrix.  Maps the 3-tier slider onto the four orthogonal
+    // dials (rotation, parallel fan-out, multi-hop, cover traffic).
+    // Level   Jitter   Cover    Rotate   Parallel   Multi-hop
+    //   0      off      off      off       off        off
+    //   1     50-300    30s     (kept)    on (all)    off
+    //   2    100-500    10s     (kept)    on (all)    on
+    //
+    // "kept" = m_sendRelays preserved as configured by the user.  Only
+    // level 0 clears the rotation list.  Parallel fan-out picks from
+    // the same list — the rotation list IS the redundancy list.
     switch (level) {
     case 0:
         setJitterRange(0, 0);
         setCoverTrafficInterval(0);
         m_sendRelays.clear();
         setMultiHopEnabled(false);
+        setParallelFanOut(false);
         m_coverSizeMode = CoverSizeMode::BandwidthBiased;
         break;
     case 1:
         setJitterRange(50, 300);
         setCoverTrafficInterval(30);
         setMultiHopEnabled(false);
+        setParallelFanOut(true);
+        setParallelFanOutK(0);  // 0 = all configured relays
         m_coverSizeMode = CoverSizeMode::BandwidthBiased;
         break;
     case 2:
         setJitterRange(100, 500);
         setCoverTrafficInterval(10);
         setMultiHopEnabled(true);
-        // Arch-review #9: Maximum privacy pays the ~3x bandwidth cost
-        // for uniform cover distribution so the relay can't correlate
-        // the user's observed bucket histogram with their actual sends.
+        // Multi-hop wins over parallel in the dispatch path (see
+        // sendEnvelope routing priority), so keeping parallel on at
+        // level 2 just makes it the fallback when multi-hop can't
+        // proceed (e.g., entry-relay pubkey not yet cached) — same
+        // redundancy story as level 1 for that window.
+        setParallelFanOut(true);
+        setParallelFanOutK(0);
         m_coverSizeMode = CoverSizeMode::UniformBuckets;
         break;
     }

@@ -15,6 +15,7 @@
 
 #include "GroupProtocol.hpp"
 
+#include "AppDataStore.hpp"
 #include "CryptoEngine.hpp"
 #include "SessionStore.hpp"
 #include "SqlCipherDb.hpp"
@@ -103,8 +104,9 @@ protected:
         m_gp = std::make_unique<GroupProtocol>(*s_meCrypto);
         m_captured.clear();
         m_gp->setSendSealedFn(
-            [this](const std::string& peer, const nlohmann::json& payload) {
+            [this](const std::string& peer, const nlohmann::json& payload) -> Bytes {
                 m_captured.push_back({peer, payload});
+                return {};
             });
     }
 
@@ -755,8 +757,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_RoundTripMatchesPlaintext) {
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
 
     // Alice sends "greetings" to a group with me and bob.
@@ -803,8 +806,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_TamperedCiphertextReturnsEmpty) {
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
     aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "untampered");
 
@@ -844,8 +848,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_WrongSenderIdBreaksAad) {
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
     aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "from alice");
 
@@ -886,8 +891,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_ErasesSkippedKeyAfterSuccess) {
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
     aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "once");
 
@@ -932,8 +938,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_ForgedCiphertextLeavesKeyForLegit
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
     aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "real");
 
@@ -995,8 +1002,9 @@ TEST_F(GroupProtocolSuite, SerializeRestoreMyChain_PreservesDecryption) {
     m_gp = std::make_unique<GroupProtocol>(*s_meCrypto);
     m_captured.clear();
     m_gp->setSendSealedFn(
-        [this](const std::string& p, const nlohmann::json& pl) {
+        [this](const std::string& p, const nlohmann::json& pl) -> Bytes {
             m_captured.push_back({p, pl});
+            return {};
         });
     EXPECT_FALSE(m_gp->hasMyChain("gid"));
 
@@ -1170,8 +1178,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_PrevEpochWithinGraceWorks) {
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
 
     // Epoch 0: first send + its announce.
@@ -1232,8 +1241,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_PrevEpochAfterGraceExpiresFails) 
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
     aliceGp.sendText("gid", "G", {s_aliceId, s_meId}, "msg at epoch 0");
     aliceGp.rotateMyChain("gid", {s_aliceId, s_meId});
@@ -1287,8 +1297,9 @@ TEST_F(GroupProtocolSuite, DecryptGroupMessage_RapidDoubleRekeyKeepsBothPrevEpoc
     std::vector<CapturedSend> aliceCaptured;
     GroupProtocol aliceGp(*s_aliceCrypto);
     aliceGp.setSendSealedFn(
-        [&](const std::string& peer, const nlohmann::json& payload) {
+        [&](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             aliceCaptured.push_back({peer, payload});
+            return {};
         });
 
     // Alice sends one message at each of three epochs (0, 1, 2),
@@ -1451,8 +1462,9 @@ static PersistenceFixture makeFixture(CryptoEngine& crypto) {
     f.gp = std::make_unique<GroupProtocol>(crypto);
     f.gp->setSessionStore(f.store.get());
     f.gp->setSendSealedFn(
-        [&f](const std::string& peer, const nlohmann::json& payload) {
+        [&f](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             f.captured.push_back({peer, payload});
+            return {};
         });
     return f;
 }
@@ -1476,8 +1488,9 @@ static PersistenceFixture reopenFixture(CryptoEngine& crypto,
     f.gp = std::make_unique<GroupProtocol>(crypto);
     f.gp->setSessionStore(f.store.get());
     f.gp->setSendSealedFn(
-        [&f](const std::string& peer, const nlohmann::json& payload) {
+        [&f](const std::string& peer, const nlohmann::json& payload) -> Bytes {
             f.captured.push_back({peer, payload});
+            return {};
         });
     return f;
 }
@@ -1677,12 +1690,430 @@ TEST_F(GroupProtocolSuite, Persist_NoStoreMeansInMemoryOnly) {
     GroupProtocol gp(*s_meCrypto);
     std::vector<CapturedSend> cap;
     gp.setSendSealedFn(
-        [&](const std::string& p, const nlohmann::json& pl) {
+        [&](const std::string& p, const nlohmann::json& pl) -> Bytes {
             cap.push_back({p, pl});
+            return {};
         });
     // No setSessionStore call.
     gp.restorePersistedChains();   // no-op without a store
 
     gp.sendText("gid", "G", {s_meId, s_aliceId}, "hi");
     EXPECT_TRUE(gp.hasMyChain("gid"));
+}
+
+// ── pv=2 Causally-Linked Pairwise receiver state machine ───────────────────
+//
+// dispatchGroupMessageV2 owns the chain-state + buffer transitions on
+// the receiver side.  These tests construct a GroupProtocol with a
+// real AppDataStore (so chain_state / group_msg_buffer round-trip
+// through SQLCipher) and exercise each transition in isolation:
+//
+//   - in-order delivery + chain advances
+//   - prev_hash chain across consecutive messages
+//   - out-of-order: buffered + blocked + gap range
+//   - drain on gap fill (multi-step)
+//   - replay drop (counter < expected)
+//   - splice rejection (prev_hash mismatch)
+//   - session reset surfaces lostMessages
+//
+// The sender path is exercised at integration level (test_e2e_two_clients)
+// where a real handshake gives sessionIdFor() something to return.
+// Here we synthesize fake sessionId / sealed envelope bytes — the
+// receiver state machine doesn't decrypt; it only chains by hash.
+
+namespace {
+
+struct V2Env {
+    std::string                   dir;
+    std::unique_ptr<SqlCipherDb>  db;
+    std::unique_ptr<AppDataStore> store;
+    std::unique_ptr<GroupProtocol> gp;
+};
+
+V2Env makeV2Env(CryptoEngine& crypto) {
+    V2Env e;
+    e.dir = makeTempDir("p2p-gp-v2");
+    e.db  = std::make_unique<SqlCipherDb>();
+    EXPECT_TRUE(e.db->open(e.dir + "/test.db", randomKey32()));
+    e.store = std::make_unique<AppDataStore>();
+    EXPECT_TRUE(e.store->bind(*e.db));
+    e.store->setEncryptionKey(randomKey32());
+    e.gp = std::make_unique<GroupProtocol>(crypto);
+    e.gp->setAppDataStore(e.store.get());
+    // FK target: every V2 test in this file uses "g" as the group_id
+    // for chain_state / replay_cache / send_state / msg_buffer.  Create
+    // the conversations row up front so those FKs resolve.
+    AppDataStore::Conversation conv;
+    conv.id   = "g";
+    conv.kind = AppDataStore::ConversationKind::Group;
+    EXPECT_TRUE(e.store->saveConversation(conv));
+    return e;
+}
+
+Bytes makeSessionId(uint8_t marker) {
+    return Bytes(8, marker);
+}
+
+// Synthesize a "sealed envelope" the receiver can hash — the hash is
+// what flows into prev_hash; the bytes themselves are otherwise opaque.
+Bytes makeSealedEnv(uint8_t marker, size_t pad = 64) {
+    Bytes env;
+    env.reserve(33 + pad);
+    env.push_back(0x01);
+    env.insert(env.end(), 32, marker);
+    env.insert(env.end(), pad, marker);
+    return env;
+}
+
+Bytes hashEnv(const Bytes& sealed) {
+    Bytes h(16);
+    crypto_generichash(h.data(), h.size(),
+                        sealed.data(), sealed.size(), nullptr, 0);
+    return h;
+}
+
+}  // namespace
+
+TEST_F(GroupProtocolSuite, V2ReceiverDeliversFirstMessageInSession) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xA1);
+    const Bytes s1  = makeSealedEnv(0xA1);
+
+    // First message of the session: empty prev_hash is the convention.
+    auto r = e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sid, /*ctr=*/1, /*prev=*/{},
+        "hello", "Alice", 1234, "msg1", s1);
+
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::Delivered);
+    ASSERT_EQ(r.deliver.size(), 1u);
+    EXPECT_EQ(r.deliver[0].body,    "hello");
+    EXPECT_EQ(r.deliver[0].counter, 1);
+    EXPECT_EQ(r.deliver[0].msgId,   "msg1");
+    EXPECT_FALSE(r.blocked);
+
+    // Chain state should be persisted: expected_next = 2,
+    // last_hash = hash(s1).
+    AppDataStore::ChainState st;
+    ASSERT_TRUE(e.store->loadChainState("g", s_aliceId, st));
+    EXPECT_EQ(st.sessionId,    sid);
+    EXPECT_EQ(st.expectedNext, 2);
+    EXPECT_EQ(st.lastHash,     hashEnv(s1));
+}
+
+TEST_F(GroupProtocolSuite, V2ReceiverChainsPrevHashAcrossMessages) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xB2);
+    const Bytes s1  = makeSealedEnv(0xB1);
+    const Bytes s2  = makeSealedEnv(0xB2);
+
+    e.gp->dispatchGroupMessageV2("g", s_aliceId, sid, 1, {}, "m1", "A", 1, "i1", s1);
+
+    // Second message: prev_hash MUST equal hash(s1) for delivery.
+    auto r = e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sid, 2, hashEnv(s1), "m2", "A", 2, "i2", s2);
+
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::Delivered);
+    ASSERT_EQ(r.deliver.size(), 1u);
+    EXPECT_EQ(r.deliver[0].body, "m2");
+
+    AppDataStore::ChainState st;
+    e.store->loadChainState("g", s_aliceId, st);
+    EXPECT_EQ(st.expectedNext, 3);
+    EXPECT_EQ(st.lastHash,     hashEnv(s2));
+}
+
+TEST_F(GroupProtocolSuite, V2ReceiverBuffersOutOfOrderAndMarksBlocked) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xC3);
+    const Bytes s3  = makeSealedEnv(0xC3);
+
+    // No prior state; ctr=3 arriving first is way ahead of expected=1.
+    auto r = e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sid, 3, /*prev=*/Bytes(16, 0xDD),
+        "third", "A", 3, "i3", s3);
+
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::Buffered);
+    EXPECT_TRUE(r.blocked);
+    EXPECT_EQ(r.gapFrom, 1);
+    EXPECT_EQ(r.gapTo,   2);
+    EXPECT_TRUE(r.deliver.empty());
+
+    // chain_state.gap_from / gap_to should be persisted.
+    AppDataStore::ChainState st;
+    e.store->loadChainState("g", s_aliceId, st);
+    EXPECT_EQ(st.expectedNext, 1) << "expectedNext stays at 1 until gap fills";
+    EXPECT_EQ(st.gapFrom,      1);
+    EXPECT_EQ(st.gapTo,        2);
+    EXPECT_NE(st.blockedSince, 0);
+}
+
+TEST_F(GroupProtocolSuite, V2ReceiverDrainsBufferOnGapFill) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xD4);
+    const Bytes s1  = makeSealedEnv(0xD1);
+    const Bytes s2  = makeSealedEnv(0xD2);
+    const Bytes s3  = makeSealedEnv(0xD3);
+
+    // Out of order: 3 arrives, then 2, then 1.
+    e.gp->dispatchGroupMessageV2("g", s_aliceId, sid, 3, hashEnv(s2), "m3", "A", 3, "i3", s3);
+    e.gp->dispatchGroupMessageV2("g", s_aliceId, sid, 2, hashEnv(s1), "m2", "A", 2, "i2", s2);
+
+    // Now ctr=1 arrives — should deliver itself + drain 2 + drain 3.
+    auto r = e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sid, 1, /*prev=*/{}, "m1", "A", 1, "i1", s1);
+
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::Delivered);
+    EXPECT_FALSE(r.blocked);
+    ASSERT_EQ(r.deliver.size(), 3u);
+    EXPECT_EQ(r.deliver[0].body, "m1");
+    EXPECT_EQ(r.deliver[0].counter, 1);
+    EXPECT_EQ(r.deliver[1].body, "m2");
+    EXPECT_EQ(r.deliver[1].counter, 2);
+    EXPECT_EQ(r.deliver[2].body, "m3");
+    EXPECT_EQ(r.deliver[2].counter, 3);
+
+    AppDataStore::ChainState st;
+    e.store->loadChainState("g", s_aliceId, st);
+    EXPECT_EQ(st.expectedNext,  4);
+    EXPECT_EQ(st.lastHash,      hashEnv(s3));
+    EXPECT_EQ(st.blockedSince,  0) << "blocked cleared once buffer empties";
+}
+
+TEST_F(GroupProtocolSuite, V2ReceiverDropsReplay) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xE5);
+    const Bytes s1  = makeSealedEnv(0xE1);
+
+    e.gp->dispatchGroupMessageV2("g", s_aliceId, sid, 1, {}, "m1", "A", 1, "i1", s1);
+
+    // Re-receive ctr=1 → silent drop, deliver list empty.
+    auto r = e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sid, 1, {}, "m1", "A", 1, "i1", s1);
+
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::Dropped);
+    EXPECT_TRUE(r.deliver.empty());
+}
+
+TEST_F(GroupProtocolSuite, V2ReceiverRejectsSpliceOnPrevHashMismatch) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xF6);
+    const Bytes s1  = makeSealedEnv(0xF1);
+    const Bytes s2  = makeSealedEnv(0xF2);
+
+    e.gp->dispatchGroupMessageV2("g", s_aliceId, sid, 1, {}, "m1", "A", 1, "i1", s1);
+
+    // ctr=2 arrives with the WRONG prev_hash (forged).  Receiver must
+    // drop without advancing the chain — defends against splice attacks.
+    Bytes wrongPrev(16, 0xFF);
+    auto r = e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sid, 2, wrongPrev, "spliced", "A", 2, "i2", s2);
+
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::Dropped);
+    EXPECT_TRUE(r.deliver.empty());
+
+    // Chain state should NOT have advanced.
+    AppDataStore::ChainState st;
+    e.store->loadChainState("g", s_aliceId, st);
+    EXPECT_EQ(st.expectedNext, 2) << "still expecting 2 — splice did not advance the chain";
+    EXPECT_EQ(st.lastHash,     hashEnv(s1));
+}
+
+TEST_F(GroupProtocolSuite, V2ReceiverSessionResetSurfacesLostMessages) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sidOld = makeSessionId(0x10);
+    const Bytes sidNew = makeSessionId(0x20);
+
+    // Buffer two messages on the OLD session — the gap never fills.
+    e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sidOld, 5, Bytes(16, 0xAA),
+        "old5", "A", 1, "io5", makeSealedEnv(0xAA));
+    e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sidOld, 6, Bytes(16, 0xBB),
+        "old6", "A", 2, "io6", makeSealedEnv(0xBB));
+
+    // Sender's session reset (e.g., they wiped + re-handshook).  We
+    // see ctr=1 on a NEW session_id.
+    const Bytes sNew1 = makeSealedEnv(0xCC);
+    auto r = e.gp->dispatchGroupMessageV2(
+        "g", s_aliceId, sidNew, 1, /*prev=*/{},
+        "fresh", "A", 100, "ifresh", sNew1);
+
+    // Old buffer drained as "lost"; fresh delivered.
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::SessionReset);
+    EXPECT_EQ(r.lostMessages, 2);
+    ASSERT_EQ(r.deliver.size(), 1u);
+    EXPECT_EQ(r.deliver[0].body, "fresh");
+
+    AppDataStore::ChainState st;
+    e.store->loadChainState("g", s_aliceId, st);
+    EXPECT_EQ(st.sessionId,    sidNew);
+    EXPECT_EQ(st.expectedNext, 2);
+    EXPECT_EQ(st.lastHash,     hashEnv(sNew1));
+}
+
+TEST_F(GroupProtocolSuite, V2ReceiverNoOpWithoutAppDataStore) {
+    GroupProtocol gp(*s_meCrypto);  // no setAppDataStore
+
+    auto r = gp.dispatchGroupMessageV2(
+        "g", s_aliceId, makeSessionId(0x99), 1, {},
+        "x", "A", 0, "i", makeSealedEnv(0x99));
+    EXPECT_EQ(r.status, GroupProtocol::ReceiveStatus::Dropped);
+}
+
+// ── gap_request: receiver→sender, sender replays from cache ────────────
+
+TEST_F(GroupProtocolSuite, V2GapRequestSendsCorrectPayloadShape) {
+    auto e = makeV2Env(*s_meCrypto);
+    std::vector<CapturedSend> cap;
+    e.gp->setSendSealedFn([&](const std::string& peer,
+                                const nlohmann::json& payload) -> Bytes {
+        cap.push_back({peer, payload});
+        return {};
+    });
+
+    const Bytes sid = makeSessionId(0xA1);
+    e.gp->sendGapRequest(s_aliceId, "g", sid, /*from=*/3, /*to=*/7);
+
+    ASSERT_EQ(cap.size(), 1u);
+    EXPECT_EQ(cap[0].peerId, s_aliceId);
+    EXPECT_EQ(cap[0].payload.value("type",     std::string()),
+              "group_gap_request");
+    EXPECT_EQ(cap[0].payload.value("from",     std::string()), s_meId);
+    EXPECT_EQ(cap[0].payload.value("groupId",  std::string()), "g");
+    EXPECT_EQ(cap[0].payload.value("session",  std::string()),
+              CryptoEngine::toBase64Url(sid));
+    EXPECT_EQ(cap[0].payload.value("from_ctr", int64_t{0}), 3);
+    EXPECT_EQ(cap[0].payload.value("to_ctr",   int64_t{0}), 7);
+    EXPECT_FALSE(cap[0].payload.value("msgId", std::string()).empty());
+}
+
+TEST_F(GroupProtocolSuite, V2GapRequestDropsInvalidArgs) {
+    auto e = makeV2Env(*s_meCrypto);
+    std::vector<CapturedSend> cap;
+    e.gp->setSendSealedFn([&](const std::string& p,
+                                const nlohmann::json& pl) -> Bytes {
+        cap.push_back({p, pl});
+        return {};
+    });
+
+    const Bytes sid = makeSessionId(0xB1);
+    // Empty target peer.
+    e.gp->sendGapRequest("", "g", sid, 1, 1);
+    // Empty group.
+    e.gp->sendGapRequest(s_aliceId, "", sid, 1, 1);
+    // Empty session.
+    e.gp->sendGapRequest(s_aliceId, "g", {}, 1, 1);
+    // Inverted range.
+    e.gp->sendGapRequest(s_aliceId, "g", sid, 5, 2);
+    // Zero/negative counter.
+    e.gp->sendGapRequest(s_aliceId, "g", sid, 0, 1);
+
+    EXPECT_TRUE(cap.empty()) << "every malformed call must short-circuit";
+}
+
+TEST_F(GroupProtocolSuite, V2HandleGapRequestReplaysCachedRange) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xC1);
+
+    // Pre-populate replay cache with five sealed envelopes for Alice.
+    Bytes envs[5];
+    for (int i = 0; i < 5; ++i) {
+        envs[i] = makeSealedEnv(0xC0 + i);
+        e.store->addReplayCacheEntry(s_aliceId, "g", sid, /*ctr=*/i + 1,
+                                       envs[i], /*sentAt=*/1000 + i);
+    }
+
+    // Wire the raw-relay callback to capture replays.
+    std::vector<Bytes> replayed;
+    e.gp->setReplayRelayFn([&](const Bytes& b) { replayed.push_back(b); });
+
+    // Alice asks us for ctr=2..4 — we should replay 3 envelopes
+    // (byte-identical to what we cached) in counter order.
+    e.gp->handleGapRequest(s_aliceId, "g", sid, 2, 4);
+
+    ASSERT_EQ(replayed.size(), 3u);
+    EXPECT_EQ(replayed[0], envs[1]);  // ctr=2
+    EXPECT_EQ(replayed[1], envs[2]);  // ctr=3
+    EXPECT_EQ(replayed[2], envs[3]);  // ctr=4
+}
+
+TEST_F(GroupProtocolSuite, V2HandleGapRequestSkipsMissingCounters) {
+    auto e = makeV2Env(*s_meCrypto);
+    const Bytes sid = makeSessionId(0xD1);
+
+    // Cache only ctr=2 and ctr=4.  Range [1..5] should replay just
+    // those two — TTL-expired or never-sent counters silently skip.
+    Bytes env2 = makeSealedEnv(0xD2);
+    Bytes env4 = makeSealedEnv(0xD4);
+    e.store->addReplayCacheEntry(s_aliceId, "g", sid, 2, env2, 1000);
+    e.store->addReplayCacheEntry(s_aliceId, "g", sid, 4, env4, 1000);
+
+    std::vector<Bytes> replayed;
+    e.gp->setReplayRelayFn([&](const Bytes& b) { replayed.push_back(b); });
+
+    e.gp->handleGapRequest(s_aliceId, "g", sid, 1, 5);
+
+    ASSERT_EQ(replayed.size(), 2u);
+    EXPECT_EQ(replayed[0], env2);
+    EXPECT_EQ(replayed[1], env4);
+}
+
+TEST_F(GroupProtocolSuite, V2HandleGapRequestNoOpWithoutDeps) {
+    GroupProtocol gp(*s_meCrypto);  // no AppDataStore, no replay relay
+    // Should not crash; should silently no-op.
+    gp.handleGapRequest(s_aliceId, "g", makeSessionId(0xE1), 1, 5);
+
+    // Even with AppDataStore but no replay relay, no-op.
+    auto e = makeV2Env(*s_meCrypto);
+    e.gp->handleGapRequest(s_aliceId, "g", makeSessionId(0xE1), 1, 5);
+    // No assertion — verifying it didn't crash is enough.
+}
+
+TEST_F(GroupProtocolSuite, V2GapRequestRoundTripAcrossPeers) {
+    // End-to-end: A pre-fills its replay cache, B sends a gap request,
+    // A handles it and B sees the replayed envelopes back in raw form.
+    auto a = makeV2Env(*s_aliceCrypto);
+    auto b = makeV2Env(*s_bobCrypto);
+
+    const Bytes sid = makeSessionId(0xF1);
+
+    // Alice sent three messages to Bob; cache the sealed bytes.
+    Bytes env1 = makeSealedEnv(0xF1);
+    Bytes env2 = makeSealedEnv(0xF2);
+    Bytes env3 = makeSealedEnv(0xF3);
+    a.store->addReplayCacheEntry(s_bobId, "g", sid, 1, env1, 1000);
+    a.store->addReplayCacheEntry(s_bobId, "g", sid, 2, env2, 1001);
+    a.store->addReplayCacheEntry(s_bobId, "g", sid, 3, env3, 1002);
+
+    // Bob fires sendGapRequest, which goes through Alice's sendSealed.
+    // We capture Bob's request and route it manually to Alice's handler
+    // (skipping the actual seal/unseal — those are SessionSealer's job).
+    std::vector<CapturedSend> bobOut;
+    b.gp->setSendSealedFn([&](const std::string& peer,
+                                const nlohmann::json& payload) -> Bytes {
+        bobOut.push_back({peer, payload});
+        return {};
+    });
+
+    std::vector<Bytes> aliceReplayed;
+    a.gp->setReplayRelayFn([&](const Bytes& env) {
+        aliceReplayed.push_back(env);
+    });
+
+    b.gp->sendGapRequest(s_aliceId, "g", sid, /*from=*/1, /*to=*/3);
+
+    // Bob's request landed at Alice's peer.
+    ASSERT_EQ(bobOut.size(), 1u);
+    EXPECT_EQ(bobOut[0].peerId, s_aliceId);
+
+    // Alice processes the request — replays all three.
+    a.gp->handleGapRequest(
+        s_bobId, "g", sid,
+        bobOut[0].payload.value("from_ctr", int64_t{0}),
+        bobOut[0].payload.value("to_ctr",   int64_t{0}));
+
+    ASSERT_EQ(aliceReplayed.size(), 3u);
+    EXPECT_EQ(aliceReplayed[0], env1);
+    EXPECT_EQ(aliceReplayed[1], env2);
+    EXPECT_EQ(aliceReplayed[2], env3);
 }

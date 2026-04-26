@@ -22,6 +22,7 @@
 #define PEER2PEAR_H
 
 #include <stdint.h>
+#include <stddef.h>  // size_t
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,7 +44,7 @@ typedef struct p2p_context p2p_context;
  */
 
 typedef struct {
-    /* WebSocket commands */
+    /* WebSocket commands (single-connection legacy path) */
     void (*ws_open)(const char* url, void* platform_ctx);
     void (*ws_close)(void* platform_ctx);
     void (*ws_send_text)(const char* message, void* platform_ctx);
@@ -60,6 +61,37 @@ typedef struct {
                       void* platform_ctx);
 
     void* platform_ctx;
+
+    /* ── Multi-connection WebSocket FFI (v2, optional) ──────────────────
+     *
+     * When `ws_alloc_connection` is non-null, the C++ core uses the v2
+     * callbacks to manage one or more independent WebSocket connections
+     * (primary subscribe + each addSubscribeRelay() slave).  Otherwise
+     * it falls back to the single-connection legacy path above and
+     * addSubscribeRelay logs a warn + skips.
+     *
+     * `conn_handle` is an opaque pointer the platform supplies on
+     * ws_alloc_connection (typically a pointer into a per-connection
+     * Swift/Kotlin object); the core passes it back on every
+     * subsequent per-connection call so the platform can route to the
+     * right underlying socket.  The core treats it as opaque — never
+     * dereferences, never modifies.
+     *
+     * The platform reciprocates with p2p_ws_on_*_v2 functions below,
+     * passing `conn_handle` so the core can find the IWebSocket whose
+     * callbacks should fire.
+     *
+     * Thread-safety: same as the v1 calls — the platform must serialise
+     * calls per `conn_handle`; the core serialises its receive-side
+     * callbacks via P2P_CTX_GUARD.
+     */
+    void* (*ws_alloc_connection)(void* platform_ctx);
+    void  (*ws_free_connection)(void* conn_handle, void* platform_ctx);
+    void  (*ws_open_v2)(void* conn_handle, const char* url, void* platform_ctx);
+    void  (*ws_close_v2)(void* conn_handle, void* platform_ctx);
+    void  (*ws_send_text_v2)(void* conn_handle, const char* message, void* platform_ctx);
+    int   (*ws_is_connected_v2)(void* conn_handle, void* platform_ctx);
+    int   (*ws_is_idle_v2)(void* conn_handle, void* platform_ctx);
 } p2p_platform;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -200,16 +232,79 @@ void p2p_connect(p2p_context* ctx);
 /** Disconnect from the relay. */
 void p2p_disconnect(p2p_context* ctx);
 
-/** Add a relay to the send pool (for multi-relay rotation). */
+/** Add a relay to the send pool (used by rotation, parallel fan-out, and multi-hop). */
 void p2p_add_send_relay(p2p_context* ctx, const char* url);
 
 /**
- * Set privacy level:
+ * Add a relay to the receive-side subscribe pool.  Causes the core to
+ * open an additional WebSocket connection to `url` so the recipient
+ * mailbox is subscribed to multiple relays simultaneously — completes
+ * the redundancy story alongside p2p_set_parallel_fan_out (sender side).
+ *
+ * Requires the platform layer to support multiple WS connections via
+ * the v2 multi-connection FFI (ws_alloc_connection et al).  When the
+ * platform shim is single-connection only, this call logs a warning
+ * and returns without effect.
+ *
+ * Inbound dedup (BLAKE2b-128 of envelope bytes) drops the same envelope
+ * arriving on multiple relays before reaching the on_message callback.
+ */
+void p2p_add_subscribe_relay(p2p_context* ctx, const char* url);
+
+/** Remove all extra subscribe relays (primary stays connected). */
+void p2p_clear_subscribe_relays(p2p_context* ctx);
+
+/**
+ * Set privacy level (preset for the four orthogonal transport dials):
  *   0 = Standard:  envelope padding only (default)
- *   1 = Enhanced:  + send jitter + cover traffic + multi-relay rotation
+ *   1 = Enhanced:  + jitter + cover traffic + parallel fan-out (all relays)
  *   2 = Maximum:   + multi-hop forwarding + high-frequency cover traffic
+ *
+ * Parallel fan-out and multi-hop are independently controllable via
+ * p2p_set_parallel_fan_out / p2p_set_multi_hop_enabled — the level
+ * is just a convenient preset.  Note: parallel fan-out (redundancy)
+ * and multi-hop (anonymity) target different threats.  See the
+ * functions below for their independent toggles.
  */
 void p2p_set_privacy_level(p2p_context* ctx, int level);
+
+/**
+ * Toggle parallel relay fan-out (redundancy, NOT anonymity).
+ *
+ * When enabled, every outbound message envelope is POSTed to multiple
+ * configured relays simultaneously (see p2p_add_send_relay).  Each
+ * relay holds a copy in the recipient's mailbox; the recipient dedups
+ * duplicate deliveries on receive by content hash.  File chunks are
+ * exempted (their bandwidth × N would defeat the redundancy benefit).
+ *
+ * `enabled` is treated as a C bool: 0 = off, non-zero = on.
+ *
+ * Distinct from p2p_set_multi_hop_enabled, which provides anonymity
+ * by chaining onion-encrypted hops through multiple relays.  Multi-hop
+ * wins in the dispatch path when both are enabled.
+ */
+void p2p_set_parallel_fan_out(p2p_context* ctx, int enabled);
+
+/**
+ * Number of relays to fan out to when parallel mode is enabled.
+ *   0       = all configured send relays (full broadcast)
+ *   K > 0   = pick K random relays per send (uniformly without replacement)
+ *   K >= configured-count collapses to "all".
+ */
+void p2p_set_parallel_fan_out_k(p2p_context* ctx, int k);
+
+/**
+ * Toggle multi-hop onion forwarding (anonymity, NOT redundancy).
+ *
+ * When enabled and at least 2 send relays are configured, each
+ * envelope is onion-wrapped: the entry relay can decrypt only its
+ * layer (revealing the next hop), and the exit relay sees only the
+ * sealed envelope addressed to the recipient.  No single relay sees
+ * both sender and recipient.  Adds latency proportional to hop count.
+ *
+ * `enabled` is treated as a C bool: 0 = off, non-zero = on.
+ */
+void p2p_set_multi_hop_enabled(p2p_context* ctx, int enabled);
 
 /**
  * Register a push-notification token with the relay.  Called by
@@ -412,6 +507,20 @@ void p2p_ws_on_binary(p2p_context* ctx, const uint8_t* data, int len);
 /** Platform: Text frame received on WebSocket. */
 void p2p_ws_on_text(p2p_context* ctx, const char* message);
 
+/* ── Multi-connection WS event callbacks (v2) ─────────────────────────
+ * Used by platforms that implement ws_alloc_connection et al.  The
+ * `conn_handle` is the opaque pointer the platform supplied on
+ * ws_alloc_connection — the core uses it to dispatch the callback to
+ * the right IWebSocket.  Passing an unrecognised `conn_handle` is a
+ * silent no-op (defensive: a free + late event race shouldn't crash).
+ */
+void p2p_ws_on_connected_v2(p2p_context* ctx, void* conn_handle);
+void p2p_ws_on_disconnected_v2(p2p_context* ctx, void* conn_handle);
+void p2p_ws_on_binary_v2(p2p_context* ctx, void* conn_handle,
+                          const uint8_t* data, int len);
+void p2p_ws_on_text_v2(p2p_context* ctx, void* conn_handle,
+                        const char* message);
+
 /**
  * Platform: HTTP POST completed.
  * @param request_id  The ID returned by the platform's http_post() callback.
@@ -487,6 +596,39 @@ void p2p_set_on_group_renamed(p2p_context* ctx,
  */
 void p2p_set_on_group_avatar(p2p_context* ctx,
     void (*cb)(const char* group_id, const char* avatar_b64, void* ud),
+    void* ud);
+
+/**
+ * pv=2 (Causally-Linked Pairwise) — a sender's stream is currently
+ * blocked because messages [from_ctr, to_ctr] (inclusive) haven't
+ * arrived yet.  The core has already fired a gap_request to the
+ * sender; this callback is purely informational so the UI can show
+ * a "waiting for messages from X..." banner.  Fires every time the
+ * blocked range grows (e.g., later out-of-order arrivals push to_ctr
+ * higher).  When the gap finally fills, the next group_message
+ * callback fires for each drained message — clear the banner once
+ * the rate of group_message arrivals catches up.
+ */
+void p2p_set_on_group_stream_blocked(p2p_context* ctx,
+    void (*cb)(const char* group_id,
+                const char* sender_peer_id,
+                int64_t from_ctr,
+                int64_t to_ctr,
+                void* ud),
+    void* ud);
+
+/**
+ * pv=2 — `count` buffered messages from `sender_peer_id` in
+ * `group_id` were dropped during a session reset (the sender's DR
+ * session rolled over before the gap could close).  Surface as a
+ * "K messages lost during reconnection" UI event.  Fires once per
+ * reset event.
+ */
+void p2p_set_on_group_messages_lost(p2p_context* ctx,
+    void (*cb)(const char* group_id,
+                const char* sender_peer_id,
+                int64_t count,
+                void* ud),
     void* ud);
 
 /**
@@ -602,37 +744,62 @@ void p2p_set_on_peer_key_changed(p2p_context* ctx,
  * call — copy if you need them past the callback's return.
  */
 
-/** Save (insert or update) a contact row.  `keys` is a NULL-terminated
- *  array of base64url public keys (one per peer for groups, one for
- *  1:1 contacts).  `last_active_secs` is unix time; pass 0 for "never".
- *  `in_address_book` toggles the iOS chats-vs-contacts split — pass 1
- *  for explicit user-added contacts, 0 for stranger-message stub rows. */
+/** Save (insert or update) a contact row.  Address-book entry only —
+ *  groups are NOT contacts in v3 (use p2p_app_save_conversation),
+ *  block lives in `blocked_keys` (use p2p_app_add_blocked_key).
+ *  `last_active_secs` is unix time; pass 0 for "never".
+ *  `muted` is the person-level mute (cross-conversation). */
 int p2p_app_save_contact(p2p_context* ctx,
                           const char* peer_id,
                           const char* name,
                           const char* subtitle,
-                          const char* const* keys,
-                          int is_blocked,
-                          int is_group,
-                          const char* group_id,
                           const char* avatar_b64,
-                          int64_t last_active_secs,
-                          int in_address_book);
+                          int muted,
+                          int64_t last_active_secs);
 
-/** Delete a contact (and CASCADE its messages). */
+/** Delete a contact (address-book entry only — does NOT touch
+ *  conversations or messages).  Use p2p_app_delete_conversation to
+ *  wipe a chat thread. */
 int p2p_app_delete_contact(p2p_context* ctx, const char* peer_id);
 
-/** Stream every contact via callback (last_active DESC). */
+/** Toggle person-level mute.  OR'd with conversation-level mute at
+ *  notification time. */
+int p2p_app_set_contact_muted(p2p_context* ctx, const char* peer_id, int muted);
+
+// ── Blocked keys (Phase 3h) ─────────────────────────────────────────────────
+//
+// Block is its own concept, separate from address-book curation.
+// A peer can be blocked without being a contact, and a contact can
+// be blocked without losing their address-book entry.
+
+/** Add `peer_id` to the blocked list.  Idempotent — re-blocking
+ *  refreshes the timestamp.  Returns 0 on success, -1 on bad args. */
+int p2p_app_add_blocked_key(p2p_context* ctx, const char* peer_id);
+
+/** Remove `peer_id` from the blocked list.  Returns 0 when a row
+ *  was removed, -1 when the key wasn't blocked or args were bad. */
+int p2p_app_remove_blocked_key(p2p_context* ctx, const char* peer_id);
+
+/** Returns 1 when blocked, 0 when not, -1 on bad args. */
+int p2p_app_is_blocked_key(p2p_context* ctx, const char* peer_id);
+
+/** Stream every blocked key in insertion order (blocked_at ASC).  The
+ *  callback fires once per row with `peer_id` and the unix-secs at
+ *  which it was blocked. */
+typedef void (*p2p_blocked_key_cb)(const char* peer_id,
+                                     int64_t blocked_at_secs,
+                                     void* ud);
+void p2p_app_load_blocked_keys(p2p_context* ctx,
+                                 p2p_blocked_key_cb cb, void* ud);
+
+/** Stream every contact via callback (last_active DESC).  Block state
+ *  is reported via p2p_app_load_blocked_keys, separate stream. */
 typedef void (*p2p_contact_cb)(const char* peer_id,
                                 const char* name,
                                 const char* subtitle,
-                                const char* const* keys,
-                                int is_blocked,
-                                int is_group,
-                                const char* group_id,
                                 const char* avatar_b64,
+                                int muted,
                                 int64_t last_active_secs,
-                                int in_address_book,
                                 void* ud);
 void p2p_app_load_contacts(p2p_context* ctx, p2p_contact_cb cb, void* ud);
 
@@ -641,28 +808,107 @@ int p2p_app_save_contact_avatar(p2p_context* ctx,
                                  const char* peer_id,
                                  const char* avatar_b64);
 
-/** Insert a 1:1 or group message.  For groups, `peer_id` is the group_id
- *  and `sender_name` carries the sender's display name (1:1 leaves it ""). */
+// ── Conversations ───────────────────────────────────────────────────────────
+//
+// Chat threads.  `kind` is "direct" (1:1) or "group".  `direct_peer_id`
+// is the peer's pubkey for direct conversations; pass NULL for groups.
+// `group_name` / `group_avatar_b64` are encrypted at rest; pass NULL
+// for direct.
+
+/** Save (insert or update) a conversation row by id. */
+int p2p_app_save_conversation(p2p_context* ctx,
+                                const char* id,
+                                const char* kind,
+                                const char* direct_peer_id,
+                                const char* group_name,
+                                const char* group_avatar_b64,
+                                int muted,
+                                int64_t last_active_secs,
+                                int in_chat_list);
+
+/** Find an existing direct conversation for `peer_id`, or mint + persist
+ *  a new one.  Writes the resulting id (UUID, NUL-terminated) into
+ *  `out_id` (caller-provided buffer of `out_id_cap` bytes — 64 is
+ *  plenty).  Returns 0 on success, -1 on bad args / DB error. */
+int p2p_app_find_or_create_direct_conversation(p2p_context* ctx,
+                                                  const char* peer_id,
+                                                  char* out_id,
+                                                  size_t out_id_cap);
+
+/** Delete a conversation and CASCADE its messages, members, and
+ *  group_* state. */
+int p2p_app_delete_conversation(p2p_context* ctx, const char* id);
+
+/** Toggle conversation-level mute. */
+int p2p_app_set_conversation_muted(p2p_context* ctx, const char* id, int muted);
+
+/** Hide / un-hide a conversation from the chat list without deleting
+ *  messages. */
+int p2p_app_set_conversation_in_chat_list(p2p_context* ctx, const char* id, int in_list);
+
+/** Stream every conversation via callback (last_active DESC). */
+typedef void (*p2p_conversation_cb)(const char* id,
+                                       const char* kind,
+                                       const char* direct_peer_id,
+                                       const char* group_name,
+                                       const char* group_avatar_b64,
+                                       int muted,
+                                       int64_t last_active_secs,
+                                       int in_chat_list,
+                                       void* ud);
+void p2p_app_load_conversations(p2p_context* ctx,
+                                  p2p_conversation_cb cb,
+                                  void* ud);
+
+/** Replace the entire member roster of a conversation atomically.
+ *  `peer_ids` is a NULL-terminated array of base64url pubkeys. */
+int p2p_app_set_conversation_members(p2p_context* ctx,
+                                        const char* conversation_id,
+                                        const char* const* peer_ids);
+
+/** Stream the peer_id of each member of a conversation. */
+typedef void (*p2p_conversation_member_cb)(const char* peer_id, void* ud);
+void p2p_app_load_conversation_members(p2p_context* ctx,
+                                          const char* conversation_id,
+                                          p2p_conversation_member_cb cb,
+                                          void* ud);
+
+// ── Messages ────────────────────────────────────────────────────────────────
+
+/** Insert a message into `conversation_id`.  The conversation row MUST
+ *  already exist — call p2p_app_find_or_create_direct_conversation
+ *  first for inbound-from-stranger.  `sender_id` is the originator
+ *  peer_id for inbound messages, NULL/"" for outbound. */
 int p2p_app_save_message(p2p_context* ctx,
-                          const char* peer_id,
+                          const char* conversation_id,
                           int sent,
                           const char* text,
                           int64_t timestamp_secs,
                           const char* msg_id,
+                          const char* sender_id,
                           const char* sender_name);
 
-/** Stream messages for `peer_id` in chronological order. */
+/** Stream messages for `conversation_id` in chronological order. */
 typedef void (*p2p_message_cb)(int sent,
                                 const char* text,
                                 int64_t timestamp_secs,
                                 const char* msg_id,
+                                const char* sender_id,
                                 const char* sender_name,
                                 void* ud);
-void p2p_app_load_messages(p2p_context* ctx, const char* peer_id,
+void p2p_app_load_messages(p2p_context* ctx, const char* conversation_id,
                             p2p_message_cb cb, void* ud);
 
-/** Wipe all messages for `peer_id`.  Doesn't touch the contact row. */
-int p2p_app_delete_messages(p2p_context* ctx, const char* peer_id);
+/** Wipe all messages for `conversation_id`.  Doesn't delete the
+ *  conversation row itself — caller decides whether the thread
+ *  stays in the chat list (use p2p_app_delete_conversation for
+ *  full removal). */
+int p2p_app_delete_messages(p2p_context* ctx, const char* conversation_id);
+
+/** Delete a single message identified by (conversation_id, msg_id).
+ *  Returns 0 on success, -1 on invalid args or when no matching row
+ *  exists. */
+int p2p_app_delete_message(p2p_context* ctx, const char* conversation_id, const char* msg_id);
 
 /** Settings key/value store.  load returns the static-storage scratch
  *  buffer in `ctx`; treat it as valid only until the next p2p_* call. */

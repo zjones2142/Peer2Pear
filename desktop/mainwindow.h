@@ -42,12 +42,16 @@ private:
     // and adds per-field XChaCha20-Poly1305.  chatview / settingspanel
     // call m_store directly with AppDataStore types; Qt↔std conversion
     // happens at render/save sites via qt_str_helpers.hpp.
-    SqlCipherDb      m_db;
-    AppDataStore     m_store;
-    QtWebSocket      m_webSocket;
-    QtHttpClient     m_httpClient;
-    QtTimerFactory   m_timerFactory;
-    ChatController   m_controller;
+    SqlCipherDb        m_db;
+    AppDataStore       m_store;
+    // Factory replaces the previous single QtWebSocket member: it
+    // creates fresh QtWebSocket instances per RelayClient subscribe
+    // (one for the primary, one per addSubscribeRelay()).  Each
+    // QtWebSocket is parented to MainWindow for thread affinity.
+    QtWebSocketFactory m_wsFactory;
+    QtHttpClient       m_httpClient;
+    QtTimerFactory     m_timerFactory;
+    ChatController     m_controller;
     ChatView        *m_chatView      = nullptr;
     ChatNotifier    *m_notifier      = nullptr;
     QStackedWidget  *m_mainStack     = nullptr;

@@ -20,6 +20,7 @@
 // as the user-visible failure "the message didn't arrive."
 
 #include "types.hpp"
+#include "AppDataStore.hpp"
 #include "ChatController.hpp"
 #include "CryptoEngine.hpp"
 #include "IHttpClient.hpp"
@@ -105,6 +106,25 @@ public:
 private:
     MockRelay* m_relay = nullptr;
     bool m_connected = false;
+};
+
+// MockWebSocketFactory — hands out MockWebSocket instances bound to a
+// shared MockRelay.  Mirrors the production CWebSocketFactory pattern:
+// RelayClient calls create() once for the primary subscribe; the test
+// captures the raw pointer in Party::ws so the relay can deliverBinary
+// to it.
+class MockWebSocketFactory : public IWebSocketFactory {
+public:
+    explicit MockWebSocketFactory(MockRelay* relay) : m_relay(relay) {}
+
+    std::unique_ptr<IWebSocket> create() override {
+        auto ws = std::make_unique<MockWebSocket>(m_relay);
+        created.push_back(ws.get());
+        return ws;
+    }
+
+    MockRelay* m_relay = nullptr;
+    std::vector<MockWebSocket*> created;  // non-owning
 };
 
 // ── MockHttpClient ───────────────────────────────────────────────────────
@@ -218,7 +238,19 @@ protected:
         std::string                      dataDir;
         std::string                      dbPath;
         std::unique_ptr<SqlCipherDb>     db;
-        std::unique_ptr<MockWebSocket>   ws;
+        // appData binds to the same SqlCipherDb as ChatController and
+        // backs the v2 group-message path (replay cache, chain state,
+        // send state, bundle map).  Without it, sendTextV2 falls back
+        // to the v1 SenderChain path — the v2 + Phase 2 tests below
+        // need it wired to actually exercise the new code.
+        std::unique_ptr<AppDataStore>    appData;
+        // wsFactory owns the MockWebSocket; ws is a non-owning view
+        // captured at construction time for the test to drive directly
+        // (registerPeer with the relay, deliverBinary etc.).  Pointer is
+        // valid as long as the ChatController (and therefore RelayClient)
+        // is alive.
+        std::unique_ptr<MockWebSocketFactory> wsFactory;
+        MockWebSocket*                   ws = nullptr;
         std::unique_ptr<MockHttpClient>  http;
         std::unique_ptr<MockTimerFactory> timers;
         std::unique_ptr<ChatController>  ctrl;
@@ -254,6 +286,37 @@ protected:
         };
         std::vector<MemberLeft> memberLeft;
 
+        // pv=2 group_msg capture — fired from
+        // ChatController::onGroupMessageReceived.  Carries the same
+        // shape as the C-API callback so the v2 dispatcher's drained-
+        // buffer messages preserve their counter ordering on receive.
+        struct GroupReceived {
+            std::string from;
+            std::string groupId;
+            std::string groupName;
+            std::vector<std::string> members;
+            std::string text;
+            int64_t     ts = 0;
+            std::string msgId;
+        };
+        std::vector<GroupReceived> groupReceived;
+
+        // pv=2 stream-blocked + lost-messages capture for gap-fill /
+        // session-reset assertions.
+        struct GroupBlocked {
+            std::string groupId;
+            std::string senderPeerId;
+            int64_t fromCtr = 0;
+            int64_t toCtr   = 0;
+        };
+        std::vector<GroupBlocked> groupBlocked;
+        struct GroupLost {
+            std::string groupId;
+            std::string senderPeerId;
+            int64_t count = 0;
+        };
+        std::vector<GroupLost> groupLost;
+
         // File-transfer capture (receiver side).  savedPath is non-empty
         // only on the final progress event; we stash only the last frame
         // per transferId so tests can check completion cleanly.
@@ -274,10 +337,15 @@ protected:
         p.dataDir = makeTempPath(("p2p-e2e-id-" + tag).c_str(), "");
         fs::create_directories(p.dataDir);
 
-        p.ws     = std::make_unique<MockWebSocket>(relay.get());
-        p.http   = std::make_unique<MockHttpClient>(relay.get());
-        p.timers = std::make_unique<MockTimerFactory>();
-        p.ctrl   = std::make_unique<ChatController>(*p.ws, *p.http, *p.timers);
+        p.wsFactory = std::make_unique<MockWebSocketFactory>(relay.get());
+        p.http      = std::make_unique<MockHttpClient>(relay.get());
+        p.timers    = std::make_unique<MockTimerFactory>();
+        p.ctrl      = std::make_unique<ChatController>(*p.wsFactory, *p.http, *p.timers);
+        // ChatController -> RelayClient called wsFactory.create() once;
+        // grab the resulting MockWebSocket as a non-owning view so the
+        // relay can route inbound envelopes to it via deliverBinary.
+        ASSERT_EQ(p.wsFactory->created.size(), 1u);
+        p.ws = p.wsFactory->created[0];
 
         p.ctrl->setDataDir(p.dataDir);
         p.ctrl->setPassphrase(tag + "-test-only-passphrase");
@@ -291,6 +359,15 @@ protected:
         randombytes_buf(dbKey.data(), dbKey.size());
         ASSERT_TRUE(p.db->open(p.dbPath, dbKey)) << p.db->lastError();
         p.ctrl->setDatabase(*p.db);
+
+        // Wire AppDataStore so the v2 group path activates.  Bind to
+        // the same SqlCipherDb the controller uses; field-encryption
+        // key is the at-rest dbKey itself (mirrors p2p_context's
+        // wiring at the C-API layer).
+        p.appData = std::make_unique<AppDataStore>();
+        ASSERT_TRUE(p.appData->bind(*p.db));
+        p.appData->setEncryptionKey(dbKey);
+        p.ctrl->setAppDataStore(p.appData.get());
 
         // ChatController drives RelayClient; setRelayUrl is required or
         // the HTTP paths it builds won't have a host.
@@ -318,6 +395,29 @@ protected:
                                           int64_t /*ts*/, const std::string& /*msgId*/) {
             p.memberLeft.push_back({from, gid, gname, members});
         };
+        p.ctrl->onGroupMessageReceived =
+            [&p](const std::string& from,
+                  const std::string& gid,
+                  const std::string& gname,
+                  const std::vector<std::string>& members,
+                  const std::string& text,
+                  int64_t ts,
+                  const std::string& msgId) {
+            p.groupReceived.push_back({from, gid, gname, members,
+                                         text, ts, msgId});
+        };
+        p.ctrl->onGroupStreamBlocked =
+            [&p](const std::string& gid,
+                  const std::string& sender,
+                  int64_t fromCtr, int64_t toCtr) {
+            p.groupBlocked.push_back({gid, sender, fromCtr, toCtr});
+        };
+        p.ctrl->onGroupMessagesLost =
+            [&p](const std::string& gid,
+                  const std::string& sender,
+                  int64_t count) {
+            p.groupLost.push_back({gid, sender, count});
+        };
         p.ctrl->onFileChunkReceived = [&p](const std::string& /*from*/,
                                             const std::string& tid,
                                             const std::string& fileName,
@@ -337,14 +437,32 @@ protected:
     void connectBoth() {
         // Register peers by id BEFORE they connect, so auth + any immediate
         // queued envelopes can be routed.
-        relay->registerPeer(alice.id, alice.ws.get());
-        relay->registerPeer(bob.id,   bob.ws.get());
+        relay->registerPeer(alice.id, alice.ws);
+        relay->registerPeer(bob.id,   bob.ws);
 
         alice.ctrl->connectToRelay();  // mock WS -> auth -> auth_ok inline
         bob.ctrl->connectToRelay();
 
         ASSERT_TRUE(alice.ctrl->relay().isConnected());
         ASSERT_TRUE(bob.ctrl->relay().isConnected());
+    }
+
+    // Force a 1:1 Noise IK handshake in both directions so the DR
+    // session exists before any v2 group_msg send.  sendTextV2 needs
+    // sessionMgr->sessionIdFor(peer) to be non-empty — that's the
+    // signal the DR session has been established.  In production the
+    // first 1:1 message naturally bootstraps it; in v2-group tests
+    // there's no preceding 1:1, so we synthesize one here.
+    //
+    // The throwaway messages land in `received` on both sides; tests
+    // that want to assert on that capture should clear it after this
+    // call returns.
+    void establishSessions() {
+        connectBoth();
+        alice.ctrl->sendText(bob.id,   "__bootstrap__");
+        bob.ctrl->sendText(alice.id,   "__bootstrap__");
+        alice.received.clear();
+        bob.received.clear();
     }
 
     // Stamp the stored fingerprint row for `peerId` in `party`'s DB with
@@ -465,11 +583,18 @@ TEST_F(TwoClientSuite, PersistentEnvelopeDedupSurvivesRestart) {
     const Bytes replay = captured.back();
 
     // Tear down Bob's controller (identity.json + DB survive on disk).
+    // bob.ctrl.reset() destroys the MockWebSocket the factory previously
+    // created, leaving bob.ws dangling.  Recreate the factory too so
+    // bob.ws gets refreshed to the new WS owned by the new controller.
     bob.ctrl.reset();
+    bob.wsFactory = std::make_unique<MockWebSocketFactory>(relay.get());
 
-    // Rebuild Bob's controller on the same data dir + same DB + same WS.
-    // The DB pointer is still valid because we kept bob.db alive.
-    bob.ctrl = std::make_unique<ChatController>(*bob.ws, *bob.http, *bob.timers);
+    // Rebuild Bob's controller on the same data dir + same DB.
+    bob.ctrl = std::make_unique<ChatController>(
+        *bob.wsFactory, *bob.http, *bob.timers);
+    ASSERT_EQ(bob.wsFactory->created.size(), 1u);
+    bob.ws = bob.wsFactory->created[0];
+
     bob.ctrl->setDataDir(bob.dataDir);
     bob.ctrl->setPassphrase("bob-test-only-passphrase");
     bob.ctrl->setDatabase(*bob.db);
@@ -481,7 +606,7 @@ TEST_F(TwoClientSuite, PersistentEnvelopeDedupSurvivesRestart) {
         bob.received.push_back({from, text, ts, msgId});
     };
     // Re-register in the mock relay so routing still works.
-    relay->registerPeer(bob.id, bob.ws.get());
+    relay->registerPeer(bob.id, bob.ws);
     bob.ctrl->connectToRelay();
 
     // Now replay the captured envelope directly onto Bob's WS.
@@ -787,4 +912,207 @@ TEST_F(TwoClientSuite, GroupFile_RoundTripDeliversAllChunks) {
     std::error_code ec;
     fs::remove(srcPath, ec);
     fs::remove(done->savedPath, ec);
+}
+
+// ── Phase 1: Causally-Linked Pairwise group_msg over real DR ──────────────
+//
+// These tests drive sendGroupMessageViaMailbox (which routes through
+// sendTextV2) and verify the v2 wire envelope flows through real
+// SessionSealer + SessionManager + AppDataStore on both ends.  The
+// receiver state machine has unit-test coverage in test_group_protocol;
+// these tests pin the integration: handshake → seal → relay → unseal
+// → dispatchGroupMessageV2 → onGroupMessageReceived.
+
+TEST_F(TwoClientSuite, V2GroupText_RoundTripDelivers) {
+    establishSessions();
+    const std::string gid = "grp-v2-text-aaa";
+    bob.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+
+    alice.ctrl->sendGroupMessageViaMailbox(
+        gid, "Project Hydra", { alice.id, bob.id }, "first v2 group msg");
+
+    ASSERT_EQ(bob.groupReceived.size(), 1u);
+    EXPECT_EQ(bob.groupReceived[0].from,      alice.id);
+    EXPECT_EQ(bob.groupReceived[0].groupId,   gid);
+    EXPECT_EQ(bob.groupReceived[0].groupName, "Project Hydra");
+    EXPECT_EQ(bob.groupReceived[0].text,      "first v2 group msg");
+    EXPECT_FALSE(bob.groupReceived[0].msgId.empty());
+}
+
+TEST_F(TwoClientSuite, V2GroupText_BidirectionalCounterIndependent) {
+    // Each (sender, group, recipient) tuple maintains its own
+    // counter — Alice→Bob and Bob→Alice are independent streams in
+    // the same group, so neither's counter affects the other's
+    // chain_state.
+    establishSessions();
+    const std::string gid = "grp-v2-bidi-bbb";
+    alice.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+    bob.ctrl->setKnownGroupMembers(gid,   { alice.id, bob.id });
+
+    alice.ctrl->sendGroupMessageViaMailbox(gid, "G", { alice.id, bob.id }, "A#1");
+    bob.ctrl->sendGroupMessageViaMailbox(gid,   "G", { alice.id, bob.id }, "B#1");
+    alice.ctrl->sendGroupMessageViaMailbox(gid, "G", { alice.id, bob.id }, "A#2");
+    bob.ctrl->sendGroupMessageViaMailbox(gid,   "G", { alice.id, bob.id }, "B#2");
+
+    ASSERT_EQ(bob.groupReceived.size(),   2u);
+    EXPECT_EQ(bob.groupReceived[0].text,  "A#1");
+    EXPECT_EQ(bob.groupReceived[1].text,  "A#2");
+    ASSERT_EQ(alice.groupReceived.size(), 2u);
+    EXPECT_EQ(alice.groupReceived[0].text, "B#1");
+    EXPECT_EQ(alice.groupReceived[1].text, "B#2");
+
+    // Neither side fired blocked or lost — the chain progressed
+    // strictly in-order.
+    EXPECT_TRUE(alice.groupBlocked.empty());
+    EXPECT_TRUE(bob.groupBlocked.empty());
+    EXPECT_TRUE(alice.groupLost.empty());
+    EXPECT_TRUE(bob.groupLost.empty());
+}
+
+TEST_F(TwoClientSuite, V2GroupText_DropsExactReplay) {
+    // The MockRelay's deliverMultiplier=2 sends each envelope twice.
+    // The pv=2 receiver dedups via its counter < expectedNext check
+    // (same envelope ID, second arrival hits "already delivered").
+    establishSessions();
+    const std::string gid = "grp-v2-replay-ccc";
+    bob.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+
+    relay->setDeliverMultiplier(2);
+    alice.ctrl->sendGroupMessageViaMailbox(
+        gid, "G", { alice.id, bob.id }, "exactly once please");
+
+    ASSERT_EQ(bob.groupReceived.size(), 1u)
+        << "v2 receiver should drop the duplicate via counter monotonicity "
+        << "(or envelope-ID dedup at the outer layer — either is fine)";
+    EXPECT_EQ(bob.groupReceived[0].text, "exactly once please");
+}
+
+// ── Phase 2: Invisible Groups (bundle_id round-trip) ─────────────────────────
+//
+// The bundle_id replaces groupId on the wire — sender mints + persists,
+// receiver learns + back-fills its mapping on first message.  Subsequent
+// messages route via bundle on both sides.
+
+TEST_F(TwoClientSuite, V2GroupBundle_SenderPersistsStableId) {
+    // The bundle_id is generated lazily on first send and reused for
+    // every subsequent send to the same group, regardless of which
+    // recipient is being addressed.
+    establishSessions();
+    const std::string gid = "grp-bundle-stable";
+    alice.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+    bob.ctrl->setKnownGroupMembers(gid,   { alice.id, bob.id });
+
+    // Pre-send: no mapping yet.
+    EXPECT_TRUE(alice.appData->bundleIdForGroup(gid).empty());
+
+    alice.ctrl->sendGroupMessageViaMailbox(gid, "G",
+                                             { alice.id, bob.id }, "first");
+    const Bytes b1 = alice.appData->bundleIdForGroup(gid);
+    ASSERT_EQ(b1.size(), 16u) << "mint should produce a 16-byte bundle";
+
+    alice.ctrl->sendGroupMessageViaMailbox(gid, "G",
+                                             { alice.id, bob.id }, "second");
+    EXPECT_EQ(alice.appData->bundleIdForGroup(gid), b1)
+        << "second send must reuse the same bundle for the same groupId";
+
+    ASSERT_EQ(bob.groupReceived.size(), 2u);
+    EXPECT_EQ(bob.groupReceived[0].text, "first");
+    EXPECT_EQ(bob.groupReceived[1].text, "second");
+}
+
+TEST_F(TwoClientSuite, V2GroupBundle_ReceiverLearnsMapping) {
+    // Bob has never seen this group's bundle before Alice's first
+    // send; after the inbound dispatch, Bob's local AppDataStore
+    // should hold the same bundle_id Alice minted, bound to the same
+    // local groupId — so future messages (and gap_requests Bob fires)
+    // resolve consistently.
+    establishSessions();
+    const std::string gid = "grp-bundle-learned";
+    alice.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+    bob.ctrl->setKnownGroupMembers(gid,   { alice.id, bob.id });
+
+    EXPECT_TRUE(bob.appData->bundleIdForGroup(gid).empty());
+
+    alice.ctrl->sendGroupMessageViaMailbox(gid, "G",
+                                             { alice.id, bob.id },
+                                             "hello, invisible group");
+
+    const Bytes aliceBundle = alice.appData->bundleIdForGroup(gid);
+    const Bytes bobBundle   = bob.appData->bundleIdForGroup(gid);
+    ASSERT_FALSE(aliceBundle.empty());
+    ASSERT_FALSE(bobBundle.empty());
+    EXPECT_EQ(aliceBundle, bobBundle)
+        << "receiver should back-fill with the sender's bundle";
+    EXPECT_EQ(bob.appData->groupIdForBundle(aliceBundle), gid)
+        << "reverse mapping must resolve to local groupId";
+}
+
+TEST_F(TwoClientSuite, V2GroupBundle_DistinctGroupsGetDistinctBundles) {
+    // Two groups, same membership — bundles MUST differ so the relay
+    // can't correlate messages across them.
+    establishSessions();
+    const std::string g1 = "grp-bundle-distinct-A";
+    const std::string g2 = "grp-bundle-distinct-B";
+    alice.ctrl->setKnownGroupMembers(g1, { alice.id, bob.id });
+    alice.ctrl->setKnownGroupMembers(g2, { alice.id, bob.id });
+    bob.ctrl->setKnownGroupMembers(g1,   { alice.id, bob.id });
+    bob.ctrl->setKnownGroupMembers(g2,   { alice.id, bob.id });
+
+    alice.ctrl->sendGroupMessageViaMailbox(g1, "G1",
+                                             { alice.id, bob.id }, "to G1");
+    alice.ctrl->sendGroupMessageViaMailbox(g2, "G2",
+                                             { alice.id, bob.id }, "to G2");
+
+    const Bytes b1 = alice.appData->bundleIdForGroup(g1);
+    const Bytes b2 = alice.appData->bundleIdForGroup(g2);
+    EXPECT_NE(b1, b2);
+    EXPECT_EQ(bob.appData->groupIdForBundle(b1), g1);
+    EXPECT_EQ(bob.appData->groupIdForBundle(b2), g2);
+}
+
+TEST_F(TwoClientSuite, V2GroupBundle_ExistingMappingWinsOverInnerGroupId) {
+    // Defense in depth: once we have a (bundle → groupId) binding, a
+    // subsequent message that tries to claim a different groupId for
+    // the same bundle is routed to the LOCALLY-bound groupId, not the
+    // forged one.  Keeps a compromised peer from cross-mapping
+    // bundles to other groups they shouldn't be able to address.
+    establishSessions();
+    const std::string realGid = "grp-bundle-defense";
+    alice.ctrl->setKnownGroupMembers(realGid, { alice.id, bob.id });
+    bob.ctrl->setKnownGroupMembers(realGid,   { alice.id, bob.id });
+
+    // First send establishes the binding on Bob's side.
+    alice.ctrl->sendGroupMessageViaMailbox(realGid, "G",
+                                             { alice.id, bob.id }, "first");
+    ASSERT_EQ(bob.groupReceived.size(), 1u);
+    EXPECT_EQ(bob.groupReceived[0].groupId, realGid);
+
+    // Second send with the same bundle continues to route to realGid
+    // even though the inner groupId field is the same (regression
+    // guard — the resolver must use the bundle, not the inner gid).
+    alice.ctrl->sendGroupMessageViaMailbox(realGid, "G",
+                                             { alice.id, bob.id }, "second");
+    ASSERT_EQ(bob.groupReceived.size(), 2u);
+    EXPECT_EQ(bob.groupReceived[1].groupId, realGid);
+}
+
+TEST_F(TwoClientSuite, V2GroupBundle_DeleteConversationClearsMapping) {
+    // v3 design: deleteConversation cascades the bundle map row via
+    // group_bundle_map.group_id FK ON DELETE CASCADE.  This is the
+    // "leave + wipe" path; deleteContact (address book only) does
+    // NOT drop bundle mappings any more.
+    establishSessions();
+    const std::string gid = "grp-bundle-leave";
+    alice.ctrl->setKnownGroupMembers(gid, { alice.id, bob.id });
+
+    alice.ctrl->sendGroupMessageViaMailbox(gid, "G",
+                                             { alice.id, bob.id }, "msg");
+    const Bytes original = alice.appData->bundleIdForGroup(gid);
+    ASSERT_EQ(original.size(), 16u);
+
+    // Delete the conversation row — FK cascade sweeps every group_*
+    // child including the bundle mapping.
+    EXPECT_TRUE(alice.appData->deleteConversation(gid));
+    EXPECT_TRUE(alice.appData->bundleIdForGroup(gid).empty());
+    EXPECT_TRUE(alice.appData->groupIdForBundle(original).empty());
 }

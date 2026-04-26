@@ -348,3 +348,114 @@ TEST(RatchetSession, MaxSkipKeysRefusesOverflow) {
     EXPECT_TRUE(p.responder.decrypt(bogus).empty())
         << "attempting to skip > kMaxSkipped keys must fail closed";
 }
+
+// ── Phase 1: stable per-session id ──────────────────────────────────────
+//
+// sessionId() is the foundation for the Causally-Linked Pairwise group
+// protocol's session_id namespacing.  Both sides must compute identical
+// bytes (so chain_state lookups match across the peer pair) and the
+// value must be stable for the life of the session — DH ratchet steps
+// MUST NOT change it.
+
+TEST(RatchetSession, SessionIdMatchesBetweenInitiatorAndResponder) {
+    auto p = makePair();
+    const Bytes a = p.initiator.sessionId();
+    const Bytes b = p.responder.sessionId();
+    ASSERT_EQ(a.size(), 8u) << "sessionId is 8 bytes";
+    EXPECT_EQ(a, b)
+        << "both sides of the same DR session must agree on sessionId";
+}
+
+TEST(RatchetSession, SessionIdIsStableAcrossDhRatchets) {
+    auto p = makePair();
+    const Bytes initial = p.initiator.sessionId();
+
+    // Drive a few message round-trips so each side performs at least
+    // one DH ratchet step.  m_rootKey evolves; m_initialRootKey must not.
+    for (int i = 0; i < 3; ++i) {
+        Bytes ct = p.initiator.encrypt(bytesOf("ping"));
+        ASSERT_FALSE(p.responder.decrypt(ct).empty());
+        Bytes ct2 = p.responder.encrypt(bytesOf("pong"));
+        ASSERT_FALSE(p.initiator.decrypt(ct2).empty());
+    }
+
+    EXPECT_EQ(p.initiator.sessionId(), initial)
+        << "sessionId must not move when m_rootKey ratchets forward";
+    EXPECT_EQ(p.responder.sessionId(), initial)
+        << "responder's sessionId must also be stable across DH steps";
+}
+
+TEST(RatchetSession, SessionIdDiffersAcrossFreshHandshakes) {
+    auto p1 = makePair();
+    auto p2 = makePair();   // independent handshake, fresh root key
+    EXPECT_NE(p1.initiator.sessionId(), p2.initiator.sessionId())
+        << "two distinct sessions MUST yield distinct sessionIds — "
+        << "this is what receivers use to detect a session reset";
+}
+
+TEST(RatchetSession, SessionIdEmptyOnDefaultConstructed) {
+    RatchetSession s;
+    EXPECT_TRUE(s.sessionId().empty());
+}
+
+TEST(RatchetSession, SessionIdSurvivesSerializeRoundTrip) {
+    // The Causally-Linked Pairwise group protocol uses sessionId to
+    // namespace per-(sender, group, recipient) counters on the wire.
+    // If a process restart clobbered sessionId, every restart would
+    // look like a session reset — group_send_state would miss, lost-
+    // message events would fire spuriously, and counters would be
+    // recomputed from scratch.  serialize/deserialize MUST carry the
+    // initial root key so sessionId() is stable across persistence.
+
+    auto p = makePair();
+    const Bytes original = p.initiator.sessionId();
+    ASSERT_EQ(original.size(), 8u);
+
+    // Drive a few message round-trips so m_rootKey ratchets forward
+    // (and would diverge from m_initialRootKey).  Then serialize the
+    // state, deserialize into a fresh instance, and verify the
+    // sessionId is preserved.
+    for (int i = 0; i < 3; ++i) {
+        Bytes ct = p.initiator.encrypt(bytesOf("ping"));
+        ASSERT_FALSE(p.responder.decrypt(ct).empty());
+    }
+
+    Bytes blob = p.initiator.serialize();
+    ASSERT_FALSE(blob.empty());
+
+    RatchetSession reloaded = RatchetSession::deserialize(blob);
+    ASSERT_TRUE(reloaded.isValid());
+    EXPECT_EQ(reloaded.sessionId(), original)
+        << "serialize → deserialize MUST preserve sessionId so a "
+        << "process restart doesn't look like a session reset";
+}
+
+TEST(RatchetSession, SessionIdEmptyOnLegacyV2DeserializedSession) {
+    // Pre-Phase-1 sessions persisted under format v=2 carried no
+    // m_initialRootKey.  Loading one through the current
+    // deserialize must yield an empty sessionId — the v2 group
+    // sender path checks for this and degrades gracefully.
+    //
+    // Construct a v=2 blob by hand: same wire shape as serialize
+    // produces today, but with the leading version byte forced to 2
+    // and the trailing m_initialRootKey field omitted.
+
+    auto p = makePair();
+    Bytes v3blob = p.initiator.serialize();
+    ASSERT_FALSE(v3blob.empty());
+
+    // Stamp the version byte back to 2 and truncate the trailing
+    // initialRootKey field.  The v=2 reader stops before that field
+    // anyway, so trimming the bytes mirrors what an old serializer
+    // would have produced.  Here we just patch the version — the
+    // deserializer is robust to trailing bytes via BinaryReader::ok.
+    Bytes v2blob = v3blob;
+    v2blob[0] = 2;
+
+    RatchetSession reloaded = RatchetSession::deserialize(v2blob);
+    ASSERT_TRUE(reloaded.isValid());
+    EXPECT_TRUE(reloaded.sessionId().empty())
+        << "pre-v3 sessions on disk MUST yield empty sessionId so "
+        << "the v2 group sender's missing-deps fallback kicks in "
+        << "rather than emitting wire-format pv=2 with junk session";
+}

@@ -252,6 +252,13 @@ final class Peer2PearClient: ObservableObject {
     @Published var myPeerId: String = ""
     @Published var statusMessage: String = ""
 
+    /// Transient status for the chat-list toast (group-send failures,
+    /// relay retry / give-up, session errors).  Set by the core's
+    /// on_status callback; the view clears it after displaying for a
+    /// few seconds.  Kept separate from `statusMessage`, which
+    /// OnboardingView uses for the persistent unlock banner.
+    @Published var toastMessage: String?
+
     /// Last-write-wins 1:1 message log.  Views may further partition by peer.
     @Published var messages: [P2PMessage] = []
 
@@ -267,6 +274,32 @@ final class Peer2PearClient: ObservableObject {
     /// groupId → base64 avatar payload.  Set by on_group_avatar or
     /// locally after a successful sendGroupAvatar.
     @Published var groupAvatars: [String: String] = [:]
+
+    /// pv=2 (Causally-Linked Pairwise) UX state.
+
+    /// One sender's missing range inside a group.  Surfaced as
+    /// "waiting for messages from X..." banner in ConversationView.
+    /// Cleared once the gap fills (next in-order group_message
+    /// arrival from this sender) or on session reset.
+    struct BlockedRange: Equatable {
+        var from: Int64
+        var to:   Int64
+    }
+    /// groupId → senderPeerId → BlockedRange.  Per-(group, sender)
+    /// because the same group may have multiple senders blocked
+    /// independently (one peer's stream stalled while another's flows).
+    @Published var groupBlockedStreams: [String: [String: BlockedRange]] = [:]
+
+    /// One "K messages lost during reconnection" event.  Appended on
+    /// session reset; the UI surfaces a one-shot alert and removes
+    /// (or marks-seen) the entry after dismissal.
+    struct LostMessagesEvent: Equatable, Identifiable {
+        let id = UUID()
+        let groupId:      String
+        let senderPeerId: String
+        let count:        Int64
+    }
+    @Published var groupLostMessages: [LostMessagesEvent] = []
 
     /// peerId → online.  Updated by `on_presence` pushes.
     @Published var peerPresence: [String: Bool] = [:]
@@ -288,18 +321,42 @@ final class Peer2PearClient: ObservableObject {
     /// the user re-verifies via `markPeerVerified`.
     @Published var keyChanges: [String: P2PKeyChange] = [:]
 
-    /// Peers the user added via "New Chat" before any messages flowed.
-    /// ChatListView unions this with the message-derived peer set so a
-    /// freshly-added contact shows up immediately.  Persisted as
-    /// in_address_book=1 contact rows in the AppDataStore so restarts
-    /// don't lose contacts that haven't yet exchanged a message.
+    /// Peers the user explicitly added to the address book — drives
+    /// ContactsListView and is unioned with message-derived peers in
+    /// ChatListView.  Backed 1:1 by the v3 contacts table now: every
+    /// row in `contacts` is by definition a curated address-book
+    /// entry (no more in_address_book toggle).
     @Published var knownPeerContacts: Set<String> = []
+
+    /// peer_id → conversation_id mapping for 1:1 chats.  Populated at
+    /// startup from the conversations table and lazily extended via
+    /// `ensureDirectConversationId(for:)` when a stranger first
+    /// messages us or we send to a peer for the first time.  The view
+    /// layer keeps `messages` peer-keyed; this dict is the indirection
+    /// that lets the bridge re-key those reads/writes onto
+    /// `messages.conversation_id` under the hood.
+    @Published var directConversationIdByPeer: [String: String] = [:]
+
+    /// Look up (or mint + cache) the conversation_id for a 1:1 chat
+    /// with `peerId`.  Returns nil only when `rawContext` is nil —
+    /// concurrent callers converge on the same id via the partial
+    /// UNIQUE index in the conversations table.
+    @discardableResult
+    func ensureDirectConversationId(for peerId: String) -> String? {
+        if let cached = directConversationIdByPeer[peerId] { return cached }
+        guard let convId = dbFindOrCreateDirectConversation(peerId: peerId) else {
+            return nil
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.directConversationIdByPeer[peerId] = convId
+        }
+        return convId
+    }
 
     /// Register a peer as a known contact.  Safe to call on an already-
     /// known peer (idempotent), and skips self (the core filters self
-    /// out everywhere else, keep the invariant here too).  Upserts the
-    /// matching contacts row with in_address_book=1 so a future restart
-    /// reloads the peer as an explicit contact.
+    /// out everywhere else, keep the invariant here too).  Upserts a
+    /// row in the v3 contacts table.
     func addContact(peerId: String) {
         let trimmed = peerId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != myPeerId else { return }
@@ -307,54 +364,112 @@ final class Peer2PearClient: ObservableObject {
             guard let self else { return }
             self.knownPeerContacts.insert(trimmed)
             self.dbSaveContact(DBContact(
-                peerId:        trimmed,
-                name:          self.contactNicknames[trimmed] ?? "",
-                keys:          [trimmed],
-                isBlocked:     self.blockedPeerIds.contains(trimmed),
-                inAddressBook: true))
+                peerId: trimmed,
+                name:   self.contactNicknames[trimmed] ?? "",
+                muted:  self.mutedPeerIds.contains(trimmed)))
         }
     }
 
-    /// Remove a peer from the address book and clear their nickname.
-    /// Leaves message history intact — the key pair still identifies
-    /// the peer, so if they message again the chat row stays attached
-    /// to the same cryptographic identity.  Use `deleteChat(peerId:)`
-    /// to wipe the transcript separately.  In the DB the row stays
-    /// (so messages.peer_id FK is satisfied) but in_address_book flips
-    /// to 0 and name resets to empty.
+    /// Remove a peer from the address book.  v3 contract: this drops
+    /// the `contacts` row only; conversations and messages with this
+    /// peer are NOT touched (chat history is the user's data, separate
+    /// from address-book curation).  Use `deleteChat(peerId:)` to wipe
+    /// the transcript separately.
     func removeContact(peerId: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.knownPeerContacts.remove(peerId)
             self.contactNicknames.removeValue(forKey: peerId)
-            self.dbSaveContact(DBContact(
-                peerId:        peerId,
-                name:          "",
-                keys:          [peerId],
-                isBlocked:     self.blockedPeerIds.contains(peerId),
-                inAddressBook: false))
+            self.dbDeleteContact(peerId: peerId)
         }
     }
 
-    /// Wipe 1:1 message history with a peer without touching the
-    /// contacts roster.  Used by the ChatListView trailing swipe so
-    /// the user can dismiss a chat row (e.g. from a stranger who
-    /// messaged first) without also deleting the contact.  Also wipes
-    /// the file_transfers rows for this chat so the strip cards
-    /// disappear — the actual files at savedPath stay on disk.
+    /// Delete a single 1:1 or group message by msgId.  Wipes the row
+    /// from the in-memory @Published arrays and from the SQLCipher
+    /// store; the chat itself is untouched.  Used by the long-press
+    /// "Delete Message" action on message bubbles.
+    ///
+    /// `chatKey` is the peer ID for 1:1s and the group ID for group
+    /// messages — under v3 we resolve it to a conversation_id before
+    /// the DB write (groups: chatKey == conv_id; direct: lookup via
+    /// directConversationIdByPeer).
+    func deleteMessage(chatKey: String, msgId: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.messages.removeAll { $0.id == msgId }
+            self.groupMessages.removeAll { $0.id == msgId }
+            // Group: chatKey IS the conversation_id (group_id == conv_id
+            // in v3 by design).  Direct: walk the peer→conv index.
+            let convId: String? = self.groups[chatKey] != nil
+                ? chatKey
+                : self.directConversationIdByPeer[chatKey]
+            if let convId {
+                self.dbDeleteMessage(conversationId: convId, msgId: msgId)
+            }
+        }
+    }
+
+    /// Wipe local message history for a chat without touching the
+    /// contacts roster.  Works for both 1:1 peers and groups — pass
+    /// the peerIdB64u for a direct chat or the groupId for a group.
+    /// Also wipes the file_transfers rows for this chat so the strip
+    /// cards disappear; the actual files at savedPath stay on disk.
+    ///
+    /// The contact row in the AppDataStore is untouched — nickname,
+    /// avatar, and (for groups) member roster all survive.  If the
+    /// peer or group messages again, the chat re-materializes with
+    /// its prior identity intact.  Use `removeContact` / `leaveGroup`
+    /// separately to drop the address-book / membership side.
+    ///
+    /// v3: this calls `dbDeleteConversation` which CASCADEs through
+    /// messages + members + group_* state — we don't have to wipe
+    /// each table individually.
     func deleteChat(peerId: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+
+            // 1:1 bucket.
             self.messages.removeAll { $0.from == peerId || $0.to == peerId }
-            // In-memory transfer cards for this peer also go away.
+
+            // Group bucket (the `peerId` arg doubles as a groupId for
+            // group-chat call sites).  Safe to run both branches: the
+            // keys don't overlap — groupIds are UUIDs, peer IDs are
+            // 43-char base64url.  v3 stores groups in `conversations`
+            // (kind='group'), and dropping the conversation cascades
+            // into messages/members/group_* automatically.
+            let wasGroup = self.groups[peerId] != nil
+            self.groupMessages.removeAll { $0.groupId == peerId }
+            self.groups.removeValue(forKey: peerId)
+            self.groupAvatars.removeValue(forKey: peerId)
+
+            // In-memory transfer cards for this chat also go away.
             // (We don't touch the on-disk files at savedPath — only
             // the bookkeeping row + UI card.)
             let toRemove = self.transfers.filter { $0.value.peerId == peerId }.keys
             for tid in toRemove {
                 self.transfers.removeValue(forKey: tid)
             }
-            self.dbDeleteMessages(peerId: peerId)
+
+            // Resolve the conversation id and cascade-delete it.
+            // Group: chatKey == group_id == conv_id (v3 invariant).
+            // Direct: lookup via the peer→conv index.  No cached row
+            // means there's nothing to delete on disk — the @Published
+            // wipe above is the whole effect.
+            let convId: String? = wasGroup
+                ? peerId
+                : self.directConversationIdByPeer[peerId]
+            if let convId {
+                self.dbDeleteConversation(id: convId)
+            }
+            // file_transfers is keyed by chatKey (peerId or groupId),
+            // independent of the conversations cascade — explicit wipe.
             self.dbDeleteFileRecordsForChat(chatKey: peerId)
+
+            // Drop the peer→conv mapping so the next message restarts
+            // with a fresh row (the user explicitly cleared this chat).
+            if !wasGroup {
+                self.directConversationIdByPeer.removeValue(forKey: peerId)
+            }
         }
     }
 
@@ -366,20 +481,116 @@ final class Peer2PearClient: ObservableObject {
     /// `ChatData.isBlocked` bit.
     @Published var blockedPeerIds: Set<String> = []
 
+    /// "Hide Alerts" membership set — peers and groups whose inbound
+    /// messages should not fire a local notification.  Persisted as
+    /// the `muted` column on the contacts table; loaded on unlock.
+    @Published var mutedPeerIds: Set<String> = []
+
+    /// Direct conversations the user archived from `ConversationDetailView`'s
+    /// "Hide from Chat List" toggle.  Mirrors `conversations.in_chat_list = 0`
+    /// for direct rows — populated on load from the DB and updated by
+    /// the toggle's write path.  Read-side: views can filter
+    /// `chatPeerIds` against this set when archive should hide rows.
+    @Published var archivedDirectPeerIds: Set<String> = []
+
+    /// Set by any view that wants the root `ChatListView` nav stack to
+    /// open a specific 1:1 chat — e.g. "Send Message" on a contact
+    /// detail reached from the contacts sheet or a group member row.
+    /// ChatListView observes this via `.navigationDestination(item:)`
+    /// and pushes a `ConversationView` when it goes non-nil.  The
+    /// destination handler zeroes it out so the same peer can be
+    /// routed to again later.
+    @Published var pendingDirectChatPeerId: String?
+
+    /// Chats with at least one unread inbound message.  Keyed by the
+    /// same id a ConversationView is loaded with (peer ID for 1:1,
+    /// group ID for groups).  Session-only for now — cleared on
+    /// `lock()` and re-populated by inbound callbacks.  The chat list
+    /// renders a blue dot for any peer/group in this set.
+    @Published var unreadChatIds: Set<String> = []
+
+    /// Mark the chat (1:1 or group) as read.  Called from the
+    /// ConversationView / GroupConversationView `onAppear` so
+    /// opening a thread clears its unread dot.  Also used when the
+    /// user deletes / leaves the chat.
+    func markChatRead(chatKey: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.unreadChatIds.contains(chatKey) {
+                self.unreadChatIds.remove(chatKey)
+            }
+        }
+    }
+
+    /// True when `peerId` (either a 1:1 peer or a group) has alerts
+    /// silenced.  Reads the in-memory set so SwiftUI views re-render
+    /// reactively.
+    func isMuted(peerId: String) -> Bool {
+        mutedPeerIds.contains(peerId)
+    }
+
+    /// Flip the mute flag for a chat (1:1 peerId or groupId).  Writes
+    /// the single-column DB update immediately so the state survives
+    /// lock/unlock and relaunch.  Safe to call on the main thread.
+    ///
+    /// v3 split: groups live in conversations and use the per-thread
+    /// mute column; 1:1s flip the contact-level mute (cross-conversation,
+    /// silences the same person in groups too).
+    func setMuted(peerId: String, muted: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if muted { self.mutedPeerIds.insert(peerId) }
+            else     { self.mutedPeerIds.remove(peerId) }
+            if self.groups[peerId] != nil {
+                // Groups: per-conversation mute (peerId == group_id == conv_id).
+                self.dbSetConversationMuted(id: peerId, muted: muted)
+            } else {
+                // Direct: person-level mute on the contact row.
+                self.dbSetContactMuted(peerId: peerId, muted: muted)
+            }
+        }
+    }
+
+    /// Per-thread mute for a 1:1 conversation.  Distinct from
+    /// `setMuted(peerId:)`, which writes the contact-row (person-level)
+    /// flag.  Used by `ConversationDetailView` so the user can silence
+    /// notifications for a single thread without touching the
+    /// address-book entry.  Resolves the conversation_id via
+    /// `directConversationIdByPeer` and writes `conversations.muted`.
+    /// `mutedPeerIds` aggregates both flags so the in-memory check
+    /// (`isMuted`) stays a single set lookup.
+    func setConversationMuted(peerId: String, muted: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if muted { self.mutedPeerIds.insert(peerId) }
+            else     { self.mutedPeerIds.remove(peerId) }
+            if let convId = self.directConversationIdByPeer[peerId] {
+                self.dbSetConversationMuted(id: convId, muted: muted)
+            }
+        }
+    }
+
     /// Toggle block state for a peer.  `blocked == true` adds to the
-    /// set; `blocked == false` removes.  Persisted via the snapshot
-    /// so blocks survive relaunch.
+    /// set; `blocked == false` removes.  Persisted as a contact-row
+    /// flag so blocks survive relaunch.  Block is a person-level
+    /// concept (always touches the contacts table, never a
+    /// conversation row).
     func setBlocked(peerId: String, blocked: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if blocked { self.blockedPeerIds.insert(peerId) }
-            else       { self.blockedPeerIds.remove(peerId) }
-            self.dbSaveContact(DBContact(
-                peerId:        peerId,
-                name:          self.contactNicknames[peerId] ?? "",
-                keys:          [peerId],
-                isBlocked:     blocked,
-                inAddressBook: self.knownPeerContacts.contains(peerId)))
+            // Block lives in its own `blocked_keys` table (Phase 3h),
+            // separate from `contacts`.  We do NOT touch the address
+            // book here — a stranger stays a stranger after block, a
+            // curated contact keeps their nickname / avatar.  The
+            // @Published set is the runtime mirror; persistence and
+            // launch hydration go through the new dedicated bridges.
+            if blocked {
+                self.blockedPeerIds.insert(peerId)
+                self.dbAddBlockedKey(peerId: peerId)
+            } else {
+                self.blockedPeerIds.remove(peerId)
+                self.dbRemoveBlockedKey(peerId: peerId)
+            }
         }
     }
 
@@ -406,6 +617,11 @@ final class Peer2PearClient: ObservableObject {
     /// Set or clear the user's nickname for a peer.  Empty / whitespace
     /// strings clear the entry so future renders fall back to the
     /// peer-published display name (or, if none, the key prefix).
+    ///
+    /// v3: setting a nickname promotes the peer into the address book
+    /// (an explicit "this is a person I know" signal).  Clearing the
+    /// nickname leaves them in the address book — call `removeContact`
+    /// to drop the row entirely.
     func setNickname(peerId: String, nickname: String) {
         let trimmed = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
         DispatchQueue.main.async { [weak self] in
@@ -415,18 +631,16 @@ final class Peer2PearClient: ObservableObject {
             } else {
                 self.contactNicknames[peerId] = trimmed
                 // Setting a nickname is a strong "this person is now
-                // in my address book" signal — promote stranger-stub
-                // rows so the peer also surfaces in ContactsListView,
-                // not just the chat thread they came from.
+                // in my address book" signal — promote stranger
+                // conversations into the contacts table so the peer
+                // also surfaces in ContactsListView, not just the
+                // thread they came from.
                 self.knownPeerContacts.insert(peerId)
             }
             self.dbSaveContact(DBContact(
-                peerId:        peerId,
-                name:          trimmed,
-                keys:          [peerId],
-                isBlocked:     self.blockedPeerIds.contains(peerId),
-                inAddressBook: !trimmed.isEmpty
-                                || self.knownPeerContacts.contains(peerId)))
+                peerId: peerId,
+                name:   trimmed,
+                muted:  self.mutedPeerIds.contains(peerId)))
         }
     }
 
@@ -540,13 +754,16 @@ final class Peer2PearClient: ObservableObject {
     /// Raw C context pointer — accessed by platform adapters
     private(set) var rawContext: OpaquePointer?
 
-    private var ws: WebSocketAdapter!
+    // v2 multi-WS pool.  Each connection (primary + each
+    // addSubscribeRelay) is its own WebSocketAdapter; the pool maps
+    // C-side conn_handle pointers to Swift adapters.
+    private var wsPool: WebSocketPool!
     private var http: HttpAdapter!
 
     // MARK: - Lifecycle
 
     init() {
-        ws = WebSocketAdapter(client: self)
+        wsPool = WebSocketPool(client: self)
         http = HttpAdapter(client: self)
         // Wipe any cached unlock passphrase as soon as the app
         // backgrounds — UIKit posts this synchronously before the
@@ -628,27 +845,50 @@ final class Peer2PearClient: ObservableObject {
         var platform = p2p_platform()
         platform.platform_ctx = selfPtr
 
-        // WebSocket callbacks
-        platform.ws_open = { urlCStr, ctx in
-            guard let client = Peer2PearClient.from(ctx), let urlCStr,
+        // v2 multi-connection WebSocket callbacks.  Each connection
+        // (primary + each addSubscribeRelay-spawned slave) is its own
+        // WebSocketAdapter; the pool maps conn_handle pointers to
+        // adapters.  When wired, the C++ core uses MultiCWebSocketFactory
+        // and addSubscribeRelay() works end-to-end.
+        platform.ws_alloc_connection = { ctx in
+            guard let client = Peer2PearClient.from(ctx) else { return nil }
+            return UnsafeMutableRawPointer(client.wsPool.allocate())
+        }
+        platform.ws_free_connection = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return }
+            client.wsPool.free(handle)
+        }
+        // v2 per-connection callbacks: each receives the conn_handle
+        // (returned from ws_alloc_connection) plus platform_ctx (the
+        // Peer2PearClient).  We look up the adapter via the pool —
+        // safe against late callbacks that arrive after free()
+        // because find() returns nil for unknown handles.
+        platform.ws_open_v2 = { handle, urlCStr, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle, let urlCStr,
                   let url = URL(string: String(cString: urlCStr)) else { return }
-            client.ws.open(url: url)
+            client.wsPool.find(handle)?.open(url: url)
         }
-        platform.ws_close = { ctx in
-            guard let client = Peer2PearClient.from(ctx) else { return }
-            client.ws.close()
+        platform.ws_close_v2 = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return }
+            client.wsPool.find(handle)?.close()
         }
-        platform.ws_send_text = { msgCStr, ctx in
-            guard let client = Peer2PearClient.from(ctx), let msgCStr else { return }
-            client.ws.sendText(String(cString: msgCStr))
+        platform.ws_send_text_v2 = { handle, msgCStr, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle, let msgCStr else { return }
+            client.wsPool.find(handle)?.sendText(String(cString: msgCStr))
         }
-        platform.ws_is_connected = { ctx in
-            guard let client = Peer2PearClient.from(ctx) else { return 0 }
-            return client.ws.isConnected ? 1 : 0
+        platform.ws_is_connected_v2 = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return 0 }
+            return (client.wsPool.find(handle)?.isConnected ?? false) ? 1 : 0
         }
-        platform.ws_is_idle = { ctx in
-            guard let client = Peer2PearClient.from(ctx) else { return 1 }
-            return client.ws.isIdle ? 1 : 0
+        platform.ws_is_idle_v2 = { handle, ctx in
+            guard let client = Peer2PearClient.from(ctx),
+                  let handle = handle else { return 1 }
+            return (client.wsPool.find(handle)?.isIdle ?? true) ? 1 : 0
         }
 
         // HTTP callback
@@ -699,7 +939,14 @@ final class Peer2PearClient: ObservableObject {
         setFileHardMaxMB(fileHardMaxMB)
         setFileRequireP2P(fileRequireP2P)
         setHardBlockOnKeyChange(hardBlockOnKeyChange)
+        // Apply the slider preset first, then re-push the explicit
+        // transport toggles so a user who has overridden parallel
+        // fan-out / multi-hop independently of the slider keeps that
+        // override across relaunches.
         setPrivacyLevel(privacyLevel.rawValue)
+        setParallelFanOut(parallelFanOutEnabled)
+        setParallelFanOutK(parallelFanOutK)
+        setMultiHopEnabled(multiHopEnabled)
         applyEffectiveAutoAcceptThreshold()
 
         p2p_set_relay_url(rawContext, relayUrl)
@@ -711,6 +958,11 @@ final class Peer2PearClient: ObservableObject {
         // relaunches — keeps forwarder selection consistent.
         for backup in backupRelayUrls {
             addSendRelay(url: backup)
+            // Also subscribe to the backup so the recipient mailbox is
+            // replicated end-to-end: sender posts to all relays via
+            // parallel fan-out, receiver listens on all of them via
+            // multi-WS subscribe, dedup catches duplicates.
+            addSubscribeRelay(url: backup)
         }
         p2p_connect(rawContext)
 
@@ -726,6 +978,11 @@ final class Peer2PearClient: ObservableObject {
             p2p_destroy(ctx)
             rawContext = nil
         }
+        // Drop every WebSocket the pool was holding — the C core is
+        // gone, so its ws_free_connection callbacks have already
+        // fired for each (in p2p_destroy).  reset() is defensive in
+        // case any straggler escaped that path.
+        wsPool.reset()
         isConnected = false
     }
 
@@ -747,14 +1004,18 @@ final class Peer2PearClient: ObservableObject {
             self.groupMessages     = []
             self.groups            = [:]
             self.groupAvatars      = [:]
-            self.knownPeerContacts = []
-            self.contactNicknames  = [:]
-            self.blockedPeerIds    = []
-            self.peerPresence      = [:]
-            self.peerAvatars       = [:]
-            self.pendingFileRequests = []
-            self.transfers         = [:]
-            self.keyChanges        = [:]
+            self.knownPeerContacts          = []
+            self.contactNicknames           = [:]
+            self.blockedPeerIds             = []
+            self.mutedPeerIds               = []
+            self.archivedDirectPeerIds      = []
+            self.unreadChatIds              = []
+            self.peerPresence               = [:]
+            self.peerAvatars                = [:]
+            self.pendingFileRequests        = []
+            self.transfers                  = [:]
+            self.keyChanges                 = [:]
+            self.directConversationIdByPeer = [:]
         }
     }
 
@@ -867,12 +1128,17 @@ final class Peer2PearClient: ObservableObject {
         }
     }
 
-    /// Three-tier privacy posture for the relay protocol.  Mirrors the
-    /// desktop "Privacy" picker — every level subsumes the previous.
-    /// Stored as the int the C API expects (0/1/2).
+    /// Three-tier privacy posture preset.  Maps onto the four
+    /// orthogonal transport dials (jitter, cover traffic, parallel
+    /// fan-out, multi-hop) in the C core's setPrivacyLevel().  Users
+    /// who want fine-grained control can also flip the parallelFanOut /
+    /// multiHopEnabled toggles directly — they're independent dials
+    /// that target different threats:
+    ///   parallel fan-out  = redundancy (one relay down ≠ delivery loss)
+    ///   multi-hop onion   = anonymity (no relay sees both sender + recipient)
     enum PrivacyLevel: Int, CaseIterable, Identifiable {
         case standard = 0   // envelope padding + sealed sender + E2EE
-        case enhanced = 1   // + send jitter + cover traffic + multi-relay rotation
+        case enhanced = 1   // + jitter + cover traffic + parallel fan-out (all relays)
         case maximum  = 2   // + multi-hop forwarding + high-frequency cover traffic
         var id: Int { rawValue }
     }
@@ -887,6 +1153,73 @@ final class Peer2PearClient: ObservableObject {
             UserDefaults.standard.set(privacyLevel.rawValue,
                                        forKey: Self.kPrivacyLevelKey)
             setPrivacyLevel(privacyLevel.rawValue)
+            // Sync the independent toggle state so the slider and the
+            // advanced toggles stay coherent.  Each assignment fires
+            // its own didSet which re-pushes to the core — harmless,
+            // since setPrivacyLevel already configured the same values
+            // in the same call.
+            switch privacyLevel {
+            case .standard:
+                parallelFanOutEnabled = false
+                multiHopEnabled       = false
+            case .enhanced:
+                parallelFanOutEnabled = true
+                multiHopEnabled       = false
+            case .maximum:
+                parallelFanOutEnabled = true
+                multiHopEnabled       = true
+            }
+        }
+    }
+
+    // MARK: - Independent transport dials
+    //
+    // These are settable orthogonally to privacyLevel — flipping
+    // either toggle here applies on top of (and overrides) whatever
+    // the preset configured.  Persisted in UserDefaults so the user's
+    // explicit choice survives relaunches even if they later move the
+    // privacy slider.
+
+    static let kParallelFanOutKey  = "p2p.parallelFanOutEnabled"
+    static let kParallelFanOutKKey = "p2p.parallelFanOutK"
+    static let kMultiHopKey        = "p2p.multiHopEnabled"
+
+    /// Send each outbound message envelope to multiple configured
+    /// relays simultaneously.  File chunks are exempt (handled in
+    /// core).  Improves reliability — does not improve anonymity.
+    @Published var parallelFanOutEnabled: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kParallelFanOutKey) {
+        didSet {
+            UserDefaults.standard.set(parallelFanOutEnabled,
+                                       forKey: Self.kParallelFanOutKey)
+            setParallelFanOut(parallelFanOutEnabled)
+        }
+    }
+
+    /// 0 = all configured send relays.  K > 0 picks K random relays
+    /// per send.  Ignored when parallelFanOutEnabled is false.
+    @Published var parallelFanOutK: Int = {
+        let raw = UserDefaults.standard.object(
+            forKey: Peer2PearClient.kParallelFanOutKKey) as? Int
+        return raw ?? 0
+    }() {
+        didSet {
+            UserDefaults.standard.set(parallelFanOutK,
+                                       forKey: Self.kParallelFanOutKKey)
+            setParallelFanOutK(parallelFanOutK)
+        }
+    }
+
+    /// Onion-route each envelope through a chain of relays.  No
+    /// single relay sees both sender and recipient.  Improves
+    /// anonymity — does not improve reliability.  Adds latency
+    /// per hop.  Wins over parallel fan-out in the dispatch path.
+    @Published var multiHopEnabled: Bool =
+        UserDefaults.standard.bool(forKey: Peer2PearClient.kMultiHopKey) {
+        didSet {
+            UserDefaults.standard.set(multiHopEnabled,
+                                       forKey: Self.kMultiHopKey)
+            setMultiHopEnabled(multiHopEnabled)
         }
     }
 
@@ -976,18 +1309,26 @@ final class Peer2PearClient: ObservableObject {
             text: text,
             timestamp: Date(),
             to: peerId)
+        // Resolve / mint the conversation_id eagerly so the dispatch
+        // below has a concrete id to write against.  Calls into the
+        // C API but doesn't touch any UI state — safe outside the
+        // main-queue async block.
+        let convId = ensureDirectConversationId(for: peerId)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.messages.append(echo)
-            // saveMessage internally INSERT-OR-IGNOREs a contacts stub
-            // row to satisfy the FK, so callers don't have to worry
-            // about ordering vs. addContact.
-            self.dbSaveMessage(peerId: peerId, message: DBMessage(
-                sent:          true,
-                text:          echo.text,
-                timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
-                msgId:         echo.id,
-                senderName:    ""))
+            // The conversation row is guaranteed to exist after
+            // ensureDirectConversationId — saveMessage requires it.
+            // Outbound: senderId == "" by convention (caller is self).
+            if let convId {
+                self.dbSaveMessage(conversationId: convId, message: DBMessage(
+                    sent:          true,
+                    text:          echo.text,
+                    timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
+                    msgId:         echo.id,
+                    senderId:      "",
+                    senderName:    ""))
+            }
         }
         p2p_send_text(ctx, peerId, text)
     }
@@ -1013,6 +1354,21 @@ final class Peer2PearClient: ObservableObject {
         p2p_set_privacy_level(ctx, Int32(level))
     }
 
+    func setParallelFanOut(_ enabled: Bool) {
+        guard let ctx = rawContext else { return }
+        p2p_set_parallel_fan_out(ctx, enabled ? 1 : 0)
+    }
+
+    func setParallelFanOutK(_ k: Int) {
+        guard let ctx = rawContext else { return }
+        p2p_set_parallel_fan_out_k(ctx, Int32(k))
+    }
+
+    func setMultiHopEnabled(_ enabled: Bool) {
+        guard let ctx = rawContext else { return }
+        p2p_set_multi_hop_enabled(ctx, enabled ? 1 : 0)
+    }
+
     /// Append a relay URL to the core's send pool for multi-hop
     /// forwarding.  Safe to call before start() — becomes a no-op when
     /// rawContext is nil, and the persisted list is replayed on every
@@ -1020,6 +1376,25 @@ final class Peer2PearClient: ObservableObject {
     func addSendRelay(url: String) {
         guard let ctx = rawContext else { return }
         p2p_add_send_relay(ctx, url)
+    }
+
+    /// Add an additional relay URL to the receive-side subscribe pool.
+    /// Spawns a parallel WebSocket connection so the recipient mailbox
+    /// is replicated across multiple relays.  Pairs with parallel
+    /// send fan-out for end-to-end redundancy.
+    ///
+    /// Requires the platform layer to expose the multi-connection FFI
+    /// (ws_alloc_connection et al).  The core silently skips with a
+    /// warning when the platform is single-connection only.
+    func addSubscribeRelay(url: String) {
+        guard let ctx = rawContext else { return }
+        p2p_add_subscribe_relay(ctx, url)
+    }
+
+    /// Drop every extra subscribe relay; the primary stays connected.
+    func clearSubscribeRelays() {
+        guard let ctx = rawContext else { return }
+        p2p_clear_subscribe_relays(ctx)
     }
 
     // MARK: - Safety numbers (key verification)

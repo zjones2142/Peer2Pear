@@ -52,6 +52,11 @@ signals:
     void exportContactsClicked();
     void importContactsClicked();
 
+    // Open the Archived Chats recovery dialog.  MainWindow listens
+    // and routes through ChatView so the underlying chat list can
+    // be re-synced after Restore / Delete.
+    void archivedChatsClicked();
+
     // File-transfer consent settings changed.
     void fileAutoAcceptMaxChanged(int mb);
     void fileHardMaxChanged(int mb);
@@ -76,6 +81,16 @@ signals:
     // to m_controller.setHardBlockOnKeyChange.
     void hardBlockOnKeyChangeToggled(bool on);
 
+    // Parallel fan-out (REDUNDANCY): post each message to all configured
+    // relays so a single relay being down doesn't drop delivery.
+    // MainWindow forwards to m_controller.relay().setParallelFanOut.
+    void parallelFanOutToggled(bool on);
+
+    // Multi-hop onion routing (ANONYMITY): chain envelopes through
+    // multiple relays so no single relay sees both sender and recipient.
+    // MainWindow forwards to m_controller.relay().setMultiHopEnabled.
+    void multiHopToggled(bool on);
+
 private slots:
     void onToggleNotifications();
     void onToggleDnd();
@@ -87,6 +102,8 @@ private slots:
     void onResetRelayUrl();
     void onPrivacyLevelChanged(int level);
     void onToggleHardBlockOnKeyChange();
+    void onToggleParallelFanOut();
+    void onToggleMultiHop();
 
 private:
     void buildUI();
@@ -102,6 +119,7 @@ private:
     QWidget *makeFileTransferSection();
     QWidget *makeRelaySection();
     QWidget *makePrivacySection();
+    QWidget *makeArchivedChatsSection();
     QWidget *makeAboutHelpSection();
 
     // Profile
@@ -155,6 +173,22 @@ private:
     QPushButton *m_hardBlockKeyChangeToggleBtn = nullptr;
     QLabel      *m_hardBlockKeyChangeStatusLbl = nullptr;
     void applyHardBlockKeyChangeState();
+
+    // Parallel fan-out toggle (redundancy).  Independent of the
+    // privacy-level slider — power users can flip this on/off
+    // regardless of preset.  Persisted in AppDataStore as
+    // "parallelFanOutEnabled".
+    bool         m_parallelFanOutEnabled       = false;
+    QPushButton *m_parallelFanOutToggleBtn     = nullptr;
+    QLabel      *m_parallelFanOutStatusLbl     = nullptr;
+    void applyParallelFanOutState();
+
+    // Multi-hop onion routing toggle (anonymity).  Independent
+    // dial.  Persisted as "multiHopEnabled".
+    bool         m_multiHopEnabled             = false;
+    QPushButton *m_multiHopToggleBtn           = nullptr;
+    QLabel      *m_multiHopStatusLbl           = nullptr;
+    void applyMultiHopState();
 
     // Appearance — three buttons styled like the privacy level picker.
     // The selected preference itself lives on ThemeManager (single

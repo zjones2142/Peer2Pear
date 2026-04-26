@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "./ui_mainwindow.h"
+#include "dialogs.h"        // openArchivedChatsDialog
 #include "onboardingdialog.h"
 #include "qt_interop.hpp"  // Qt↔std boundary helpers for CryptoEngine calls
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
@@ -199,7 +200,8 @@ bool openAppDataDb(SqlCipherDb &db, const QByteArray &dbKey)
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
-    , m_controller(m_webSocket, m_httpClient, m_timerFactory)
+    , m_wsFactory(this)
+    , m_controller(m_wsFactory, m_httpClient, m_timerFactory)
 {
     ui->setupUi(this);
 
@@ -574,6 +576,21 @@ MainWindow::MainWindow(QWidget *parent)
             cv->onGroupAvatarReceived(toQ(gid), toQ(b64));
         };
 
+    // pv=2 (Causally-Linked Pairwise) UX events.  See ChatView for
+    // the banner / status surfaces on the receiving side.
+    m_controller.onGroupStreamBlocked =
+        [cv = m_chatView, toQ](const std::string& gid,
+                                  const std::string& sender,
+                                  int64_t fromCtr, int64_t toCtr) {
+            cv->onGroupStreamBlocked(toQ(gid), toQ(sender), fromCtr, toCtr);
+        };
+    m_controller.onGroupMessagesLost =
+        [cv = m_chatView, toQ](const std::string& gid,
+                                  const std::string& sender,
+                                  int64_t count) {
+            cv->onGroupMessagesLost(toQ(gid), toQ(sender), count);
+        };
+
     // ── Notifier ──────────────────────────────────────────────────────────────
     m_notifier = new ChatNotifier(this);
     m_chatView->setNotifier(m_notifier);
@@ -592,6 +609,23 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onExportContacts);
     connect(m_settingsPanel, &SettingsPanel::importContactsClicked,
             this, &MainWindow::onImportContacts);
+
+    // Archived Chats — opens the recovery dialog.  The dialog is
+    // self-contained (reads + writes the store directly); we just
+    // hand it the address-book snapshot for display-name resolution
+    // and route the per-row action callback through ChatView so
+    // m_chats / m_messagesByConv / etc. stay in sync.
+    connect(m_settingsPanel, &SettingsPanel::archivedChatsClicked,
+            this, [this]() {
+        if (!m_chatView) return;
+        dialogs::openArchivedChatsDialog(
+            m_settingsPanel,
+            &m_store,
+            m_chatView->addressBookSnapshot(),
+            [cv = m_chatView](const dialogs::ArchivedChatEvent &) {
+                cv->reloadAfterArchiveAction();
+            });
+    });
 
     // Apply persisted notification state to the notifier.  Both the
     // global on/off and the content-privacy mode are mirrored from
@@ -629,6 +663,18 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_settingsPanel, &SettingsPanel::privacyLevelChanged,
             this, [this](int level) {
         m_controller.relay().setPrivacyLevel(level);
+    });
+
+    // Independent transport dials — wire each directly to the
+    // RelayClient toggle.  These let power users override the
+    // preset's bundled choices without moving the privacy slider.
+    connect(m_settingsPanel, &SettingsPanel::parallelFanOutToggled,
+            this, [this](bool on) {
+        m_controller.relay().setParallelFanOut(on);
+    });
+    connect(m_settingsPanel, &SettingsPanel::multiHopToggled,
+            this, [this](bool on) {
+        m_controller.relay().setMultiHopEnabled(on);
     });
 
     // Safety numbers — hard-block on key change.

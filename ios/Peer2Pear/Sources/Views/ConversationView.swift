@@ -60,6 +60,7 @@ struct ConversationView: View {
         }
         .onAppear {
             activeFileRequest = pendingRequestsForPeer.first
+            client.markChatRead(chatKey: peerId)
         }
         .sheet(item: $activeFileRequest) { req in
             FileRequestSheet(client: client, request: req) {
@@ -74,6 +75,18 @@ struct ConversationView: View {
     @ViewBuilder private var messagesScroll: some View {
         ChatMessagesScroll(messages: peerMessages) { msg in
             MessageBubble(message: msg, isMine: msg.from == client.myPeerId)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = msg.text
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    Button(role: .destructive) {
+                        client.deleteMessage(chatKey: peerId, msgId: msg.id)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
         }
     }
 
@@ -101,17 +114,26 @@ struct ConversationView: View {
     }
 
     @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
+        // Trust marker lives beside the display name; the trailing
+        // slot is the always-visible info button so the user can get
+        // to thread settings regardless of verification state.
+        // Phase 3d: this opens the THREAD editor (1:1 conversation row),
+        // not the person editor — the conv editor drills into
+        // `ContactDetailView` via "View Contact" when the user wants
+        // to manage the person.
+        ToolbarItem(placement: .principal) {
+            HStack(spacing: 6) {
+                Text(client.displayName(for: peerId))
+                    .font(.headline)
+                TrustBadge(trust: client.peerTrust(for: peerId))
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             NavigationLink {
-                ContactDetailView(client: client, peerId: peerId)
+                ConversationDetailView(client: client, peerId: peerId)
             } label: {
-                let trust = client.peerTrust(for: peerId)
-                if trust == .unverified {
-                    Image(systemName: "info.circle")
-                        .foregroundStyle(.blue)
-                } else {
-                    TrustBadge(trust: trust)
-                }
+                Image(systemName: "info.circle")
+                    .foregroundStyle(.blue)
             }
         }
     }
@@ -144,8 +166,9 @@ struct GroupConversationView: View {
     @ObservedObject var client: Peer2PearClient
     let groupId: String
     @State private var messageText = ""
-    @State private var showRoster = false
+    @State private var showInfo = false
     @State private var showFilePicker = false
+    @State private var dismissedLostEventId: UUID?
 
     private var group: P2PGroup? { client.groups[groupId] }
 
@@ -153,27 +176,83 @@ struct GroupConversationView: View {
         client.groupMessages.filter { $0.groupId == groupId }
     }
 
+    /// pv=2: any blocked senders for this group → banner state.
+    /// We dedupe by senderPeerId; multiple stalls on the same sender
+    /// just update the range in place via the @Published map.
+    private var blockedSenders: [(sender: String, range: Peer2PearClient.BlockedRange)] {
+        guard let map = client.groupBlockedStreams[groupId] else { return [] }
+        return map.map { (sender: $0.key, range: $0.value) }
+                  .sorted { $0.sender < $1.sender }
+    }
+
+    /// pv=2: oldest unhandled lost-messages event for this group, if any.
+    private var pendingLostEvent: Peer2PearClient.LostMessagesEvent? {
+        client.groupLostMessages
+            .first { $0.groupId == groupId && $0.id != dismissedLostEventId }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
+            // Per-sender blocked banner.  Surfaces the gap range so
+            // power users can see "waiting for messages 47–52 from X."
+            // ChatController already fired a gap_request to the
+            // sender; this is purely informational.
+            if !blockedSenders.isEmpty {
+                blockedBanner
+            }
             messagesScroll
             Divider()
             inputBar
         }
+        .alert(
+            "Some messages were lost",
+            isPresented: Binding(
+                get: { pendingLostEvent != nil },
+                set: { if !$0 { dismissedLostEventId = pendingLostEvent?.id } }
+            ),
+            presenting: pendingLostEvent
+        ) { _ in
+            Button("OK", role: .cancel) {
+                if let ev = pendingLostEvent {
+                    dismissedLostEventId = ev.id
+                    client.groupLostMessages.removeAll { $0.id == ev.id }
+                }
+            }
+        } message: { ev in
+            Text("\(ev.count) message\(ev.count == 1 ? "" : "s") from this group could not be delivered. They were sent before the encrypted session was reset and can no longer be recovered.")
+        }
         .navigationTitle(group?.name ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { client.markChatRead(chatKey: groupId) }
         .toolbar {
+            // Phase 3d: (i) opens the GROUP editor (rename / avatar /
+            // mute / archive / member list / delete).  Member rows in
+            // the editor drill into ContactDetailView for per-person
+            // editing, mirroring the 1:1 toolbar's convention.
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    showRoster = true
+                    showInfo = true
                 } label: {
-                    Image(systemName: "person.3")
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.blue)
                 }
                 .disabled(group == nil)
             }
         }
-        .sheet(isPresented: $showRoster) {
+        .sheet(isPresented: $showInfo) {
             if let group {
-                GroupRosterSheet(client: client, group: group)
+                GroupDetailView(client: client, group: group,
+                                onOpenChat: { peerId in
+                                    // Close the editor, then hand the
+                                    // request off to ChatListView's
+                                    // navigationDestination.  Small
+                                    // delay so the sheet finishes
+                                    // sliding before the push starts.
+                                    showInfo = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                        client.pendingDirectChatPeerId = peerId
+                                    }
+                                })
             }
         }
         .fileImporter(isPresented: $showFilePicker,
@@ -183,10 +262,63 @@ struct GroupConversationView: View {
         }
     }
 
+    /// Banner surfaced at the top of the conversation while ANY
+    /// sender's stream is blocked at a gap.  ChatController has
+    /// already fired gap_request(s); the banner is purely
+    /// informational ("waiting for X's missing messages...").  Once
+    /// each gap fills, the v2 dispatcher delivers the drained
+    /// messages and the on_group_message handler clears the entry —
+    /// the banner shrinks / disappears automatically.
+    @ViewBuilder private var blockedBanner: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(blockedSenders, id: \.sender) { entry in
+                HStack(spacing: 8) {
+                    Image(systemName: "hourglass")
+                        .foregroundStyle(.orange)
+                    let label = entry.range.from == entry.range.to
+                        ? "Waiting for message \(entry.range.from)"
+                        : "Waiting for messages \(entry.range.from)–\(entry.range.to)"
+                    Text("\(label) from \(senderShortName(entry.sender))…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .background(Color(.systemBackground).opacity(0.95))
+        .overlay(
+            Rectangle()
+                .frame(height: 0.5)
+                .foregroundStyle(Color(.separator)),
+            alignment: .bottom
+        )
+    }
+
+    /// Best display name for a peer ID.  Delegates to the single
+    /// source-of-truth helper on Peer2PearClient (nickname → peer-
+    /// published display name → key prefix).
+    private func senderShortName(_ peerId: String) -> String {
+        client.displayName(for: peerId)
+    }
+
     @ViewBuilder private var messagesScroll: some View {
         ChatMessagesScroll(messages: groupMessages) { msg in
             GroupMessageBubble(message: msg,
                                isMine: msg.from == client.myPeerId)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = msg.text
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    Button(role: .destructive) {
+                        client.deleteMessage(chatKey: groupId, msgId: msg.id)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
         }
     }
 
@@ -233,23 +365,26 @@ struct GroupConversationView: View {
         var g = group
         g.lastActivity = Date()
         client.groups[group.id] = g
-        // Persist: bump the group's contact row + insert the echo
-        // message.  senderName carries our peerId so the row maps back
-        // to "you" on a future restart.
-        client.dbSaveContact(Peer2PearClient.DBContact(
-            peerId:        g.id,
-            name:          g.name,
-            keys:          g.memberIds,
-            isGroup:       true,
-            groupId:       g.id,
-            avatarB64:     client.groupAvatars[g.id] ?? "",
-            lastActiveSecs: Int64(g.lastActivity.timeIntervalSince1970)))
-        client.dbSaveMessage(peerId: g.id, message: Peer2PearClient.DBMessage(
+        // Persist: bump the group's conversation row + insert the
+        // echo message.  v3: groups live in conversations(kind=group),
+        // and conv_id == group_id by design.  senderId == "" is the
+        // outbound convention; senderName stays empty since the
+        // sender (us) doesn't ship a self-declared name.
+        client.dbSaveConversation(Peer2PearClient.DBConversation(
+            id:              g.id,
+            kind:            .group,
+            groupName:       g.name,
+            groupAvatarB64:  client.groupAvatars[g.id] ?? "",
+            muted:           client.isMuted(peerId: g.id),
+            lastActiveSecs:  Int64(g.lastActivity.timeIntervalSince1970),
+            inChatList:      true))
+        client.dbSaveMessage(conversationId: g.id, message: Peer2PearClient.DBMessage(
             sent:          true,
             text:          echo.text,
             timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
             msgId:         echo.id,
-            senderName:    client.myPeerId))
+            senderId:      "",
+            senderName:    ""))
         messageText = ""
     }
 }
@@ -287,17 +422,43 @@ struct GroupMessageBubble: View {
     }
 }
 
-// Group roster sheet — shows the full member list with trust badges +
-// online status dots.  No mutations from here today (no C API for
-// adding/removing members yet); it's purely a view.
+// MARK: - Group detail (group thread editor)
+//
+// Phase 3d: the group equivalent of `ConversationDetailView`.  Mutates
+// the `conversations` row for a group (kind = .group) plus the
+// `conversation_members` roster.  Sheet-shaped because the editor's
+// own NavigationStack hosts member drill-ins to `ContactDetailView`
+// without colliding with the chat-list nav stack underneath.
+//
+// Group fields:
+//   • name (broadcast via renameGroup)
+//   • avatar (broadcast via sendGroupAvatar)
+//   • thread mute (conversations.muted via setMuted — for groups,
+//     setMuted already routes to the conv row)
+//   • archive (conversations.in_chat_list)
+//   • member roster (add via AddGroupMemberSheet, remove inline)
+//
+// Destructive actions:
+//   • Leave Group — broadcast network-side leave; preserves local
+//     history.  Surfaced as a button so the user can step away from
+//     the conversation without nuking it.
+//   • Delete Group — full local cascade via deleteChat; mirrors the
+//     trailing-swipe Delete on ChatListView with an explicit prompt.
 
-struct GroupRosterSheet: View {
+struct GroupDetailView: View {
     @ObservedObject var client: Peer2PearClient
     let group: P2PGroup
+    /// Relayed to ContactDetailView when the user opens a member's
+    /// card.  Tapping Send Message inside that card invokes this; the
+    /// parent (GroupConversationView) dismisses the sheet and routes
+    /// through `client.pendingDirectChatPeerId`.
+    var onOpenChat: ((String) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var showRename = false
     @State private var newName = ""
     @State private var confirmLeave = false
+    @State private var confirmDelete = false
+    @State private var confirmResetSessions = false
     @State private var avatarSelection: PhotosPickerItem?
     @State private var showAddMember = false
     @State private var isEditing = false
@@ -314,7 +475,8 @@ struct GroupRosterSheet: View {
             List {
                 avatarSection
                 membersSection
-                actionsSection
+                threadActionsSection
+                destructiveSection
             }
             .navigationTitle(group.name)
             .navigationBarTitleDisplayMode(.inline)
@@ -342,18 +504,39 @@ struct GroupRosterSheet: View {
             } message: {
                 Text("Other members will see the new name.")
             }
-            .confirmationDialog("Leave this group?",
-                                isPresented: $confirmLeave,
-                                titleVisibility: .visible) {
+            .alert("Reset sessions with all members?",
+                   isPresented: $confirmResetSessions) {
+                Button("Cancel", role: .cancel) {}
+                Button("Reset", role: .destructive) {
+                    let me = client.myPeerId
+                    for member in group.memberIds where member != me {
+                        client.resetSession(peerId: member)
+                    }
+                }
+            } message: {
+                Text("Wipes the encrypted session with every member of this group. Each member's safety number will change — re-verify any you'd confirmed previously.")
+            }
+            .alert("Leave this group?",
+                   isPresented: $confirmLeave) {
+                Button("Cancel", role: .cancel) {}
                 Button("Leave", role: .destructive) {
                     _ = client.leaveGroup(groupId: group.id,
                                           groupName: group.name,
                                           memberPeerIds: group.memberIds)
                     dismiss()
                 }
-                Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Other members will see you left.  Your local messages will be cleared.")
+                Text("Other members will see you left. Your local transcript stays on this device — use Delete Group to wipe it.")
+            }
+            .alert("Delete this group?",
+                   isPresented: $confirmDelete) {
+                Button("Cancel", role: .cancel) {}
+                Button("Delete", role: .destructive) {
+                    client.deleteChat(peerId: group.id)
+                    dismiss()
+                }
+            } message: {
+                Text("This will permanently delete the group and its message history on this device. Other members are not notified.")
             }
             .sheet(isPresented: $showAddMember) {
                 AddGroupMemberSheet(client: client, group: group)
@@ -380,6 +563,13 @@ struct GroupRosterSheet: View {
                         Text("Change Group Photo")
                             .font(.caption)
                     }
+                    Button {
+                        newName = group.name
+                        showRename = true
+                    } label: {
+                        Label("Rename Group", systemImage: "pencil")
+                            .font(.caption)
+                    }
                 }
                 Spacer()
             }
@@ -396,14 +586,26 @@ struct GroupRosterSheet: View {
                 Spacer()
             }
             ForEach(otherMembers, id: \.self) { peerId in
-                HStack {
-                    Image(systemName: "person").foregroundStyle(.secondary)
-                    Text(peerId.prefix(12) + "...")
-                    Spacer()
-                    if client.peerPresence[peerId] == true {
-                        Circle().fill(.green).frame(width: 8, height: 8)
+                // Tap a member to open their contact info.  Inside the
+                // detail view, "Send Message" calls `onOpenChat`, which
+                // the parent uses to dismiss this sheet and hand the
+                // push off to the root ChatListView stack.  The detail
+                // view auto-handles strangers via its inAddressBook
+                // gate (Add-to-Address-Book affordance instead of
+                // editable fields).
+                NavigationLink {
+                    ContactDetailView(client: client, peerId: peerId,
+                                       onOpenChat: onOpenChat)
+                } label: {
+                    HStack {
+                        Image(systemName: "person").foregroundStyle(.secondary)
+                        Text(client.displayName(for: peerId))
+                        Spacer()
+                        if client.peerPresence[peerId] == true {
+                            Circle().fill(.green).frame(width: 8, height: 8)
+                        }
+                        TrustBadge(trust: client.peerTrust(for: peerId))
                     }
-                    TrustBadge(trust: client.peerTrust(for: peerId))
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     if isEditing {
@@ -433,19 +635,74 @@ struct GroupRosterSheet: View {
         }
     }
 
-    @ViewBuilder private var actionsSection: some View {
+    /// Per-thread toggles — mute + archive.  For groups, `setMuted`
+    /// already routes to the conv row (peerId == groupId == convId).
+    /// Archive writes `conversations.in_chat_list = 0` and removes
+    /// the @Published `groups` entry so the row drops out of the
+    /// chat list immediately.  The DB row stays so the load-time
+    /// filter (which honours `inChatList`) keeps the group hidden
+    /// across relaunches — no `dbDeleteConversation` here, that's
+    /// the Delete Group path.
+    @ViewBuilder private var threadActionsSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { client.isMuted(peerId: group.id) },
+                set: { client.setMuted(peerId: group.id, muted: $0) }
+            )) {
+                Label("Hide Alerts", systemImage: "bell.slash")
+            }
+            Toggle(isOn: Binding(
+                get: { false },  // Active groups always render here.
+                set: { hide in
+                    guard hide else { return }
+                    _ = client.dbSetConversationInChatList(id: group.id, inList: false)
+                    // Drop the @Published group so ChatListView re-renders
+                    // without it.  The conv row remains on disk for the
+                    // un-archive path (next inbound message).
+                    client.groups.removeValue(forKey: group.id)
+                    dismiss()
+                }
+            )) {
+                Label("Hide from Chat List", systemImage: "eye.slash")
+            }
+        } header: {
+            Text("This Chat")
+        } footer: {
+            Text("Hide Alerts silences notifications for this group only. Hide from Chat List removes it from the main list without losing the message history.")
+        }
+    }
+
+    /// Three actions, in order of severity:
+    ///   • Reset Sessions — wipes the pairwise DR ratchet with every
+    ///     member.  Causally-Linked Pairwise has no group session; we
+    ///     iterate per-member.  Each member's safety number changes,
+    ///     so re-verify any you'd previously confirmed.
+    ///   • Leave — network-visible departure (other members see the
+    ///     leave marker).  Local history is preserved.
+    ///   • Delete — full local cascade.  Wipes messages + member
+    ///     roster + group avatar on this device.  Other members are
+    ///     NOT notified — use Leave first if you want them to know
+    ///     you left.
+    @ViewBuilder private var destructiveSection: some View {
         Section {
             Button {
-                newName = group.name
-                showRename = true
+                confirmResetSessions = true
             } label: {
-                Label("Rename Group", systemImage: "pencil")
+                Label("Reset Sessions", systemImage: "arrow.clockwise.shield")
             }
+            .tint(.orange)
             Button(role: .destructive) {
                 confirmLeave = true
             } label: {
                 Label("Leave Group", systemImage: "rectangle.portrait.and.arrow.right")
             }
+            Button(role: .destructive) {
+                confirmDelete = true
+            } label: {
+                Label("Delete Group", systemImage: "trash")
+            }
+        } footer: {
+            Text("Leave Group tells other members you left but keeps your local history. Delete Group removes everything from this device permanently.")
         }
     }
 

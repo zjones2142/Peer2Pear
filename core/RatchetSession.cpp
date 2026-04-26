@@ -169,6 +169,27 @@ std::pair<Bytes, Bytes> RatchetSession::kdfChainKey(const Bytes& chainKey) {
 // Factory methods
 // ---------------------------
 
+// Stable per-session id (8 bytes BLAKE2b of the initial root key).
+// See header docstring for how Phase 1 group messaging uses this.
+//
+// Persistence: m_initialRootKey is round-tripped via serialize/
+// deserialize at version >= 3.  Sessions persisted under v1 / v2
+// (pre-Phase-1 deploys) carry an empty m_initialRootKey on load and
+// sessionId() returns empty bytes — the v2 group sender path
+// degrades gracefully (group_send_state lookups miss; the chain
+// resumes from counter=1 on the next outbound, which a fresh
+// handshake would have done anyway).
+Bytes RatchetSession::sessionId() const
+{
+    if (m_initialRootKey.size() != 32) return {};
+    Bytes out(8);
+    (void)crypto_generichash(out.data(), out.size(),
+                             m_initialRootKey.data(),
+                             m_initialRootKey.size(),
+                             nullptr, 0);
+    return out;
+}
+
 RatchetSession RatchetSession::initAsInitiator(const Bytes& rootKey,
                                                 const Bytes& remoteDhPub,
                                                 const Bytes& localDhPub,
@@ -177,6 +198,11 @@ RatchetSession RatchetSession::initAsInitiator(const Bytes& rootKey,
     RatchetSession s;
     s.m_hybrid = hybrid;
     s.m_remoteDhPub = remoteDhPub;
+    // Pin the handshake-time root key for stable per-session
+    // identification (see sessionId() docstring).  Both sides receive
+    // the same rootKey from the Noise chaining_key, so they compute
+    // identical sessionId bytes without exchanging anything.
+    s.m_initialRootKey = rootKey;
 
     // Use the provided DH keypair (Noise ephemeral) so the responder already knows our pub
     s.m_dhPub  = localDhPub;
@@ -233,6 +259,9 @@ RatchetSession RatchetSession::initAsResponder(const Bytes& rootKey,
     RatchetSession s;
     s.m_hybrid = hybrid;
     s.m_remoteDhPub = remoteDhPub;
+    // Pin the handshake-time root key for sessionId() — see the
+    // matching note in initAsInitiator above.
+    s.m_initialRootKey = rootKey;
 
     // Reject all-zeros remote pubkey before the first scalarmult.
     if (remoteDhPub.size() != 32 ||
@@ -627,7 +656,12 @@ Bytes RatchetSession::decrypt(const Bytes& headerAndCiphertext) {
 Bytes RatchetSession::serialize() const {
     p2p::BinaryWriter w;
 
-    w.u8(2); // v2: adds hybrid PQ fields
+    // Format versions:
+    //   v1: legacy classical-only fields
+    //   v2: + hybrid PQ state (kem keys, remote kem pub, pending kem ct)
+    //   v3: + m_initialRootKey at the end so sessionId() round-trips
+    //        across persistence (Phase 1 Causally-Linked Pairwise dep)
+    w.u8(3);
     w.bytes(m_rootKey);
     w.bytes(m_sendChainKey);
     w.bytes(m_recvChainKey);
@@ -653,6 +687,9 @@ Bytes RatchetSession::serialize() const {
     w.bytes(m_remoteKemPub);
     w.bytes(m_pendingKemCt);
 
+    // v3: handshake-time root key (stable sessionId source)
+    w.bytes(m_initialRootKey);
+
     return w.take();
 }
 
@@ -661,7 +698,7 @@ RatchetSession RatchetSession::deserialize(const Bytes& data) {
     p2p::BinaryReader r(data);
 
     const uint8_t version = r.u8();
-    if (version < 1 || version > 2) return s;
+    if (version < 1 || version > 3) return s;
 
     s.m_rootKey      = r.bytes();
     s.m_sendChainKey = r.bytes();
@@ -698,6 +735,16 @@ RatchetSession RatchetSession::deserialize(const Bytes& data) {
                 return RatchetSession{};  // corrupted — return invalid
             }
         }
+    }
+
+    // v3: persisted handshake-time root key.  Pre-v3 sessions that
+    // load through this path leave m_initialRootKey empty —
+    // sessionId() returns empty bytes, signaling "this session was
+    // persisted before sessionId support; UI degrades gracefully
+    // (group_send_state lookups miss, peers fall back to a fresh
+    // chain on the next outbound)."
+    if (version >= 3) {
+        s.m_initialRootKey = r.bytes();
     }
 
     if (!r.ok()) return RatchetSession{};

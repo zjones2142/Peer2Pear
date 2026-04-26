@@ -170,6 +170,18 @@ TEST_F(SessionManagerSuite, ClassicalPreKeyRoundTrip) {
 
     EXPECT_TRUE(alice.mgr->hasSession(bob.peerId));
     EXPECT_TRUE(bob.mgr->hasSession(alice.peerId));
+
+    // ── Phase 1: stable per-peer sessionId via SessionManager ──────────
+    // Both ends of the same DR session must compute identical bytes.
+    const Bytes aliceView = alice.mgr->sessionIdFor(bob.peerId);
+    const Bytes bobView   = bob.mgr->sessionIdFor(alice.peerId);
+    ASSERT_EQ(aliceView.size(), 8u);
+    EXPECT_EQ(aliceView, bobView)
+        << "sessionIdFor must agree on both sides of the same handshake";
+
+    // Unknown peer returns empty (no session) — used by the v2 group
+    // sender to skip recipients we have no DR session with yet.
+    EXPECT_TRUE(alice.mgr->sessionIdFor("nonexistent-peer-id").empty());
 }
 
 // ── 2. Hybrid PQ (ML-KEM-768) handshake round-trip ────────────────────────
