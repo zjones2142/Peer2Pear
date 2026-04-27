@@ -93,7 +93,8 @@ void GroupProtocol::sendText(const std::string& groupId,
 void GroupProtocol::sendTextV2(const std::string& groupId,
                                  const std::string& groupName,
                                  const std::vector<std::string>& memberPeerIds,
-                                 const std::string& text)
+                                 const std::string& text,
+                                 const std::string& callerMsgId)
 {
     if (!m_sendSealed) return;
     if (groupId.empty()) return;
@@ -117,7 +118,16 @@ void GroupProtocol::sendTextV2(const std::string& groupId,
     }
 
     const int64_t     ts    = nowSecs();
-    const std::string msgId = p2p::makeUuid();
+    // Honor a caller-provided id so the platform's UI bubble and
+    // every fan-out envelope share the same msgId.  All N
+    // envelopes (one per recipient) carry the same id; on the
+    // first one to fail at the relay-retry-give-up boundary,
+    // RelayClient hands it to onMessageSendFailed and the
+    // platform marks the bubble.  Empty falls back to legacy v1
+    // semantics (mint internally, no per-bubble feedback).
+    const std::string msgId = callerMsgId.empty()
+        ? p2p::makeUuid()
+        : callerMsgId;
 
     // v3: ensure the conversations row exists for groupId before any
     // group_* CRUD fires.  Idempotent — no-op when the row's already

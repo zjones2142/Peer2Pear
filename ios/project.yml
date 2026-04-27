@@ -58,6 +58,15 @@ targets:
         NSLocalNetworkUsageDescription: >-
           Peer2Pear may use your local network to establish direct peer-to-peer
           connections for faster, more private messaging.
+        # MultipeerConnectivity for device-to-device migration (Phase 4
+        # backup-strategy step 2 / "Transfer to new device").  iOS
+        # requires every Bonjour service the app advertises or browses
+        # to be listed here verbatim — MPC publishes both _tcp and _udp
+        # variants under the hood.  Service name MUST stay in sync
+        # with kMigrationServiceType in MigrationSession.swift.
+        NSBonjourServices:
+          - _p2p-migration._tcp
+          - _p2p-migration._udp
         # QRScannerView opens AVCaptureSession to read peer-ID QR codes from
         # MyKeyView on a counterpart device.  iOS hard-aborts capture-session
         # start without this string.

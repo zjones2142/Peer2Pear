@@ -146,6 +146,15 @@ ChatController::ChatController(IWebSocketFactory& wsFactory, IHttpClient& http,
     };
     m_relay.onConnected = [this]() { handleRelayConnected(); };
 
+    // Per-bubble fail forwarder.  RelayClient hands us the msgId
+    // tagged on the failed sendEnvelope; ChatController forwards
+    // it up to whoever owns onMessageSendFailed (peer2pear_api on
+    // mobile, mainwindow.cpp on desktop) so the UI can mark the
+    // matching bubble.
+    m_relay.onSendFailed = [this](const std::string& msgId) {
+        if (onMessageSendFailed) onMessageSendFailed(msgId);
+    };
+
     // FileTransferManager callbacks — plain class; direct assignment.
     // Tagged FileChunk so the transport skips parallel fan-out for
     // chunk-shaped payloads (240 KB × hundreds-of-chunks per file
@@ -449,14 +458,19 @@ std::string ChatController::myIdB64u() const
     return CryptoEngine::toBase64Url(m_crypto.identityPub());
 }
 
-void ChatController::sendText(const std::string& peerIdB64u, const std::string& text)
+void ChatController::sendText(const std::string& peerIdB64u,
+                                const std::string& text,
+                                const std::string& msgId)
 {
     json payload = json::object();
     payload["from"]  = myIdB64u();
     payload["type"]  = "text";
     payload["text"]  = text;
     payload["ts"]    = nowSecs();
-    payload["msgId"] = p2p::makeUuid();
+    // Honor a caller-provided msgId so the platform's UI bubble
+    // and the protocol envelope share the same id — that's what
+    // lets onMessageSendFailed correlate back to the bubble.
+    payload["msgId"] = msgId.empty() ? p2p::makeUuid() : msgId;
     sendSealedPayload(peerIdB64u, payload, SendMode::PreferP2P);
 }
 
@@ -507,7 +521,40 @@ std::string ChatController::sendGroupFile(const std::string& groupId,
 
 void ChatController::connectToRelay()
 {
+    validateWiring();
     m_relay.connectToRelay();
+}
+
+void ChatController::validateWiring() const
+{
+    // Tripwire to surface "I forgot to wire X" missteps at the
+    // moment the controller starts being used, instead of failing
+    // silently later (e.g., GroupProto v2 dropping every inbound
+    // group message because m_appData is null — what just bit
+    // desktop on the Phase 3 schema split).  Both platforms hand-
+    // wire dependencies through setters; if either misses one,
+    // the warns below name the dep so the diff is obvious.
+    //
+    // This is NOT a real fix for the parallel-init-paths anti-
+    // pattern — it just fails loudly.  The right long-term move
+    // is constructor-based DI / a Dependencies struct that the
+    // compiler enforces at every callsite; tracked in
+    // project_chatcontroller_di.md.
+    if (!m_appData) {
+        P2P_WARN("[ChatController] AppDataStore not wired — "
+                  "GroupProto v2 will drop inbound + outbound group "
+                  "messages.  Did you call setAppDataStore()?");
+    }
+    if (!m_sessionStore) {
+        P2P_WARN("[ChatController] SessionStore not wired — "
+                  "session state won't persist across launches.  "
+                  "Did you call setDatabase()?");
+    }
+    if (!m_sessionMgr) {
+        P2P_WARN("[ChatController] SessionManager not wired — "
+                  "encrypted send + decrypt paths will no-op.  "
+                  "Did you call setDatabase() with a valid handle?");
+    }
 }
 
 void ChatController::disconnectFromRelay()
@@ -605,13 +652,14 @@ void ChatController::checkPresence(const std::vector<std::string>& peerIds)
 void ChatController::sendGroupMessageViaMailbox(const std::string& groupId,
                                                 const std::string& groupName,
                                                 const std::vector<std::string>& memberPeerIds,
-                                                const std::string& text)
+                                                const std::string& text,
+                                                const std::string& msgId)
 {
     // Default to the pv=2 path.  sendTextV2 internally falls back to
     // the legacy sendText when its deps (AppDataStore + SessionManager)
     // aren't wired — protects boot-up windows where the DB key hasn't
     // been derived yet.
-    m_groupProto.sendTextV2(groupId, groupName, memberPeerIds, text);
+    m_groupProto.sendTextV2(groupId, groupName, memberPeerIds, text, msgId);
 }
 
 void ChatController::sendGroupLeaveNotification(const std::string& groupId,
@@ -763,7 +811,19 @@ Bytes ChatController::sendSealedPayload(const std::string& peerIdB64u,
 #endif
 
     P2P_LOG("[SEND MAILBOX] " << type << " to " << p2p::peerPrefix(peerIdB64u) << "...");
-    m_relay.sendEnvelope(env);
+    // Tag with msgId so RelayClient's give-up path can hand it
+    // back via onSendFailed → onMessageSendFailed.  Both "text"
+    // (1:1) and "group_msg" payloads carry a msgId field; for
+    // groups all N envelopes (one per recipient) share the same
+    // msgId, so the FIRST envelope to fail at retry-exhaustion
+    // surfaces the bubble.  Other payload types (avatars, ICE
+    // signalling, KEM announces, control envelopes) pass empty —
+    // no user-visible bubble to mark.
+    const std::string msgIdForRetry =
+        (type == "text" || type == "group_msg")
+            ? payload.value("msgId", std::string())
+            : std::string();
+    m_relay.sendEnvelope(env, RelayClient::TrafficClass::Message, msgIdForRetry);
 
 #ifdef PEER2PEAR_P2P
     if (mode == SendMode::PreferP2P) {

@@ -20,6 +20,11 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_p2p-migration._tcp</string>
+		<string>_p2p-migration._udp</string>
+	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Peer2Pear uses the camera to scan other users' QR codes so you can add them as contacts without typing a 43-character key.</string>
 	<key>NSFaceIDUsageDescription</key>

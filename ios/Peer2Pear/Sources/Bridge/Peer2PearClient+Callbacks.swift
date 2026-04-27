@@ -46,13 +46,6 @@ extension Peer2PearClient {
                 text: String(cString: text),
                 timestamp: Date(timeIntervalSince1970: TimeInterval(ts))
             )
-            // Resolve / mint the conversation_id BEFORE the dispatch —
-            // ensureDirectConversationId hits the C API and is safe
-            // off the main thread, but the in-memory cache update
-            // hops back to main on its own.  v3 contract: stranger's
-            // first inbound message creates a CONVERSATION, not a
-            // contact (address book stays user-curated).
-            let convId = client.ensureDirectConversationId(for: msg.from)
             DispatchQueue.main.async {
                 // Drop messages from blocked peers.  Mirrors desktop
                 // chatview `if (chat.isBlocked) return`.  Silent — no
@@ -61,7 +54,28 @@ extension Peer2PearClient {
                 client.messages.append(msg)
                 // Blue-dot marker in ChatListView.  Cleared when the
                 // user opens the thread (ConversationView.onAppear).
-                client.unreadChatIds.insert(msg.from)
+                // Skip the insert when the user is actively viewing
+                // this thread — they're already watching the message
+                // land, so re-flagging it as unread the moment they
+                // back out is a regression they (rightly) noticed.
+                if client.activeChatId != msg.from {
+                    client.unreadChatIds.insert(msg.from)
+                }
+                // Resolve / mint the conversation_id INSIDE the async
+                // block.  Calling ensureDirectConversationId
+                // synchronously BEFORE the dispatch re-enters
+                // p2p_app_find_or_create_direct_conversation while
+                // the C++ side still holds the WS-receive ctrlMu —
+                // same non-recursive std::mutex, same thread →
+                // deadlock.  See peer2pear_api.cpp ~line 1605: the
+                // p2p_app_load_contacts case documents the same
+                // invariant ("Do NOT hold ctrlMu across the
+                // callback...").  By the time this async block fires
+                // the C++ side has returned and the lock is free.
+                // v3 contract: stranger's first inbound message
+                // creates a CONVERSATION, not a contact (address
+                // book stays user-curated).
+                let convId = client.ensureDirectConversationId(for: msg.from)
                 // Persist into the v3 messages table keyed by
                 // conversation_id.  senderId carries the originator's
                 // peer_id — needed on a later restart to route the
@@ -117,11 +131,15 @@ extension Peer2PearClient {
                         client.groupBlockedStreams.removeValue(forKey: gm.groupId)
                     }
                 }
-                // Skip the unread marker when it's our own echo — the
-                // sender sees their message immediately and doesn't
-                // need a "new" indicator.  Same behaviour as the
-                // notification-suppression guard below.
-                if gm.from != client.myPeerId {
+                // Skip the unread marker when (a) it's our own echo
+                // — the sender sees their message immediately and
+                // doesn't need a "new" indicator (same behaviour as
+                // the notification-suppression guard below), or
+                // (b) the user is currently viewing this group's
+                // thread — re-flagging a chat the user is reading
+                // produces a stale dot the moment they back out.
+                if gm.from != client.myPeerId
+                    && client.activeChatId != gm.groupId {
                     client.unreadChatIds.insert(gm.groupId)
                 }
                 // Upsert group roster.  Non-creator members learn about
@@ -485,6 +503,45 @@ extension Peer2PearClient {
             let byRcv = byReceiver != 0
             DispatchQueue.main.async {
                 client.markTransferStatus(id: id, status: .blocked(byReceiver: byRcv))
+            }
+        }, selfPtr)
+
+        // ── Per-bubble send failure (post retry-exhaustion) ────────────
+        // Fires once the relay-client's retry loop runs out
+        // (~30–60s after the first attempt).  We mark the matching
+        // P2PMessage so MessageBubble renders the red icon + the
+        // bubble's tap action offers retry / delete.  Also persist
+        // the flag so the indicator survives a relaunch — the
+        // C++-side stamps the row's send_failed column to 1, mirror
+        // it into our @Published set for the live view.
+        p2p_set_on_send_failed(ctx, { msgId, ud in
+            guard let client = Peer2PearClient.from(ud), let msgId else { return }
+            let id = String(cString: msgId)
+            DispatchQueue.main.async {
+                client.failedMessageIds.insert(id)
+                // Persistence: find the conversation that holds this
+                // message and stamp the column.  Outbound messages
+                // carry `to` (DM) or live in groupMessages by groupId.
+                // Search both — whichever matches is the one to
+                // persist against.  Cheap enough: searches walk the
+                // in-memory mirrors, not the DB.
+                if let dm = client.messages.first(where: { $0.id == id }),
+                   let to = dm.to,
+                   let convId = client.directConversationIdByPeer[to] {
+                    client.dbSetMessageSendFailed(
+                        conversationId: convId,
+                        msgId:          id,
+                        failed:         true)
+                } else if let gm = client.groupMessages.first(where: { $0.id == id }) {
+                    // Group conversation_id is the groupId itself
+                    // (groups skip the directConversationIdByPeer
+                    // indirection — the conv id IS the group id by
+                    // convention).
+                    client.dbSetMessageSendFailed(
+                        conversationId: gm.groupId,
+                        msgId:          id,
+                        failed:         true)
+                }
             }
         }, selfPtr)
 

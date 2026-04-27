@@ -102,10 +102,16 @@ public:
     /// Wire format documented in core/CausallyLinkedPairwise.hpp.
     /// Requires both setAppDataStore() and setSessionManager() to
     /// have been called; otherwise it logs and no-ops.
+    /// Optional `msgId` parameter mirrors `ChatController::sendText`'s
+    /// caller-tracked-id pattern: pass the same UUID the platform's UI
+    /// bubble carries so on_send_failed can correlate a delivery
+    /// failure back to a specific bubble.  Empty/default mints a fresh
+    /// UUID (legacy behaviour, no per-bubble feedback).
     void sendTextV2(const std::string& groupId,
                      const std::string& groupName,
                      const std::vector<std::string>& memberPeerIds,
-                     const std::string& text);
+                     const std::string& text,
+                     const std::string& msgId = "");
 
     // ── Receive side (pv=2) ───────────────────────────────────────────
 

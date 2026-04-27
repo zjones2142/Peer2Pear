@@ -21,7 +21,7 @@ extension Peer2PearClient {
     /// Block state lives in `blocked_keys` (Phase 3h), reachable via
     /// `dbAddBlockedKey` / `dbIsBlockedKey` / `dbLoadAllBlockedKeys` —
     /// never on this row.
-    struct DBContact {
+    struct DBContact: Codable {
         let peerId: String
         var name: String = ""
         var subtitle: String = ""
@@ -34,7 +34,7 @@ extension Peer2PearClient {
 
     /// Conversation kind discriminator.  Maps to the `"direct"` /
     /// `"group"` strings the C boundary expects.
-    enum DBConversationKind {
+    enum DBConversationKind: String, Codable {
         case direct
         case group
 
@@ -59,7 +59,7 @@ extension Peer2PearClient {
     /// `id` is a UUID minted by the core (NOT the peer's pubkey);
     /// `directPeerId` carries the peer's pubkey.  For groups, `id`
     /// equals the group_id and `directPeerId` is empty.
-    struct DBConversation {
+    struct DBConversation: Codable {
         let id: String
         var kind: DBConversationKind = .direct
         var directPeerId: String = ""
@@ -74,7 +74,7 @@ extension Peer2PearClient {
     }
 
     /// Mirror of AppDataStore::Message (v3 shape — adds senderId).
-    struct DBMessage {
+    struct DBMessage: Codable {
         let sent: Bool
         let text: String
         let timestampSecs: Int64
@@ -87,11 +87,16 @@ extension Peer2PearClient {
         /// Self-declared display name carried in group inbound messages.
         /// Empty for 1:1 inbound and for outbound.
         let senderName: String
+        /// Outbound-only persistence of the per-bubble fail flag.
+        /// Default false — flips true on the relay-retry-exhaustion
+        /// path so the red-! indicator survives a relaunch.  Inbound
+        /// rows always carry this as false.
+        var sendFailed: Bool = false
     }
 
     /// Mirror of AppDataStore::FileRecord.  Used to persist the
     /// `transfers` dict so file rows survive lock/unlock.
-    struct DBFileRecord {
+    struct DBFileRecord: Codable {
         let transferId: String
         let chatKey: String           // 1:1 peerId or groupId
         let fileName: String
@@ -253,7 +258,8 @@ extension Peer2PearClient {
             message.timestampSecs,
             message.msgId,
             message.senderId,
-            message.senderName) == 0
+            message.senderName,
+            message.sendFailed ? 1 : 0) == 0
     }
 
     @discardableResult
@@ -266,6 +272,19 @@ extension Peer2PearClient {
     func dbDeleteMessage(conversationId: String, msgId: String) -> Bool {
         guard let ctx = rawContext else { return false }
         return p2p_app_delete_message(ctx, conversationId, msgId) == 0
+    }
+
+    /// Flip the persisted send_failed flag on a single message —
+    /// used by the on_send_failed callback (mark) and by retry /
+    /// delete paths (clear).  Mirrors the in-memory mutation on
+    /// `failedMessageIds`.
+    @discardableResult
+    func dbSetMessageSendFailed(conversationId: String,
+                                 msgId: String,
+                                 failed: Bool) -> Bool {
+        guard let ctx = rawContext else { return false }
+        return p2p_app_set_message_send_failed(
+            ctx, conversationId, msgId, failed ? 1 : 0) == 0
     }
 
     // MARK: - Save (settings + file records)
@@ -418,7 +437,7 @@ extension Peer2PearClient {
         let box = Unmanaged.passRetained(MessageCallbackBox(handler: each))
         defer { box.release() }
         p2p_app_load_messages(ctx, conversationId,
-            { sent, textC, ts, msgIdC, senderIdC, senderNameC, ud in
+            { sent, textC, ts, msgIdC, senderIdC, senderNameC, sendFailed, ud in
             guard let ud, let textC, let msgIdC,
                   let senderIdC, let senderNameC else { return }
             let unbox = Unmanaged<MessageCallbackBox>.fromOpaque(ud).takeUnretainedValue()
@@ -428,7 +447,8 @@ extension Peer2PearClient {
                 timestampSecs: ts,
                 msgId:         String(cString: msgIdC),
                 senderId:      String(cString: senderIdC),
-                senderName:    String(cString: senderNameC)))
+                senderName:    String(cString: senderNameC),
+                sendFailed:    sendFailed != 0))
         }, box.toOpaque())
     }
 
@@ -592,6 +612,11 @@ extension Peer2PearClient {
         var newMessages:      [P2PMessage]              = []
         var newGroupMessages: [P2PGroupMessage]         = []
         var newTransfers:     [String: P2PTransferRecord] = [:]
+        // Rehydrates @Published failedMessageIds: any outbound row
+        // with send_failed=1 from the DB feeds in here so the
+        // red-! indicator survives a relaunch instead of vanishing
+        // when the in-memory set was cleared on lock.
+        var newFailedIds:     Set<String> = []
 
         let myId = myPeerId
         for conv in loadedConversations {
@@ -631,25 +656,33 @@ extension Peer2PearClient {
                     let from = dbm.sent
                         ? myId
                         : (dbm.senderId.isEmpty ? myId : dbm.senderId)
+                    let id = dbm.msgId.isEmpty ? UUID().uuidString : dbm.msgId
                     newGroupMessages.append(P2PGroupMessage(
-                        id:        dbm.msgId.isEmpty ? UUID().uuidString : dbm.msgId,
+                        id:        id,
                         from:      from,
                         groupId:   conv.id,
                         groupName: groupName,
                         members:   memberIds,
                         text:      dbm.text,
                         timestamp: Date(timeIntervalSince1970: TimeInterval(dbm.timestampSecs))))
+                    if dbm.sent && dbm.sendFailed {
+                        newFailedIds.insert(id)
+                    }
                 }
             case .direct:
                 guard !conv.directPeerId.isEmpty else { continue }
                 let other = conv.directPeerId
                 dbLoadMessages(conversationId: conv.id) { dbm in
+                    let id = dbm.msgId.isEmpty ? UUID().uuidString : dbm.msgId
                     newMessages.append(P2PMessage(
-                        id:        dbm.msgId.isEmpty ? UUID().uuidString : dbm.msgId,
+                        id:        id,
                         from:      dbm.sent ? myId : other,
                         text:      dbm.text,
                         timestamp: Date(timeIntervalSince1970: TimeInterval(dbm.timestampSecs)),
                         to:        dbm.sent ? other : nil))
+                    if dbm.sent && dbm.sendFailed {
+                        newFailedIds.insert(id)
+                    }
                 }
             }
         }
@@ -675,6 +708,7 @@ extension Peer2PearClient {
             self.archivedDirectPeerIds      = newArchivedDirectPeerIds
             self.messages                   = newMessages
             self.groupMessages              = newGroupMessages
+            self.failedMessageIds           = newFailedIds
             self.transfers                  = newTransfers
 
             // Replay group rosters to the core so inbound control

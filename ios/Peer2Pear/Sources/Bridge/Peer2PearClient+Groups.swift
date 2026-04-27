@@ -73,14 +73,62 @@ extension Peer2PearClient {
 
     /// Send a text message to every member of a group.  `memberPeerIds`
     /// must include the recipients (self is filtered out internally).
+    /// `msgId` is optional but recommended — passing the same UUID
+    /// the local echo bubble carries lets `on_send_failed` correlate
+    /// retry-exhaustion back to that specific bubble (red-! indicator,
+    /// retry / delete affordance).  Empty falls back to v1 (core mints
+    /// internally, no per-bubble feedback).
     func sendGroupText(groupId: String,
                        groupName: String,
                        memberPeerIds: [String],
-                       text: String) {
+                       text: String,
+                       msgId: String = "") {
         guard let ctx = rawContext else { return }
         withCStringArray(memberPeerIds) { ptr in
-            _ = p2p_send_group_text(ctx, groupId, groupName, ptr, text)
+            _ = p2p_send_group_text_v2(ctx, groupId, groupName, ptr, text, msgId)
         }
+    }
+
+    /// Retry a previously-failed group send.  Drops the old echo
+    /// bubble (memory + DB) + clears its failure marker, then
+    /// re-sends with a fresh msgId.  Mirrors retryFailedMessage's
+    /// 1:1 semantics — old bubble is replaced by the new attempt
+    /// at the bottom of the thread.
+    func retryFailedGroupMessage(messageId: String,
+                                   groupId: String,
+                                   groupName: String,
+                                   memberPeerIds: [String],
+                                   text: String) {
+        if failedMessageIds.contains(messageId) {
+            failedMessageIds.remove(messageId)
+        }
+        // deleteMessage(chatKey:msgId:) accepts either a peerId or
+        // a groupId; for groups the chatKey IS the conversation_id.
+        deleteMessage(chatKey: groupId, msgId: messageId)
+        // Fresh send — generates a new bubble + new msgId via the
+        // normal sendGroupText path.  The caller (ConversationView)
+        // mints the UUID; this helper uses the standard send path
+        // through the existing send() callsite.
+        let newId = UUID().uuidString
+        let echo = P2PGroupMessage(
+            id: newId,
+            from: myPeerId,
+            groupId: groupId,
+            groupName: groupName,
+            members: memberPeerIds,
+            text: text,
+            timestamp: Date())
+        groupMessages.append(echo)
+        dbSaveMessage(conversationId: groupId, message: DBMessage(
+            sent:          true,
+            text:          text,
+            timestampSecs: Int64(echo.timestamp.timeIntervalSince1970),
+            msgId:         newId,
+            senderId:      "",
+            senderName:    ""))
+        sendGroupText(groupId: groupId, groupName: groupName,
+                       memberPeerIds: memberPeerIds, text: text,
+                       msgId: newId)
     }
 
     /// Send a file to every member of a group.  Mirrors `sendFile` for

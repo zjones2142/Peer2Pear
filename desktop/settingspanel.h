@@ -57,6 +57,12 @@ signals:
     // be re-synced after Restore / Delete.
     void archivedChatsClicked();
 
+    // Factory reset.  MainWindow handles the wipe (close DB, delete
+    // dataDir contents, clear QSettings, quit) — done as a top-level
+    // action so the user-curated UI is at the bottom of the panel and
+    // confirmation guards keep stray clicks from nuking state.
+    void factoryResetClicked();
+
     // File-transfer consent settings changed.
     void fileAutoAcceptMaxChanged(int mb);
     void fileHardMaxChanged(int mb);
@@ -121,6 +127,7 @@ private:
     QWidget *makePrivacySection();
     QWidget *makeArchivedChatsSection();
     QWidget *makeAboutHelpSection();
+    QWidget *makeFactoryResetSection();
 
     // Profile
     QLabel      *m_displayNameLabel     = nullptr;

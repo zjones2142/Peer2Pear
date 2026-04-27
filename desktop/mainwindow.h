@@ -59,4 +59,13 @@ private:
 
     // Debounce: only reload bubbles after resize activity stops
     QTimer m_resizeDebounce;
+
+    // Top-bar relay-status indicator.  Mirrors the iOS connectivity
+    // popover (wifi icon → tap → card showing "Connected" / "Offline"
+    // + relay URL + backup relays).  Tracks live state via the
+    // RelayClient's onConnected / onDisconnected callbacks; click
+    // the 📡 button to see the popover.
+    bool m_relayConnected = false;
+    void updateConnectivityIndicator();
+    void showConnectivityPopover();
 };

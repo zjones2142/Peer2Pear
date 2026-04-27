@@ -27,3 +27,20 @@
 // Xcode → Settings → Accounts.
 CODE_SIGN_STYLE = Automatic
 CODE_SIGN_IDENTITY = Apple Development
+
+// Privacy hardening: Release builds MUST use Apple Distribution (not
+// Apple Development).  Distribution profiles automatically clear
+// `get-task-allow`, which means a signed-distributed binary can't be
+// attached to with lldb / Xcode debugger — closing the
+// "extract memory at runtime" surface that's available with Dev signing.
+//
+// Side effect: a developer who hasn't set up Distribution signing in
+// their Xcode account will see Release builds fail at the codesign
+// step.  That's the right place for that error to surface — Debug
+// builds are unaffected and continue to use Apple Development for
+// normal on-device debugging.
+//
+// To verify a Release build is correctly signed:
+//   codesign -d --entitlements - /path/to/Peer2Pear.app
+// `get-task-allow` should be `false` (or absent — same effect).
+CODE_SIGN_IDENTITY[config=Release] = Apple Distribution

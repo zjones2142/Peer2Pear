@@ -26,11 +26,14 @@ struct SettingsView: View {
                     BiometricUnlockSection(client: client)
                     NotificationPrivacySection(client: client)
                     PrivacyLevelSection(client: client)
+                    ScreenCaptureSection()
                     TrustSection(client: client)
                     FileTransferSection(client: client)
                     RelayServersSection(client: client)
                     ArchivedChatsSection(client: client)
                     LockSection(client: client, dismiss: dismiss)
+                    TransferDeviceSection(client: client)
+                    FactoryResetSection(client: client, dismiss: dismiss)
                 }
                 .padding(.horizontal)
                 .padding(.vertical)
@@ -531,6 +534,76 @@ private struct AdvancedTransportToggles: View {
     }
 }
 
+// Screen-capture redaction toggles.  iOS doesn't let apps prevent
+// capture itself (no Android FLAG_SECURE equivalent); what we CAN
+// do is detect it via UIScreen.isCaptured + capturedDidChange and
+// replace the sensitive view with a placeholder so the captured
+// frames carry no plaintext.
+//
+// Two scopes, separately toggleable so the user can pick the
+// posture that matches their threat model:
+//
+//   * Login screen — DEFAULT ON.  Passphrase entry is the highest-
+//     leverage moment to leak: typed dots reveal length and
+//     timing, and the field is on screen for several seconds.
+//   * Inside the app — DEFAULT OFF.  Plaintext messages, contacts,
+//     and files become visible once unlocked, and the user
+//     generally knows when they're recording.  Opt-in for users
+//     who want the extra friction.
+//
+// Doesn't help against external cameras or jailbroken-device frame
+// grabbers — that's a separate threat model (see
+// project_ios_privacy_hardening.md).
+private struct ScreenCaptureSection: View {
+    @AppStorage(ScreenCapturePolicy.blockOnLoginKey)
+    private var blockOnLogin: Bool = ScreenCapturePolicy.blockOnLoginDefault
+
+    @AppStorage(ScreenCapturePolicy.blockInAppKey)
+    private var blockInApp: Bool = ScreenCapturePolicy.blockInAppDefault
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "rectangle.dashed.badge.record")
+                    .foregroundStyle(.green)
+                Text("Screen Capture")
+                    .font(.headline)
+            }
+
+            Toggle(isOn: $blockOnLogin) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Block on Login screen")
+                        .font(.subheadline)
+                    Text("Hides the passphrase field while the screen is being recorded or mirrored.  Recommended.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.green)
+
+            Divider()
+
+            Toggle(isOn: $blockInApp) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Block inside the app")
+                        .font(.subheadline)
+                    Text("Blanks message threads, contacts, and files while the screen is being recorded or mirrored.  Off by default — most users know when they're recording.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tint(.green)
+
+            Text("iOS doesn't let apps prevent capture; we detect it and replace the sensitive view with a placeholder.  External cameras and shoulder-surfing aren't affected.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+    }
+}
+
 // Trust & Verification — mirrors desktop's "Block contacts whose
 // safety number changed" toggle.  The mismatch warning (orange triangle
 // in ChatRow) still fires either way; this control just decides whether
@@ -846,5 +919,120 @@ private struct LockSection: View {
         .padding(12)
         .background(Color(.secondarySystemBackground))
         .cornerRadius(10)
+    }
+}
+
+// Transfer to new device — Phase 4 backup-strategy step 2 entry
+// point on the SOURCE device (the unlocked one).  Sister of
+// OnboardingView's "Transfer from another device" footer button
+// on the receiving device.  Sits between Lock and Factory Reset
+// in the settings panel — same "lifecycle / one-time" mental
+// neighborhood as those two, but neither destructive (Factory
+// Reset) nor session-only (Lock).
+//
+// See project_backup_strategy.md for the full design — blob
+// format, ratchet rebuild decision, settings inventory, UX
+// warnings.  Phase A is UI scaffolding; Phase B will land the
+// crypto + transport.
+private struct TransferDeviceSection: View {
+    @ObservedObject var client: Peer2PearClient
+    @State private var showTransferSend = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "iphone.and.arrow.forward")
+                    .foregroundStyle(.green)
+                Text("Transfer to new device")
+                    .font(.headline)
+            }
+
+            Button {
+                showTransferSend = true
+            } label: {
+                Text("Start transfer")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.bordered)
+            .tint(.green)
+
+            Text("Move your identity, contacts, conversations, groups, and settings to a new iPhone.  The transfer is encrypted device-to-device — nothing touches Apple's servers or any other third party.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+        .sheet(isPresented: $showTransferSend) {
+            TransferSendView(client: client)
+        }
+    }
+}
+
+// Factory reset — same destructive wipe the auto-wipe path runs
+// after 12 failed unlock attempts.  Surfaced explicitly so a user
+// can return the app to first-launch state on demand without
+// uninstalling.  Type-to-confirm guards against stray taps.
+
+private struct FactoryResetSection: View {
+    @ObservedObject var client: Peer2PearClient
+    let dismiss: DismissAction
+    @State private var showAlert = false
+    @State private var confirmText = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text("FACTORY RESET")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .tracking(0.5)
+            }
+
+            Button(role: .destructive) {
+                showAlert = true
+            } label: {
+                Text("Erase Identity & All Data")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+
+            Text("Wipes your identity keys, contacts, message history, files, blocked keys, and every setting on this device. The app returns to first-launch state. Peers won't be notified — they'll keep your old key as stale.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(10)
+        .alert("Factory Reset",
+               isPresented: $showAlert) {
+            TextField("Type RESET to confirm", text: $confirmText)
+                .textInputAutocapitalization(.characters)
+                .autocorrectionDisabled()
+            Button("Cancel", role: .cancel) {
+                confirmText = ""
+            }
+            Button("Reset", role: .destructive) {
+                if confirmText == "RESET" {
+                    dismiss()
+                    // surfaceFailedAttemptsAlert: false — the
+                    // "Too many failed unlock attempts" message is
+                    // for the auto-wipe path; an explicit factory
+                    // reset is user-initiated and doesn't need a
+                    // post-hoc explanation.
+                    client.wipeAllData(
+                        documentDir: Peer2PearClient.documentsPath,
+                        surfaceFailedAttemptsAlert: false)
+                }
+                confirmText = ""
+            }
+        } message: {
+            Text("This permanently erases everything stored by Peer2Pear on this device. Cannot be undone.\n\nType RESET to confirm.")
+        }
     }
 }

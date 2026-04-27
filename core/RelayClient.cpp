@@ -329,7 +329,9 @@ void RelayClient::onWsTextMessage(const std::string& message)
 
 // ── Sending envelopes ────────────────────────────────────────────────────────
 
-void RelayClient::sendEnvelope(const Bytes& sealedEnvelope, TrafficClass cls)
+void RelayClient::sendEnvelope(const Bytes& sealedEnvelope,
+                                  TrafficClass cls,
+                                  const std::string& messageId)
 {
     if (m_coverIntervalSec > 0 && m_burstRemaining <= 0 && isConnected()) {
         const int precover = 1 + int(randombytes_uniform(2));
@@ -338,7 +340,7 @@ void RelayClient::sendEnvelope(const Bytes& sealedEnvelope, TrafficClass cls)
     }
     onRealActivity();
 
-    auto retryCb = [this, sealedEnvelope](const IHttpClient::Response& r) {
+    auto retryCb = [this, sealedEnvelope, messageId](const IHttpClient::Response& r) {
         if (r.error.empty()) return;
 
         if (r.status == 413) {
@@ -347,12 +349,33 @@ void RelayClient::sendEnvelope(const Bytes& sealedEnvelope, TrafficClass cls)
         }
 
         if (static_cast<int>(m_retryQueue.size()) < kMaxRetryQueue)
-            m_retryQueue.push_back({ sealedEnvelope, 0 });
+            m_retryQueue.push_back({ sealedEnvelope, 0, messageId });
         if (!m_retryTimer->isActive())
             scheduleRetry();
 
-        if (r.status != 429)
-            emitStatus("relay send error: " + r.error + " — will retry");
+        // Don't toast on the FIRST failed attempt — silent retry.
+        //
+        // Transport-level errors (iOS NSURLErrorNetworkConnectionLost,
+        // request-cancelled-on-app-backgrounding, mid-flight TLS
+        // hiccups) commonly fire even when the relay actually
+        // received + accepted the envelope.  The user sees their
+        // message arrive on the recipient (relay deduplicates the
+        // retry by envelope id), but the sender's UI flashed
+        // "relay send error: will retry" — confusing.
+        //
+        // Truly stuck sends still surface via the
+        // "Couldn't deliver message — check your connection."
+        // toast emitted from processRetryQueue() once
+        // kMaxRetries elapses (~31s of attempts on the current
+        // 1→2→4→8→16s backoff, plus each attempt's per-request
+        // timeout — so genuine failures take roughly 30–60s to
+        // surface).  That's a tolerable delay for a real failure
+        // signal, and avoids the false-positive cry-wolf
+        // pattern that erodes user trust in the toast.
+        //
+        // The 413 short-circuit above still fires immediately
+        // because that's a definitive rejection, not a transient
+        // condition.
     };
 
     // Routing priority:
@@ -485,7 +508,25 @@ void RelayClient::processRetryQueue()
             m_retryQueue.insert(m_retryQueue.begin(), std::move(next));
             scheduleRetry();
         } else {
-            emitStatus("Gave up delivering envelope after max retries.");
+            // End of the line: kMaxRetries (5) attempts on a
+            // 1→2→4→8→16s backoff schedule (~31s of attempts plus
+            // each attempt's own per-request timeout) all failed.
+            // This is the toast users actually need to see — they
+            // tried to send a message and it didn't land.  Phrased
+            // user-facing rather than protocol-facing so it reads
+            // sensibly without context.
+            emitStatus("Couldn't deliver message — check your connection.");
+
+            // Per-bubble fail indicator.  If sendEnvelope was
+            // tagged with a non-empty messageId, fire the
+            // typed callback so the platform can mark the
+            // corresponding bubble as undelivered and offer a
+            // retry affordance.  Empty messageIds (cover
+            // traffic, presence, control envelopes) skip this
+            // — they have no UI surface to mark.
+            if (!pe.messageId.empty() && onSendFailed) {
+                onSendFailed(pe.messageId);
+            }
         }
     });
 }

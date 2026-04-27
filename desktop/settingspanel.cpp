@@ -12,6 +12,8 @@
 #include <QPushButton>
 #include <QClipboard>
 #include <QApplication>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QTimer>
 
 // ── SettingsPanel ─────────────────────────────────────────────────────────────
@@ -122,6 +124,9 @@ void SettingsPanel::buildUI()
 
     // ── Getting Started / Help section ───────────────────────────────────────
     bodyLayout->addWidget(makeAboutHelpSection());
+
+    // ── Factory Reset (always at the bottom) ─────────────────────────────────
+    bodyLayout->addWidget(makeFactoryResetSection());
 
     bodyLayout->addStretch();
     scroll->setWidget(body);
@@ -973,6 +978,88 @@ QWidget *SettingsPanel::makeAboutHelpSection()
         "background: transparent; border: none; padding: 10px 16px 14px 16px;"
         );
     cardLayout->addWidget(guideLabel);
+
+    return card;
+}
+
+// ── Factory reset (always at the bottom) ────────────────────────────────────
+//
+// One destructive button that wipes the whole local data dir + the
+// SQLCipher DB.  MainWindow handles the actual mechanics (close DB,
+// rm -rf dataDir, QSettings::clear, QApplication::quit) on the
+// `factoryResetClicked` signal — this section just gates the click
+// behind a type-to-confirm dialog so a stray hit can't nuke
+// everything.
+QWidget *SettingsPanel::makeFactoryResetSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    QLabel *heading = new QLabel("FACTORY RESET");
+    heading->setStyleSheet(
+        "color: #e57373;"  // muted red — distinct from the green
+                            // section headers; signals destructive
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    QWidget *row = new QWidget();
+    row->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *rv = new QVBoxLayout(row);
+    rv->setContentsMargins(16, 10, 16, 14);
+    rv->setSpacing(8);
+
+    QPushButton *btn = new QPushButton("Erase Identity & All Data");
+    btn->setObjectName("factoryResetBtn");
+    themeStyles::applyRole(btn, "destructiveBtn",
+        themeStyles::destructiveBtnCss(ThemeManager::instance().current()));
+    connect(btn, &QPushButton::clicked, this, [this]() {
+        // Type-to-confirm: a stray click on a destructive button
+        // shouldn't be enough to nuke the user's identity.  We use a
+        // QInputDialog with the canonical phrase the user has to
+        // type back; cancel + empty + wrong-phrase are all no-ops.
+        bool ok = false;
+        const QString phrase = QInputDialog::getText(
+            this,
+            "Factory Reset",
+            "This permanently erases your identity, contacts, message "
+            "history, files, blocked keys, and every setting on this "
+            "device.  Cannot be undone — peers won't know you've reset "
+            "and will keep your old key as stale.\n\n"
+            "Type RESET to confirm:",
+            QLineEdit::Normal, QString(), &ok);
+        if (!ok) return;
+        if (phrase.trimmed() == "RESET") {
+            emit factoryResetClicked();
+        }
+    });
+    rv->addWidget(btn);
+
+    QLabel *sub = new QLabel(
+        "Wipes your identity keys, contacts, message history, files, "
+        "blocked keys, and every setting on this device.  The app "
+        "returns to first-launch state.  Peers won't be notified — "
+        "they'll keep your old key as stale."
+        );
+    sub->setStyleSheet(
+        "color: #777777; font-size: 11px; background: transparent; border: none;"
+        );
+    sub->setWordWrap(true);
+    rv->addWidget(sub);
+
+    cardLayout->addWidget(row);
 
     return card;
 }

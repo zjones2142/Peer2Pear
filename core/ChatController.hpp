@@ -54,18 +54,50 @@ public:
     void setRelayUrl(const std::string& url);
     void setDatabase(SqlCipherDb& db);
 
-    /// Wire the per-user app data store so the v2 group sender path
-    /// can persist its monotonic counter (group_send_state) and cache
-    /// sealed envelopes for replay (group_replay_cache).  Pointer is
-    /// not owned; the caller (p2p_context) keeps it alive for the
-    /// life of the ChatController.  Optional — the legacy v1 group
-    /// path works without it.
+    /// Wire the per-user app data store so the v2 group sender +
+    /// receiver paths can persist their monotonic counters
+    /// (group_send_state), replay caches (group_replay_cache),
+    /// chain state, and out-of-order buffer.  Pointer is not
+    /// owned; the caller keeps it alive for the life of the
+    /// ChatController.  Effectively mandatory — without it,
+    /// GroupProto v2 drops every group message and logs a
+    /// per-message warning.  validateWiring() will surface a
+    /// missing call once at connectToRelay() time.
     void setAppDataStore(AppDataStore* appData);
+
+    /// One-shot tripwire: walks the mandatory dependency pointers
+    /// and warns once for each that's null.  Called from
+    /// connectToRelay() so a missing setter call (typically a
+    /// platform init path forgetting to add a new dep when
+    /// ChatController grows one) shows up at app startup with a
+    /// named warn, rather than silently failing on the first
+    /// inbound or outbound message.  Documentation, not
+    /// enforcement — see project_chatcontroller_di.md for the
+    /// deferred Dependencies-struct refactor that would catch
+    /// this at compile time.
+    void validateWiring() const;
+
+    /// Fires from RelayClient's give-up branch with the msgId that
+    /// was tagged on sendText(... msgId).  Lets the platform layer
+    /// mark the corresponding bubble as undelivered + offer a
+    /// retry affordance.  Empty msgIds (the legacy sendText
+    /// overload, cover traffic, control envelopes) never reach
+    /// this — the typed callback only fires for caller-tracked
+    /// sends.
+    std::function<void(const std::string&)> onMessageSendFailed;
     std::string myIdB64u() const;
     const Bytes& identityPub() const { return m_crypto.identityPub(); }
 
-    // Send encrypted text to a peer
-    void sendText(const std::string& peerIdB64u, const std::string& text);
+    // Send encrypted text to a peer.  `msgId` is optional; an empty
+    // string makes ChatController mint a fresh UUID for the
+    // envelope's `msgId` field.  Callers that want to correlate
+    // delivery callbacks back to a UI bubble (e.g., iOS pre-creating
+    // the echo bubble before calling) should pass the same id they
+    // used for the bubble — that's the id the retry path will hand
+    // back via onMessageSendFailed if the send exhausts retries.
+    void sendText(const std::string& peerIdB64u,
+                  const std::string& text,
+                  const std::string& msgId = "");
 
     // Send an encrypted file via FileTransferManager — path-based, streams from disk.
     // Returns the transferId on success or an empty string on failure.
@@ -99,7 +131,8 @@ public:
     void sendGroupMessageViaMailbox(const std::string& groupId,
                                     const std::string& groupName,
                                     const std::vector<std::string>& memberPeerIds,
-                                    const std::string& text);
+                                    const std::string& text,
+                                    const std::string& msgId = "");
     void sendGroupLeaveNotification(const std::string& groupId,
                                     const std::string& groupName,
                                     const std::vector<std::string>& memberPeerIds);

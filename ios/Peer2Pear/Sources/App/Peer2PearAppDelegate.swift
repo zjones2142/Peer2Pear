@@ -61,7 +61,16 @@ final class Peer2PearAppDelegate: NSObject, UIApplicationDelegate,
         // Not fatal — the app still works on the foreground WebSocket
         // path.  Background delivery just won't be possible until the
         // next registration attempt succeeds.
+        //
+        // Debug-only: NSLog writes to the unified OS log, which is
+        // queryable via `log stream` and persists across launches.
+        // The error itself carries no peer / message content, but
+        // we gate it behind DEBUG to keep production builds silent
+        // on this surface — diagnostic noise is a privacy posture
+        // concern even when the payload is benign.
+        #if DEBUG
         NSLog("[Peer2Pear] APNs registration failed: %@", error.localizedDescription)
+        #endif
     }
 
     // MARK: - Silent push (content-available)
@@ -87,11 +96,51 @@ final class Peer2PearAppDelegate: NSObject, UIApplicationDelegate,
     // When a local notification fires while the app is foregrounded,
     // let it appear as a banner anyway — matches what users expect
     // from a messaging app.  Without this the OS suppresses it.
+    //
+    // Exception: when the user is currently viewing the matching
+    // thread, drop the banner + badge but keep the sound.  Mirrors
+    // iMessage's "in-conversation receive tone" pattern: peripheral
+    // audio cue so the user knows a message landed, without the
+    // visual interruption of a banner over the thread they're
+    // already reading.  TODO: ship a quieter custom .caf asset and
+    // assign it via content.sound in fireLocalNotification — the
+    // system .default is louder than iMessage's in-convo tone.
+    //
+    // This delegate is ONLY invoked when the app is foregrounded;
+    // backgrounded notifications surface directly through the OS
+    // (lock screen / notification center) without going through
+    // here, so any policy here can't hide a notification the user
+    // wouldn't otherwise see.
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                   willPresent notification: UNNotification,
                                   withCompletionHandler completion:
                                       @escaping (UNNotificationPresentationOptions) -> Void) {
+        if let activeId = client?.activeChatId,
+           notificationMatchesActiveThread(notification, activeId: activeId) {
+            completion([.sound])
+            return
+        }
         completion([.banner, .sound, .badge])
+    }
+
+    /// Strip the "dm:" / "group:" prefix that fireLocalNotification
+    /// sets on `threadIdentifier` and compare against the raw id
+    /// stored in `client.activeChatId`.  Peer IDs (43-char
+    /// base64url) and group IDs (also random) don't collide in
+    /// practice, but the prefix check still guards against the
+    /// pathological case of a DM peer and a group sharing an id.
+    private func notificationMatchesActiveThread(_ notification: UNNotification,
+                                                   activeId: String) -> Bool {
+        let tid = notification.request.content.threadIdentifier
+        let unprefixed: String
+        if tid.hasPrefix("dm:") {
+            unprefixed = String(tid.dropFirst("dm:".count))
+        } else if tid.hasPrefix("group:") {
+            unprefixed = String(tid.dropFirst("group:".count))
+        } else {
+            return false
+        }
+        return unprefixed == activeId
     }
 
     // MARK: - Helpers

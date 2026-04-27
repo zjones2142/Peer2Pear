@@ -7,13 +7,48 @@ struct Peer2PearApp: App {
     @UIApplicationDelegateAdaptor(Peer2PearAppDelegate.self) private var appDelegate
     @StateObject private var client = Peer2PearClient()
 
+    // Drives the app-switcher snapshot overlay below.  iOS captures
+    // a screenshot of the active scene when the app backgrounds, and
+    // that snapshot is cached in the multitasker until next launch
+    // — a fingerprintable forensic surface separate from the app's
+    // sandbox.  By installing a brand placeholder when scenePhase
+    // leaves .active, we keep conversation content out of that
+    // cached image.
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some Scene {
         WindowGroup {
             Group {
                 if client.myPeerId.isEmpty {
                     OnboardingView(client: client)
                 } else {
+                    // In-app screen-capture redaction: when the user
+                    // has enabled the in-app block in Settings, this
+                    // overlay covers ChatListView (and pushed
+                    // navigation views) with an opaque placeholder
+                    // while the screen is being recorded / mirrored.
+                    // Sheets (Settings, MyKey, etc.) are presented
+                    // outside the overlay's bounds and therefore not
+                    // covered — acceptable since those are
+                    // user-initiated and momentary.  See
+                    // ScreenCaptureMonitor.swift for threat-model
+                    // notes.
                     ChatListView(client: client)
+                        .overlay { InAppCaptureRedaction() }
+                }
+            }
+            // App-switcher snapshot overlay.  Wraps the entire
+            // root content (both locked + unlocked branches) so
+            // the cached snapshot iOS takes during backgrounding
+            // shows the brand placeholder instead of the active
+            // conversation.  Stacked OUTSIDE InAppCaptureRedaction
+            // so it covers OnboardingView too — the lock screen
+            // doesn't show conversation content but applying the
+            // placeholder uniformly avoids "different overlay
+            // behaviour depending on auth state" weirdness.
+            .overlay {
+                if scenePhase != .active {
+                    SnapshotOverlay()
                 }
             }
             .p2pColorScheme(client.colorScheme)
@@ -83,5 +118,72 @@ private func schemeFor(_ pref: Peer2PearClient.ColorSchemePreference) -> ColorSc
     case .dark:   return .dark
     case .light:  return .light
     case .system: return nil
+    }
+}
+
+// App-switcher snapshot overlay.  iOS caches a screenshot of the
+// active scene in the multitasker UI when the app backgrounds; that
+// cache survives until the next foreground launch and lives outside
+// the app's sandbox (read by forensic tools with device access).
+// Without this overlay the snapshot captures whatever the user was
+// looking at — usually a conversation thread.
+//
+// We install the overlay whenever scenePhase != .active.  The
+// snapshot fires on the .active → .inactive transition; SwiftUI
+// re-renders fast enough that the placeholder is in place before
+// the snapshot is taken in practice on iOS 17+.  If timing-
+// sensitive cases arise, the next-step fix is a UIWindow-level
+// overlay installed from `applicationWillResignActive` in the
+// AppDelegate — heavier-weight but guarantees the ordering.
+private struct SnapshotOverlay: View {
+    var body: some View {
+        ZStack {
+            Color(.systemBackground)
+                .ignoresSafeArea()
+            VStack(spacing: 16) {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .font(.system(size: 80))
+                    .foregroundStyle(.green)
+                Text("Peer2Pear")
+                    .font(.title.bold())
+            }
+        }
+    }
+}
+
+// In-app screen-capture redaction.  Renders an opaque placeholder
+// when (a) the screen is being recorded / mirrored AND (b) the user
+// has opted into in-app blocking in Settings (off by default — the
+// post-unlock threat model is weaker than the login screen).
+//
+// Lives at the WindowGroup level so it covers ChatListView and any
+// pushed NavigationStack views (ConversationView, ArchivedChatsView,
+// etc.).  Sheets and full-screen covers present in their own
+// presentation context and aren't covered — accepted limitation.
+private struct InAppCaptureRedaction: View {
+    @StateObject private var monitor = ScreenCaptureMonitor()
+
+    @AppStorage(ScreenCapturePolicy.blockInAppKey)
+    private var blockInApp: Bool = ScreenCapturePolicy.blockInAppDefault
+
+    var body: some View {
+        if monitor.isCaptured && blockInApp {
+            ZStack {
+                Color(.systemBackground)
+                VStack(spacing: 12) {
+                    Image(systemName: "eye.slash.fill")
+                        .font(.system(size: 48))
+                        .foregroundStyle(.orange)
+                    Text("Screen capture detected")
+                        .font(.headline)
+                    Text("Stop screen recording or mirroring to view the app.  You can disable this in Settings → Screen Capture.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+            }
+            .ignoresSafeArea()
+        }
     }
 }

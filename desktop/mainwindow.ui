@@ -207,6 +207,31 @@ QToolButton#editProfileBtn:hover, QToolButton#editItemBtn:hover { color: #5dd868
            </widget>
           </item>
           <item>
+           <widget class="QToolButton" name="connectivityBtn">
+            <property name="minimumSize">
+             <size>
+              <width>36</width>
+              <height>36</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>36</width>
+              <height>36</height>
+             </size>
+            </property>
+            <property name="styleSheet">
+             <string notr="true">font-size: 18px;</string>
+            </property>
+            <property name="text">
+             <string>📡</string>
+            </property>
+            <property name="toolTip">
+             <string>Relay status</string>
+            </property>
+           </widget>
+          </item>
+          <item>
            <widget class="QToolButton" name="settingsBtn_12">
             <property name="minimumSize">
              <size>

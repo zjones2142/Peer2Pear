@@ -353,11 +353,22 @@ void AppDataStore::createTables()
         "  msg_id           TEXT NOT NULL DEFAULT '',"
         "  sender_id        TEXT NOT NULL DEFAULT '',"
         "  sender_name      TEXT NOT NULL DEFAULT '',"
+        // Outbound-only flag: 1 once the relay's retry loop has
+        // exhausted for this message.  Persists the per-bubble
+        // red-! indicator across app relaunches.  Inbound rows
+        // always read this as 0 (we don't track inbound failures
+        // — those are receiver-side / decrypt-side concerns).
+        "  send_failed      INTEGER NOT NULL DEFAULT 0,"
         "  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE"
         ");"
     );
     q.exec("CREATE INDEX IF NOT EXISTS idx_messages_conv_ts"
            " ON messages(conversation_id, timestamp);");
+    // Idempotent migration: existing v3 DBs predate the
+    // send_failed column.  ALTER quietly returns false on DBs
+    // that already have it (fresh installs go through the CREATE
+    // above and this is a no-op).
+    q.exec("ALTER TABLE messages ADD COLUMN send_failed INTEGER NOT NULL DEFAULT 0;");
 
     // group_seq_counters: legacy SenderChain v1 counters.  Untouched
     // by Phase 3 — dies with the SenderChain deletion (deferred).
@@ -1086,8 +1097,8 @@ bool AppDataStore::saveMessage(const std::string& conversationId, const Message&
         SqlCipherQuery q(*m_db);
         q.prepare(
             "INSERT INTO messages"
-            " (conversation_id,sent,text,timestamp,msg_id,sender_id,sender_name)"
-            " VALUES (:cid,:sent,:text,:ts,:msg_id,:sender_id,:sender_name);"
+            " (conversation_id,sent,text,timestamp,msg_id,sender_id,sender_name,send_failed)"
+            " VALUES (:cid,:sent,:text,:ts,:msg_id,:sender_id,:sender_name,:send_failed);"
         );
         q.bindValue(":cid",         conversationId);
         q.bindValue(":sent",        m.sent ? 1 : 0);
@@ -1102,6 +1113,7 @@ bool AppDataStore::saveMessage(const std::string& conversationId, const Message&
         q.bindValue(":sender_id",   m.senderId);
         q.bindValue(":sender_name", encryptField(m.senderName,
                                       fieldAad("messages", "sender_name", rowKey)));
+        q.bindValue(":send_failed", m.sendFailed ? 1 : 0);
         if (!q.exec()) return false;
     }
     touchConversation(conversationId, m.timestampSecs > 0
@@ -1140,7 +1152,7 @@ void AppDataStore::loadMessages(const std::string& conversationId,
     if (!m_db || !cb || conversationId.empty()) return;
     SqlCipherQuery q(m_db->handle());
     q.prepare(
-        "SELECT sent,text,timestamp,msg_id,sender_id,sender_name FROM messages"
+        "SELECT sent,text,timestamp,msg_id,sender_id,sender_name,send_failed FROM messages"
         " WHERE conversation_id=:cid ORDER BY timestamp ASC, id ASC;"
     );
     q.bindValue(":cid", conversationId);
@@ -1156,8 +1168,25 @@ void AppDataStore::loadMessages(const std::string& conversationId,
                                           fieldAad("messages", "text",        rowKey));
         m.senderName    = decryptField(q.valueText(5),
                                           fieldAad("messages", "sender_name", rowKey));
+        m.sendFailed    = q.valueInt(6) == 1;
         cb(m);
     }
+}
+
+bool AppDataStore::setMessageSendFailed(const std::string& conversationId,
+                                          const std::string& msgId,
+                                          bool failed)
+{
+    if (!m_db || conversationId.empty() || msgId.empty()) return false;
+    SqlCipherQuery q(*m_db);
+    q.prepare(
+        "UPDATE messages SET send_failed=:val"
+        " WHERE conversation_id=:cid AND msg_id=:msg_id;"
+    );
+    q.bindValue(":val",    failed ? 1 : 0);
+    q.bindValue(":cid",    conversationId);
+    q.bindValue(":msg_id", msgId);
+    return q.exec();
 }
 
 bool AppDataStore::deleteMessages(const std::string& conversationId)

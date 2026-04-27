@@ -310,27 +310,20 @@ struct ReentrancyState {
 extern "C" void deadlockProbeCb(const char* peer_id,
                                  const char* name,
                                  const char* subtitle,
-                                 const char* const* keys,
-                                 int is_blocked,
-                                 int is_group,
-                                 const char* group_id,
                                  const char* avatar_b64,
-                                 int64_t last_active_secs,
-                                 int in_address_book,
                                  int muted,
+                                 int64_t last_active_secs,
                                  void* ud)
 {
-    (void)name; (void)subtitle; (void)keys; (void)is_blocked;
-    (void)is_group; (void)group_id; (void)avatar_b64;
-    (void)last_active_secs; (void)in_address_book; (void)muted;
+    (void)name; (void)subtitle; (void)avatar_b64;
+    (void)muted; (void)last_active_secs;
     auto* s = static_cast<ReentrancyState*>(ud);
     // Re-enter the C API from inside the callback.  A non-recursive
     // ctrlMu held across the callback would deadlock here.  Use
     // p2p_app_save_contact — a no-op semantic update (same row)
     // that still grabs ctrlMu and exercises the reentrant path.
-    const char* noKeys[] = {nullptr};
     (void)p2p_app_save_contact(s->ctx, peer_id, "Alice-updated", "",
-                                noKeys, 0, 0, "", "", 0, 1, 0);
+                                /*avatar*/"", /*muted*/0, /*last_active*/0);
     s->count++;
 }
 
@@ -341,10 +334,9 @@ TEST(CApi, LoadContactsCallbackReentrancyDoesNotDeadlock) {
     ASSERT_EQ(p2p_set_passphrase_v2(ctx, "testpass"), 0);
 
     // Seed three contacts so the callback fires multiple times.
-    const char* keys[] = {nullptr};
-    p2p_app_save_contact(ctx, "peer1", "Alice", "", keys, 0, 0, "", "", 0, 1, 0);
-    p2p_app_save_contact(ctx, "peer2", "Bob",   "", keys, 0, 0, "", "", 0, 1, 0);
-    p2p_app_save_contact(ctx, "peer3", "Carol", "", keys, 0, 0, "", "", 0, 1, 0);
+    p2p_app_save_contact(ctx, "peer1", "Alice", "", "", 0, 0);
+    p2p_app_save_contact(ctx, "peer2", "Bob",   "", "", 0, 0);
+    p2p_app_save_contact(ctx, "peer3", "Carol", "", "", 0, 0);
 
     ReentrancyState state{ctx, 0};
     auto fut = std::async(std::launch::async, [&]() {

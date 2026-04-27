@@ -60,7 +60,10 @@ struct ConversationView: View {
         }
         .onAppear {
             activeFileRequest = pendingRequestsForPeer.first
-            client.markChatRead(chatKey: peerId)
+            client.enterChat(id: peerId)
+        }
+        .onDisappear {
+            client.exitChat(id: peerId)
         }
         .sheet(item: $activeFileRequest) { req in
             FileRequestSheet(client: client, request: req) {
@@ -74,7 +77,9 @@ struct ConversationView: View {
 
     @ViewBuilder private var messagesScroll: some View {
         ChatMessagesScroll(messages: peerMessages) { msg in
-            MessageBubble(message: msg, isMine: msg.from == client.myPeerId)
+            MessageBubble(client: client,
+                           message: msg,
+                           isMine: msg.from == client.myPeerId)
                 .contextMenu {
                     Button {
                         UIPasteboard.general.string = msg.text
@@ -223,7 +228,8 @@ struct GroupConversationView: View {
         }
         .navigationTitle(group?.name ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { client.markChatRead(chatKey: groupId) }
+        .onAppear { client.enterChat(id: groupId) }
+        .onDisappear { client.exitChat(id: groupId) }
         .toolbar {
             // Phase 3d: (i) opens the GROUP editor (rename / avatar /
             // mute / archive / member list / delete).  Member rows in
@@ -305,7 +311,8 @@ struct GroupConversationView: View {
 
     @ViewBuilder private var messagesScroll: some View {
         ChatMessagesScroll(messages: groupMessages) { msg in
-            GroupMessageBubble(message: msg,
+            GroupMessageBubble(client: client,
+                                message: msg,
                                isMine: msg.from == client.myPeerId)
                 .contextMenu {
                     Button {
@@ -344,15 +351,21 @@ struct GroupConversationView: View {
 
     private func send() {
         guard let group, !messageText.isEmpty else { return }
+        // Mint the msgId BEFORE the C call so the protocol envelope
+        // and the local echo bubble share the id — that's what lets
+        // on_send_failed mark the right group bubble after retry-
+        // exhaustion.  Same pattern as the 1:1 sendText path.
+        let msgId = UUID().uuidString
         client.sendGroupText(groupId: group.id,
                              groupName: group.name,
                              memberPeerIds: group.memberIds,
-                             text: messageText)
+                             text: messageText,
+                             msgId: msgId)
         // Local echo — the core doesn't loop-back our own group sends
         // through on_group_message, so we append ourselves to keep the
         // transcript in-sync with what recipients see.
         let echo = P2PGroupMessage(
-            id: UUID().uuidString,
+            id: msgId,
             from: client.myPeerId,
             groupId: group.id,
             groupName: group.name,
@@ -393,12 +406,35 @@ struct GroupConversationView: View {
 // members can attribute messages.  Own messages skip the label.
 
 struct GroupMessageBubble: View {
+    @ObservedObject var client: Peer2PearClient
     let message: P2PGroupMessage
     let isMine: Bool
 
+    @State private var showFailedActions = false
+
+    /// Outbound only — same semantics as MessageBubble's check.
+    /// All N fan-out envelopes share the bubble's msgId, so the
+    /// FIRST envelope's retry-exhaustion is what flips this true.
+    private var sendFailed: Bool {
+        isMine && client.failedMessageIds.contains(message.id)
+    }
+
     var body: some View {
-        HStack {
+        HStack(alignment: .bottom, spacing: 6) {
             if isMine { Spacer() }
+
+            if sendFailed {
+                Button {
+                    showFailedActions = true
+                } label: {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.body)
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Group message failed to send")
+            }
+
             VStack(alignment: isMine ? .trailing : .leading, spacing: 2) {
                 if !isMine {
                     Text(message.from.prefix(8) + "...")
@@ -412,12 +448,40 @@ struct GroupMessageBubble: View {
                     .background(isMine ? Color.green : Color(.systemGray5))
                     .foregroundStyle(isMine ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .opacity(sendFailed ? 0.65 : 1.0)
 
-                Text(message.timestamp, style: .time)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if sendFailed {
+                    Text("Not delivered")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                } else {
+                    Text(message.timestamp, style: .time)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             if !isMine { Spacer() }
+        }
+        .confirmationDialog(
+            "Group message not delivered",
+            isPresented: $showFailedActions,
+            titleVisibility: .visible
+        ) {
+            Button("Try Again") {
+                client.retryFailedGroupMessage(
+                    messageId:     message.id,
+                    groupId:       message.groupId,
+                    groupName:     message.groupName,
+                    memberPeerIds: message.members,
+                    text:          message.text)
+            }
+            Button("Delete", role: .destructive) {
+                client.deleteMessage(chatKey: message.groupId, msgId: message.id)
+                client.failedMessageIds.remove(message.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Couldn't reach the relay after retrying for ~30 seconds.  At least one recipient didn't get this message.")
         }
     }
 }
@@ -861,12 +925,40 @@ private extension UIImage {
 // MARK: - Message bubble (unchanged)
 
 struct MessageBubble: View {
+    @ObservedObject var client: Peer2PearClient
     let message: P2PMessage
     let isMine: Bool
 
+    @State private var showFailedActions = false
+
+    /// True for outbound messages whose send exhausted the relay
+    /// retry loop.  Reads off the @Published set on the client so
+    /// the view re-renders the moment on_send_failed fires.
+    private var sendFailed: Bool {
+        isMine && client.failedMessageIds.contains(message.id)
+    }
+
     var body: some View {
-        HStack {
+        HStack(alignment: .bottom, spacing: 6) {
             if isMine { Spacer() }
+
+            // Red exclamation appears to the LEFT of the bubble
+            // (mirror of iMessage) so it's visually grouped with
+            // the bubble it annotates.  Tap target is the icon
+            // itself; the bubble text stays selectable so users
+            // can copy a failed message before retrying.
+            if sendFailed {
+                Button {
+                    showFailedActions = true
+                } label: {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.body)
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Message failed to send")
+            }
+
             VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
                 Text(message.text)
                     .padding(.horizontal, 12)
@@ -874,12 +966,47 @@ struct MessageBubble: View {
                     .background(isMine ? Color.green : Color(.systemGray5))
                     .foregroundStyle(isMine ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
+                    // Slight visual desaturation on failed bubbles
+                    // so it reads as "this didn't go through" even
+                    // before the user notices the icon.
+                    .opacity(sendFailed ? 0.65 : 1.0)
 
-                Text(message.timestamp, style: .time)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if sendFailed {
+                    Text("Not delivered")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                } else {
+                    Text(message.timestamp, style: .time)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             if !isMine { Spacer() }
+        }
+        .confirmationDialog(
+            "Message not delivered",
+            isPresented: $showFailedActions,
+            titleVisibility: .visible
+        ) {
+            // Retry only renders when we have a peerId — outbound
+            // P2PMessage carries `to`, which `sendText` populates.
+            if let peerId = message.to {
+                Button("Try Again") {
+                    client.retryFailedMessage(
+                        messageId: message.id,
+                        peerId:    peerId,
+                        text:      message.text)
+                }
+            }
+            Button("Delete", role: .destructive) {
+                if let peerId = message.to {
+                    client.deleteMessage(chatKey: peerId, msgId: message.id)
+                }
+                client.failedMessageIds.remove(message.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Couldn't reach the relay after retrying for ~30 seconds.")
         }
     }
 }
@@ -949,9 +1076,30 @@ struct ChatMessagesScroll<Message: Identifiable, Bubble: View>: View {
                 }
                 .padding()
             }
+            // iOS 17+ — sets the initial scroll position to the
+            // bottom on first render.  Without this, the user
+            // opens a thread that already has history loaded and
+            // lands at the TOP (default), having to scroll down
+            // to see the most recent message — the standard
+            // "messaging app" affordance is to start at the
+            // bottom like iMessage / Signal / Telegram.
+            .defaultScrollAnchor(.bottom)
             .onChange(of: messages.count) {
                 if let last = messages.last {
                     proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+            // Belt-and-suspenders for the rare case where the
+            // ScrollView's default-anchor doesn't take (typically
+                // when navigating in mid-frame and SwiftUI hasn't
+            // composed the LazyVStack rows yet).  Fires once on
+            // appear, deferred to the next runloop so the rows
+            // exist before we jump to them.
+            .onAppear {
+                if let last = messages.last {
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
                 }
             }
         }

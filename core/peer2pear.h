@@ -342,6 +342,23 @@ void p2p_wake_for_push(p2p_context* ctx);
 int p2p_send_text(p2p_context* ctx, const char* peer_id, const char* text);
 
 /**
+ * Send an encrypted text message to a peer, tagged with a
+ * caller-provided msg_id.  The platform layer typically already
+ * mints a UUID for the local UI bubble before calling — passing
+ * that same UUID here makes the protocol envelope and the bubble
+ * share the id, which is what lets `p2p_set_on_send_failed`
+ * correlate a delivery failure back to the specific bubble.
+ *
+ * msg_id MUST be a non-empty NULL-terminated string for the
+ * correlation to work; an empty / NULL msg_id falls back to the
+ * v1 behaviour (core mints its own UUID, no per-bubble feedback).
+ *
+ * @return 0 on success, -1 on failure (no session, seal failed, etc.)
+ */
+int p2p_send_text_v2(p2p_context* ctx, const char* peer_id,
+                       const char* text, const char* msg_id);
+
+/**
  * Send an encrypted text message to a group.
  * @param member_ids  NULL-terminated array of peer ID strings.
  */
@@ -350,6 +367,23 @@ int p2p_send_group_text(p2p_context* ctx,
                         const char* group_name,
                         const char** member_ids,
                         const char* text);
+
+/**
+ * Send an encrypted text message to a group, tagged with a
+ * caller-provided msg_id so on_send_failed can correlate a
+ * delivery failure back to the platform's UI bubble.  All N
+ * fan-out envelopes (one per recipient) carry the same msg_id;
+ * the first envelope to exhaust retries surfaces the bubble.
+ *
+ * Empty / NULL msg_id falls back to v1 semantics (core mints
+ * its own UUID, no per-bubble feedback).
+ */
+int p2p_send_group_text_v2(p2p_context* ctx,
+                            const char* group_id,
+                            const char* group_name,
+                            const char** member_ids,
+                            const char* text,
+                            const char* msg_id);
 
 /**
  * Send an encrypted file to every member of a group.
@@ -729,6 +763,96 @@ void p2p_set_on_peer_key_changed(p2p_context* ctx,
                void* ud),
     void* ud);
 
+/**
+ * Per-message delivery failure.  Fires once per envelope after
+ * the relay-client retry loop exhausts (kMaxRetries=5 attempts on
+ * a 1→2→4→8→16s backoff schedule, plus per-attempt timeout — so
+ * roughly 30–60s after the first attempt).  The msg_id is the one
+ * the caller passed to p2p_send_text_v2; sends made with the
+ * legacy p2p_send_text never reach this callback (they have no
+ * caller-tracked id).  Pair with a UI affordance to mark the
+ * matching bubble as undelivered + offer retry.
+ */
+void p2p_set_on_send_failed(p2p_context* ctx,
+    void (*cb)(const char* msg_id, void* ud),
+    void* ud);
+
+/* ── Migration (device-to-device account transfer) ────────────────────────
+ *
+ * Hybrid X25519 + ML-KEM-768 AEAD seal — same primitive set the rest
+ * of the protocol uses (NoiseState, RatchetSession, SealedEnvelope).
+ * Used by the platform's "Transfer to new device" flow:
+ *   1. Receiver calls p2p_migration_keypair → 4 buffers populated
+ *   2. Receiver calls p2p_migration_fingerprint → 16-byte hash for QR
+ *   3. After QR scan + MPC handshake exchanges full pubkeys, sender
+ *      calls p2p_migration_seal to build the encrypted envelope
+ *   4. Receiver calls p2p_migration_open to decrypt
+ *
+ * All buffer sizes are exposed as #defines so the platform layer
+ * can size allocations without hardcoded magic numbers.
+ *
+ * Wire format and crypto details: see core/MigrationCrypto.hpp.
+ */
+
+#define P2P_MIGRATION_X25519_PUB_LEN     32
+#define P2P_MIGRATION_X25519_PRIV_LEN    32
+#define P2P_MIGRATION_MLKEM_PUB_LEN      1184
+#define P2P_MIGRATION_MLKEM_PRIV_LEN     2400
+#define P2P_MIGRATION_FINGERPRINT_LEN    16
+#define P2P_MIGRATION_NONCE_LEN          16
+#define P2P_MIGRATION_ENVELOPE_OVERHEAD  1149  /* sealed envelope =
+                                                  payload + this */
+
+/** Generate fresh ephemeral keypairs for migration.  All four buffers
+ *  must be at least the corresponding *_LEN bytes; on success exactly
+ *  those many bytes are written.  The two _priv buffers contain
+ *  secret material and the caller MUST wipe them when done.
+ *  Returns 0 on success, -1 on libsodium / liboqs error. */
+int p2p_migration_keypair(uint8_t* x25519_pub,
+                           uint8_t* x25519_priv,
+                           uint8_t* mlkem_pub,
+                           uint8_t* mlkem_priv);
+
+/** Compute the 16-byte fingerprint a receiver displays in the QR.
+ *  Format: SHA-256(x25519_pub || mlkem_pub) truncated to 16 bytes.
+ *  Returns 0 on success, -1 on malformed input. */
+int p2p_migration_fingerprint(const uint8_t* x25519_pub,
+                               const uint8_t* mlkem_pub,
+                               uint8_t* fingerprint_out);
+
+/** Seal a payload for transit.
+ *
+ *  envelope_out should be at least (payload_len + P2P_MIGRATION_ENVELOPE_OVERHEAD)
+ *  bytes.  On success returns the byte length actually written.
+ *  Returns -1 on failure (malformed input, allocation, encrypt error,
+ *  or envelope_cap too small).
+ *
+ *  handshake_nonce is the 16-byte nonce from the QR; used as HKDF salt
+ *  so a stale QR can't be reused verbatim across migration sessions. */
+int p2p_migration_seal(const uint8_t* payload, int payload_len,
+                        const uint8_t* receiver_x25519_pub,
+                        const uint8_t* receiver_mlkem_pub,
+                        const uint8_t* handshake_nonce,
+                        uint8_t* envelope_out, int envelope_cap);
+
+/** Open a sealed envelope.
+ *
+ *  Receiver passes BOTH pubs and privs — pubs reconstruct the AAD
+ *  identically to how the sender built it, privs perform the DH +
+ *  decapsulation.  payload_out should be at least
+ *  (envelope_len - P2P_MIGRATION_ENVELOPE_OVERHEAD) bytes.
+ *
+ *  Returns the byte length of the decrypted payload, or -1 on any
+ *  failure (auth tag mismatch, version mismatch, malformed envelope).
+ *  Failure modes are NOT distinguished by return value. */
+int p2p_migration_open(const uint8_t* envelope, int envelope_len,
+                        const uint8_t* receiver_x25519_pub,
+                        const uint8_t* receiver_x25519_priv,
+                        const uint8_t* receiver_mlkem_pub,
+                        const uint8_t* receiver_mlkem_priv,
+                        const uint8_t* handshake_nonce,
+                        uint8_t* payload_out, int payload_cap);
+
 /* ── App-data store (contacts / messages / settings / file_transfers) ───
  *
  * Persistent app-data layer on the same SQLCipher DB the core uses for
@@ -878,7 +1002,10 @@ void p2p_app_load_conversation_members(p2p_context* ctx,
 /** Insert a message into `conversation_id`.  The conversation row MUST
  *  already exist — call p2p_app_find_or_create_direct_conversation
  *  first for inbound-from-stranger.  `sender_id` is the originator
- *  peer_id for inbound messages, NULL/"" for outbound. */
+ *  peer_id for inbound messages, NULL/"" for outbound.
+ *  `send_failed` is the persistent per-bubble fail flag — pass 0 for
+ *  fresh inserts (the on_send_failed callback later flips it via
+ *  p2p_app_set_message_send_failed once retries actually exhaust). */
 int p2p_app_save_message(p2p_context* ctx,
                           const char* conversation_id,
                           int sent,
@@ -886,15 +1013,19 @@ int p2p_app_save_message(p2p_context* ctx,
                           int64_t timestamp_secs,
                           const char* msg_id,
                           const char* sender_id,
-                          const char* sender_name);
+                          const char* sender_name,
+                          int send_failed);
 
-/** Stream messages for `conversation_id` in chronological order. */
+/** Stream messages for `conversation_id` in chronological order.  The
+ *  `send_failed` int trails 0/1 alongside `sent` — outbound rows that
+ *  have been marked failed by the retry-give-up path will read as 1. */
 typedef void (*p2p_message_cb)(int sent,
                                 const char* text,
                                 int64_t timestamp_secs,
                                 const char* msg_id,
                                 const char* sender_id,
                                 const char* sender_name,
+                                int send_failed,
                                 void* ud);
 void p2p_app_load_messages(p2p_context* ctx, const char* conversation_id,
                             p2p_message_cb cb, void* ud);
@@ -909,6 +1040,17 @@ int p2p_app_delete_messages(p2p_context* ctx, const char* conversation_id);
  *  Returns 0 on success, -1 on invalid args or when no matching row
  *  exists. */
 int p2p_app_delete_message(p2p_context* ctx, const char* conversation_id, const char* msg_id);
+
+/** Mark / unmark a message's `send_failed` flag.  Called by the
+ *  platform's on_send_failed handler after the relay retry loop
+ *  exhausts so the per-bubble red-! indicator survives a relaunch.
+ *  Also called on retry / delete paths to clear the flag.
+ *  `failed` is 0 to clear, 1 to set.
+ *  Returns 0 on success, -1 on invalid args or no matching row. */
+int p2p_app_set_message_send_failed(p2p_context* ctx,
+                                       const char* conversation_id,
+                                       const char* msg_id,
+                                       int failed);
 
 /** Settings key/value store.  load returns the static-storage scratch
  *  buffer in `ctx`; treat it as valid only until the next p2p_* call. */

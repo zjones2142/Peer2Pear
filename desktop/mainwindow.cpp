@@ -17,6 +17,7 @@
 #include <QStackedWidget>
 #include <QTimer>
 #include <QApplication>
+#include <QSettings>
 #include <QDateTime>
 #include <QTimeZone>
 #include <QDir>
@@ -26,6 +27,11 @@
 #include <QMessageBox>
 #include <QLineEdit>
 #include <QToolButton>
+#include <QMenu>
+#include <QWidgetAction>
+#include <QFrame>
+#include <QLabel>
+#include <QClipboard>
 #include <QDebug>
 #include <QFileDialog>
 #include <QJsonDocument>
@@ -373,6 +379,17 @@ MainWindow::MainWindow(QWidget *parent)
             // Wire DB to ChatController for Noise/Ratchet session persistence
             m_controller.setDatabase(m_db);
 
+            // Hand the AppDataStore pointer to ChatController so the
+            // GroupProtocol v2 receive path can persist its monotonic
+            // counters, replay cache, and chain state.  Without this,
+            // dispatchGroupMessageV2 logs "no AppDataStore wired" and
+            // drops every inbound group message — m_store is already
+            // bind()'d + keyed by this point.  iOS does the equivalent
+            // call from peer2pear_api.cpp's p2p_set_passphrase_v2;
+            // desktop missed it when GroupProtocol grew the
+            // AppDataStore dependency.
+            m_controller.setAppDataStore(&m_store);
+
             // Restore persisted group sequence counters — AppDataStore
             // returns std::map directly so no Qt-bridge conversion needed.
             m_controller.setGroupSeqCounters(m_store.loadGroupSeqOut(),
@@ -595,6 +612,33 @@ MainWindow::MainWindow(QWidget *parent)
     m_notifier = new ChatNotifier(this);
     m_chatView->setNotifier(m_notifier);
 
+    // ── Connectivity indicator ───────────────────────────────────────────────
+    // Mirror the iOS top-bar wifi icon: green when the relay
+    // WebSocket is authenticated, red otherwise.  Click → popover
+    // showing the relay URL + any user-configured backup relays.
+    // Bound here (not earlier in init) because we need m_controller
+    // wired AND the .ui's connectivityBtn to exist.
+    m_controller.onRelayConnected =
+        [this]() {
+            // RelayClient's onConnected fires from its own thread;
+            // marshal to the main thread via Qt's queued connection
+            // so we can safely touch widgets.
+            QMetaObject::invokeMethod(this, [this] {
+                m_relayConnected = true;
+                updateConnectivityIndicator();
+            }, Qt::QueuedConnection);
+        };
+    m_controller.relay().onDisconnected =
+        [this]() {
+            QMetaObject::invokeMethod(this, [this] {
+                m_relayConnected = false;
+                updateConnectivityIndicator();
+            }, Qt::QueuedConnection);
+        };
+    updateConnectivityIndicator();   // paint initial offline state
+    connect(ui->connectivityBtn, &QToolButton::clicked,
+            this, &MainWindow::showConnectivityPopover);
+
     // ── Settings ──────────────────────────────────────────────────────────────
     connect(ui->settingsBtn_12,  &QToolButton::clicked,
             this, &MainWindow::onSettingsClicked);
@@ -625,6 +669,27 @@ MainWindow::MainWindow(QWidget *parent)
             [cv = m_chatView](const dialogs::ArchivedChatEvent &) {
                 cv->reloadAfterArchiveAction();
             });
+    });
+
+    // Factory reset — wipe everything, quit.  SettingsPanel's button
+    // already gated this behind a type-RESET-to-confirm dialog, so by
+    // the time we get here the user has explicitly opted in.  Order:
+    // close the DB → remove every file in the AppDataLocation dir
+    // (keys/identity.json, peer2PearUser.db, .sqlcipher_migrated
+    // marker, file_transfers/*, etc.) → wipe QSettings →
+    // QApplication::quit().  User relaunches manually for a clean
+    // first-run experience.
+    connect(m_settingsPanel, &SettingsPanel::factoryResetClicked,
+            this, [this]() {
+        m_db.close();
+        const QString base = QStandardPaths::writableLocation(
+            QStandardPaths::AppDataLocation);
+        if (!base.isEmpty()) {
+            QDir d(base);
+            if (d.exists()) d.removeRecursively();
+        }
+        QSettings().clear();
+        QApplication::quit();
     });
 
     // Apply persisted notification state to the notifier.  Both the
@@ -791,4 +856,145 @@ void MainWindow::onImportContacts()
 
     QMessageBox::information(this, "Import Complete",
                              QString("Imported %1 contact(s).").arg(imported));
+}
+
+// ── Connectivity indicator ──────────────────────────────────────────────────
+//
+// Top-bar 📡 button.  Mirrors iOS's wifi-icon connectivity popover
+// (ChatListView.swift::ConnectivityPopover) — at-a-glance signal of
+// whether the relay WS is up + which relay we're talking to.
+//
+// State source: m_relayConnected, flipped by the
+// onRelayConnected / onDisconnected lambdas wired in the init
+// path.  Both lambdas marshal to the main thread before touching
+// the widget.
+
+void MainWindow::updateConnectivityIndicator()
+{
+    if (!ui || !ui->connectivityBtn) return;
+    // Background-tinted circle around the icon — green when
+    // connected, red when offline.  Pure stylesheet so it lives
+    // in the .ui's theming surface, not in code-as-strings.
+    const QString styleConnected =
+        "QToolButton#connectivityBtn { background-color: #1a2e1c; "
+        "color: #5dd868; border: 1px solid #2e5e30; "
+        "border-radius: 18px; font-size: 18px; }"
+        "QToolButton#connectivityBtn:hover { background-color: #223a24; }";
+    const QString styleOffline =
+        "QToolButton#connectivityBtn { background-color: #2e1a1a; "
+        "color: #d85d5d; border: 1px solid #5e2e2e; "
+        "border-radius: 18px; font-size: 18px; }"
+        "QToolButton#connectivityBtn:hover { background-color: #3a2222; }";
+    ui->connectivityBtn->setStyleSheet(
+        m_relayConnected ? styleConnected : styleOffline);
+    ui->connectivityBtn->setToolTip(
+        m_relayConnected
+            ? QStringLiteral("Connected — click for relay details")
+            : QStringLiteral("Offline — click for relay details"));
+}
+
+void MainWindow::showConnectivityPopover()
+{
+    // Build a small QFrame card with the same shape as iOS's
+    // popover: status header + relay URL + (optional) backup
+    // relays.  Hosted inside a QMenu so QFocus / outside-click
+    // dismissal works for free; the QMenu itself is invisible
+    // (no background, just the embedded card).
+
+    auto *frame = new QFrame;
+    frame->setObjectName("connectivityCard");
+    frame->setStyleSheet(
+        "QFrame#connectivityCard { background-color: #141414; "
+        "border: 1px solid #2a2a2a; border-radius: 10px; }"
+        "QLabel { color: #f0f0f0; }"
+        "QLabel#statusLabel { font-size: 15px; font-weight: bold; }"
+        "QLabel#relayHeader { color: #888888; font-size: 11px; "
+        "letter-spacing: 0.5px; }"
+        "QLabel#relayUrl { font-family: monospace; font-size: 12px; "
+        "color: #cccccc; }");
+
+    auto *layout = new QVBoxLayout(frame);
+    layout->setContentsMargins(14, 12, 14, 12);
+    layout->setSpacing(8);
+
+    // Status header — emoji + bold "Connected" or "Offline".
+    auto *status = new QLabel(
+        m_relayConnected
+            ? QStringLiteral("🟢  Connected")
+            : QStringLiteral("🔴  Offline"));
+    status->setObjectName("statusLabel");
+    status->setStyleSheet(
+        QStringLiteral("color: %1; font-size: 15px; font-weight: bold;")
+            .arg(m_relayConnected ? "#5dd868" : "#d85d5d"));
+    layout->addWidget(status);
+
+    // Thin divider.
+    auto *div = new QFrame;
+    div->setFrameShape(QFrame::HLine);
+    div->setStyleSheet("color: #2a2a2a; background-color: #2a2a2a;");
+    div->setFixedHeight(1);
+    layout->addWidget(div);
+
+    // Primary relay row.
+    auto *relayHeader = new QLabel(QStringLiteral("RELAY"));
+    relayHeader->setObjectName("relayHeader");
+    layout->addWidget(relayHeader);
+
+    const QString primaryUrl = QString::fromStdString(
+        m_store.loadSetting("relayUrl", "https://peer2pear.com"));
+    auto *relayUrl = new QLabel(primaryUrl);
+    relayUrl->setObjectName("relayUrl");
+    relayUrl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    relayUrl->setWordWrap(true);
+    layout->addWidget(relayUrl);
+
+    // Backup relays — only render the section when there are any.
+    // Stored in the settings table under "backupRelayUrls" as
+    // newline-delimited URLs.  Currently no desktop UI writes this
+    // key (iOS uses UserDefaults), so the section won't appear in
+    // practice yet — but the read path is here for cross-platform
+    // parity once a Settings → Backup Relays UI lands on desktop.
+    const QString backupRaw = QString::fromStdString(
+        m_store.loadSetting("backupRelayUrls", ""));
+    QStringList backups;
+    for (const QString& u :
+            backupRaw.split('\n', Qt::SkipEmptyParts)) {
+        const QString t = u.trimmed();
+        if (!t.isEmpty()) backups.push_back(t);
+    }
+    if (!backups.isEmpty()) {
+        auto *backupHeader = new QLabel(QStringLiteral("BACKUP RELAYS"));
+        backupHeader->setObjectName("relayHeader");
+        backupHeader->setStyleSheet(
+            "color: #888888; font-size: 11px; "
+            "letter-spacing: 0.5px; padding-top: 4px;");
+        layout->addWidget(backupHeader);
+        for (const QString& b : backups) {
+            auto *bl = new QLabel(b);
+            bl->setObjectName("relayUrl");
+            bl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            bl->setWordWrap(true);
+            layout->addWidget(bl);
+        }
+    }
+
+    frame->setMinimumWidth(280);
+    frame->setMaximumWidth(360);
+
+    // Mount in a QMenu so dismissal-on-outside-click is free.
+    auto *menu = new QMenu(this);
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    auto *action = new QWidgetAction(menu);
+    action->setDefaultWidget(frame);
+    menu->addAction(action);
+
+    // Position below + right-aligned with the button so the
+    // popover anchors visually to its trigger.
+    if (ui && ui->connectivityBtn) {
+        const QPoint anchor = ui->connectivityBtn->mapToGlobal(
+            QPoint(0, ui->connectivityBtn->height() + 4));
+        menu->popup(anchor);
+    } else {
+        menu->popup(QCursor::pos());
+    }
 }

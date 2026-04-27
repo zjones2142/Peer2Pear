@@ -68,8 +68,15 @@ public:
     // Send a sealed envelope anonymously via HTTP POST /v1/send.
     // The recipient is parsed from the envelope header (bytes 1-32).
     // `cls` selects per-class transport policy; defaults to Message.
+    // `messageId` (optional) tags the envelope so the retry-give-up
+    // path can fire `onSendFailed(messageId)` to mark the
+    // corresponding bubble in the UI as undelivered.  Empty string
+    // means "don't track" — used for cover traffic, presence
+    // refreshes, control envelopes that have no user-visible
+    // bubble.
     void sendEnvelope(const Bytes& sealedEnvelope,
-                      TrafficClass cls = TrafficClass::Message);
+                      TrafficClass cls = TrafficClass::Message,
+                      const std::string& messageId = "");
 
     // Presence: subscribe to online/offline updates for a set of peers.
     void subscribePresence(const std::vector<std::string>& peerIds);
@@ -166,6 +173,15 @@ public:
     std::function<void(const Bytes&)>              onEnvelopeReceived;
     std::function<void(const std::string&, bool)>  onPresenceChanged;
 
+    // Fires from processRetryQueue's give-up branch with the
+    // messageId that was tagged on sendEnvelope, IF non-empty.
+    // Lets the platform layer surface a per-bubble "failed to
+    // deliver" indicator next to the specific message that
+    // ran out of retries — separate from the broader
+    // onStatus toast.  Empty messageIds (cover traffic etc.)
+    // never trigger this callback.
+    std::function<void(const std::string&)>        onSendFailed;
+
 private:
     void onWsConnected();
     void onWsDisconnected();
@@ -250,6 +266,11 @@ private:
     struct PendingEnvelope {
         Bytes data;
         int   retryCount = 0;
+        // Tagged at sendEnvelope-time so the give-up branch can
+        // fire onSendFailed(messageId) and the platform can mark
+        // the corresponding bubble as undelivered.  Empty for
+        // cover traffic / control envelopes.
+        std::string messageId;
     };
     std::vector<PendingEnvelope> m_retryQueue;
     std::unique_ptr<ITimer>      m_retryTimer;

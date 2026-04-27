@@ -255,6 +255,12 @@ public:
         std::string  msgId;
         std::string  senderId;       // empty on outbound; peer_id on inbound
         std::string  senderName;     // self-declared name (group inbound only)
+        // Outbound only: true once the relay-client retry loop
+        // exhausts and onMessageSendFailed has fired for this
+        // msgId.  Inbound rows always read this as false (irrelevant).
+        // Persisted so the per-bubble red-! indicator survives
+        // app relaunches, not just the unlocked session.
+        bool         sendFailed = false;
     };
 
     /// Insert a message and bump conversations.last_active in one
@@ -262,6 +268,15 @@ public:
     /// that handle inbound-from-stranger should call
     /// `findOrCreateDirectConversation` first.
     bool saveMessage(const std::string& conversationId, const Message& m);
+
+    /// Mark / unmark an outbound message's `sendFailed` flag.  Used
+    /// by the on-send-failed callback path (post retry-exhaustion)
+    /// and by retry-success / user-delete to clear the flag.
+    /// Returns true when a row was updated, false when no message
+    /// matched the (conversationId, msgId) pair.
+    bool setMessageSendFailed(const std::string& conversationId,
+                                 const std::string& msgId,
+                                 bool failed);
 
     /// Stream every message for `conversationId` in chronological order.
     void loadMessages(const std::string& conversationId,

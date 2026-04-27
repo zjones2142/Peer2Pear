@@ -220,6 +220,73 @@ final class Peer2PearClient: ObservableObject {
             .urls(for: .documentDirectory, in: .userDomainMask)[0].path
     }
 
+    /// Walk `dir` and apply two on-disk privacy attributes to every
+    /// file:
+    ///
+    /// 1. **`NSFileProtectionComplete`** — iOS drops the per-file
+    ///    storage key whenever the device locks.  Default for app-
+    ///    sandbox files is `.completeUntilFirstUserAuthentication`
+    ///    (key stays resident across lock cycles after the first
+    ///    post-boot unlock).
+    ///
+    /// 2. **`isExcludedFromBackup = true`** — keep the SQLCipher DB,
+    ///    identity keys, salt, and saved files out of iCloud Backup.
+    ///    The bytes are encrypted (SQLCipher + Argon2id over the
+    ///    user passphrase), but iCloud Backup persists ciphertext on
+    ///    Apple's servers indefinitely — a long-tail subpoena /
+    ///    server-compromise / brute-force surface that an
+    ///    on-device-only privacy app shouldn't carry.  Migration to
+    ///    a new device is intentionally NOT served by iCloud here;
+    ///    a deliberate export/import flow is tracked in
+    ///    project_backup_strategy.md as future work.
+    ///
+    /// Called after every successful unlock.  Both operations are
+    /// idempotent — re-applying on a file that already has them is
+    /// a cheap no-op.  Failures on individual files are swallowed
+    /// (debug-logged) so a single permission glitch doesn't break
+    /// the whole unlock flow.
+    ///
+    /// Doesn't recurse into subdirectories today — we don't have
+    /// any.  Add a `subpathsOfDirectory` walk here if that changes.
+    fileprivate func applyDataProtection(toDirectory dir: String) {
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(atPath: dir) else {
+            return
+        }
+        for item in contents {
+            let path = dir + "/" + item
+
+            // Pass 1: NSFileProtectionComplete via FileManager
+            // attributes.
+            do {
+                try fm.setAttributes(
+                    [.protectionKey: FileProtectionType.complete],
+                    ofItemAtPath: path)
+            } catch {
+                #if DEBUG
+                print("[Peer2Pear] couldn't set .complete protection on \(item): \(error)")
+                #endif
+            }
+
+            // Pass 2: exclude from iCloud Backup.  Uses URL resource
+            // values, not FileManager attributes — the key lives on
+            // the URL's resource-properties surface, not the
+            // POSIX-style file metadata.  setResourceValues mutates
+            // the URL value (it's `inout` semantically even though
+            // not declared so), which is why `url` is `var`.
+            var url = URL(fileURLWithPath: path)
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            do {
+                try url.setResourceValues(values)
+            } catch {
+                #if DEBUG
+                print("[Peer2Pear] couldn't exclude \(item) from iCloud Backup: \(error)")
+                #endif
+            }
+        }
+    }
+
     // MARK: - Appearance preference
 
     /// Three-way color scheme preference.  `.system` follows the OS
@@ -233,7 +300,7 @@ final class Peer2PearClient: ObservableObject {
         var id: String { rawValue }
     }
 
-    private static let kColorSchemeKey = "p2p.colorScheme"
+    static let kColorSchemeKey = "p2p.colorScheme"
 
     @Published var colorScheme: ColorSchemePreference = {
         let raw = UserDefaults.standard.string(forKey: kColorSchemeKey)
@@ -509,16 +576,66 @@ final class Peer2PearClient: ObservableObject {
     /// renders a blue dot for any peer/group in this set.
     @Published var unreadChatIds: Set<String> = []
 
-    /// Mark the chat (1:1 or group) as read.  Called from the
-    /// ConversationView / GroupConversationView `onAppear` so
-    /// opening a thread clears its unread dot.  Also used when the
-    /// user deletes / leaves the chat.
+    /// Messages whose send exhausted the relay's retry loop
+    /// (~30–60s of attempts on the 1→2→4→8→16s backoff schedule).
+    /// Keyed by P2PMessage.id — same UUID we hand to
+    /// p2p_send_text_v2, which the C++ retry-give-up path hands
+    /// back via the on_send_failed C callback.
+    ///
+    /// Session-only — cleared on `lock()` (the message itself is
+    /// still in the DB, just without the failure marker after a
+    /// relaunch).  Persistence would need a `messages.send_failed`
+    /// column; tracked as future work in
+    /// project_ios_notification_polish.md alongside the other
+    /// per-message UX items.
+    @Published var failedMessageIds: Set<String> = []
+
+    /// Mark the chat (1:1 or group) as read.  Used when the user
+    /// deletes / leaves a thread — the more common
+    /// "user-is-viewing" case goes through `enterChat(id:)` below
+    /// so the active id is tracked alongside the marker clear.
     func markChatRead(chatKey: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if self.unreadChatIds.contains(chatKey) {
                 self.unreadChatIds.remove(chatKey)
             }
+        }
+    }
+
+    /// The chat the user is currently viewing (peer ID for 1:1,
+    /// group ID for groups), or nil when they're on the chat list
+    /// / a settings sheet / anywhere not chat-specific.  Inbound
+    /// messages addressed to this id skip the unread-marker insert
+    /// in the message callbacks — the user is already watching the
+    /// message land.  Set/cleared by ConversationView's onAppear /
+    /// onDisappear.
+    @Published var activeChatId: String? = nil
+
+    /// User opened a chat thread.  Clears any existing unread dot
+    /// AND tracks the active id so subsequent inbound messages
+    /// don't re-flag the thread while it's on screen.  Replaces
+    /// the bare `markChatRead` call at the onAppear callsites.
+    func enterChat(id: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.activeChatId = id
+            if self.unreadChatIds.contains(id) {
+                self.unreadChatIds.remove(id)
+            }
+        }
+    }
+
+    /// User backed out of a chat thread.  Only clears
+    /// `activeChatId` if it still matches the leaving id — guards
+    /// against the iOS quirk where a sibling view's onAppear can
+    /// fire before the leaving view's onDisappear under certain
+    /// pop / present orderings, which would otherwise null out the
+    /// freshly-set active id.
+    func exitChat(id: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.activeChatId == id else { return }
+            self.activeChatId = nil
         }
     }
 
@@ -784,6 +901,51 @@ final class Peer2PearClient: ObservableObject {
         ) { [weak self] _ in
             self?.maybeAutoLock()
         }
+        // Device-lock-while-foregrounded coverage.  iOS does NOT
+        // fire didEnterBackground when the user locks the device
+        // with our app on screen — the app stays foregrounded but
+        // inactive.  Without this hook the autoLockMinutes timer
+        // would never start, plaintext lingers in memory.  Pairs
+        // with the .complete file-protection class we set in
+        // privacy-hardening #4: that class is what makes iOS post
+        // these notifications at lock/unlock boundaries.
+        protectedDataWillUnavailObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            // Mirror didEnterBackground's effect.  Only stamp if
+            // not already set — if the app was ALREADY in
+            // background (timer already running), keep the older
+            // timestamp so we don't reset the elapsed clock on
+            // every device re-lock.
+            if self.backgroundedAt == nil {
+                _ = self.consumeUnlockPassphrase()
+                self.backgroundedAt = Date()
+            }
+            // "Immediately" (autoLockMinutes == 0) wants the lock
+            // to fire BEFORE the device unlocks, so the user
+            // never sees the unlocked app peek through after a
+            // device unlock.  Other thresholds (5, 15, 60, etc.)
+            // wait for the unlock-and-foreground path to evaluate
+            // elapsed time.
+            if self.autoLockMinutes == 0 {
+                self.maybeAutoLock()
+            }
+        }
+        protectedDataDidAvailObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            // Device unlock.  If the app was foregrounded the
+            // whole time, willEnterForeground will NOT fire
+            // (the app didn't enter background) — so we evaluate
+            // auto-lock here.  If the app WAS backgrounded,
+            // willEnterForeground also fires; maybeAutoLock is
+            // idempotent past the first call (clears
+            // backgroundedAt to nil, second call early-returns).
+            self?.maybeAutoLock()
+        }
     }
 
     deinit {
@@ -793,11 +955,19 @@ final class Peer2PearClient: ObservableObject {
         if let foregroundObserver {
             NotificationCenter.default.removeObserver(foregroundObserver)
         }
+        if let protectedDataWillUnavailObserver {
+            NotificationCenter.default.removeObserver(protectedDataWillUnavailObserver)
+        }
+        if let protectedDataDidAvailObserver {
+            NotificationCenter.default.removeObserver(protectedDataDidAvailObserver)
+        }
         stop()
     }
 
     private var backgroundObserver: NSObjectProtocol?
     private var foregroundObserver: NSObjectProtocol?
+    private var protectedDataWillUnavailObserver: NSObjectProtocol?
+    private var protectedDataDidAvailObserver: NSObjectProtocol?
 
     /// Wall-clock instant the app most recently entered background.
     /// Cleared once the auto-lock decision is made on foreground.
@@ -812,7 +982,17 @@ final class Peer2PearClient: ObservableObject {
     /// reinstall.  After this returns the app is in the "fresh
     /// install" state and OnboardingView's next render will show the
     /// "Get Started" branch instead of "Unlock".
-    func wipeAllData(documentDir: String) {
+    ///
+    /// `surfaceFailedAttemptsAlert` controls whether the
+    /// `dataWipedNotice` flag is set, which fires the "Too many
+    /// failed unlock attempts" alert in OnboardingView.  Default
+    /// `true` matches the auto-wipe path (12-strike) where the user
+    /// genuinely needs to be told why their data is gone.  Pass
+    /// `false` from explicit factory-reset flows (Settings →
+    /// Erase Identity & All Data) — the user just tapped the button,
+    /// they don't need an alert telling them what they did.
+    func wipeAllData(documentDir: String,
+                      surfaceFailedAttemptsAlert: Bool = true) {
         stop()
         BiometricUnlock.remove()
         UserDefaults.standard.set(0, forKey: Self.kFailedUnlockAttemptsKey)
@@ -826,7 +1006,9 @@ final class Peer2PearClient: ObservableObject {
             guard let self else { return }
             self.myPeerId        = ""
             self.statusMessage   = ""
-            self.dataWipedNotice = true
+            if surfaceFailedAttemptsAlert {
+                self.dataWipedNotice = true
+            }
         }
     }
 
@@ -925,6 +1107,28 @@ final class Peer2PearClient: ObservableObject {
         }
         myPeerId = String(cString: p2p_my_id(rawContext))
 
+        // Privacy hardening: elevate every file in the data
+        // directory to NSFileProtectionComplete.  iOS' default for
+        // app sandbox files is
+        // `NSFileProtectionCompleteUntilFirstUserAuthentication` —
+        // the storage class key stays resident across lock cycles
+        // after the first post-boot unlock, so a forensic image of
+        // a still-warm device can read the on-disk ciphertext.
+        // `.complete` drops the key on every device-lock event,
+        // closing that gap.
+        //
+        // Trade-off: silent-push handlers can't read the DB while
+        // the device is locked → notifications for messages
+        // received during a locked session don't surface in
+        // real-time, they materialize on next unlock.  The DB is
+        // already encrypted with SQLCipher + Argon2id over the
+        // user's passphrase — this is a defense-in-depth layer
+        // that costs some push-UX freshness in exchange for
+        // forensic-resistance on stolen devices.  See
+        // project_ios_privacy_hardening.md #4 for the full
+        // rationale.
+        applyDataProtection(toDirectory: dataDir)
+
         // Hydrate the @Published surface from the SQLCipher AppDataStore.
         // Done BEFORE p2p_connect so setKnownGroupMembers replays the
         // roster authorization gate before any inbound control
@@ -993,6 +1197,18 @@ final class Peer2PearClient: ObservableObject {
     /// `client.myPeerId.isEmpty` state-machine guard at the app root.
     /// On the next unlock, `loadStateFromDb()` repopulates from the
     /// SQLCipher AppDataStore so contacts/messages/etc. survive the lock.
+    ///
+    /// Privacy invariant (project_ios_privacy_hardening.md #5):
+    /// EVERY @Published mirror that holds plaintext-derived data
+    /// (message bodies, peer IDs, contact names, file paths,
+    /// presence, key fingerprints, conversation gap state) MUST be
+    /// reset here.  When this list drifts vs. the @Published
+    /// declarations above, plaintext stays resident across an
+    /// auto-lock — undoing the memory-bounding the lock is
+    /// supposed to provide.  Settings-shaped @Published fields
+    /// (autoLockMinutes, fileHardMaxMB, privacyLevel, colorScheme,
+    /// backupRelayUrls, etc.) are intentionally NOT cleared —
+    /// they're durable preferences, not session state.
     func lock() {
         _ = consumeUnlockPassphrase()  // belt-and-braces — also wiped on background
         stop()
@@ -1000,22 +1216,40 @@ final class Peer2PearClient: ObservableObject {
             guard let self else { return }
             self.myPeerId          = ""
             self.statusMessage     = ""
+            // Toast string can carry "Couldn't deliver message to
+            // <prefix>…" — short-lived but still session content.
+            self.toastMessage      = nil
             self.messages          = []
             self.groupMessages     = []
             self.groups            = [:]
             self.groupAvatars      = [:]
+            // Group v2 chain-state surface — counter ranges and
+            // per-(group,sender) pairings.  Not plaintext message
+            // bodies, but it does trace the user's group activity.
+            self.groupBlockedStreams        = [:]
+            self.groupLostMessages          = []
             self.knownPeerContacts          = []
             self.contactNicknames           = [:]
             self.blockedPeerIds             = []
             self.mutedPeerIds               = []
             self.archivedDirectPeerIds      = []
+            // Pending nav target carries a peer ID — clear so a
+            // post-unlock re-render doesn't auto-navigate into a
+            // thread the user didn't reopen this session.
+            self.pendingDirectChatPeerId    = nil
             self.unreadChatIds              = []
+            self.failedMessageIds           = []
+            self.activeChatId               = nil
             self.peerPresence               = [:]
             self.peerAvatars                = [:]
             self.pendingFileRequests        = []
             self.transfers                  = [:]
             self.keyChanges                 = [:]
             self.directConversationIdByPeer = [:]
+            // Auto-wipe alert flag.  If a wipe DOES fire, it sets
+            // this true after lock() teardown — the OnboardingView
+            // alert shows on the next render, not the current one.
+            self.dataWipedNotice            = false
         }
     }
 
@@ -1276,7 +1510,68 @@ final class Peer2PearClient: ObservableObject {
         UserDefaults.standard.integer(forKey: Self.kFailedUnlockAttemptsKey)
     }
 
-    private static let kNotificationModeKey = "p2p.notificationContentMode"
+    // MARK: - Migration sentinel
+    //
+    // Post-migration courtesy: tell every contact + group "I moved
+    // devices" using the OLD device's still-aligned ratchets.
+    // Buys us "user got pre-warned" — when the new device next
+    // sends to each peer, the safety-number-changed alarm fires
+    // anyway (we strip ratchet state on migrate by design), but
+    // recipients have context for it.
+    //
+    // Sender-side ONLY (this is the user's own outgoing message
+    // from the device they're leaving).  Opt-in: TransferSendView
+    // exposes a "Tell my contacts I moved" button on the post-
+    // success screen; this isn't auto-fired, since "I moved"
+    // isn't always the user's mental model (re-setup, testing,
+    // etc.).
+    //
+    // Returns the total count of envelopes scheduled — UI surfaces
+    // it as "Sent to N contacts and M groups."  Each send is async
+    // at the protocol layer; failures (no session, etc.) are
+    // surfaced via the existing onStatus / failed-message path,
+    // not here.
+
+    /// Sentinel text — kept short + tone-neutral.  Recipients
+    /// see it as a normal message in their thread; pairs well
+    /// with the "safety number changed" UI that fires on the
+    /// next ratchet rebuild.
+    static let kMigrationSentinelDmText =
+        "📱 I just switched devices.  My safety number with you will change — feel free to verify out of band if you want to confirm it's me."
+
+    static let kMigrationSentinelGroupText =
+        "📱 I just switched devices.  My safety number in this group will change — verify next time we chat."
+
+    /// Send the migration-sentinel message to every known
+    /// contact (1:1 DM) and every group the user is in.  Caller
+    /// gets back the count actually scheduled so UI can show
+    /// honest feedback.  Idempotent at the protocol layer (each
+    /// send mints a new msgId), so calling twice is wasteful but
+    /// not broken — UI gates against repeat taps via @State.
+    @discardableResult
+    func sendMigrationSentinel() -> (contacts: Int, groups: Int) {
+        var contactCount = 0
+        for peerId in knownPeerContacts {
+            // Skip blocked contacts — sending "I moved" to
+            // someone you've blocked is a footgun.
+            if isBlocked(peerId: peerId) { continue }
+            sendText(to: peerId, text: Self.kMigrationSentinelDmText)
+            contactCount += 1
+        }
+
+        var groupCount = 0
+        for (gid, group) in groups {
+            sendGroupText(groupId: gid,
+                           groupName: group.name,
+                           memberPeerIds: group.memberIds,
+                           text: Self.kMigrationSentinelGroupText)
+            groupCount += 1
+        }
+
+        return (contactCount, groupCount)
+    }
+
+    static let kNotificationModeKey = "p2p.notificationContentMode"
 
     @Published var notificationContentMode: NotificationContentMode = {
         let raw = UserDefaults.standard.string(forKey: kNotificationModeKey)
@@ -1303,6 +1598,12 @@ final class Peer2PearClient: ObservableObject {
         // with from == myPeerId so MessageBubble renders it on the
         // right side.  Mirrors the group send path which already echoes
         // via `client.groupMessages.append(...)` in ConversationView.
+        //
+        // The id we mint here is also what we hand to
+        // p2p_send_text_v2 so the protocol envelope shares the
+        // bubble's id — that's the round-trip the on_send_failed
+        // callback needs to mark THIS bubble specifically when its
+        // retry loop exhausts.
         let echo = P2PMessage(
             id: UUID().uuidString,
             from: myPeerId,
@@ -1330,7 +1631,29 @@ final class Peer2PearClient: ObservableObject {
                     senderName:    ""))
             }
         }
-        p2p_send_text(ctx, peerId, text)
+        p2p_send_text_v2(ctx, peerId, text, echo.id)
+    }
+
+    /// Retry a previously-failed send.  Removes the old failed
+    /// bubble (memory + DB) and re-sends with a fresh msgId — the
+    /// new bubble appears at the bottom of the thread in
+    /// "sending" state.  Cleaner UX than leaving the old failed
+    /// bubble in place and silently appending a duplicate; matches
+    /// iMessage's "tap to retry" behaviour where the failed
+    /// bubble is replaced by the new attempt.
+    func retryFailedMessage(messageId: String, peerId: String, text: String) {
+        // Drop the failure marker first so the icon disappears
+        // even if the retry's bubble lands a frame later.
+        if failedMessageIds.contains(messageId) {
+            failedMessageIds.remove(messageId)
+        }
+        // Remove the old bubble from memory + DB.  The
+        // conversation row stays (other messages still belong to
+        // it); we just delete this one message by id.
+        deleteMessage(chatKey: peerId, msgId: messageId)
+        // Fresh send — generates a new bubble + new msgId via the
+        // normal sendText path.
+        sendText(to: peerId, text: text)
     }
     // MARK: - Presence
 

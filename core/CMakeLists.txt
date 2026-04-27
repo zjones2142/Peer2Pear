@@ -29,6 +29,7 @@ set(CORE_SOURCES
     ChatController.cpp      ChatController.hpp
     RelayClient.cpp         RelayClient.hpp
     FileTransferManager.cpp FileTransferManager.hpp
+    MigrationCrypto.cpp     MigrationCrypto.hpp
     IWebSocket.hpp
     IHttpClient.hpp
     peer2pear.h

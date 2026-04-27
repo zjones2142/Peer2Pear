@@ -42,7 +42,14 @@ final class WebSocketAdapter: NSObject, URLSessionWebSocketDelegate {
 
     func sendText(_ message: String) {
         task?.send(.string(message)) { error in
+            // Debug-only: print(...) writes to stdout, which is
+            // visible via the OS log stream in Release.  The error
+            // string itself doesn't carry plaintext, but we still
+            // gate it behind DEBUG so production builds don't emit
+            // any per-WS-call diagnostics into the OS log.
+            #if DEBUG
             if let error { print("[WS] send error: \(error)") }
+            #endif
         }
     }
 

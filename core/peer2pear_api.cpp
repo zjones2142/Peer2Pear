@@ -18,6 +18,7 @@
 #include "SqlCipherDb.hpp"
 #include "SessionStore.hpp"
 #include "AppDataStore.hpp"
+#include "MigrationCrypto.hpp"
 #include "log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -480,6 +481,10 @@ struct p2p_context {
                                     const uint8_t*, int,
                                     void*) = nullptr;
         void* peer_key_changed_ud = nullptr;
+
+        // Per-bubble delivery failure (post retry-exhaustion).
+        void (*on_send_failed)(const char* msg_id, void* ud) = nullptr;
+        void* send_failed_ud = nullptr;
     } cb;
 
     std::string dataDir;
@@ -691,6 +696,11 @@ static void wire_signals(p2p_context* ctx)
             newFp.empty() ? nullptr : newFp.data(),
             static_cast<int>(newFp.size()),
             ctx->cb.peer_key_changed_ud);
+    };
+
+    c.onMessageSendFailed = [ctx](const std::string& msgId) {
+        if (!ctx->cb.on_send_failed) return;
+        ctx->cb.on_send_failed(msgId.c_str(), ctx->cb.send_failed_ud);
     };
 }
 
@@ -921,6 +931,19 @@ int p2p_send_text(p2p_context* ctx, const char* peer_id, const char* text)
     return 0;
 }
 
+int p2p_send_text_v2(p2p_context* ctx, const char* peer_id,
+                       const char* text, const char* msg_id)
+{
+    if (!ctx || !peer_id || !text) return -1;
+    P2P_CTX_GUARD(ctx);
+    // NULL or empty msg_id falls back to v1 semantics (core mints
+    // its own UUID).  A non-empty value is what makes the
+    // on_send_failed correlation work — the platform passes the
+    // same id its UI bubble carries.
+    ctx->controller->sendText(peer_id, text, msg_id ? msg_id : "");
+    return 0;
+}
+
 // Helper: materialize a NULL-terminated C array into a std::vector.  Used
 // by every group action that takes a member list.
 static std::vector<std::string> cStringArrayToVector(const char** arr) {
@@ -942,6 +965,23 @@ int p2p_send_group_text(p2p_context* ctx,
         group_id,
         group_name ? group_name : "",
         cStringArrayToVector(member_ids), text);
+    return 0;
+}
+
+int p2p_send_group_text_v2(p2p_context* ctx,
+                            const char* group_id,
+                            const char* group_name,
+                            const char** member_ids,
+                            const char* text,
+                            const char* msg_id)
+{
+    if (!ctx || !group_id || !text || !member_ids) return -1;
+    P2P_CTX_GUARD(ctx);
+    ctx->controller->sendGroupMessageViaMailbox(
+        group_id,
+        group_name ? group_name : "",
+        cStringArrayToVector(member_ids), text,
+        msg_id ? msg_id : "");
     return 0;
 }
 
@@ -1490,6 +1530,16 @@ void p2p_set_on_peer_key_changed(p2p_context* ctx,
     ctx->cb.peer_key_changed_ud = ud;
 }
 
+void p2p_set_on_send_failed(p2p_context* ctx,
+    void (*cb)(const char* msg_id, void* ud),
+    void* ud)
+{
+    if (!ctx) return;
+    P2P_CTX_GUARD(ctx);
+    ctx->cb.on_send_failed = cb;
+    ctx->cb.send_failed_ud = ud;
+}
+
 // ── App-data store (contacts / messages / settings / file_transfers) ──────
 //
 // All entry points guard ctx + p2p_context::ctrlMu so a callback that
@@ -1644,7 +1694,8 @@ int p2p_app_save_message(p2p_context* ctx,
                           int64_t timestamp_secs,
                           const char* msg_id,
                           const char* sender_id,
-                          const char* sender_name)
+                          const char* sender_name,
+                          int send_failed)
 {
     if (!ctx || !conversation_id) return -1;
     P2P_CTX_GUARD(ctx);
@@ -1655,6 +1706,7 @@ int p2p_app_save_message(p2p_context* ctx,
     m.msgId         = msg_id      ? msg_id      : "";
     m.senderId      = sender_id   ? sender_id   : "";
     m.senderName    = sender_name ? sender_name : "";
+    m.sendFailed    = send_failed != 0;
     return ctx->appData->saveMessage(conversation_id, m) ? 0 : -1;
 }
 
@@ -1670,6 +1722,7 @@ void p2p_app_load_messages(p2p_context* ctx, const char* conversation_id,
            m.msgId.c_str(),
            m.senderId.c_str(),
            m.senderName.c_str(),
+           m.sendFailed ? 1 : 0,
            ud);
     });
 }
@@ -1686,6 +1739,17 @@ int p2p_app_delete_message(p2p_context* ctx, const char* conversation_id, const 
     if (!ctx || !conversation_id || !msg_id) return -1;
     P2P_CTX_GUARD(ctx);
     return ctx->appData->deleteMessage(conversation_id, msg_id) ? 0 : -1;
+}
+
+int p2p_app_set_message_send_failed(p2p_context* ctx,
+                                       const char* conversation_id,
+                                       const char* msg_id,
+                                       int failed)
+{
+    if (!ctx || !conversation_id || !msg_id) return -1;
+    P2P_CTX_GUARD(ctx);
+    return ctx->appData->setMessageSendFailed(conversation_id, msg_id, failed != 0)
+        ? 0 : -1;
 }
 
 // ── Conversations ───────────────────────────────────────────────────────────
@@ -1934,4 +1998,121 @@ int p2p_import_contacts_json(p2p_context* ctx, const char* json)
     if (!ctx || !json) return -1;
     P2P_CTX_GUARD(ctx);
     return ctx->appData->importContactsJson(json);
+}
+
+// ── Migration (device-to-device account transfer) ───────────────────────────
+//
+// Stateless thin wrappers around MigrationCrypto::*.  No p2p_context
+// guard — these don't touch any session / DB / relay state, they're
+// pure crypto operations using libsodium + liboqs.  Threading-wise
+// the underlying libs are reentrant so multiple migration flows
+// in flight don't conflict (not that there will be — exactly one
+// migration ever runs at a time per device pair).
+
+int p2p_migration_keypair(uint8_t* x25519_pub,
+                           uint8_t* x25519_priv,
+                           uint8_t* mlkem_pub,
+                           uint8_t* mlkem_priv)
+{
+    if (!x25519_pub || !x25519_priv || !mlkem_pub || !mlkem_priv) return -1;
+
+    auto k = MigrationCrypto::generateKeypairs();
+    if (k.x25519Pub.size()  != MigrationCrypto::kX25519PubLen)  return -1;
+    if (k.x25519Priv.size() != MigrationCrypto::kX25519PrivLen) return -1;
+    if (k.mlkemPub.size()   != MigrationCrypto::kMlkemPubLen)   return -1;
+    if (k.mlkemPriv.size()  != MigrationCrypto::kMlkemPrivLen)  return -1;
+
+    std::memcpy(x25519_pub,  k.x25519Pub.data(),  k.x25519Pub.size());
+    std::memcpy(x25519_priv, k.x25519Priv.data(), k.x25519Priv.size());
+    std::memcpy(mlkem_pub,   k.mlkemPub.data(),   k.mlkemPub.size());
+    std::memcpy(mlkem_priv,  k.mlkemPriv.data(),  k.mlkemPriv.size());
+
+    // Wipe the temporaries inside the Keypairs struct — caller's
+    // copies are now in their own buffers.
+    CryptoEngine::secureZero(k.x25519Priv);
+    CryptoEngine::secureZero(k.mlkemPriv);
+    return 0;
+}
+
+int p2p_migration_fingerprint(const uint8_t* x25519_pub,
+                               const uint8_t* mlkem_pub,
+                               uint8_t* fingerprint_out)
+{
+    if (!x25519_pub || !mlkem_pub || !fingerprint_out) return -1;
+
+    Bytes xPub(x25519_pub, x25519_pub + MigrationCrypto::kX25519PubLen);
+    Bytes mPub(mlkem_pub,  mlkem_pub  + MigrationCrypto::kMlkemPubLen);
+    Bytes fp = MigrationCrypto::fingerprint(xPub, mPub);
+    if (fp.size() != MigrationCrypto::kFingerprintLen) return -1;
+
+    std::memcpy(fingerprint_out, fp.data(), fp.size());
+    return 0;
+}
+
+int p2p_migration_seal(const uint8_t* payload, int payload_len,
+                        const uint8_t* receiver_x25519_pub,
+                        const uint8_t* receiver_mlkem_pub,
+                        const uint8_t* handshake_nonce,
+                        uint8_t* envelope_out, int envelope_cap)
+{
+    if (!payload || payload_len <= 0)        return -1;
+    if (!receiver_x25519_pub)                return -1;
+    if (!receiver_mlkem_pub)                 return -1;
+    if (!handshake_nonce)                    return -1;
+    if (!envelope_out || envelope_cap <= 0)  return -1;
+
+    Bytes pl(payload, payload + payload_len);
+    Bytes rxPub(receiver_x25519_pub,
+                 receiver_x25519_pub + MigrationCrypto::kX25519PubLen);
+    Bytes rmPub(receiver_mlkem_pub,
+                 receiver_mlkem_pub + MigrationCrypto::kMlkemPubLen);
+    Bytes nonce(handshake_nonce,
+                 handshake_nonce + MigrationCrypto::kHandshakeNonceLen);
+
+    Bytes env = MigrationCrypto::seal(pl, rxPub, rmPub, nonce);
+    if (env.empty()) return -1;
+    if (static_cast<int>(env.size()) > envelope_cap) return -1;
+
+    std::memcpy(envelope_out, env.data(), env.size());
+    return static_cast<int>(env.size());
+}
+
+int p2p_migration_open(const uint8_t* envelope, int envelope_len,
+                        const uint8_t* receiver_x25519_pub,
+                        const uint8_t* receiver_x25519_priv,
+                        const uint8_t* receiver_mlkem_pub,
+                        const uint8_t* receiver_mlkem_priv,
+                        const uint8_t* handshake_nonce,
+                        uint8_t* payload_out, int payload_cap)
+{
+    if (!envelope || envelope_len <= 0)      return -1;
+    if (!receiver_x25519_pub)                return -1;
+    if (!receiver_x25519_priv)               return -1;
+    if (!receiver_mlkem_pub)                 return -1;
+    if (!receiver_mlkem_priv)                return -1;
+    if (!handshake_nonce)                    return -1;
+    if (!payload_out || payload_cap <= 0)    return -1;
+
+    Bytes env(envelope, envelope + envelope_len);
+    Bytes rxPub(receiver_x25519_pub,
+                 receiver_x25519_pub + MigrationCrypto::kX25519PubLen);
+    Bytes rxPriv(receiver_x25519_priv,
+                  receiver_x25519_priv + MigrationCrypto::kX25519PrivLen);
+    Bytes rmPub(receiver_mlkem_pub,
+                 receiver_mlkem_pub + MigrationCrypto::kMlkemPubLen);
+    Bytes rmPriv(receiver_mlkem_priv,
+                  receiver_mlkem_priv + MigrationCrypto::kMlkemPrivLen);
+    Bytes nonce(handshake_nonce,
+                 handshake_nonce + MigrationCrypto::kHandshakeNonceLen);
+
+    Bytes pl = MigrationCrypto::open(env, rxPub, rxPriv,
+                                       rmPub, rmPriv, nonce);
+    // Wipe secret material we just copied into stack temporaries.
+    CryptoEngine::secureZero(rxPriv);
+    CryptoEngine::secureZero(rmPriv);
+    if (pl.empty()) return -1;
+    if (static_cast<int>(pl.size()) > payload_cap) return -1;
+
+    std::memcpy(payload_out, pl.data(), pl.size());
+    return static_cast<int>(pl.size());
 }
