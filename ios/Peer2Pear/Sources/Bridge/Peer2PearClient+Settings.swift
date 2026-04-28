@@ -169,51 +169,70 @@ extension Peer2PearClient {
     /// hardcoded defaults).
     func loadAllSettingsFromDB() {
         guard rawContext != nil else { return }
-        loadingSettingsFromDB = true
-        defer { loadingSettingsFromDB = false }
 
-        // ── Lock + auto-lock ────────────────────────────────
-        autoLockMinutes = loadInt(Self.kAutoLockMinutesKey, default: 5)
-        if let lm = LockMode(rawValue:
+        // Read every value on the calling (background) thread —
+        // pure SQLCipher reads, no @Published touches.  Then push
+        // the assignments to the main thread in a single sync
+        // block so they (a) marshal correctly through SwiftUI's
+        // ObservableObjectPublisher, and (b) serialize against
+        // `loadStateFromDb`'s own main-dispatched setter block —
+        // running both on background concurrently was a SwiftUI
+        // deadlock (background waits on _MovableLockSyncMain
+        // while main holds the publisher's _os_unfair_lock).
+        let lAutoLockMinutes        = loadInt (Self.kAutoLockMinutesKey,    default: 5)
+        let lLockMode               = LockMode(rawValue:
                 loadString(Self.kLockModeKey,
-                            default: LockMode.quickWithEviction.rawValue)) {
-            lockMode = lm
-        }
-
-        // ── Notifications ───────────────────────────────────
-        if let nm = NotificationContentMode(rawValue:
+                            default: LockMode.quickWithEviction.rawValue))
+        let lNotificationMode       = NotificationContentMode(rawValue:
                 loadString(Self.kNotificationModeKey,
-                            default: NotificationContentMode.hidden.rawValue)) {
-            notificationContentMode = nm
+                            default: NotificationContentMode.hidden.rawValue))
+        let lFileAutoAcceptMB       = loadInt (Self.kFileAutoAcceptMBKey,       default: 10)
+        let lFileHardMaxMB          = loadInt (Self.kFileHardMaxMBKey,          default: 500)
+        let lFileRequireP2P         = loadBool(Self.kFileRequireP2PKey,         default: false)
+        let lFileVerifiedOnly       = loadBool(Self.kFileVerifiedOnlyKey,       default: false)
+        let lFileAutoAcceptWifiOnly = loadBool(Self.kFileAutoAcceptWifiOnlyKey, default: false)
+        let lPrivacyLevel           = PrivacyLevel(rawValue:
+                loadInt(Self.kPrivacyLevelKey, default: 0))
+        let lParallelFanOut         = loadBool(Self.kParallelFanOutKey,         default: false)
+        let lParallelFanOutK        = loadInt (Self.kParallelFanOutKKey,        default: 2)
+        let lMultiHopEnabled        = loadBool(Self.kMultiHopKey,               default: false)
+        let lHardBlockOnKeyChange   = loadBool(Self.kHardBlockOnKeyChangeKey,   default: true)
+        let lBackupRelayUrls        = loadStringArray(Self.kBackupRelayUrlsKey, default: [])
+
+        // Sync (not async) so callers downstream of
+        // `loadAllSettingsFromDB()` in `start()` — `setPrivacyLevel`,
+        // `setParallelFanOut`, the `for backup in backupRelayUrls`
+        // loop — read the freshly-loaded values, not the init
+        // defaults.  Safe from main→main deadlock: the only
+        // caller is `start()`, which runs on a background queue.
+        DispatchQueue.main.sync { [weak self] in
+            guard let self else { return }
+            self.loadingSettingsFromDB = true
+            defer { self.loadingSettingsFromDB = false }
+
+            self.autoLockMinutes = lAutoLockMinutes
+            if let lm = lLockMode { self.lockMode = lm }
+            if let nm = lNotificationMode { self.notificationContentMode = nm }
+
+            self.fileAutoAcceptMB           = lFileAutoAcceptMB
+            self.fileHardMaxMB              = lFileHardMaxMB
+            self.fileRequireP2P             = lFileRequireP2P
+            self.fileRequireVerifiedContact = lFileVerifiedOnly
+            self.fileAutoAcceptWifiOnly     = lFileAutoAcceptWifiOnly
+
+            // Load privacyLevel FIRST so its didSet's override of
+            // parallelFanOutEnabled / multiHopEnabled fires before
+            // we then apply the user's actual saved toggle values
+            // — avoids a load-order clobber when the user has
+            // explicitly set toggles inconsistent with the slider.
+            if let pl = lPrivacyLevel { self.privacyLevel = pl }
+            self.parallelFanOutEnabled = lParallelFanOut
+            self.parallelFanOutK       = lParallelFanOutK
+            self.multiHopEnabled       = lMultiHopEnabled
+            self.hardBlockOnKeyChange  = lHardBlockOnKeyChange
+
+            self.backupRelayUrls = lBackupRelayUrls
         }
-
-        // ── File-transfer prefs ─────────────────────────────
-        fileAutoAcceptMB        = loadInt (Self.kFileAutoAcceptMBKey,       default: 10)
-        fileHardMaxMB           = loadInt (Self.kFileHardMaxMBKey,          default: 500)
-        fileRequireP2P          = loadBool(Self.kFileRequireP2PKey,         default: false)
-        fileRequireVerifiedContact
-                                = loadBool(Self.kFileVerifiedOnlyKey,       default: false)
-        fileAutoAcceptWifiOnly  = loadBool(Self.kFileAutoAcceptWifiOnlyKey, default: false)
-
-        // ── Privacy posture ─────────────────────────────────
-        // Load privacyLevel FIRST so its didSet's override of
-        // parallelFanOutEnabled / multiHopEnabled fires before
-        // we then apply the user's actual saved toggle values
-        // — avoids a load-order clobber when the user has
-        // explicitly set toggles inconsistent with the slider.
-        if let pl = PrivacyLevel(rawValue:
-                loadInt(Self.kPrivacyLevelKey, default: 0)) {
-            privacyLevel = pl
-        }
-        parallelFanOutEnabled  = loadBool(Self.kParallelFanOutKey,  default: false)
-        parallelFanOutK        = loadInt (Self.kParallelFanOutKKey, default: 2)
-        multiHopEnabled        = loadBool(Self.kMultiHopKey,        default: false)
-        hardBlockOnKeyChange   = loadBool(Self.kHardBlockOnKeyChangeKey,
-                                            default: true)
-
-        // ── Backup relays ───────────────────────────────────
-        backupRelayUrls = loadStringArray(Self.kBackupRelayUrlsKey,
-                                            default: [])
 
         // Screen-capture toggles intentionally stay UserDefaults-
         // backed: `blockScreenCaptureOnLogin` is read pre-unlock

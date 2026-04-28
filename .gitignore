@@ -124,3 +124,13 @@ ios/Peer2Pear/Configs/Signing.local.xcconfig
 !third_party/sqlcipher/LICENSE
 !third_party/sqlcipher/SQLCIPHER_VERSION.txt
 Testing/
+
+# ── relay-go local artifacts ────────────────────────────────────────────────
+# The Go relay creates `peer2pear_relay.db` (+ -shm/-wal sidecars) in its
+# working directory on every run.  Local-only state, regenerated on each
+# launch — never commit.  The compiled `relay-go` binary is produced by
+# `go build` next to main.go; it's also local-only.
+relay-go/peer2pear_relay.db
+relay-go/peer2pear_relay.db-shm
+relay-go/peer2pear_relay.db-wal
+relay-go/relay-go
