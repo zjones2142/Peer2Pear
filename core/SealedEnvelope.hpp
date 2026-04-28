@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <vector>
 
@@ -27,7 +29,6 @@
  * Types: std::vector<uint8_t> for all binary buffers.
  */
 
-using Bytes = std::vector<uint8_t>;
 
 struct UnsealResult {
     Bytes senderEdPub;   // 32 bytes — sender's Ed25519 public key
@@ -35,6 +36,24 @@ struct UnsealResult {
     Bytes envelopeId;    // 16 bytes — unique per-envelope id, for replay dedup
     bool  valid = false;
 };
+
+// Inner-wire prefixes prepended to a sealed envelope before it's
+// wrapped into a routing envelope.  They tell the receiver which
+// decrypt path to take:
+//
+//   kSealedPrefix      — ratchet ciphertext.  Goes through
+//                        SessionManager::decryptFromPeer.
+//   kSealedFCPrefix    — AEAD-encrypted file chunk under a per-file
+//                        key derived from the ratchet.  Handled by
+//                        FileTransferManager::handleFileEnvelope.
+//
+// These are wire-format constants — changing their bytes breaks
+// every deployed client.  The reference implementation used to
+// duplicate them across SessionSealer.cpp and ChatController.cpp
+// with a comment asking future authors to keep them in sync by
+// hand; consolidating here means the compiler catches drift.
+inline constexpr const char kSealedPrefix[]   = "SEALED:";
+inline constexpr const char kSealedFCPrefix[] = "SEALEDFC:";
 
 class SealedEnvelope {
 public:
@@ -76,6 +95,27 @@ public:
     // Returns empty if the header is malformed.
     static Bytes unwrapFromRelay(const Bytes& relayEnvelope,
                                  Bytes* recipientEdPub = nullptr);
+
+    // Strip the routing header IFF `relayEnvelope` carries one, otherwise
+    // return the input unchanged.  Useful for callers that need to hash or
+    // sign the same shape the receiver naturally sees (post-strip), without
+    // caring whether transport added the routing wrap.  Detection mirrors
+    // ChatController::onEnvelope and onP2PDataReceived.
+    static Bytes stripRoutingIfWrapped(const Bytes& relayEnvelope);
+
+    // Pad a P2P QUIC-stream payload to the next fixed bucket so an
+    // external network observer can't distinguish file chunks from
+    // control frames by size alone.  Wire layout:
+    //   innerLen(4 BE) || payload || randomPadding
+    // Buckets are the same 2 / 16 / 256 KiB set used by wrapForRelay.
+    // Unlike wrapForRelay, there's no routing header (P2P is already
+    // addressed by the QUIC connection itself).
+    static Bytes padForP2P(const Bytes& payload);
+
+    // Strip the length header + padding added by padForP2P.  Returns
+    // empty if the header is malformed or claims more bytes than the
+    // framed buffer can hold.
+    static Bytes unpadFromP2P(const Bytes& padded);
 
     // Unseal an envelope using the recipient's keys.
     //

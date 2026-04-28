@@ -5,28 +5,19 @@
 #include "SealedEnvelope.hpp"
 #include "SqlCipherDb.hpp"
 #include "log.hpp"
+#include "shared.hpp"
 
 #include <sodium.h>
 
 #include <chrono>
 #include <cstring>
 
-using Bytes = SessionSealer::Bytes;
+using Bytes = Bytes;
 
-namespace {
-
-// Sealed-envelope inner-wire prefix.  Duplicated in ChatController.cpp
-// for the handshake-response + file-chunk sealing paths that don't go
-// through sealForPeer.  Keeping them in sync is a wire-compat
-// requirement — do not change without coordinating.
-const char kSealedPrefix[] = "SEALED:";
-
-int64_t nowSecs() {
-    using namespace std::chrono;
-    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-}
-
-}  // namespace
+// kSealedPrefix / kSealedFCPrefix now live in SealedEnvelope.hpp so
+// ChatController + SessionSealer share the same symbol and the
+// compiler catches any drift.  nowSecs() lives in core/shared.hpp.
+using p2p::nowSecs;
 
 SessionSealer::SessionSealer(CryptoEngine& crypto) : m_crypto(crypto) {}
 
@@ -43,12 +34,24 @@ Bytes SessionSealer::sealForPeer(const std::string& peerIdB64u,
 {
     if (!m_sessionMgr) return {};
 
+    // Validate the peer ID up front, before we spend crypto on it.
+    // CryptoEngine::edPubToCurvePub does the libsodium call for us +
+    // returns empty on bad length; a truncated or non-base64url
+    // peerIdB64u is rejected before encryptForPeer runs.
+    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEdPub.size() != 32) {
+        P2P_WARN("[SEND] sealForPeer rejecting bad peerId length="
+                 << peerEdPub.size() << " for "
+                 << p2p::peerPrefix(peerIdB64u) << "...");
+        return {};
+    }
+
     // detectKeyChange fires onPeerKeyChanged once per session per peer.
     // When the hard-block toggle is on, a Mismatch returns empty here
     // and the caller sees "seal failed" → surfaces as a status message.
     if (detectKeyChange(peerIdB64u) && m_hardBlockOnKeyChange) {
         P2P_WARN("[SEND] BLOCKED — peer's safety number changed for "
-                 << peerIdB64u.substr(0, 8) << "... (hard-block on)");
+                 << p2p::peerPrefix(peerIdB64u) << "... (hard-block on)");
         return {};
     }
 
@@ -57,13 +60,8 @@ Bytes SessionSealer::sealForPeer(const std::string& peerIdB64u,
     Bytes sessionBlob = m_sessionMgr->encryptForPeer(peerIdB64u, plaintext, peerKemPub);
     if (sessionBlob.empty()) return {};
 
-    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
-    unsigned char peerCurvePub[32];
-    if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0)
-        return {};
-
-    Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
-    sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
+    Bytes recipientCurvePub = CryptoEngine::edPubToCurvePub(peerEdPub);
+    if (recipientCurvePub.empty()) return {};
 
     // Use hybrid seal if we know the peer's ML-KEM-768 public key.
     // Include ML-DSA-65 signature if we have DSA keys.
@@ -85,6 +83,89 @@ Bytes SessionSealer::sealForPeer(const std::string& peerIdB64u,
     inner.insert(inner.end(), sealed.begin(), sealed.end());
 
     // Wrap with relay routing header so /v1/send can route anonymously.
+    return SealedEnvelope::wrapForRelay(peerEdPub, inner);
+}
+
+Bytes SessionSealer::sealPreEncryptedForPeer(const std::string& peerIdB64u,
+                                               const Bytes& preEncryptedPayload)
+{
+    if (preEncryptedPayload.empty()) return {};
+
+    // Validate peerId shape up front so the libsodium
+    // pk_to_curve25519 call doesn't read past the end of a short
+    // buffer on a malformed peerIdB64u.
+    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    if (peerEdPub.size() != 32) {
+        P2P_WARN("[SEND] sealPreEncryptedForPeer rejecting bad peerId length="
+                 << peerEdPub.size() << " for "
+                 << p2p::peerPrefix(peerIdB64u) << "...");
+        return {};
+    }
+
+    // Arch-review #2: file chunks share the hard-block trust gate
+    // with user-facing sends.  A key change mid-transfer must halt
+    // the chunk stream; previously the setSealFn path went straight
+    // to SealedEnvelope::seal and leaked every remaining chunk to a
+    // peer whose safety number just flipped.
+    if (detectKeyChange(peerIdB64u) && m_hardBlockOnKeyChange) {
+        P2P_WARN("[SEND] BLOCKED (pre-encrypted) — peer's safety number changed for "
+                 << p2p::peerPrefix(peerIdB64u) << "... (hard-block on)");
+        return {};
+    }
+
+    Bytes recipientCurvePub = CryptoEngine::edPubToCurvePub(peerEdPub);
+    if (recipientCurvePub.empty()) return {};
+
+    Bytes peerKemPub = lookupPeerKemPub(peerIdB64u);
+    Bytes sealed = SealedEnvelope::seal(
+        recipientCurvePub, peerEdPub,
+        m_crypto.identityPub(), m_crypto.identityPriv(),
+        preEncryptedPayload, peerKemPub,
+        m_crypto.dsaPub(), m_crypto.dsaPriv());
+    if (sealed.empty()) return {};
+
+    Bytes inner;
+    const size_t prefixLen = std::strlen(kSealedFCPrefix);
+    inner.reserve(prefixLen + 1 + sealed.size());
+    inner.insert(inner.end(),
+                 reinterpret_cast<const uint8_t*>(kSealedFCPrefix),
+                 reinterpret_cast<const uint8_t*>(kSealedFCPrefix) + prefixLen);
+    inner.push_back('\n');
+    inner.insert(inner.end(), sealed.begin(), sealed.end());
+
+    return SealedEnvelope::wrapForRelay(peerEdPub, inner);
+}
+
+Bytes SessionSealer::sealHandshakeResponseForPeer(const std::string& peerIdB64u,
+                                                     const Bytes& handshakeBlob)
+{
+    if (handshakeBlob.empty()) return {};
+
+    Bytes peerEdPub = CryptoEngine::fromBase64Url(peerIdB64u);
+    Bytes recipientCurvePub = CryptoEngine::edPubToCurvePub(peerEdPub);
+    if (recipientCurvePub.empty()) return {};
+
+    // Handshake responses do NOT run detectKeyChange / hard-block:
+    // the response itself is the identity proof, and refusing it
+    // would permanently wedge a legitimate re-keyed peer.
+
+    Bytes peerKemPub = lookupPeerKemPub(peerIdB64u);
+    Bytes sealed = SealedEnvelope::seal(
+        recipientCurvePub, peerEdPub,
+        m_crypto.identityPub(), m_crypto.identityPriv(),
+        handshakeBlob, peerKemPub,
+        m_crypto.dsaPub(), m_crypto.dsaPriv());
+    if (sealed.empty()) return {};
+
+    Bytes inner;
+    const size_t prefixLen = std::strlen(kSealedPrefix);
+    inner.reserve(prefixLen + 1 + sealed.size());
+    inner.insert(inner.end(),
+                 reinterpret_cast<const uint8_t*>(kSealedPrefix),
+                 reinterpret_cast<const uint8_t*>(kSealedPrefix) + prefixLen);
+    inner.push_back('\n');
+    inner.insert(inner.end(), sealed.begin(), sealed.end());
+
     return SealedEnvelope::wrapForRelay(peerEdPub, inner);
 }
 
@@ -135,7 +216,7 @@ bool SessionSealer::detectKeyChange(const std::string& peerIdB64u)
     // Mismatch.  Fire the callback at most once per session per peer.
     if (m_keyChangeWarned.insert(peerIdB64u).second) {
         if (onPeerKeyChanged) onPeerKeyChanged(peerIdB64u, c.stored, c.current);
-        P2P_WARN("[SAFETY] key-change detected for " << peerIdB64u.substr(0, 8)
+        P2P_WARN("[SAFETY] key-change detected for " << p2p::peerPrefix(peerIdB64u)
                  << "... (hardBlock=" << (m_hardBlockOnKeyChange ? "on" : "off") << ")");
     }
     return true;

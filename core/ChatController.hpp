@@ -4,6 +4,8 @@
 class QuicConnection;  // forward declaration — full include in .cpp
 #endif
 
+class AppDataStore;
+
 // Qt is not part of ChatController's public surface.  All types are std::*
 // (string / vector / map / set) or Bytes (std::vector<uint8_t>).  desktop/
 // still uses Qt for UI but calls the std-typed surface with
@@ -26,6 +28,7 @@ class QuicConnection;  // forward declaration — full include in .cpp
 #include <functional>
 #include <memory>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -33,8 +36,11 @@ class QuicConnection;  // forward declaration — full include in .cpp
 
 class ChatController {
 public:
-    explicit ChatController(IWebSocket& ws, IHttpClient& http,
+    explicit ChatController(IWebSocketFactory& wsFactory, IHttpClient& http,
                             ITimerFactory& timers);
+
+    // Zero TURN creds + key material on destruction.
+    ~ChatController();
 
     // Set the app data directory (where identity.json + per-user DB live).
     // Must be called before setPassphrase() on hosts that don't have a
@@ -47,6 +53,14 @@ public:
     void setPassphrase(const std::string& pass, const Bytes& identityKey);
     void setRelayUrl(const std::string& url);
     void setDatabase(SqlCipherDb& db);
+
+    /// Wire the per-user app data store so the v2 group sender path
+    /// can persist its monotonic counter (group_send_state) and cache
+    /// sealed envelopes for replay (group_replay_cache).  Pointer is
+    /// not owned; the caller (p2p_context) keeps it alive for the
+    /// life of the ChatController.  Optional — the legacy v1 group
+    /// path works without it.
+    void setAppDataStore(AppDataStore* appData);
     std::string myIdB64u() const;
     const Bytes& identityPub() const { return m_crypto.identityPub(); }
 
@@ -242,6 +256,27 @@ public:
                        const std::string& msgId)>
         onGroupMessageReceived;
 
+    /// pv=2 only: a stream from `senderPeerId` in `groupId` is blocked
+    /// because messages [gapFrom, gapTo] are missing.  UI surfaces
+    /// "waiting for messages from X..." banner; ChatController has
+    /// already fired a gap_request, so the caller doesn't need to
+    /// (callback is purely informational).  Fires every time the
+    /// blocked range grows (additional out-of-order arrivals).
+    std::function<void(const std::string& groupId,
+                       const std::string& senderPeerId,
+                       int64_t gapFrom, int64_t gapTo)>
+        onGroupStreamBlocked;
+
+    /// pv=2 only: `count` buffered messages from `senderPeerId` in
+    /// `groupId` were dropped during a session reset (they came in
+    /// after a gap that never closed before the sender's session
+    /// rolled over).  UI surfaces "K messages lost during reconnection"
+    /// once per reset event.
+    std::function<void(const std::string& groupId,
+                       const std::string& senderPeerId,
+                       int64_t count)>
+        onGroupMessagesLost;
+
     std::function<void(const std::string& from, const std::string& groupId,
                        const std::string& groupName, const std::vector<std::string>& members,
                        int64_t tsSecs, const std::string& msgId)>
@@ -310,22 +345,73 @@ private:
     // session decrypt.  The file_key handler installs it as the file's
     // AEAD key; other handlers ignore it.  Passed by value so the handler
     // can zero it on exit.
+    /// `outerSealed` is the sender's sealed-envelope bytes
+    /// (post-routing-strip).  Used by the pv=2 group_msg branch to
+    /// chain the prev_hash; ignored by every other type.
     void dispatchSealedPayload(const nlohmann::json& o,
                                 const std::string& senderId,
                                 int64_t tsSecs,
                                 const std::string& msgId,
                                 const std::string& via,
-                                Bytes msgKey);
+                                Bytes msgKey,
+                                const Bytes& outerSealed = Bytes{});
+
+    // Phase 2: resolve a wire `bundle` field (base64url 16B) to its
+    // local groupId via `group_bundle_map`.  When the mapping exists,
+    // overwrites `gid` with the locally-bound value (defends against
+    // a peer sending a forged groupId for a bundle we already know).
+    // When it doesn't and `allowBackfill` is true, accepts the
+    // (gid, bundle) binding from the inbound payload — caller has
+    // already authenticated the envelope so the binding is trusted.
+    void resolveBundleToGroupId(const std::string& bundleB64,
+                                 std::string& gid,
+                                 bool allowBackfill);
+
+    // Decrypt a `group_rename` / `group_avatar` / `group_leave` /
+    // `group_member_update` envelope and return the parsed inner JSON,
+    // or an empty optional on any failure (malformed envelope,
+    // unauthorized sender, decrypt failed, inner JSON malformed).
+    // Every branch used to open-code the same five-step pattern;
+    // collapsing here makes the control-message handlers one-liners
+    // and guarantees they stay in sync when the pattern evolves.
+    //
+    // `requireAuthorizedSender = false` is for bootstrap-capable
+    // messages (`group_member_update`) that have their own auth
+    // check after decryption.
+    std::optional<nlohmann::json> decryptGroupControlInner(
+        const std::string& msgType,
+        const std::string& senderId,
+        const nlohmann::json& outer,
+        bool requireAuthorizedSender);
 #ifdef PEER2PEAR_P2P
     void onP2PDataReceived(const std::string& peerIdB64u, const Bytes& data);
 #endif
     void handleRelayConnected();
 
 private:
+    // Transport preference for sendSealedPayload.  RelayOnly is the
+    // default — used for every message type that should never go
+    // direct (ICE / KEM announce / group fan-outs).  PreferP2P tries
+    // the direct QUIC stream first and falls back to the relay,
+    // initiating a new P2P connection on the way.  Only 1:1 text
+    // uses PreferP2P today.
+    enum class SendMode { RelayOnly, PreferP2P };
+
     // Seal + send.  Thin wrapper — the sealing itself lives on
     // SessionSealer (the choke point for safety-number enforcement);
-    // this just adds the "hand the sealed envelope to the relay" step.
-    void sendSealedPayload(const std::string& peerIdB64u, const nlohmann::json& payload);
+    // this just adds the "hand the sealed envelope to the relay /
+    // direct QUIC stream" step.  Arch-review #3: sendText used to
+    // open-code its own seal-then-dispatch inline; sendSealedPayload
+    // is now the single outbound code path for everything that goes
+    // through the ratchet.
+    /// Returns the sealed envelope bytes that were dispatched (or
+    /// empty Bytes when sealing failed and nothing went on the wire).
+    /// The pv=2 group sender uses the return value to compute the
+    /// prev_hash chain and populate the group_replay_cache; legacy
+    /// callers ignore it.
+    Bytes sendSealedPayload(const std::string& peerIdB64u,
+                            const nlohmann::json& payload,
+                            SendMode mode = SendMode::RelayOnly);
 
     // Roster authorization for inbound group control messages lives on
     // GroupProtocol.  onEnvelope calls m_groupProto.isAuthorizedSender
@@ -382,6 +468,7 @@ private:
     std::unique_ptr<SessionStore>   m_sessionStore;
     std::unique_ptr<SessionManager> m_sessionMgr;
     SqlCipherDb* m_dbPtr = nullptr;  // kept for group / file / seen-envelopes tables
+    AppDataStore* m_appData = nullptr;  // optional, for v2 group send path
 
     std::vector<std::string> m_selfKeys;
 
@@ -431,11 +518,20 @@ private:
     std::map<std::string, int> m_fileRequestCount;
 
 #ifdef PEER2PEAR_P2P
-    // TURN relay config for symmetric NAT fallback
-    std::string m_turnHost;
+    // TURN relay config for symmetric NAT fallback.
+    //
+    // Keep creds encrypted between calls so a crash dump or
+    // memory-scraping attack can't surface them.  We hold an
+    // ephemeral per-session AEAD key and only store the ciphertext;
+    // setupP2PConnection decrypts into scratch buffers, hands them to
+    // QuicConnection, and zeroes the scratch immediately.  The key
+    // itself is 32 bytes of sodium randomness generated once in
+    // ChatController's ctor.
+    std::string m_turnHost;   // host is not a secret — keep as-is
     int         m_turnPort = 0;
-    std::string m_turnUser;
-    std::string m_turnPass;
+    Bytes       m_turnCredsKey;   // 32 bytes; never rotates within a session
+    Bytes       m_turnUserCt;     // nonce||ct of username
+    Bytes       m_turnPassCt;     // nonce||ct of password
 #endif
 
     // Periodic maintenance (handshake pruning, file key cleanup)

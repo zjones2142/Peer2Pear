@@ -5,6 +5,7 @@
 #include "SessionManager.hpp"
 #include "SessionSealer.hpp"
 #include "log.hpp"
+#include "shared.hpp"
 #include "uuid.hpp"
 
 #include <sodium.h>
@@ -15,21 +16,8 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-namespace {
-
-int64_t nowSecs() {
-    using namespace std::chrono;
-    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-}
-
-std::string trimmed(const std::string& s) {
-    auto lb = s.find_first_not_of(" \t\r\n");
-    if (lb == std::string::npos) return {};
-    auto rb = s.find_last_not_of(" \t\r\n");
-    return s.substr(lb, rb - lb + 1);
-}
-
-}  // namespace
+using p2p::nowSecs;
+using p2p::trimmed;
 
 FileProtocol::FileProtocol(CryptoEngine& crypto,
                             SessionSealer& sealer,
@@ -58,7 +46,7 @@ void FileProtocol::sendControlMessage(const std::string& peerIdB64u,
     Bytes sealed = m_sealer.sealForPeer(peerIdB64u, pt);
     if (sealed.empty()) {
         P2P_WARN("[FILE] BLOCKED — cannot seal " << msg.value("type", std::string())
-                   << " for " << peerIdB64u.substr(0, 8) << "...");
+                   << " for " << p2p::peerPrefix(peerIdB64u) << "...");
         return;
     }
     m_sendEnvelope(sealed);
@@ -102,7 +90,7 @@ std::string FileProtocol::sendFile(const std::string& peerIdB64u,
     const Bytes pt(ptStr.begin(), ptStr.end());
     Bytes sealedEnv = m_sealer.sealForPeer(peerIdB64u, pt);
     if (sealedEnv.empty()) {
-        P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerIdB64u.substr(0, 8) << "...");
+        P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << p2p::peerPrefix(peerIdB64u) << "...");
         return {};
     }
 
@@ -110,17 +98,26 @@ std::string FileProtocol::sendFile(const std::string& peerIdB64u,
     // Otherwise the receiver's file_accept can race back faster than the
     // queue call completes and FTM sees "startOutboundStream: unknown
     // transferId" — a race latent in production and reliably reproduced
-    // by in-process test mocks.  The read of lastMessageKey() is safe
-    // here because sealForPeer just populated it.
-    Bytes fileKey = m_sessionMgr->lastMessageKey();
+    // by in-process test mocks.
+    //
+    // Arch-review #4: derive the per-file key explicitly from the
+    // ratchet key via HKDF(info = "peer2pear:file-key-v1:" || tid).
+    // The raw ratchet key sits in m_sessionMgr->lastMessageKey() for
+    // a brief window after sealForPeer; we capture + immediately
+    // transform, then zero the intermediate.  The transferId binding
+    // means a compromised ratchet-key snapshot can't be misapplied
+    // to a different in-flight transfer.
+    Bytes ratchetMsgKey = m_sessionMgr->lastMessageKey();
+    Bytes fileKey = CryptoEngine::deriveFileKey(ratchetMsgKey, transferId);
+    CryptoEngine::secureZero(ratchetMsgKey);
     m_ftm.queueOutboundFile(myId(), peerIdB64u,
                              fileKey, transferId, fileName, filePath,
                              fileSize, fileHash);
-    sodium_memzero(fileKey.data(), fileKey.size());
+    CryptoEngine::secureZero(fileKey);
 
     m_sendEnvelope(sealedEnv);
-    P2P_LOG("[FILE] file_key announced for " << transferId.substr(0, 8) << "..."
-             << " to " << peerIdB64u.substr(0, 8) << "... size=" << fileSize);
+    P2P_LOG("[FILE] file_key announced for " << p2p::peerPrefix(transferId) << "..."
+             << " to " << p2p::peerPrefix(peerIdB64u) << "... size=" << fileSize);
     return transferId;
 }
 
@@ -177,20 +174,25 @@ std::string FileProtocol::sendGroupFile(const std::string& groupId,
         const Bytes pt(ptStr.begin(), ptStr.end());
         Bytes sealedEnv = m_sealer.sealForPeer(peerId, pt);
         if (sealedEnv.empty()) {
-            P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << peerId.substr(0, 8) << "...");
+            P2P_WARN("[FILE] BLOCKED — cannot seal file_key for " << p2p::peerPrefix(peerId) << "...");
             continue;
         }
 
         // Queue BEFORE send — see sendFile for the race rationale.
-        Bytes fileKey = m_sessionMgr->lastMessageKey();
+        // Arch-review #4: explicit deriveFileKey with the member's
+        // unique transferId so cross-member file-key mixups are
+        // cryptographically impossible even with a serialized loop.
+        Bytes ratchetMsgKey = m_sessionMgr->lastMessageKey();
+        Bytes fileKey = CryptoEngine::deriveFileKey(ratchetMsgKey, memberTid);
+        CryptoEngine::secureZero(ratchetMsgKey);
         m_ftm.queueOutboundFile(me, peerId, fileKey, memberTid, fileName,
                                  filePath, fileSize, fileHash,
                                  groupId, groupName);
-        sodium_memzero(fileKey.data(), fileKey.size());
+        CryptoEngine::secureZero(fileKey);
 
         m_sendEnvelope(sealedEnv);
-        P2P_LOG("[FILE] file_key announced for " << memberTid.substr(0, 8) << "..."
-                 << " to " << peerId.substr(0, 8) << "... (group)");
+        P2P_LOG("[FILE] file_key announced for " << p2p::peerPrefix(memberTid) << "..."
+                 << " to " << p2p::peerPrefix(peerId) << "... (group)");
 
         memberTids.push_back(memberTid);
     }
@@ -207,7 +209,7 @@ void FileProtocol::acceptIncoming(const std::string& transferId, bool requireP2P
 {
     auto it = m_pendingIncomingFiles.find(transferId);
     if (it == m_pendingIncomingFiles.end()) {
-        P2P_WARN("[FILE] acceptIncoming: no pending transfer " << transferId.substr(0, 8));
+        P2P_WARN("[FILE] acceptIncoming: no pending transfer " << p2p::peerPrefix(transferId));
         return;
     }
 
@@ -226,7 +228,7 @@ void FileProtocol::acceptIncoming(const std::string& transferId, bool requireP2P
                                   it->second.groupId,
                                   it->second.groupName)) {
         P2P_WARN("[FILE] acceptIncoming: announceIncoming failed for "
-                   << transferId.substr(0, 8));
+                   << p2p::peerPrefix(transferId));
         sodium_memzero(it->second.fileKey.data(), it->second.fileKey.size());
         m_pendingIncomingFiles.erase(it);
         return;
@@ -332,5 +334,58 @@ void FileProtocol::eraseFileKey(const std::string& compoundKey)
     if (it != m_fileKeys.end()) {
         sodium_memzero(it->second.data(), it->second.size());
         m_fileKeys.erase(it);
+    }
+}
+
+// Arch-review #5: consolidated helpers that used to be open-coded in
+// ChatController.  They keep file-key + control-message state owned
+// by FileProtocol so the file-transfer boundary is cohesive instead
+// of spread across three classes.
+
+void FileProtocol::sendFileAck(const std::string& peerIdB64u,
+                                 const std::string& transferId)
+{
+    if (peerIdB64u.empty() || transferId.empty()) return;
+    nlohmann::json ack = nlohmann::json::object();
+    ack["type"]       = "file_ack";
+    ack["transferId"] = transferId;
+    sendControlMessage(peerIdB64u, ack);
+}
+
+void FileProtocol::installChunkSealCallback()
+{
+    // Route every outbound file chunk through SessionSealer so the
+    // hard-block-on-key-change policy applies (Arch-review #2).
+    m_ftm.setSealFn([this](const std::string& peerId,
+                            const Bytes& payload)
+                              -> Bytes {
+        return m_sealer.sealPreEncryptedForPeer(peerId, payload);
+    });
+}
+
+void FileProtocol::installIncomingKey(const std::string& peerIdB64u,
+                                       const std::string& transferId,
+                                       const Bytes& fileKey)
+{
+    if (peerIdB64u.empty() || transferId.empty() || fileKey.size() != 32) return;
+    const std::string compound = peerIdB64u + ":" + transferId;
+    m_fileKeys[compound] = fileKey;
+}
+
+void FileProtocol::eraseFileKeysFor(const std::string& transferId)
+{
+    if (transferId.empty()) return;
+    const std::string suffix = ":" + transferId;
+    auto it = m_fileKeys.begin();
+    while (it != m_fileKeys.end()) {
+        const auto& k = it->first;
+        const bool ends = k.size() >= suffix.size() &&
+                          k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (ends || k == transferId) {
+            sodium_memzero(it->second.data(), it->second.size());
+            it = m_fileKeys.erase(it);
+        } else {
+            ++it;
+        }
     }
 }

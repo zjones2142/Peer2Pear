@@ -1,4 +1,4 @@
-# Peer2Pear
+# Peer2Pear 🍐
 
 A peer-to-peer encrypted messaging and file-sharing **protocol**. Open source, relay-first, post-quantum cryptography, no phone numbers, no accounts.
 
@@ -8,7 +8,7 @@ This repository contains:
 - **`desktop/`** — Qt 5/6 desktop client for Linux, macOS, and Windows.
 - **`ios/`** — SwiftUI iOS client built on the C FFI (`core/peer2pear.h`), targeting iOS 26+ arm64. Relay-only transport for now (P2P deferred); full feature parity with desktop for messaging, groups, files, safety numbers, and QR exchange.
 - **`relay-go/`** — reference Go relay server (single static binary, SQLite mailbox, onion-capable).
-- **`core/tests/`** — GoogleTest suite (176 cases across 13 binaries) covering crypto primitives, sealed envelopes, ratchet, session manager, sealer / group / file protocols, full E2E two-client round-trips, the C API surface, and relay cover traffic.
+- **`core/tests/`** — GoogleTest suite (295 cases across 17 binaries) covering crypto primitives, sealed envelopes, ratchet, session manager, sealer / group / file protocols, full E2E two-client round-trips, the C API surface, and relay cover traffic.
 
 ---
 
@@ -246,11 +246,11 @@ iOS is relay-only (`PEER2PEAR_P2P=OFF`); the core is built Qt-free (`WITH_QT_COR
 
 ## Testing
 
-The core library ships a GoogleTest suite of 176 cases across 13 binaries — crypto primitives, Noise/ratchet/sealed-envelope round trips, persistence (SQLCipher), the per-module security gates (SessionSealer / GroupProtocol / FileProtocol), end-to-end two-client scenarios over a mock relay, the C FFI surface, and relay cover-traffic timing. Tests build by default on desktop (`BUILD_TESTS=ON`) and are skipped on iOS / Android cross-compiles.
+The core library ships a GoogleTest suite of 295 cases across 17 binaries — crypto primitives, Noise/ratchet/sealed-envelope round trips, persistence (SQLCipher), the per-module security gates (SessionSealer / GroupProtocol / FileProtocol), end-to-end two-client scenarios over a mock relay, the C FFI surface, and relay cover-traffic timing. Tests build by default on desktop (`BUILD_TESTS=ON`) and are skipped on iOS / Android cross-compiles.
 
 ```bash
 cmake --build build              # builds the test binaries alongside the app
-ctest --test-dir build           # runs all 176 cases (~90 s on M-series Mac)
+ctest --test-dir build           # runs all 295 cases (~125 s on M-series Mac)
 ctest --test-dir build -R Group  # filter by name regex
 ```
 

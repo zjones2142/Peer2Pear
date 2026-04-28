@@ -1,36 +1,21 @@
 #pragma once
 
+// File-transfer UI helpers — pure presentation utilities shared by
+// ChatView's render path.  The actual file-record struct lives on
+// AppDataStore::FileRecord now; this header keeps just the switch-
+// friendly status enum + icon / size / preview-type formatters.
+
 #include <QString>
-#include <QByteArray>
-#include <QDateTime>
 
 // ── FileTransferStatus ────────────────────────────────────────────────────────
+// Mirrors the integer stored in AppDataStore::FileRecord::status.
+// Kept as an enum here so switch statements and guards in the UI
+// layer read naturally; cast via static_cast<int>(...) at the DB edge.
 enum class FileTransferStatus {
     Sending,    // outgoing: chunks are being queued
     Receiving,  // incoming: partial — waiting for more chunks
     Complete,   // all chunks delivered; file accessible on disk
     Failed
-};
-
-// ── FileTransferRecord ────────────────────────────────────────────────────────
-// One row in the Files tab.
-// Keyed in ChatView by stable peerIdB64u/groupId — NOT by list index.
-struct FileTransferRecord {
-    QString            transferId;
-    QString            fileName;
-    qint64             fileSize       = 0;   // unencrypted byte count
-    QString            peerIdB64u;
-    QString            peerName;
-    QDateTime          timestamp;
-    bool               sent           = false;
-
-    FileTransferStatus status         = FileTransferStatus::Sending;
-    int                chunksTotal    = 0;
-    int                chunksComplete = 0;
-
-    // Received files: path where the file was auto-saved to Downloads/Peer2Pear/
-    // Sent files:     path the user originally selected (so Download re-opens it)
-    QString            savedPath;
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

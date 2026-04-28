@@ -77,6 +77,7 @@ func newTestRelayOpt(t *testing.T, trustProxy bool) *testRelay {
 	pub, priv := testRelayOnionKey(t)
 	hub.relayX25519Pub = pub
 	hub.relayX25519Priv = priv
+	hub.InitPush(priv)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/send", hub.HandleSend)
@@ -417,14 +418,20 @@ func TestWsAuth_RejectsReplay(t *testing.T) {
 func TestWsAuth_ReplayPersistsAcrossRelayRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "relay.db")
 
+	// Arch-review #8 makes the auth-nonce HMAC key a function of the
+	// relay's onion private key — a production-faithful "restart on
+	// the same DB" test must also restore the same onion key, the
+	// way loadOrCreateRelayKey would.  Generate once, reuse both boots.
+	pub, priv := testRelayOnionKey(t)
+
 	bootHub := func() *testRelay {
 		mbox, err := NewMailbox(dbPath)
 		if err != nil {
 			t.Fatalf("mbox: %v", err)
 		}
 		hub := NewHub(mbox, false)
-		pub, priv := testRelayOnionKey(t)
 		hub.relayX25519Pub, hub.relayX25519Priv = pub, priv
+		hub.InitPush(priv)
 		mux := http.NewServeMux()
 		mux.HandleFunc("/v1/receive", hub.HandleReceive)
 		srv := httptest.NewServer(mux)
@@ -456,14 +463,20 @@ func TestWsAuth_ReplayPersistsAcrossRelayRestart(t *testing.T) {
 func TestMailboxDelivery_SurvivesRelayRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "relay.db")
 
+	// Arch-review #8: same constraint as TestWsAuth_ReplayPersists
+	// — the HMAC key under mailbox row lookups is derived from the
+	// onion key, so the test must reuse it across reboots the way
+	// loadOrCreateRelayKey would.
+	pub, priv := testRelayOnionKey(t)
+
 	bootHub := func() *testRelay {
 		mbox, err := NewMailbox(dbPath)
 		if err != nil {
 			t.Fatalf("mbox: %v", err)
 		}
 		hub := NewHub(mbox, false)
-		pub, priv := testRelayOnionKey(t)
 		hub.relayX25519Pub, hub.relayX25519Priv = pub, priv
+		hub.InitPush(priv)
 		mux := http.NewServeMux()
 		mux.HandleFunc("POST /v1/send", hub.HandleSend)
 		mux.HandleFunc("/v1/receive", hub.HandleReceive)
@@ -728,6 +741,7 @@ func TestRelay_NativeTlsEndpointServes(t *testing.T) {
 	hub := NewHub(mbox, false)
 	pub, priv := testRelayOnionKey(t)
 	hub.relayX25519Pub, hub.relayX25519Priv = pub, priv
+	hub.InitPush(priv)
 	defer hub.CloseAll()
 
 	mux := http.NewServeMux()
@@ -1164,6 +1178,59 @@ func TestPresence_QueryRateLimitDropsAfterCap(t *testing.T) {
 		var msg map[string]any
 		if json.Unmarshal(data, &msg) == nil && msg["type"] == "presence_result" {
 			t.Fatalf("presence_result after cap — regression: %v", msg)
+		}
+	}
+}
+
+// ── 24b. presence_subscribe is rate-limited per connection ───────────
+// Without the rate cap the handler would accept unlimited subscribe
+// calls per connection, letting an authenticated peer churn the
+// 200-id watched set repeatedly to enumerate the social graph at
+// WebSocket speed.  With the cap in place, the
+// (maxPresenceSubsPerWin+1)th call in a window must be silently
+// dropped (no presence_result reply).
+
+func TestPresence_SubscribeRateLimitDropsAfterCap(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	bob := newTestPeer(t)
+
+	conn, _ := dialAndAuth(t, r, alice, time.Now().UnixMilli())
+	defer conn.Close()
+
+	// Burn the budget — every subscribe within the cap gets a snapshot.
+	for i := 0; i < maxPresenceSubsPerWin; i++ {
+		if err := conn.WriteJSON(map[string]any{
+			"type":     "presence_subscribe",
+			"peer_ids": []string{bob.idB64},
+		}); err != nil {
+			t.Fatalf("subscribe #%d: %v", i, err)
+		}
+		readNextJSONOfType(t, conn, "presence_result", 3*time.Second)
+	}
+
+	// One more subscribe — must be silently dropped.
+	if err := conn.WriteJSON(map[string]any{
+		"type":     "presence_subscribe",
+		"peer_ids": []string{bob.idB64},
+	}); err != nil {
+		t.Fatalf("overflow subscribe: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+	for {
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			return // expected — no presence_result arrived
+		}
+		if mt == websocket.BinaryMessage {
+			continue
+		}
+		var msg map[string]any
+		if json.Unmarshal(data, &msg) == nil && msg["type"] == "presence_result" {
+			t.Fatalf("presence_result after subscribe cap — regression: %v", msg)
 		}
 	}
 }

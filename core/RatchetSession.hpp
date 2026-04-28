@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -20,7 +22,6 @@
  * Types: std::vector<uint8_t> for all buffers.
  */
 
-using Bytes = std::vector<uint8_t>;
 
 struct RatchetHeader {
     Bytes    dhPub;          // 32 bytes — sender's current DH ratchet public key
@@ -83,6 +84,22 @@ public:
 
     bool isValid() const { return m_rootKey.size() == 32; }
 
+    /// Stable per-session identifier derived from the initial root key
+    /// at handshake time.  Both sides of the same DR session compute
+    /// identical bytes (8B BLAKE2b of the initial rootKey).  Re-running
+    /// the handshake (session reset) produces a fresh sessionId because
+    /// the initial rootKey is fresh.
+    ///
+    /// Used by Causally-Linked Pairwise group messaging
+    /// (Phase 1) to namespace per-(sender, group, recipient) counters:
+    /// when sessionId changes, expectedNext resets to 1, and any
+    /// buffered group_msgs from the prior session are surfaced as
+    /// "K messages lost during reconnection" UI events.
+    ///
+    /// Returns 8 bytes; empty if the session was constructed via the
+    /// default ctor and never initialised.
+    Bytes sessionId() const;
+
     RatchetSession() = default;
 
 private:
@@ -107,7 +124,11 @@ private:
     bool skipMessageKeys(const Bytes& dhPub, uint32_t until);
 
     // State
-    Bytes m_rootKey;          // 32 bytes — root chain key
+    Bytes m_rootKey;          // 32 bytes — root chain key (evolves on each DH ratchet)
+    Bytes m_initialRootKey;   // 32 bytes — root key at handshake time, never updated.
+                               // Source for sessionId().  Stored separately
+                               // because m_rootKey ratchets forward and would
+                               // give a moving sessionId otherwise.
     Bytes m_sendChainKey;     // 32 bytes — sending symmetric chain
     Bytes m_recvChainKey;     // 32 bytes — receiving symmetric chain
 

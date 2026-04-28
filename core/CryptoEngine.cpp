@@ -1156,6 +1156,60 @@ Bytes CryptoEngine::deriveSubkey(const Bytes& masterKey,
     return hkdf(masterKey, {}, info, len);
 }
 
+Bytes CryptoEngine::edPubToCurvePub(const Bytes& edPub)
+{
+    if (edPub.size() != 32) return {};
+    unsigned char curvePub[32];
+    if (crypto_sign_ed25519_pk_to_curve25519(curvePub, edPub.data()) != 0)
+        return {};
+    Bytes out(curvePub, curvePub + 32);
+    sodium_memzero(curvePub, sizeof(curvePub));
+    return out;
+}
+
+Bytes CryptoEngine::deriveFileKey(const Bytes& ratchetMsgKey,
+                                    const std::string& transferId)
+{
+    if (ratchetMsgKey.size() != 32 || transferId.empty()) return {};
+    const std::string infoStr = "peer2pear:file-key-v1:" + transferId;
+    Bytes info(reinterpret_cast<const uint8_t*>(infoStr.data()),
+               reinterpret_cast<const uint8_t*>(infoStr.data()) + infoStr.size());
+    return hkdf(ratchetMsgKey, {}, info, 32);
+}
+
+// File-key wrap.  Both methods derive a 32-byte AEAD key from
+// m_identityKey on demand (stable across sessions because
+// m_identityKey is stable post-unlock).  Wrapped blob layout is
+// exactly what aeadEncrypt returns (nonce||ct); transferId rides in
+// the AAD so a row swap fails verification.
+Bytes CryptoEngine::wrapFileKey(const std::string& transferId,
+                                 const Bytes& fileKey) const
+{
+    if (m_identityKey.empty() || fileKey.size() != 32) return {};
+    Bytes wrapKey = hkdf(m_identityKey, {},
+        Bytes(reinterpret_cast<const uint8_t*>("peer2pear:file-key-wrap-v1"),
+              reinterpret_cast<const uint8_t*>("peer2pear:file-key-wrap-v1") + 26),
+        32);
+    Bytes aad(transferId.begin(), transferId.end());
+    Bytes out = aeadEncrypt(wrapKey, fileKey, aad);
+    secureZero(wrapKey);
+    return out;
+}
+
+Bytes CryptoEngine::unwrapFileKey(const std::string& transferId,
+                                   const Bytes& wrapped) const
+{
+    if (m_identityKey.empty() || wrapped.empty()) return {};
+    Bytes wrapKey = hkdf(m_identityKey, {},
+        Bytes(reinterpret_cast<const uint8_t*>("peer2pear:file-key-wrap-v1"),
+              reinterpret_cast<const uint8_t*>("peer2pear:file-key-wrap-v1") + 26),
+        32);
+    Bytes aad(transferId.begin(), transferId.end());
+    Bytes out = aeadDecrypt(wrapKey, wrapped, aad);
+    secureZero(wrapKey);
+    return out;
+}
+
 Bytes CryptoEngine::loadOrCreateSalt(const std::string& path) {
     const size_t expectedSize = crypto_pwhash_SALTBYTES;
     const std::string backupPath = path + ".bak";

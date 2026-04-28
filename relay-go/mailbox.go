@@ -3,19 +3,35 @@ package main
 import (
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	// SQLCipher fork of mattn/go-sqlite3.  Registers itself as the
+	// `"sqlite3"` driver; opens unencrypted when no `_pragma_key` is
+	// supplied in the DSN, so the default-plaintext behaviour is
+	// preserved.  When RELAY_DB_KEY is set, NewMailbox threads the
+	// key into the DSN and the file is SQLCipher-encrypted at rest
+	// (operator-opt-in, matching the RELAY_KEY_KEK pattern).
+	_ "github.com/mutecomm/go-sqlcipher/v4"
 )
 
 const (
-	defaultTTLMs  = 7 * 24 * 60 * 60 * 1000 // 7 days
-	maxTTLMs      = 7 * 24 * 60 * 60 * 1000
+	// Mailbox retention.  Bumped from 7d to 14d alongside Phase 1 of
+	// the Causally-Linked Pairwise group-messaging design — the relay
+	// is the primary delivery path; the sender-side replay cache (7d)
+	// is a fallback for narrower edge cases.  At 14d the recipient
+	// can be offline up to two weeks and miss nothing.  See
+	// docs/PROTOCOL.md and the design discussion attached to PR #X.
+	defaultTTLMs  = 14 * 24 * 60 * 60 * 1000 // 14 days
+	maxTTLMs      = 14 * 24 * 60 * 60 * 1000
 	maxQueueItems = 5000
 	// Two-phase delivery: FetchAll marks rows as in-flight (delivered_at =
 	// now) instead of deleting; the caller DELETEs each row only after the
@@ -40,10 +56,110 @@ type Mailbox struct {
 	db *sql.DB
 }
 
+// loadRelayDbKey returns the 32-byte SQLCipher page key the relay
+// should use to open / create its mailbox DB.  Order of precedence:
+//   * RELAY_DB_KEY      — base64url (RFC-4648 raw) 32-byte key
+//   * RELAY_DB_KEY_FILE — path to a file containing exactly 32 raw
+//                          bytes (same file format as RELAY_KEY_KEK_FILE)
+// Returns (nil, nil) when neither is set — callers then open the DB
+// in plaintext mode with a stderr warning (mirrors the opt-in
+// pattern the onion key uses).
+func loadRelayDbKey() ([]byte, error) {
+	if b64 := os.Getenv("RELAY_DB_KEY"); b64 != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(b64)
+		if err != nil {
+			raw2, err2 := base64.StdEncoding.DecodeString(b64)
+			if err2 != nil {
+				return nil, fmt.Errorf("RELAY_DB_KEY: not base64url or base64: %w", err)
+			}
+			raw = raw2
+		}
+		if len(raw) != 32 {
+			return nil, fmt.Errorf("RELAY_DB_KEY must decode to 32 bytes, got %d", len(raw))
+		}
+		return raw, nil
+	}
+	if path := os.Getenv("RELAY_DB_KEY_FILE"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read RELAY_DB_KEY_FILE: %w", err)
+		}
+		if len(raw) != 32 {
+			return nil, fmt.Errorf("RELAY_DB_KEY_FILE must contain exactly 32 bytes, got %d", len(raw))
+		}
+		return raw, nil
+	}
+	return nil, nil
+}
+
+// buildMailboxDsn assembles the SQLite DSN, threading the SQLCipher
+// page key through `_pragma_key=x'<hex>'` when a key is available.
+// The key is URL-encoded defensively; mutecomm's go-sqlcipher parses
+// DSN query params and feeds them to the underlying PRAGMA command.
+func buildMailboxDsn(dbPath string, key []byte) string {
+	base := dbPath + "?_journal_mode=WAL&_foreign_keys=ON"
+	if len(key) == 0 {
+		return base
+	}
+	// `x'<hex>'` is SQLCipher's canonical raw-key form.  Wrapping in
+	// url.QueryEscape keeps the single-quotes / hex safe across DSN
+	// parsers; the driver strips the quoting before issuing PRAGMA.
+	raw := fmt.Sprintf("x'%s'", hex.EncodeToString(key))
+	return base + "&_pragma_key=" + url.QueryEscape(raw) +
+		"&_pragma_cipher_page_size=4096"
+}
+
+// isLikelyPlainSqliteFile returns true when `dbPath` exists and begins
+// with the literal "SQLite format 3" magic — i.e. it's an UN-encrypted
+// SQLite file.  Used to fail loudly when an operator sets RELAY_DB_KEY
+// against a pre-existing plaintext mailbox so they notice before mixed
+// plaintext / encrypted state confuses the driver.
+func isLikelyPlainSqliteFile(dbPath string) bool {
+	f, err := os.Open(dbPath)
+	if err != nil {
+		return false // missing is fine — freshly-created on open
+	}
+	defer f.Close()
+	const magic = "SQLite format 3\x00"
+	buf := make([]byte, len(magic))
+	n, _ := f.Read(buf)
+	return n == len(magic) && strings.HasPrefix(string(buf), "SQLite format 3")
+}
+
 func NewMailbox(dbPath string) (*Mailbox, error) {
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_foreign_keys=ON")
+	key, kerr := loadRelayDbKey()
+	if kerr != nil {
+		return nil, kerr
+	}
+	// Fail-safe: reject mixed states so the operator has to make a
+	// deliberate choice when switching modes.  (Encrypted DB with no
+	// key is caught by the driver itself; plaintext DB with a key
+	// would "work" but leak the next startup's writes — refuse.)
+	if key != nil && isLikelyPlainSqliteFile(dbPath) {
+		return nil, fmt.Errorf(
+			"RELAY_DB_KEY is set but %s is an existing plaintext SQLite file; "+
+				"either remove it (expected: the relay regenerates empty state) "+
+				"or run a one-shot migration with the sqlcipher CLI", dbPath)
+	}
+	if key == nil {
+		fmt.Fprintln(os.Stderr,
+			"warning: RELAY_DB_KEY not set — mailbox SQLite file stored "+
+				"in plaintext.  Set it to enable at-rest encryption.")
+	}
+
+	db, err := sql.Open("sqlite3", buildMailboxDsn(dbPath, key))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+
+	// Sanity-check the key actually unlocked the file.  Without this
+	// probe, go-sqlcipher defers the PRAGMA key validation until the
+	// first real query — giving surprising cascading errors later.
+	if key != nil {
+		if _, perr := db.Exec("SELECT count(*) FROM sqlite_master;"); perr != nil {
+			db.Close()
+			return nil, fmt.Errorf("RELAY_DB_KEY does not unlock %s: %w", dbPath, perr)
+		}
 	}
 
 	// Connection pool tuning for concurrent access
@@ -86,7 +202,10 @@ func NewMailbox(dbPath string) (*Mailbox, error) {
 
 // RegisterAuthNonce records `key` as seen with `expiryMs`.  Returns true if
 // the nonce was new (auth proceeds), false if it was already seen (replay).
-// Survives relay restart.
+// Survives relay restart.  Arch-review #8: the caller-supplied key
+// carries a peer_id substring; we hash it before persisting so a DB
+// snapshot can't link "peer X authenticated at ts Y" to a specific
+// peer.  Collision resistance of the HMAC preserves uniqueness.
 func (m *Mailbox) RegisterAuthNonce(key string, expiryMs int64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -95,9 +214,10 @@ func (m *Mailbox) RegisterAuthNonce(key string, expiryMs int64) bool {
 	// on expiry_ms is used; avoids a background sweep lagging behind a flood.
 	m.db.Exec("DELETE FROM seen_auth_nonces WHERE expiry_ms < ?", nowMs())
 
+	hashedKey := hashPeerID(key)
 	res, err := m.db.Exec(
 		"INSERT OR IGNORE INTO seen_auth_nonces (key, expiry_ms) VALUES (?, ?)",
-		key, expiryMs,
+		hashedKey, expiryMs,
 	)
 	if err != nil {
 		log.Printf("RegisterAuthNonce insert error: %v", err)
@@ -132,12 +252,17 @@ func (m *Mailbox) Close() {
 }
 
 // Store saves an envelope for later delivery. Returns an error if the
-// recipient's mailbox is full.
+// recipient's mailbox is full.  Arch-review #8: the recipient_id
+// column holds `hashPeerID(recipientID)` rather than the raw peer
+// ID, so a disk snapshot alone can't reveal which users use this
+// relay.  The payload is already E2E-sealed; only the routing key
+// changes here.
 func (m *Mailbox) Store(recipientID string, payload []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	now := nowMs()
+	recipientKey := hashPeerID(recipientID)
 
 	// Purge expired before checking capacity
 	m.db.Exec("DELETE FROM envelopes WHERE expiry_ms < ?", now)
@@ -145,7 +270,7 @@ func (m *Mailbox) Store(recipientID string, payload []byte) error {
 	// Check per-recipient capacity
 	var count int
 	m.db.QueryRow("SELECT COUNT(*) FROM envelopes WHERE recipient_id=?",
-		recipientID).Scan(&count)
+		recipientKey).Scan(&count)
 	if count >= maxQueueItems {
 		return fmt.Errorf("mailbox full")
 	}
@@ -162,7 +287,7 @@ func (m *Mailbox) Store(recipientID string, payload []byte) error {
 
 	_, err := m.db.Exec(
 		"INSERT OR IGNORE INTO envelopes (env_id, recipient_id, payload, created_ms, expiry_ms) VALUES (?, ?, ?, ?, ?)",
-		envID, recipientID, payload, now, expiry,
+		envID, recipientKey, payload, now, expiry,
 	)
 	return err
 }
@@ -180,6 +305,7 @@ func (m *Mailbox) FetchAll(recipientID string) []StoredEnvelope {
 	defer m.mu.Unlock()
 
 	now := nowMs()
+	recipientKey := hashPeerID(recipientID)
 	m.db.Exec("DELETE FROM envelopes WHERE expiry_ms < ?", now)
 
 	// Reset stale in-flight marks so a crashed previous delivery attempt
@@ -191,7 +317,7 @@ func (m *Mailbox) FetchAll(recipientID string) []StoredEnvelope {
 
 	rows, err := m.db.Query(
 		"SELECT env_id, payload FROM envelopes WHERE recipient_id=? AND delivered_at IS NULL ORDER BY created_ms ASC",
-		recipientID,
+		recipientKey,
 	)
 	if err != nil {
 		log.Printf("fetchAll query error: %v", err)
@@ -287,11 +413,12 @@ func (m *Mailbox) FetchOne(recipientID string) (envID string, payload []byte, cr
 	defer m.mu.Unlock()
 
 	now := nowMs()
+	recipientKey := hashPeerID(recipientID)
 	m.db.Exec("DELETE FROM envelopes WHERE expiry_ms < ?", now)
 
 	row := m.db.QueryRow(
 		"SELECT env_id, payload, created_ms, expiry_ms FROM envelopes WHERE recipient_id=? ORDER BY created_ms ASC LIMIT 1",
-		recipientID,
+		recipientKey,
 	)
 	if err := row.Scan(&envID, &payload, &createdMs, &expiryMs); err != nil {
 		return "", nil, 0, 0
@@ -311,11 +438,12 @@ func (m *Mailbox) StoreWithTTL(recipientID string, payload []byte, ttlMs int64) 
 	defer m.mu.Unlock()
 
 	now := nowMs()
+	recipientKey := hashPeerID(recipientID)
 	m.db.Exec("DELETE FROM envelopes WHERE expiry_ms < ?", now)
 
 	var count int
 	m.db.QueryRow("SELECT COUNT(*) FROM envelopes WHERE recipient_id=?",
-		recipientID).Scan(&count)
+		recipientKey).Scan(&count)
 	if count >= maxQueueItems {
 		return "", fmt.Errorf("mailbox full")
 	}
@@ -332,7 +460,7 @@ func (m *Mailbox) StoreWithTTL(recipientID string, payload []byte, ttlMs int64) 
 
 	_, err := m.db.Exec(
 		"INSERT OR IGNORE INTO envelopes (env_id, recipient_id, payload, created_ms, expiry_ms) VALUES (?, ?, ?, ?, ?)",
-		envID, recipientID, payload, now, expiry,
+		envID, recipientKey, payload, now, expiry,
 	)
 	return envID, err
 }
@@ -353,8 +481,13 @@ func (m *Mailbox) PurgeExpired() (int, int) {
 	return before - after, after
 }
 
-// Count returns the total number of stored envelopes.
+// Count returns the total number of stored envelopes.  The lock
+// matches every other Mailbox accessor so a concurrent Store /
+// FetchAll can't race the COUNT(*) read against an insert or delete
+// in flight.
 func (m *Mailbox) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var count int
 	m.db.QueryRow("SELECT COUNT(*) FROM envelopes").Scan(&count)
 	return count

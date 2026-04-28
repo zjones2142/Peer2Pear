@@ -105,6 +105,10 @@ build-ios-*/  # the CMake iOS build dirs (already caught by /build*/, here for c
 # drops its DerivedData inside the iOS dir instead of ~/Library.  Local-only
 # intermediate output — 90 MB+ of .o/.swiftmodule/etc., regenerated on build.
 ios/.xcodebuild/
+# Some xcodebuild invocations land DerivedData at ios/build/ instead (e.g.
+# direct `xcodebuild ... -derivedDataPath build` from within ios/).  Same
+# story as ios/.xcodebuild/ — local-only, big, regenerated.
+ios/build/
 # Per-developer Apple Developer Team ID — never commit your Team ID.
 # Copy Signing.local.xcconfig.template (committed) to Signing.local.xcconfig
 # and edit your local copy.  See ios/README.md → "Code signing" section.
@@ -119,3 +123,4 @@ ios/Peer2Pear/Configs/Signing.local.xcconfig
 !third_party/sqlcipher/sqlite3.h
 !third_party/sqlcipher/LICENSE
 !third_party/sqlcipher/SQLCIPHER_VERSION.txt
+Testing/

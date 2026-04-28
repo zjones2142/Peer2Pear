@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -15,7 +17,6 @@
  * Types: std::vector<uint8_t> for bytes, std::string (UTF-8) for text.
  */
 
-using Bytes = std::vector<uint8_t>;
 
 // ML-KEM-768 encapsulation result
 struct KemEncapsResult {
@@ -61,6 +62,15 @@ public:
     // X25519 key accessors (derived from Ed25519 identity)
     const Bytes& curvePub()  const { return m_curvePub;  }
     const Bytes& curvePriv() const { return m_curvePriv; }
+
+    // Convert a 32-byte Ed25519 public key to its X25519 equivalent
+    // via crypto_sign_ed25519_pk_to_curve25519.  Returns empty on
+    // bad input — the libsodium primitive has no length guard of
+    // its own, so every call site used to hand-roll the same size
+    // check + memzero dance.  Consolidating here guarantees every
+    // caller gets the same discipline: length-check, convert,
+    // memzero the scratch buffer before returning.
+    static Bytes edPubToCurvePub(const Bytes& edPub);
 
     // ML-KEM-768 key accessors (generated alongside Ed25519 identity)
     // Empty if PQ keys haven't been generated yet (legacy identity file)
@@ -116,6 +126,40 @@ public:
 
     Bytes aeadDecrypt(const Bytes& key32, const Bytes& nonceAndCiphertext,
                       const Bytes& aad = {}) const;
+
+    // Derive the per-file AEAD key from the ratchet message key used
+    // to encrypt the file_key announcement (Arch-review #4).  Before
+    // this helper existed, FileProtocol captured the message key via
+    // SessionManager::lastMessageKey() — a stateful getter whose
+    // value was whatever seal/decrypt ran last.  The derivation was
+    // implicit and race-prone.  `deriveFileKey(ratchetMsgKey, tid)`
+    // is pure, binds the transferId into the HKDF info string, and
+    // both sender + receiver compute it the same way.  Returns an
+    // empty vector on bad inputs (wrong msg-key size / empty tid).
+    //
+    // Wire impact: the per-file AEAD key under v2.1.2+ is
+    //   HKDF-BLAKE2b(ikm=ratchetMsgKey,
+    //                info="peer2pear:file-key-v1:" || transferId)
+    // rather than the raw ratchet key — a flag-day break from
+    // earlier builds that used the raw key.  PROTOCOL.md §7.3.1
+    // documents it.
+    static Bytes deriveFileKey(const Bytes& ratchetMsgKey,
+                                const std::string& transferId);
+
+    // Wrap / unwrap a 32-byte file-transfer AEAD key for at-rest
+    // storage in file_transfers_{in,out}.  SQLCipher's page key
+    // already encrypts the row, but a compromise of that page key
+    // alone would expose the raw file key and let the attacker
+    // decrypt past chunks.  Wrapping with a key derived from
+    // m_identityKey (which sits behind the Argon2-gated master key)
+    // means even a page-key leak doesn't surface usable file keys.
+    // transferId binds into the AAD so a swapped row fails to
+    // unwrap.  Returns {} if the derived key is unavailable (e.g.,
+    // pre-unlock).
+    Bytes wrapFileKey(const std::string& transferId,
+                      const Bytes& fileKey) const;
+    Bytes unwrapFileKey(const std::string& transferId,
+                        const Bytes& wrapped) const;
 
     // Ed25519 signature verification (static — any key, not just ours)
     static bool verifySignature(const Bytes& sig, const Bytes& message,

@@ -27,10 +27,12 @@
 
 #include <sodium.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -265,5 +267,145 @@ TEST(CApi, SetPassphraseV2RejectsBadArguments) {
     EXPECT_NE(p2p_set_passphrase_v2(ctxNoDir, "whatever"), 0);
     p2p_destroy(ctxNoDir);
 
+    fs::remove_all(dir);
+}
+
+// ── 5. FFI null/length guards ─────────────────────────────────────────────
+// A buggy or hostile platform adapter could pass (NULL, anything),
+// (anything, negative), or (NULL, 0).  Constructing the inner Bytes
+// vector under those conditions would be UB even on (nullptr, 0)
+// because pointer arithmetic on null is undefined.  These tests pin
+// the no-crash contract for both binary-WS and HTTP-response entry
+// points.
+
+TEST(CApi, WsOnBinaryRejectsMalformedInputs) {
+    const std::string dir = makeTempDir("p2p-capi-fficrash");
+    p2p_context* ctx = p2p_create(dir.c_str(), nullPlatform());
+    ASSERT_NE(ctx, nullptr);
+
+    // Each of these would have been UB pre-fix; now they're silent no-ops.
+    p2p_ws_on_binary(nullptr, nullptr, 0);
+    p2p_ws_on_binary(ctx,     nullptr, 0);
+    p2p_ws_on_binary(ctx,     nullptr, 16);     // null with positive len
+    p2p_ws_on_binary(ctx,     nullptr, -1);     // null + negative
+    const uint8_t buf[1] = {0};
+    p2p_ws_on_binary(ctx,     buf,     -1);     // valid ptr + negative
+    p2p_ws_on_binary(ctx,     buf,     0);      // empty frame, valid ptr
+
+    p2p_destroy(ctx);
+    fs::remove_all(dir);
+}
+
+// p2p_app_load_contacts must not deadlock if its callback re-enters
+// another p2p_app_* function.  The implementation snapshots the rows
+// under ctrlMu and releases before firing callbacks.  A regression
+// (moving the callback back inside the lock) deadlocks here because
+// std::mutex is non-recursive; we bound the call with a watchdog
+// future.
+struct ReentrancyState {
+    p2p_context* ctx;
+    int          count;
+};
+
+extern "C" void deadlockProbeCb(const char* peer_id,
+                                 const char* name,
+                                 const char* subtitle,
+                                 const char* const* keys,
+                                 int is_blocked,
+                                 int is_group,
+                                 const char* group_id,
+                                 const char* avatar_b64,
+                                 int64_t last_active_secs,
+                                 int in_address_book,
+                                 int muted,
+                                 void* ud)
+{
+    (void)name; (void)subtitle; (void)keys; (void)is_blocked;
+    (void)is_group; (void)group_id; (void)avatar_b64;
+    (void)last_active_secs; (void)in_address_book; (void)muted;
+    auto* s = static_cast<ReentrancyState*>(ud);
+    // Re-enter the C API from inside the callback.  A non-recursive
+    // ctrlMu held across the callback would deadlock here.  Use
+    // p2p_app_save_contact — a no-op semantic update (same row)
+    // that still grabs ctrlMu and exercises the reentrant path.
+    const char* noKeys[] = {nullptr};
+    (void)p2p_app_save_contact(s->ctx, peer_id, "Alice-updated", "",
+                                noKeys, 0, 0, "", "", 0, 1, 0);
+    s->count++;
+}
+
+TEST(CApi, LoadContactsCallbackReentrancyDoesNotDeadlock) {
+    const std::string dir = makeTempDir("p2p-capi-reentrant");
+    p2p_context* ctx = p2p_create(dir.c_str(), nullPlatform());
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(p2p_set_passphrase_v2(ctx, "testpass"), 0);
+
+    // Seed three contacts so the callback fires multiple times.
+    const char* keys[] = {nullptr};
+    p2p_app_save_contact(ctx, "peer1", "Alice", "", keys, 0, 0, "", "", 0, 1, 0);
+    p2p_app_save_contact(ctx, "peer2", "Bob",   "", keys, 0, 0, "", "", 0, 1, 0);
+    p2p_app_save_contact(ctx, "peer3", "Carol", "", keys, 0, 0, "", "", 0, 1, 0);
+
+    ReentrancyState state{ctx, 0};
+    auto fut = std::async(std::launch::async, [&]() {
+        p2p_app_load_contacts(ctx, &deadlockProbeCb, &state);
+    });
+    // 5 s is generous — a deadlock here would never resolve.
+    auto status = fut.wait_for(std::chrono::seconds(5));
+    ASSERT_EQ(status, std::future_status::ready)
+        << "p2p_app_load_contacts deadlocked on reentrant callback";
+
+    EXPECT_EQ(state.count, 3) << "callback fired for every contact";
+
+    p2p_destroy(ctx);
+    fs::remove_all(dir);
+}
+
+// p2p_check_presence + p2p_subscribe_presence must reject count<0
+// without hitting the reserve(size_t) underflow (which would allocate
+// ~SIZE_MAX bytes on a 64-bit host).  Also pins the count=0 no-op.
+TEST(CApi, PresenceRejectsNegativeAndZeroCount) {
+    const std::string dir = makeTempDir("p2p-capi-presence");
+    p2p_context* ctx = p2p_create(dir.c_str(), nullPlatform());
+    ASSERT_NE(ctx, nullptr);
+
+    const char* peerIds[] = {"alice", "bob"};
+
+    // Each of these would have underflowed reserve() pre-fix.  The
+    // C API accepts null peer_ids as "ignore the rest" too.
+    p2p_check_presence(nullptr, peerIds, 2);
+    p2p_check_presence(ctx, nullptr, 2);
+    p2p_check_presence(ctx, peerIds, -1);
+    p2p_check_presence(ctx, peerIds, 0);
+    p2p_check_presence(ctx, peerIds, -2147483648); // INT_MIN
+
+    p2p_subscribe_presence(nullptr, peerIds, 2);
+    p2p_subscribe_presence(ctx, nullptr, 2);
+    p2p_subscribe_presence(ctx, peerIds, -1);
+    p2p_subscribe_presence(ctx, peerIds, 0);
+    p2p_subscribe_presence(ctx, peerIds, -1000000);
+
+    p2p_destroy(ctx);
+    fs::remove_all(dir);
+}
+
+TEST(CApi, HttpResponseRejectsMalformedInputs) {
+    const std::string dir = makeTempDir("p2p-capi-httpcrash");
+    p2p_context* ctx = p2p_create(dir.c_str(), nullPlatform());
+    ASSERT_NE(ctx, nullptr);
+
+    // No request was ever issued, so the request_id won't match — the
+    // downstream onResponse() will look it up + bail.  But the
+    // pre-lookup boundary guards in p2p_http_response are what we're
+    // pinning here: malformed (body, body_len) must not crash.
+    p2p_http_response(nullptr, 0, 200, nullptr, 0,    nullptr);
+    p2p_http_response(ctx,     0, 200, nullptr, 0,    nullptr);
+    p2p_http_response(ctx,     0, 200, nullptr, 16,   nullptr);   // null + positive
+    p2p_http_response(ctx,     0, 500, nullptr, -1,   "boom");    // null + negative
+    const uint8_t body[1] = {0};
+    p2p_http_response(ctx,     0, 200, body,    -1,   nullptr);   // valid ptr + neg
+    p2p_http_response(ctx,     0, 200, body,    0,    nullptr);   // empty body OK
+
+    p2p_destroy(ctx);
     fs::remove_all(dir);
 }

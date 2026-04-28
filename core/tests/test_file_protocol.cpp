@@ -42,7 +42,7 @@ namespace {
 
 using p2p_test::makeTempDir;
 using p2p_test::makeTempPath;
-using Bytes = FileProtocol::Bytes;
+using Bytes = Bytes;
 
 // 32-byte non-zero vector.  Callers use it to verify that
 // declineIncoming / cancel actually zero the stored key on drop.
@@ -166,8 +166,15 @@ std::string                   FileProtocolSuite::s_peerId;
 // ── 1. Consent policy ────────────────────────────────────────────────────────
 
 TEST_F(FileProtocolSuite, Consent_DefaultValues) {
-    EXPECT_EQ(m_fp->autoAcceptMaxMB(), 100);
+    // Defaults must leave a NON-EMPTY prompt range (autoAccept <
+    // hardMax) so the consent prompt path is reachable.  If both
+    // defaults were equal the range would be empty and the consent
+    // prompt would be dead code.  25 MB auto-accept, 100 MB hard cap,
+    // 26-100 MB prompts the user.
+    EXPECT_EQ(m_fp->autoAcceptMaxMB(), 25);
     EXPECT_EQ(m_fp->hardMaxMB(),       100);
+    EXPECT_LT(m_fp->autoAcceptMaxMB(), m_fp->hardMaxMB())
+        << "consent prompt range must be non-empty by default";
     EXPECT_FALSE(m_fp->requireP2P());
 }
 

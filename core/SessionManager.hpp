@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -31,7 +33,6 @@
  * for byte blobs.
  */
 
-using Bytes = std::vector<uint8_t>;
 
 class SessionManager {
 public:
@@ -70,6 +71,16 @@ public:
 
     // Check if a ratchet session exists for a peer.
     bool hasSession(const std::string& peerIdB64u) const;
+
+    /// 8-byte stable identifier for the live DR session with `peerIdB64u`,
+    /// derived from the handshake-time root key (see RatchetSession::sessionId).
+    /// Returns an empty Bytes when no session exists yet — callers should
+    /// either establish one (via the regular send path that lazy-handshakes)
+    /// or skip the per-peer envelope.
+    ///
+    /// Used by Causally-Linked Pairwise group messaging to namespace
+    /// per-(sender, group, recipient) counters on the wire.
+    Bytes sessionIdFor(const std::string& peerIdB64u);
 
     // Get the last message key from the most recent encrypt() call.
     // Useful for deriving file transfer sub-keys.

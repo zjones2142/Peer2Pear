@@ -1,4 +1,6 @@
 #pragma once
+
+#include "types.hpp"
 //
 // Qt ↔ std interop helpers — permanent boundary layer between Qt-typed
 // callers (desktop UI, QuicConnection signals) and the std-typed core API.
@@ -32,7 +34,6 @@
 
 namespace p2p::bridge {
 
-using Bytes = std::vector<uint8_t>;
 
 inline Bytes toBytes(const QByteArray& q) {
     return Bytes(reinterpret_cast<const uint8_t*>(q.constData()),

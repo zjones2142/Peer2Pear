@@ -18,6 +18,7 @@
 // The single test enables cover traffic, fires the timer with zero
 // known peers, and asserts the captured envelope is self-addressed.
 
+#include "types.hpp"
 #include "RelayClient.hpp"
 #include "CryptoEngine.hpp"
 #include "IHttpClient.hpp"
@@ -40,7 +41,6 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using Bytes = std::vector<uint8_t>;
 
 namespace {
 
@@ -129,6 +129,7 @@ public:
 class SimpleWebSocket : public IWebSocket {
 public:
     std::string lastOpenUrl;
+    std::vector<std::string> sentTexts;  // captures outbound text frames
 
     void open(const std::string& url) override {
         lastOpenUrl = url;
@@ -144,7 +145,12 @@ public:
     bool isConnected() const override { return m_connected; }
     bool isIdle() const override { return !m_connected; }
 
-    void sendTextMessage(const std::string& /*message*/) override {
+    void sendTextMessage(const std::string& message) override {
+        sentTexts.push_back(message);
+        // Only the first text frame is auth — subsequent frames
+        // (push_register, presence_query, etc.) don't need a reply.
+        if (m_authReplied) return;
+        m_authReplied = true;
         nlohmann::json r;
         r["type"] = "auth_ok";
         if (onTextMessage) onTextMessage(r.dump());
@@ -152,6 +158,37 @@ public:
 
 private:
     bool m_connected = false;
+    bool m_authReplied = false;
+};
+
+// SimpleWebSocket variant that bumps a shared destruction counter on
+// teardown so tests can verify slave WSs were dropped without holding
+// dangling pointers.
+class TrackedWebSocket : public SimpleWebSocket {
+public:
+    explicit TrackedWebSocket(int* destroyCounter) : m_destroyCounter(destroyCounter) {}
+    ~TrackedWebSocket() override {
+        if (m_destroyCounter) ++(*m_destroyCounter);
+    }
+private:
+    int* m_destroyCounter = nullptr;
+};
+
+// Factory shim used by both the existing single-WS tests and the
+// new MultiSubscribe / ParallelFanOut suites.  RelayClient calls
+// create() once at construction (for the primary subscribe), then
+// per addSubscribeRelay() for slaves.  `created` tracks every WS
+// allocated; `destroyed` counts teardowns (so tests can verify
+// lifecycle without dangling pointers).
+class SimpleWebSocketFactory : public IWebSocketFactory {
+public:
+    std::unique_ptr<IWebSocket> create() override {
+        auto ws = std::make_unique<TrackedWebSocket>(&destroyed);
+        created.push_back(ws.get());
+        return ws;
+    }
+    std::vector<SimpleWebSocket*> created;  // non-owning, may dangle after relay teardown
+    int destroyed = 0;
 };
 
 }  // namespace
@@ -171,10 +208,10 @@ TEST(RelayCoverTraffic, SelfAddressedFallbackWhenNoPeersOnline) {
     const Bytes selfEdPub = crypto.identityPub();
     ASSERT_EQ(selfEdPub.size(), 32u);
 
-    FireableTimerFactory timers;
-    CapturingHttpClient  http;
-    SimpleWebSocket      ws;
-    RelayClient          relay(ws, http, timers, &crypto);
+    FireableTimerFactory   timers;
+    CapturingHttpClient    http;
+    SimpleWebSocketFactory wsFactory;
+    RelayClient            relay(wsFactory, http, timers, &crypto);
 
     relay.setRelayUrl("wss://mock-relay.test");
 
@@ -210,6 +247,65 @@ TEST(RelayCoverTraffic, SelfAddressedFallbackWhenNoPeersOnline) {
     fs::remove_all(dataDir);
 }
 
+// Arch-review #9: cover traffic must cover all three padding buckets.
+// Pre-fix cover only hit 2 KiB and 256 KiB, which meant a relay
+// observing "this client never emits 16 KiB envelopes" could
+// fingerprint a user who never sends medium-sized real traffic.
+// This test runs enough cover fires to see every bucket, then
+// verifies each one showed up at least once at privacy level 2
+// (uniform mode) and each one showed up at privacy level 1
+// (bandwidth-biased mode still allocates the medium bucket 30%).
+TEST(RelayCoverTraffic, CoverHitsAllThreePaddingBucketsAtBothLevels) {
+    ASSERT_GE(sodium_init(), 0);
+
+    constexpr size_t kBucketSmall  =   2 * 1024;
+    constexpr size_t kBucketMedium =  16 * 1024;
+    constexpr size_t kBucketLarge  = 256 * 1024;
+
+    auto runLevel = [&](int level) {
+        const std::string dataDir = makeTempDir("p2p-cover-dist");
+        CryptoEngine crypto;
+        crypto.setDataDir(dataDir);
+        crypto.setPassphrase("cover-dist-passphrase");
+        ASSERT_NO_THROW(crypto.ensureIdentity());
+
+        FireableTimerFactory   timers;
+        CapturingHttpClient    http;
+        SimpleWebSocketFactory wsFactory;
+        RelayClient            relay(wsFactory, http, timers, &crypto);
+        relay.setRelayUrl("wss://mock-relay.test");
+        relay.connectToRelay();
+        ASSERT_TRUE(relay.isConnected());
+        http.posts.clear();
+        relay.setPrivacyLevel(level);
+
+        // Fire ~300 cover events; with either mode, probabilities
+        // make a missed bucket vanishingly unlikely (biased mode has
+        // 10% large → P(miss) ≈ 0.9^300 ≈ 10^-14).
+        size_t smallCount = 0, mediumCount = 0, largeCount = 0;
+        for (int i = 0; i < 300; ++i) {
+            if (!timers.fireNext()) break;
+        }
+        for (const auto& p : http.posts) {
+            switch (p.body.size()) {
+                case kBucketSmall:  ++smallCount; break;
+                case kBucketMedium: ++mediumCount; break;
+                case kBucketLarge:  ++largeCount; break;
+                default: break;  // retry queue / other — ignore
+            }
+        }
+        EXPECT_GT(smallCount,  0u) << "level " << level << ": small bucket never hit";
+        EXPECT_GT(mediumCount, 0u) << "level " << level << ": medium bucket never hit";
+        EXPECT_GT(largeCount,  0u) << "level " << level << ": large bucket never hit";
+
+        relay.setPrivacyLevel(0);  // stops the cover timer
+        fs::remove_all(dataDir);
+    };
+
+    runLevel(1);
+    runLevel(2);
+}
+
 // ── setRelayUrl refuses non-TLS URLs ─────────────────────────────────────
 // An http:// or ws:// URL would silently downgrade the transport to
 // cleartext.  Only https:// / wss:// are accepted for production URLs;
@@ -233,45 +329,518 @@ TEST(RelayUrlScheme, RejectsNonTlsUrls) {
     };
 
     for (const auto& c : cases) {
-        FireableTimerFactory timers;
-        CapturingHttpClient  http;
-        SimpleWebSocket      ws;
-        CryptoEngine         crypto;
-        RelayClient          relay(ws, http, timers, &crypto);
+        FireableTimerFactory   timers;
+        CapturingHttpClient    http;
+        SimpleWebSocketFactory wsFactory;
+        CryptoEngine           crypto;
+        RelayClient            relay(wsFactory, http, timers, &crypto);
 
-        // Detach the onConnected callback so RelayClient::authenticate()
-        // never runs (it would try to sign with an uninitialised identity
-        // and crash).  We only need to observe the URL passed to open().
-        ws.onConnected = nullptr;
+        // Grab the primary WS that the factory just created so we can
+        // detach onConnected (RelayClient::authenticate would otherwise
+        // sign with an uninitialised identity and crash) and observe
+        // the URL passed to open().
+        ASSERT_EQ(wsFactory.created.size(), 1u);
+        SimpleWebSocket* ws = wsFactory.created[0];
+        ws->onConnected = nullptr;
 
         relay.setRelayUrl(c.url);
         relay.connectToRelay();
 
         const bool sawTlsOpen =
-            ws.lastOpenUrl.rfind("wss://",  0) == 0 ||
-            ws.lastOpenUrl.rfind("https://", 0) == 0;
-        const bool sawAnyOpen = !ws.lastOpenUrl.empty();
+            ws->lastOpenUrl.rfind("wss://",  0) == 0 ||
+            ws->lastOpenUrl.rfind("https://", 0) == 0;
+        const bool sawAnyOpen = !ws->lastOpenUrl.empty();
         const bool sawDevOpen =
-            ws.lastOpenUrl.rfind("ws://localhost",  0) == 0 ||
-            ws.lastOpenUrl.rfind("ws://127.0.0.1",  0) == 0 ||
-            ws.lastOpenUrl.rfind("http://localhost", 0) == 0;
+            ws->lastOpenUrl.rfind("ws://localhost",  0) == 0 ||
+            ws->lastOpenUrl.rfind("ws://127.0.0.1",  0) == 0 ||
+            ws->lastOpenUrl.rfind("http://localhost", 0) == 0;
 
         if (c.shouldAccept) {
             EXPECT_TRUE(sawAnyOpen) << "accepted url=\"" << c.url << "\" but WS.open never fired";
             EXPECT_TRUE(sawTlsOpen || sawDevOpen)
                 << "accepted url=\"" << c.url << "\" produced ws.open(\""
-                << ws.lastOpenUrl << "\")";
+                << ws->lastOpenUrl << "\")";
         } else {
             // A rejected URL leaves m_relayUrl empty.  connectToRelay
             // would then ws.open("ws:///v1/receive") or similar path-
             // only garbage — we want NO host in the opened URL.
             const bool hostlessOrEmpty =
-                ws.lastOpenUrl.empty() ||
-                ws.lastOpenUrl.find("://") == std::string::npos ||
-                ws.lastOpenUrl.find("://relay.peer2pear.org") == std::string::npos;
+                ws->lastOpenUrl.empty() ||
+                ws->lastOpenUrl.find("://") == std::string::npos ||
+                ws->lastOpenUrl.find("://relay.peer2pear.org") == std::string::npos;
             EXPECT_TRUE(hostlessOrEmpty)
                 << "rejected url=\"" << c.url
-                << "\" leaked through to ws.open(\"" << ws.lastOpenUrl << "\")";
+                << "\" leaked through to ws.open(\"" << ws->lastOpenUrl << "\")";
         }
     }
+}
+
+// Push token registration E2E.  A call to
+// RelayClient::registerPushToken on a connected relay must produce
+// exactly one push_register text frame with the right shape.  An
+// unconnected client should cache the token and replay it on the
+// next auth_ok (separate concern — tested inside RelayClient's
+// auth path; this test only pins the connected path).
+TEST(PushRegistration, SendsPushRegisterFrameOnConnectedRelay) {
+    ASSERT_GE(sodium_init(), 0);
+
+    const std::string dataDir = makeTempDir("p2p-push-e2e");
+    CryptoEngine crypto;
+    crypto.setDataDir(dataDir);
+    crypto.setPassphrase("push-test-passphrase");
+    ASSERT_NO_THROW(crypto.ensureIdentity());
+
+    FireableTimerFactory   timers;
+    CapturingHttpClient    http;
+    SimpleWebSocketFactory wsFactory;
+    RelayClient            relay(wsFactory, http, timers, &crypto);
+    ASSERT_EQ(wsFactory.created.size(), 1u);
+    SimpleWebSocket* ws = wsFactory.created[0];
+
+    relay.setRelayUrl("wss://mock-relay.test");
+    relay.connectToRelay();
+    ASSERT_TRUE(relay.isConnected());
+
+    // Clear the auth frame so we can find the push_register frame alone.
+    const size_t framesBeforePush = ws->sentTexts.size();
+
+    relay.registerPushToken("ios", "deadbeefcafef00d");
+
+    ASSERT_GT(ws->sentTexts.size(), framesBeforePush)
+        << "registerPushToken did not send a frame while connected";
+
+    // The newest frame must be the push_register payload with the
+    // right platform + token.
+    const std::string& pushFrame = ws->sentTexts.back();
+    auto j = nlohmann::json::parse(pushFrame);
+    EXPECT_EQ(j.value("type",     std::string()), "push_register");
+    EXPECT_EQ(j.value("platform", std::string()), "ios");
+    EXPECT_EQ(j.value("token",    std::string()), "deadbeefcafef00d");
+
+    // Empty token → unregister.  Also goes on the wire as push_register
+    // with empty token (relay interprets empty as delete).
+    relay.registerPushToken("ios", "");
+    const std::string& unregFrame = ws->sentTexts.back();
+    auto jEmpty = nlohmann::json::parse(unregFrame);
+    EXPECT_EQ(jEmpty.value("type",     std::string()), "push_register");
+    EXPECT_EQ(jEmpty.value("token",    std::string()), "");
+
+    fs::remove_all(dataDir);
+}
+
+// ── Parallel fan-out (Phase 0a redundancy) ──────────────────────────────────
+//
+// Phase 0a adds a transport-level dial that posts the same sealed
+// envelope to multiple configured send relays in parallel, so a
+// recipient mailbox is replicated across them and one relay being
+// unreachable doesn't drop delivery.  Distinct from multi-hop, which
+// targets anonymity by chaining onion-wrapped hops.
+//
+// These tests pin the dispatch logic in RelayClient::sendEnvelope:
+//
+//   * fan-out posts once per configured relay when enabled
+//   * fan-out is bounded by K when configured (random subset)
+//   * file-chunk traffic skips fan-out (per-class policy)
+//   * fan-out is a no-op with fewer than 2 send relays
+
+namespace {
+
+// Build a syntactically-valid sealed envelope of arbitrary content.
+// The relay-routing header (1B version + 32B recipient) is the only
+// thing the transport inspects pre-send; the body bytes are opaque.
+Bytes makeFakeEnvelope(uint8_t marker, size_t pad = 64) {
+    Bytes env;
+    env.reserve(33 + pad);
+    env.push_back(0x01);                  // routing version
+    env.insert(env.end(), 32, marker);    // 32B "recipient"
+    env.insert(env.end(), pad, marker);   // body filler
+    return env;
+}
+
+struct PrimedRelay {
+    std::string                              dataDir;
+    std::unique_ptr<CryptoEngine>            crypto;
+    std::unique_ptr<FireableTimerFactory>    timers;
+    std::unique_ptr<CapturingHttpClient>     http;
+    std::unique_ptr<SimpleWebSocketFactory>  wsFactory;
+    SimpleWebSocket*                         ws = nullptr;  // non-owning
+    std::unique_ptr<RelayClient>             relay;
+};
+
+PrimedRelay primeRelay(const std::vector<std::string>& sendRelays) {
+    PrimedRelay r;
+    r.dataDir = makeTempDir("p2p-fanout");
+    r.crypto  = std::make_unique<CryptoEngine>();
+    r.crypto->setDataDir(r.dataDir);
+    r.crypto->setPassphrase("fanout-test-passphrase");
+    r.crypto->ensureIdentity();
+
+    r.timers    = std::make_unique<FireableTimerFactory>();
+    r.http      = std::make_unique<CapturingHttpClient>();
+    r.wsFactory = std::make_unique<SimpleWebSocketFactory>();
+    r.relay     = std::make_unique<RelayClient>(
+        *r.wsFactory, *r.http, *r.timers, r.crypto.get());
+    // RelayClient called wsFactory.create() once for the primary;
+    // grab the resulting SimpleWebSocket as a non-owning view for
+    // tests that need to drive auth/binary frames directly.
+    EXPECT_EQ(r.wsFactory->created.size(), 1u);
+    r.ws = r.wsFactory->created[0];
+
+    r.relay->setRelayUrl("wss://primary.test");
+    r.relay->connectToRelay();
+    EXPECT_TRUE(r.relay->isConnected());
+    for (const std::string& url : sendRelays) r.relay->addSendRelay(url);
+    r.http->posts.clear();  // discard refreshRelayInfo / cover noise
+    return r;
+}
+
+// Count POSTs whose URL targets /v1/send (i.e., direct sends, not
+// /v1/forward-onion or /v1/relay_info).
+size_t countSendPosts(const std::vector<CapturingHttpClient::Post>& posts) {
+    size_t n = 0;
+    for (const auto& p : posts) {
+        if (p.url.find("/v1/send") != std::string::npos) ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST(ParallelFanOut, PostsToAllConfiguredSendRelaysWhenEnabled) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({"https://r1.test", "https://r2.test", "https://r3.test"});
+    r.relay->setParallelFanOut(true);
+    r.relay->setParallelFanOutK(0);
+
+    const Bytes env = makeFakeEnvelope(0xAA);
+    r.relay->sendEnvelope(env);
+
+    const size_t sends = countSendPosts(r.http->posts);
+    EXPECT_EQ(sends, 3u)
+        << "parallel fan-out posted " << sends
+        << " envelopes, expected one per send relay";
+
+    // Distinct base URLs — fan-out picks without replacement.
+    std::set<std::string> targets;
+    for (const auto& p : r.http->posts) {
+        if (p.url.find("/v1/send") == std::string::npos) continue;
+        const auto schemeEnd = p.url.find("://");
+        const auto pathStart = p.url.find('/', schemeEnd + 3);
+        targets.insert(p.url.substr(0, pathStart));
+    }
+    EXPECT_EQ(targets.size(), 3u);
+
+    // Body bytes byte-identical across copies — recipient dedup
+    // depends on stable content hashing.
+    for (const auto& p : r.http->posts) {
+        if (p.url.find("/v1/send") == std::string::npos) continue;
+        EXPECT_EQ(p.body, env);
+    }
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(ParallelFanOut, KCapsTheNumberOfRelays) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({
+        "https://r1.test", "https://r2.test", "https://r3.test",
+        "https://r4.test", "https://r5.test"
+    });
+    r.relay->setParallelFanOut(true);
+    r.relay->setParallelFanOutK(2);
+
+    r.relay->sendEnvelope(makeFakeEnvelope(0xBB));
+    EXPECT_EQ(countSendPosts(r.http->posts), 2u)
+        << "K=2 should produce exactly 2 POSTs out of 5 configured relays";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(ParallelFanOut, KZeroOrOversizeBroadcastsToAll) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({"https://r1.test", "https://r2.test", "https://r3.test"});
+    r.relay->setParallelFanOut(true);
+
+    r.relay->setParallelFanOutK(0);
+    r.relay->sendEnvelope(makeFakeEnvelope(0xC1));
+    EXPECT_EQ(countSendPosts(r.http->posts), 3u);
+
+    r.http->posts.clear();
+
+    r.relay->setParallelFanOutK(99);
+    r.relay->sendEnvelope(makeFakeEnvelope(0xC2));
+    EXPECT_EQ(countSendPosts(r.http->posts), 3u);
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(ParallelFanOut, FileChunkClassSkipsFanOut) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({"https://r1.test", "https://r2.test", "https://r3.test"});
+    r.relay->setParallelFanOut(true);
+    r.relay->setParallelFanOutK(0);
+
+    r.relay->sendEnvelope(makeFakeEnvelope(0xCC),
+                          RelayClient::TrafficClass::FileChunk);
+    EXPECT_EQ(countSendPosts(r.http->posts), 1u)
+        << "file chunks must NOT be replicated across relays — "
+        << "240 KB × hundreds of chunks would multiply egress";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(ParallelFanOut, NoOpWithFewerThanTwoSendRelays) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({"https://r1.test"});
+    r.relay->setParallelFanOut(true);
+
+    r.relay->sendEnvelope(makeFakeEnvelope(0xDD));
+    EXPECT_EQ(countSendPosts(r.http->posts), 1u);
+
+    fs::remove_all(r.dataDir);
+}
+
+// ── Receive-side dedup ──────────────────────────────────────────────────────
+//
+// When a recipient subscribes to multiple relays simultaneously (or
+// receives the same sealed envelope through multiple WS pushes for
+// any other reason), the second delivery must not surface to UI.
+// RelayClient hashes incoming envelopes (BLAKE2b-128) and dedups via
+// a bounded LRU before invoking onEnvelopeReceived.
+
+TEST(ReceiveDedup, DropsExactRepeatOfSameEnvelope) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    int deliveries = 0;
+    r.relay->onEnvelopeReceived = [&](const Bytes&) { ++deliveries; };
+
+    const Bytes env = makeFakeEnvelope(0xE1, 128);
+
+    r.ws->onBinaryMessage(env);
+    r.ws->onBinaryMessage(env);
+    r.ws->onBinaryMessage(env);
+
+    EXPECT_EQ(deliveries, 1)
+        << "dedup should collapse 3 deliveries of identical bytes to 1";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(ReceiveDedup, DistinctEnvelopesAllPassThrough) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    int deliveries = 0;
+    r.relay->onEnvelopeReceived = [&](const Bytes&) { ++deliveries; };
+
+    r.ws->onBinaryMessage(makeFakeEnvelope(0xF1));
+    r.ws->onBinaryMessage(makeFakeEnvelope(0xF2));
+    r.ws->onBinaryMessage(makeFakeEnvelope(0xF3));
+
+    EXPECT_EQ(deliveries, 3)
+        << "dedup must distinguish by content; distinct envelopes pass";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(ReceiveDedup, OneByteDifferenceIsADifferentEnvelope) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    int deliveries = 0;
+    r.relay->onEnvelopeReceived = [&](const Bytes&) { ++deliveries; };
+
+    Bytes a = makeFakeEnvelope(0x10, 64);
+    Bytes b = a;
+    b.back() ^= 0x01;  // flip a single bit
+
+    r.ws->onBinaryMessage(a);
+    r.ws->onBinaryMessage(b);
+
+    EXPECT_EQ(deliveries, 2)
+        << "a one-bit difference must hash differently and pass dedup";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(ReceiveDedup, IgnoresZeroByteCoverDummies) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    int deliveries = 0;
+    r.relay->onEnvelopeReceived = [&](const Bytes&) { ++deliveries; };
+
+    Bytes dummy = makeFakeEnvelope(0xAB);
+    dummy[0] = 0x00;  // cover-traffic version byte
+    r.ws->onBinaryMessage(dummy);
+
+    EXPECT_EQ(deliveries, 0) << "cover dummies must not surface to UI";
+
+    fs::remove_all(r.dataDir);
+}
+
+// ── Multi-relay subscribe (Phase 0a Milestone 2) ────────────────────────────
+//
+// IWebSocketFactory + addSubscribeRelay extend the receiver to listen
+// on N relays simultaneously.  Together with parallel send fan-out,
+// this delivers true redundancy: sender posts to N relays, receiver
+// subscribes to those same N relays, dedup catches duplicates.
+//
+// These tests pin the slave-WS lifecycle:
+//   * factory wires up additional WS instances on addSubscribeRelay
+//   * slaves authenticate independently of the primary
+//   * envelopes from any slave route through onWsBinaryMessage
+//   * dedup catches the same envelope arriving from primary + slave
+//   * addSubscribeRelay without a factory is a safe no-op
+
+// In the IWebSocketFactory model, the primary subscribe is created
+// at RelayClient construction (factory.created[0] in the PrimedRelay).
+// Each addSubscribeRelay() then creates one more slave, appending to
+// factory.created.  Tests below indexed by [primary=0, slave1=1,
+// slave2=2, ...].
+
+TEST(MultiSubscribe, FactoryCreatesSlaveOnAddSubscribeRelay) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    // primary already counts as factory.created[0]
+    EXPECT_EQ(r.wsFactory->created.size(), 1u);
+
+    r.relay->addSubscribeRelay("https://slave1.test");
+    ASSERT_EQ(r.wsFactory->created.size(), 2u);
+
+    // Slave should already be connected because the primary was
+    // connected when the slave was added (eager-connect path).
+    EXPECT_TRUE(r.wsFactory->created[1]->isConnected());
+    EXPECT_NE(r.wsFactory->created[1]->lastOpenUrl.find("slave1.test"),
+              std::string::npos);
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(MultiSubscribe, EnvelopesFromSlavesReachOnEnvelopeReceived) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    r.relay->addSubscribeRelay("https://slave1.test");
+    r.relay->addSubscribeRelay("https://slave2.test");
+
+    ASSERT_EQ(r.wsFactory->created.size(), 3u);
+
+    int deliveries = 0;
+    r.relay->onEnvelopeReceived = [&](const Bytes&) { ++deliveries; };
+
+    r.wsFactory->created[1]->onBinaryMessage(makeFakeEnvelope(0xA1));
+    r.wsFactory->created[2]->onBinaryMessage(makeFakeEnvelope(0xA2));
+
+    EXPECT_EQ(deliveries, 2)
+        << "distinct envelopes from each slave must reach UI";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(MultiSubscribe, DedupDropsEnvelopeArrivingViaPrimaryThenSlave) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    r.relay->addSubscribeRelay("https://slave1.test");
+    ASSERT_EQ(r.wsFactory->created.size(), 2u);
+
+    int deliveries = 0;
+    r.relay->onEnvelopeReceived = [&](const Bytes&) { ++deliveries; };
+
+    const Bytes env = makeFakeEnvelope(0xB0, 96);
+
+    // Same envelope delivered through primary first, then slave.
+    r.ws->onBinaryMessage(env);
+    r.wsFactory->created[1]->onBinaryMessage(env);
+
+    EXPECT_EQ(deliveries, 1)
+        << "dedup should suppress the second delivery from the slave";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(MultiSubscribe, DedupAlsoCoversSlaveToSlaveDuplicates) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    r.relay->addSubscribeRelay("https://slave1.test");
+    r.relay->addSubscribeRelay("https://slave2.test");
+    ASSERT_EQ(r.wsFactory->created.size(), 3u);
+
+    int deliveries = 0;
+    r.relay->onEnvelopeReceived = [&](const Bytes&) { ++deliveries; };
+
+    const Bytes env = makeFakeEnvelope(0xC0, 200);
+
+    // Same envelope arriving on both slaves (e.g., sender fan-out
+    // posted to both relays, both delivered to us).
+    r.wsFactory->created[1]->onBinaryMessage(env);
+    r.wsFactory->created[2]->onBinaryMessage(env);
+
+    EXPECT_EQ(deliveries, 1)
+        << "dedup must work across slave-WS deliveries too";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(MultiSubscribe, ClearSubscribeRelaysTearsDownSlaves) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    r.relay->addSubscribeRelay("https://slave1.test");
+    r.relay->addSubscribeRelay("https://slave2.test");
+
+    ASSERT_EQ(r.wsFactory->created.size(), 3u);
+    // Slaves are alive while RelayClient owns them.
+    EXPECT_TRUE(r.wsFactory->created[1]->isConnected());
+    EXPECT_TRUE(r.wsFactory->created[2]->isConnected());
+    EXPECT_EQ(r.wsFactory->destroyed, 0);
+
+    r.relay->clearSubscribeRelays();
+
+    // After clear, both slave WSs have been destroyed.  Don't touch
+    // the dangling created[1]/created[2] pointers — count destructions
+    // via the deleter counter instead.  Primary is still alive.
+    EXPECT_EQ(r.wsFactory->destroyed, 2)
+        << "clearSubscribeRelays must release ownership of all slaves";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(MultiSubscribe, AddSubscribeRelayDedupsByUrl) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    r.relay->addSubscribeRelay("https://slave1.test");
+    r.relay->addSubscribeRelay("https://slave1.test");  // duplicate
+    r.relay->addSubscribeRelay("https://slave1.test");  // duplicate
+
+    // Primary (1) + one slave (1) = 2 created total
+    EXPECT_EQ(r.wsFactory->created.size(), 2u)
+        << "duplicate URLs must not spawn redundant slaves";
+
+    fs::remove_all(r.dataDir);
+}
+
+TEST(MultiSubscribe, RejectsNonTlsSubscribeUrl) {
+    ASSERT_GE(sodium_init(), 0);
+
+    auto r = primeRelay({});
+    r.relay->addSubscribeRelay("http://malicious.test");
+    EXPECT_EQ(r.wsFactory->created.size(), 1u)
+        << "non-TLS subscribe URL must be refused (only primary present)";
+
+    // Localhost dev exception still works.
+    r.relay->addSubscribeRelay("http://localhost:9000");
+    EXPECT_EQ(r.wsFactory->created.size(), 2u);
+
+    fs::remove_all(r.dataDir);
 }

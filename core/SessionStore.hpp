@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -22,7 +24,6 @@
  */
 class SessionStore {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     // db must outlive this SessionStore.
     // storeKey must be exactly 32 bytes to enable at-rest encryption.
@@ -49,6 +50,33 @@ public:
     // the peer.  Returns peer IDs whose handshakes were pruned (used by
     // callers for upgrade detection).
     std::vector<std::string> pruneStaleHandshakes(int maxAgeSecs = 300);
+
+    // ── Group sender-chain persistence ────────────────────────────────
+    // Stores one chain blob per (group, sender) pair.  The sender_id
+    // for our own outbound chain is our own peer_id; inbound chains
+    // from other group members carry their peer_id.  Callers
+    // discriminate based on the sender_id at restore time.  Blobs are
+    // encrypted at rest with AAD="sender_chain|<gid>|<sid>" so a row
+    // swap between groups or senders trips the AEAD tag.
+
+    struct SenderChainRecord {
+        std::string groupId;
+        std::string senderId;
+        uint64_t    epoch = 0;
+        Bytes       chainBlob;   // decrypted serialize() output
+    };
+
+    void saveSenderChain(const std::string& groupId,
+                          const std::string& senderId,
+                          uint64_t epoch,
+                          const Bytes& chainBlob);
+
+    std::vector<SenderChainRecord> loadAllSenderChains() const;
+
+    void deleteSenderChain(const std::string& groupId,
+                            const std::string& senderId);
+
+    void deleteSenderChainsForGroup(const std::string& groupId);
 
 private:
     // Encrypt/decrypt a BLOB using XChaCha20-Poly1305 and m_storeKey.

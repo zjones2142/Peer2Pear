@@ -23,6 +23,7 @@
 // directory — see cleanupSavedPath() below.  The transferId is random
 // per test so there's no collision with real user files.
 
+#include "types.hpp"
 #include "FileTransferManager.hpp"
 #include "CryptoEngine.hpp"
 #include "SqlCipherDb.hpp"
@@ -44,7 +45,6 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using Bytes = std::vector<uint8_t>;
 
 namespace {
 
@@ -303,7 +303,14 @@ TEST_F(FileTransferRoundTrip, FileRoundTripInOrderReassembles) {
     auto markSeen = [](const std::string&) { return true; };
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
     for (const auto& w : wire) {
-        EXPECT_TRUE(receiver->handleFileEnvelope(w.peerId, w.payload, markSeen, fileKeys));
+        // fromId is who the receiver believes sent the chunk — in
+        // production this comes from the sealed envelope's sender
+        // pub.  Past versions of this test passed `w.peerId` (which
+        // is actually the recipient that the sender targeted), and
+        // handleFileEnvelope's trial-decrypt loop masked the
+        // mismatch; the peer-scoped filter now requires the arg to
+        // match a key in fileKeys.
+        EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
     EXPECT_TRUE(transferCompletedFired);
@@ -336,7 +343,14 @@ TEST_F(FileTransferRoundTrip, FileRoundTripOutOfOrderReassembles) {
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
     std::reverse(wire.begin(), wire.end());
     for (const auto& w : wire) {
-        EXPECT_TRUE(receiver->handleFileEnvelope(w.peerId, w.payload, markSeen, fileKeys));
+        // fromId is who the receiver believes sent the chunk — in
+        // production this comes from the sealed envelope's sender
+        // pub.  Past versions of this test passed `w.peerId` (which
+        // is actually the recipient that the sender targeted), and
+        // handleFileEnvelope's trial-decrypt loop masked the
+        // mismatch; the peer-scoped filter now requires the arg to
+        // match a key in fileKeys.
+        EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
     EXPECT_TRUE(transferCompletedFired);
@@ -379,7 +393,14 @@ TEST_F(FileTransferRoundTrip, HashMismatchDiscardsFile) {
     auto markSeen = [](const std::string&) { return true; };
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
     for (const auto& w : wire) {
-        EXPECT_TRUE(receiver->handleFileEnvelope(w.peerId, w.payload, markSeen, fileKeys));
+        // fromId is who the receiver believes sent the chunk — in
+        // production this comes from the sealed envelope's sender
+        // pub.  Past versions of this test passed `w.peerId` (which
+        // is actually the recipient that the sender targeted), and
+        // handleFileEnvelope's trial-decrypt loop masked the
+        // mismatch; the peer-scoped filter now requires the arg to
+        // match a key in fileKeys.
+        EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, w.payload, markSeen, fileKeys));
     }
 
     EXPECT_TRUE(transferCompletedFired) << "transfer should still fire 'completed' to clean up";
@@ -405,7 +426,7 @@ TEST_F(FileTransferRoundTrip, ResumptionListsMissingChunksAfterRestart) {
     // Attach a fresh DB to the receiver so the partial transfer persists.
     const std::string dbPath = makeTempPath("p2p-ft-resume", ".db");
     SqlCipherDb db;
-    SqlCipherDb::Bytes dbKey(32);
+    Bytes dbKey(32);
     randombytes_buf(dbKey.data(), dbKey.size());
     ASSERT_TRUE(db.open(dbPath, dbKey)) << db.lastError();
     receiver->setDatabase(&db);
@@ -420,8 +441,9 @@ TEST_F(FileTransferRoundTrip, ResumptionListsMissingChunksAfterRestart) {
     // Deliver only chunks 0 and 2 — leave 1 missing.
     auto markSeen = [](const std::string&) { return true; };
     const std::map<std::string, Bytes> fileKeys = {{senderPeerId, fileKey}};
-    EXPECT_TRUE(receiver->handleFileEnvelope(wire[0].peerId, wire[0].payload, markSeen, fileKeys));
-    EXPECT_TRUE(receiver->handleFileEnvelope(wire[2].peerId, wire[2].payload, markSeen, fileKeys));
+    // fromId is the sender's ID — see peer-scoped filter note above.
+    EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, wire[0].payload, markSeen, fileKeys));
+    EXPECT_TRUE(receiver->handleFileEnvelope(senderPeerId, wire[2].payload, markSeen, fileKeys));
     EXPECT_FALSE(transferCompletedFired);  // still waiting on chunk 1
 
     // Simulate a restart: throw away the receiver, build a new one on the

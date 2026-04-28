@@ -36,10 +36,10 @@ namespace {
 
 using p2p_test::makeTempDir;
 using p2p_test::makeTempPath;
-using Bytes = SessionSealer::Bytes;
+using Bytes = Bytes;
 
-SqlCipherDb::Bytes randomKey32() {
-    SqlCipherDb::Bytes k(32);
+Bytes randomKey32() {
+    Bytes k(32);
     randombytes_buf(k.data(), k.size());
     return k;
 }
@@ -435,4 +435,79 @@ TEST_F(SessionSealerSuite, SealForPeer_EmptyWithoutSessionManager) {
     // No m_sessionMgr wired → must return empty, not crash.
     Bytes pt = {1, 2, 3};
     EXPECT_TRUE(m_sealer->sealForPeer(s_peerIdB64u, pt).empty());
+}
+
+// Arch-review #2: file chunks must share the hard-block-on-key-change
+// gate with text messages.  Before the fix, the setSealFn path called
+// SealedEnvelope::seal directly and skipped the trust check, so a
+// peer whose safety number had just flipped would keep receiving
+// chunks of any in-flight transfer.  sealPreEncryptedForPeer now
+// runs detectKeyChange + the hard-block policy exactly like
+// sealForPeer.  Test: verify a mismatch + hard-block on → empty
+// result, and verify that a Verified peer seals normally.
+TEST_F(SessionSealerSuite, SealPreEncrypted_HardBlockRefusesOnKeyMismatch) {
+    const Bytes chunk = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+
+    // Baseline: unverified peer, hard-block off → seal succeeds (the
+    // payload + wrap is self-contained, no SessionManager needed).
+    m_sealer->setHardBlockOnKeyChange(false);
+    Bytes sealed = m_sealer->sealPreEncryptedForPeer(s_peerIdB64u, chunk);
+    EXPECT_FALSE(sealed.empty());
+
+    // Verify the peer, corrupt the stored fingerprint so the current
+    // check produces a Mismatch, and turn on hard-block.
+    ASSERT_TRUE(m_sealer->markPeerVerified(s_peerIdB64u));
+    corruptStoredFingerprint(*m_db, s_peerIdB64u);
+    m_sealer->clearPeerKeyCache();
+    m_sealer->setHardBlockOnKeyChange(true);
+
+    Bytes blocked = m_sealer->sealPreEncryptedForPeer(s_peerIdB64u, chunk);
+    EXPECT_TRUE(blocked.empty())
+        << "file-chunk seal must refuse when hard-block is on and peer Mismatch";
+
+    // Turning hard-block back off restores the seal (the key change is
+    // still observed once — onPeerKeyChanged — but not fatal).
+    m_sealer->setHardBlockOnKeyChange(false);
+    Bytes afterUnblock = m_sealer->sealPreEncryptedForPeer(s_peerIdB64u, chunk);
+    EXPECT_FALSE(afterUnblock.empty());
+}
+
+TEST_F(SessionSealerSuite, SealPreEncrypted_RejectsTruncatedPeerIdAndEmpty) {
+    const Bytes chunk = {0x11, 0x22, 0x33};
+
+    // Empty payload is refused up front — callers shouldn't reach us
+    // with nothing to seal.
+    EXPECT_TRUE(m_sealer->sealPreEncryptedForPeer(s_peerIdB64u, Bytes{}).empty());
+
+    // Truncated / oversized peerId — same posture as sealForPeer.
+    EXPECT_TRUE(m_sealer->sealPreEncryptedForPeer("", chunk).empty());
+    EXPECT_TRUE(m_sealer->sealPreEncryptedForPeer("abc", chunk).empty());
+    EXPECT_TRUE(m_sealer->sealPreEncryptedForPeer(
+        s_peerIdB64u.substr(0, 10), chunk).empty());
+}
+
+// peerIdB64u that decodes to anything other than 32 bytes must be
+// rejected up front.  Without this guard the libsodium call
+// crypto_sign_ed25519_pk_to_curve25519 reads past the end of the
+// underlying Bytes buffer (UB).  A no-session sealer is enough to
+// exercise the size check because the validation now runs before
+// the SessionManager wiring is touched.
+TEST_F(SessionSealerSuite, SealForPeer_RejectsTruncatedPeerId) {
+    Bytes pt = {1, 2, 3};
+
+    // Empty + various short truncations of a real peer ID.  Each should
+    // return empty (silent reject) instead of crashing on the missing
+    // SessionManager guard further down.
+    EXPECT_TRUE(m_sealer->sealForPeer("", pt).empty());
+    EXPECT_TRUE(m_sealer->sealForPeer("abc", pt).empty());
+    EXPECT_TRUE(m_sealer->sealForPeer(s_peerIdB64u.substr(0, 10), pt).empty());
+
+    // Garbage non-base64url string also decodes to fewer than 32 bytes
+    // (or empty, depending on the codec) — must reject the same way.
+    EXPECT_TRUE(m_sealer->sealForPeer(std::string(43, '!'), pt).empty());
+
+    // A correctly-shaped but oversized blob (extra padding) likewise
+    // decodes past 32 bytes; reject.
+    std::string oversized = s_peerIdB64u + s_peerIdB64u;  // 86 chars → 64+ bytes
+    EXPECT_TRUE(m_sealer->sealForPeer(oversized, pt).empty());
 }

@@ -52,7 +52,10 @@ require_cmd() {
 }
 
 require_cmd git   "Install git from your package manager or https://git-scm.com"
-require_cmd cmake "Install CMake >= 3.16 from your package manager or https://cmake.org"
+# cmake is auto-installed via brew/apt below alongside the other system
+# deps — checked again after install.  Mirrors the Windows pattern in
+# winsetup.bat (winget Kitware.CMake) so a fresh checkout becomes
+# `clone → ./setup.sh → cmake --build` with no manual prereq install.
 
 # ── System dependencies ──────────────────────────────────────────────────────
 #
@@ -80,7 +83,9 @@ install_macos_deps() {
 
     # `qt` currently maps to Qt 6 on Homebrew.  CMake's find_package(Qt6)
     # picks up the brew prefix via the default CMAKE_SYSTEM_PREFIX_PATH.
-    local pkgs=(ninja pkg-config qt)
+    # cmake bundled here so a fresh Mac without Xcode CLI tools / cmake
+    # is one `./setup.sh` away from buildable.
+    local pkgs=(cmake ninja pkg-config qt)
     for p in "${pkgs[@]}"; do
         if brew list --versions "$p" >/dev/null 2>&1; then
             echo "  [ok] $p (already installed)"
@@ -100,6 +105,7 @@ install_debian_deps() {
     # back to the legacy one if unavailable.
     local base_pkgs=(
         build-essential
+        cmake
         ninja-build
         pkg-config
         qt6-base-dev
@@ -153,6 +159,22 @@ else
     echo "    sudo pacman -S base-devel ninja pkgconf cmake qt6-base qt6-websockets"
     exit 1
 fi
+
+# Re-check cmake after the install step.  brew + apt usually put their
+# binaries in directories already on PATH, so this is normally a no-op.
+# But on a fresh Homebrew install (where /opt/homebrew/bin or
+# /usr/local/bin isn't yet on the user's PATH) cmake exists on disk but
+# isn't visible to this shell.  Detect + prompt the same way
+# winsetup.bat does with its `need_rerun` block, instead of letting
+# downstream `cmake --build` fail with a "command not found" later.
+hash -r 2>/dev/null  # bust bash's $PATH lookup cache
+if ! command -v cmake >/dev/null 2>&1; then
+    echo
+    echo "cmake was installed but isn't on this shell's PATH yet."
+    echo "Open a new terminal and re-run ./setup.sh"
+    exit 1
+fi
+echo "  [ok] cmake on PATH ($(cmake --version | head -1))"
 echo
 
 # ── vcpkg (manifest mode via vcpkg.json) ─────────────────────────────────────

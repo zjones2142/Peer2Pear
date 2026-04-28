@@ -1,7 +1,10 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -21,7 +24,6 @@
  */
 class IWebSocket {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     virtual ~IWebSocket() = default;
 
@@ -53,4 +55,34 @@ public:
 
     /// Called for each text frame received (auth response, presence updates).
     std::function<void(const std::string&)> onTextMessage;
+};
+
+/*
+ * IWebSocketFactory — creates additional IWebSocket instances on demand.
+ *
+ * Used by RelayClient's multi-relay subscribe feature: when a recipient
+ * is configured to listen on N relays simultaneously, RelayClient asks
+ * the factory for N-1 additional IWebSocket instances (the "primary"
+ * IWebSocket passed to the constructor counts as the first one).
+ *
+ * Each returned IWebSocket is owned by RelayClient via unique_ptr —
+ * the factory transfers ownership.  Implementations typically wrap a
+ * fresh QWebSocket / URLSessionWebSocketTask / OkHttp WebSocket each
+ * call so the platform-side connection state is independent.
+ *
+ * Mirrors ITimerFactory — same lifetime + ownership semantics.  Tests
+ * can ship a SimpleWebSocketFactory that hands back deterministic
+ * mock instances; production wires through to platform networking.
+ */
+class IWebSocketFactory {
+public:
+    virtual ~IWebSocketFactory() = default;
+
+    /// Create a fresh IWebSocket instance.  The returned object is
+    /// idle (not connected) and has no callbacks wired — the caller
+    /// installs onConnected / onBinaryMessage / etc. before calling
+    /// open().  Returning nullptr signals that the factory cannot
+    /// create more instances right now (e.g. resource cap hit);
+    /// RelayClient treats that as "skip this subscribe URL."
+    virtual std::unique_ptr<IWebSocket> create() = 0;
 };

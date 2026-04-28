@@ -1,4 +1,6 @@
 #pragma once
+
+#include "types.hpp"
 //
 // NiceConnection — ICE NAT-traversal layer (libnice + GLib).
 //
@@ -29,7 +31,6 @@
 
 class NiceConnection {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     NiceConnection();
     ~NiceConnection();

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -24,7 +26,6 @@ struct sqlite3_stmt;
  */
 class SqlCipherDb {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     SqlCipherDb() = default;
     ~SqlCipherDb();
@@ -80,7 +81,6 @@ private:
  */
 class SqlCipherQuery {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     /// Construct from a SqlCipherDb (convenience).
     explicit SqlCipherQuery(SqlCipherDb& db);

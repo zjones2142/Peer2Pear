@@ -1,4 +1,6 @@
 #pragma once
+
+#include "types.hpp"
 //
 // Small binary serialization helpers used by session/ratchet persistence.
 //
@@ -17,7 +19,6 @@
 
 namespace p2p {
 
-using Bytes = std::vector<uint8_t>;
 
 // ── BinaryWriter ────────────────────────────────────────────────────────────
 

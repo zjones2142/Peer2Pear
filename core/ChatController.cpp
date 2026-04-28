@@ -1,4 +1,5 @@
 #include "ChatController.hpp"
+#include "AppDataStore.hpp"  // used by v2 group_msg + gap_request dispatch
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
 #ifdef PEER2PEAR_P2P
 // NiceConnection.hpp pulls in nice/agent.h, whose gio dependency uses
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include "log.hpp"
+#include "shared.hpp"
 #include "uuid.hpp"
 
 using nlohmann::json;
@@ -25,16 +27,15 @@ using nlohmann::json;
 // Envelope header prefixes.  Every outbound frame is a sealed envelope;
 // every inbound frame that isn't sealed is dropped by onEnvelope /
 // onP2PDataReceived.
-static const char kSealedPrefix[]   = "SEALED:";
-static const char kSealedFCPrefix[] = "SEALEDFC:";
+// kSealedPrefix / kSealedFCPrefix moved to SealedEnvelope.hpp so
+// ChatController + SessionSealer share a single definition.
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Current unix time in seconds.  Replaces QDateTime::currentSecsSinceEpoch().
-static int64_t nowSecs() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch()).count();
-}
+// nowSecs / trimmed / peerPrefix live in core/shared.hpp so every
+// translation unit sees the same definition (they used to be
+// duplicated in each file's anonymous namespace).
+using p2p::nowSecs;
 
 // Byte range starts-with / utility — replaces QByteArray::startsWith.
 static bool bytesStartsWith(const Bytes& data, const char* prefix) {
@@ -53,13 +54,21 @@ static Bytes bytesAfterPrefix(const Bytes& data, const char* prefix) {
 
 // ── ChatController ────────────────────────────────────────────────────────────
 
-ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
+ChatController::ChatController(IWebSocketFactory& wsFactory, IHttpClient& http,
                                 ITimerFactory& timers)
-    : m_relay(ws, http, timers, &m_crypto)
+    : m_relay(wsFactory, http, timers, &m_crypto)
     , m_fileMgr(m_crypto)
     , m_timerFactory(&timers)
     , m_maintenanceTimer(timers.create())
 {
+#ifdef PEER2PEAR_P2P
+    // Session-random 32-byte AEAD key for TURN creds.  Never persisted;
+    // never exposed outside this class.  Lifetime = this ChatController
+    // instance, so creds from one process can't be replayed against a
+    // later one.
+    m_turnCredsKey.assign(32, 0);
+    randombytes_buf(m_turnCredsKey.data(), m_turnCredsKey.size());
+#endif
     // Forward the sealer's key-change event through ChatController's own
     // public callback surface — keeps the onPeerKeyChanged(peerId,
     // oldFp, newFp) signature stable for the C API + desktop.
@@ -74,9 +83,27 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     // invariant: every outbound group byte still passes through
     // SessionSealer.sealForPeer.
     m_groupProto.setSendSealedFn(
-        [this](const std::string& peerId, const nlohmann::json& payload) {
-            sendSealedPayload(peerId, payload);
+        [this](const std::string& peerId, const nlohmann::json& payload) -> Bytes {
+            return sendSealedPayload(peerId, payload);
         });
+    // Wire the v2 sender path's required dependencies.  AppDataStore
+    // pointer comes from p2p_context via setAppDataStore() (see below);
+    // SessionManager is owned by ChatController so we forward it now.
+    // GroupProtocol uses these only in sendTextV2; the legacy v1 path
+    // (sendText / sendRename / etc.) ignores them.
+    // m_sessionMgr is owned by ChatController but created lazily in
+    // setDatabase().  Wire it here too so the legacy callers see a
+    // consistent surface; setDatabase() re-wires once it has built
+    // the actual SessionManager instance (see below).
+
+    // Raw-relay callback for handleGapRequest: replays cached sealed
+    // envelopes byte-identically.  Bypasses SessionSealer because the
+    // bytes are already sealed for the requestor — re-sealing would
+    // produce a fresh DR step and shift the chain past their
+    // expected counter.
+    m_groupProto.setReplayRelayFn([this](const Bytes& env) {
+        m_relay.sendEnvelope(env);
+    });
 
     // FileProtocol needs a raw relay-send callback because sendFile
     // builds the file_key envelope + reads the ratchet's
@@ -111,7 +138,7 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     m_relay.onStatus = [this](const std::string& s) {
         if (onStatus) onStatus(s);
     };
-    m_relay.onEnvelopeReceived = [this](const RelayClient::Bytes& b) {
+    m_relay.onEnvelopeReceived = [this](const Bytes& b) {
         onEnvelope(b);
     };
     m_relay.onPresenceChanged = [this](const std::string& pid, bool online) {
@@ -120,9 +147,13 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     m_relay.onConnected = [this]() { handleRelayConnected(); };
 
     // FileTransferManager callbacks — plain class; direct assignment.
+    // Tagged FileChunk so the transport skips parallel fan-out for
+    // chunk-shaped payloads (240 KB × hundreds-of-chunks per file
+    // would multiply egress out of proportion to the redundancy gain).
+    // Multi-hop / rotation still apply normally.
     m_fileMgr.setSendFn([this](const std::string& /*peerId*/,
-                               const FileTransferManager::Bytes& env) {
-        m_relay.sendEnvelope(env);
+                               const Bytes& env) {
+        m_relay.sendEnvelope(env, RelayClient::TrafficClass::FileChunk);
     });
     m_fileMgr.onStatus = [this](const std::string& s) {
         if (onStatus) onStatus(s);
@@ -162,11 +193,9 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
             groupId, groupName);
 
         // Receiver finished writing and verified — send file_ack.
+        // Arch-review #5: composition lives in FileProtocol now.
         if (chunksReceived == chunksTotal && !savedPath.empty()) {
-            json ack = json::object();
-            ack["type"]       = "file_ack";
-            ack["transferId"] = transferId;
-            m_fileProto.sendControlMessage(fromPeerId, ack);
+            m_fileProto.sendFileAck(fromPeerId, transferId);
         }
     };
 
@@ -177,20 +206,10 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
 #endif
 
     // Remove ratchet-derived file key when transfer completes.
+    // Arch-review #5: cleanup lives in FileProtocol — ChatController
+    // just forwards the event.
     m_fileMgr.onTransferCompleted = [this](const std::string& transferId) {
-        const std::string suffix = ":" + transferId;
-        auto it = m_fileProto.fileKeys().begin();
-        while (it != m_fileProto.fileKeys().end()) {
-            const auto& k = it->first;
-            const bool ends = k.size() >= suffix.size() &&
-                              k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
-            if (ends || k == transferId) {
-                sodium_memzero(it->second.data(), it->second.size());
-                it = m_fileProto.fileKeys().erase(it);
-            } else {
-                ++it;
-            }
-        }
+        m_fileProto.eraseFileKeysFor(transferId);
     };
 
     m_fileMgr.onOutboundAbandoned = [this](const std::string& transferId, const std::string&) {
@@ -207,15 +226,15 @@ ChatController::ChatController(IWebSocket& ws, IHttpClient& http,
     };
 
     // Rehydrate file keys from DB after loadPersistedTransfers().
+    // Arch-review #5: install through FileProtocol instead of reaching
+    // into its internal map.
     m_fileMgr.onIncomingFileKeyRestored =
         [this](const std::string& fromPeerId,
                const std::string& transferId,
-               const FileTransferManager::Bytes& fileKey) {
-        if (fileKey.size() != 32) return;
-        const std::string compound = fromPeerId + ":" + transferId;
-        m_fileProto.fileKeys()[compound] = fileKey;
-        P2P_LOG("[FILE] restored file key for " << transferId.substr(0, 8)
-                 << " from " << fromPeerId.substr(0, 8) << "...");
+               const Bytes& fileKey) {
+        m_fileProto.installIncomingKey(fromPeerId, transferId, fileKey);
+        P2P_LOG("[FILE] restored file key for " << p2p::peerPrefix(transferId)
+                 << " from " << p2p::peerPrefix(fromPeerId) << "...");
     };
 
     // Periodic maintenance — ITimer replaces the former QTimer.  Self-rearms.
@@ -266,7 +285,7 @@ void ChatController::runMaintenance()
         toRemove.push_back(it->first);
     }
     for (const std::string &key : toRemove) {
-        P2P_LOG("[ICE] Cleaning up stale connection to " << key.substr(0, 8) << "..."
+        P2P_LOG("[ICE] Cleaning up stale connection to " << p2p::peerPrefix(key) << "..."
                  << " (exceeded " << kP2PCleanupGraceSecs << "s grace)");
         delete m_p2pConnections[key];
         m_p2pConnections.erase(key);
@@ -290,6 +309,28 @@ void ChatController::setPassphrase(const std::string& pass, const Bytes& identit
 void ChatController::setRelayUrl(const std::string& url)
 {
     m_relay.setRelayUrl(url);
+}
+
+void ChatController::setAppDataStore(AppDataStore* appData)
+{
+    m_appData = appData;
+    m_groupProto.setAppDataStore(appData);
+}
+
+void ChatController::resolveBundleToGroupId(const std::string& bundleB64,
+                                              std::string& gid,
+                                              bool allowBackfill)
+{
+    if (bundleB64.empty() || !m_appData) return;
+    const Bytes bundleId = CryptoEngine::fromBase64Url(bundleB64);
+    if (bundleId.empty()) return;
+
+    if (std::string knownGid = m_appData->groupIdForBundle(bundleId);
+        !knownGid.empty()) {
+        gid = std::move(knownGid);
+    } else if (allowBackfill && !gid.empty()) {
+        m_appData->addBundleMapping(gid, bundleId, nowSecs());
+    }
 }
 
 void ChatController::setDatabase(SqlCipherDb& db)
@@ -323,6 +364,18 @@ void ChatController::setDatabase(SqlCipherDb& db)
 
     m_sessionMgr = std::make_unique<SessionManager>(m_crypto, *m_sessionStore);
 
+    // Wire the session manager into GroupProtocol now that it exists.
+    // The v2 group sender path uses sessionIdFor() to namespace its
+    // counter on the wire — see CausallyLinkedPairwise.hpp.
+    m_groupProto.setSessionManager(m_sessionMgr.get());
+
+    // Hand the store to GroupProtocol so sender chains get persisted
+    // on every advance and restored after restart.  Restore happens
+    // here (before any group traffic flows) so inbound group_msgs that
+    // arrive early find their chains already in memory.
+    m_groupProto.setSessionStore(m_sessionStore.get());
+    m_groupProto.restorePersistedChains();
+
     // Wire up file-transfer persistence and restore any in-flight state.
     m_fileMgr.setDatabase(&db);
     m_fileMgr.loadPersistedTransfers();
@@ -340,79 +393,52 @@ void ChatController::setDatabase(SqlCipherDb& db)
     m_fileProto.setSessionManager(m_sessionMgr.get());
 
     // When SessionManager needs to send a handshake response, seal it and enqueue
+    // Arch-review #3: envelope framing lives on SessionSealer now —
+    // this lambda is just "pipe the wrapped envelope at the relay."
     m_sessionMgr->setSendResponseFn([this](const std::string& peerId, const Bytes& blob) {
-        // Convert peer's Ed25519 pub to X25519 for sealing
-        Bytes peerEdPub = CryptoEngine::fromBase64Url(peerId);
-        unsigned char peerCurvePub[32];
-        if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0) return;
-
-        Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
-        Bytes peerKemPub = m_sealer.lookupPeerKemPub(peerId);
-        Bytes sealed = SealedEnvelope::seal(
-            recipientCurvePub, peerEdPub,
-            m_crypto.identityPub(), m_crypto.identityPriv(),
-            blob, peerKemPub,
-            m_crypto.dsaPub(), m_crypto.dsaPriv());
-        if (sealed.empty()) return;
-        P2P_LOG("[SEND MAILBOX] sealed handshake response to " << peerId.substr(0, 8) << "..."
-                 << " " << (peerKemPub.empty() ? "(classical)" : "(hybrid PQ)"));
-
-        // Inner wire: kSealedPrefix + "\n" + sealed
-        Bytes inner;
-        const size_t prefixLen = std::strlen(kSealedPrefix);
-        inner.reserve(prefixLen + 1 + sealed.size());
-        inner.insert(inner.end(),
-                     reinterpret_cast<const uint8_t*>(kSealedPrefix),
-                     reinterpret_cast<const uint8_t*>(kSealedPrefix) + prefixLen);
-        inner.push_back('\n');
-        inner.insert(inner.end(), sealed.begin(), sealed.end());
-
-        m_relay.sendEnvelope(SealedEnvelope::wrapForRelay(peerEdPub, inner));
+        Bytes env = m_sealer.sealHandshakeResponseForPeer(peerId, blob);
+        if (env.empty()) return;
+        P2P_LOG("[SEND MAILBOX] sealed handshake response to "
+                 << p2p::peerPrefix(peerId) << "...");
+        m_relay.sendEnvelope(env);
     });
 
-    // Seal callback for file chunks — FTM speaks std types end-to-end.
-    m_fileMgr.setSealFn([this](const std::string& peerId,
-                               const FileTransferManager::Bytes& payload)
-                              -> FileTransferManager::Bytes {
-        Bytes peerEdPub = CryptoEngine::fromBase64Url(peerId);
-        unsigned char peerCurvePub[32];
-        if (crypto_sign_ed25519_pk_to_curve25519(peerCurvePub, peerEdPub.data()) != 0)
-            return {};
-
-        Bytes recipientCurvePub(peerCurvePub, peerCurvePub + 32);
-        sodium_memzero(peerCurvePub, sizeof(peerCurvePub));
-        Bytes peerKemPub = m_sealer.lookupPeerKemPub(peerId);
-        Bytes sealed = SealedEnvelope::seal(
-            recipientCurvePub, peerEdPub,
-            m_crypto.identityPub(), m_crypto.identityPriv(),
-            payload, peerKemPub,
-            m_crypto.dsaPub(), m_crypto.dsaPriv());
-        if (sealed.empty()) return {};
-
-        // Inner wire: kSealedFCPrefix + "\n" + sealed
-        Bytes inner;
-        const size_t prefixLen = std::strlen(kSealedFCPrefix);
-        inner.reserve(prefixLen + 1 + sealed.size());
-        inner.insert(inner.end(),
-                     reinterpret_cast<const uint8_t*>(kSealedFCPrefix),
-                     reinterpret_cast<const uint8_t*>(kSealedFCPrefix) + prefixLen);
-        inner.push_back('\n');
-        inner.insert(inner.end(), sealed.begin(), sealed.end());
-
-        return SealedEnvelope::wrapForRelay(peerEdPub, inner);
-    });
+    // Seal callback for file chunks.  Routes through SessionSealer
+    // (Arch-review #2) so hard-block-on-key-change applies to the
+    // chunk stream just like it does to user messages.  Arch-review
+    // #5: FileProtocol owns the wiring.
+    m_fileProto.installChunkSealCallback();
 #ifdef PEER2PEAR_P2P
-    // QUIC P2P file send callback: try sending file chunks directly via QUIC stream
+    // QUIC P2P file send callback: try sending file chunks directly via QUIC.
+    //
+    // Arch-review #10 parity with the relay path:
+    //   * Hard-block check.  If the peer's safety number flipped and
+    //     hard-block is on, refuse the direct send.  Returning false
+    //     falls the stream back onto the sealed-envelope relay path,
+    //     where sealPreEncryptedForPeer runs the same check and
+    //     drops the chunk authoritatively.
+    //   * Bucket padding.  Pad each chunk frame to 2 / 16 / 256 KiB
+    //     so a passive network observer between the two peers can't
+    //     distinguish file-chunk sizes from control frames.  The
+    //     receiver unpads in onFileDataReceived before handing the
+    //     bytes to FileTransferManager.
     m_fileMgr.setP2PFileSendFn([this](const std::string& peerId,
-                                       const FileTransferManager::Bytes& data) -> bool {
+                                       const Bytes& data) -> bool {
         auto it = m_p2pConnections.find(peerId);
-        if (it != m_p2pConnections.end() &&
-            it->second->isReady() &&
-            it->second->quicActive()) {
-            it->second->sendFileData(data);
-            return true;
+        if (it == m_p2pConnections.end() ||
+            !it->second->isReady() ||
+            !it->second->quicActive()) {
+            return false;  // fall back to mailbox
         }
-        return false;  // fall back to mailbox
+        if (m_sealer.detectKeyChange(peerId) && m_sealer.hardBlockOnKeyChange()) {
+            P2P_WARN("[P2P] BLOCKED — peer's safety number changed for "
+                     << p2p::peerPrefix(peerId) << "... (hard-block on)");
+            return false;
+        }
+        const Bytes padded = SealedEnvelope::padForP2P(data);
+        if (padded.empty()) return false;
+        it->second->sendFileData(padded);
+        return true;
     });
 #endif
 
@@ -425,43 +451,13 @@ std::string ChatController::myIdB64u() const
 
 void ChatController::sendText(const std::string& peerIdB64u, const std::string& text)
 {
-    // Safety-numbers check happens inside sealForPeer — one choke point
-    // covers 1:1 text, 1:1 avatar/file, group fan-outs, and group control
-    // messages uniformly.  sealForPeer returns empty under hard-block,
-    // which the caller interprets as "message not sent".
-
     json payload = json::object();
     payload["from"]  = myIdB64u();
     payload["type"]  = "text";
     payload["text"]  = text;
     payload["ts"]    = nowSecs();
     payload["msgId"] = p2p::makeUuid();
-
-    const std::string ptStr = payload.dump();
-    const Bytes pt(ptStr.begin(), ptStr.end());
-
-    // ── Sealed path (always required for text) ──────────────────────────────
-    Bytes sealedEnv = m_sealer.sealForPeer(peerIdB64u, pt);
-    if (sealedEnv.empty()) {
-        P2P_WARN("[SEND] BLOCKED — cannot seal text to " << peerIdB64u.substr(0, 8) << "...");
-        if (onStatus) onStatus("Message not sent — encrypted session unavailable. Try again shortly.");
-        return;
-    }
-
-#ifdef PEER2PEAR_P2P
-    auto itConn = m_p2pConnections.find(peerIdB64u);
-    if (itConn != m_p2pConnections.end() && itConn->second->isReady()) {
-        P2P_LOG("[SEND P2P] sealed text to " << peerIdB64u.substr(0, 8) << "...");
-        itConn->second->sendData(sealedEnv);
-    } else
-#endif
-    {
-        P2P_LOG("[SEND RELAY] sealed text to " << peerIdB64u.substr(0, 8) << "...");
-        m_relay.sendEnvelope(sealedEnv);
-#ifdef PEER2PEAR_P2P
-        initiateP2PConnection(peerIdB64u);
-#endif
-    }
+    sendSealedPayload(peerIdB64u, payload, SendMode::PreferP2P);
 }
 
 void ChatController::sendAvatar(const std::string& peerIdB64u,
@@ -538,8 +534,8 @@ void ChatController::handleRelayConnected()
         msg["chunks"]     = std::move(chunks);
         m_fileProto.sendControlMessage(pr.peerId, msg);
         P2P_LOG("[FILE] requested resumption of "
-                 << pr.transferId.substr(0, 8)
-                 << " from " << pr.peerId.substr(0, 8) << "..."
+                 << p2p::peerPrefix(pr.transferId)
+                 << " from " << p2p::peerPrefix(pr.peerId) << "..."
                  << " missing " << int(pr.missingChunks.size()) << " chunks");
     }
 }
@@ -553,14 +549,42 @@ void ChatController::setSelfKeys(const std::vector<std::string>& keys) {
     m_selfKeys = keys;
 }
 
+ChatController::~ChatController()
+{
+#ifdef PEER2PEAR_P2P
+    // Make sure TURN creds + the session-AEAD key don't linger in freed
+    // pages after the controller goes away.
+    if (!m_turnCredsKey.empty()) CryptoEngine::secureZero(m_turnCredsKey);
+    if (!m_turnUserCt.empty())   CryptoEngine::secureZero(m_turnUserCt);
+    if (!m_turnPassCt.empty())   CryptoEngine::secureZero(m_turnPassCt);
+#endif
+}
+
 #ifdef PEER2PEAR_P2P
 void ChatController::setTurnServer(const std::string& host, int port,
                                     const std::string& username, const std::string& password)
 {
     m_turnHost = host;
     m_turnPort = port;
-    m_turnUser = username;
-    m_turnPass = password;
+
+    // Encrypt creds before they touch a long-lived member.  The
+    // ciphertext sits in m_turnUserCt / m_turnPassCt; the key is
+    // session-ephemeral (m_turnCredsKey).  setupP2PConnection is the
+    // only reader and zeroes its scratch buffers right after use.
+    auto encCred = [this](const std::string& s) -> Bytes {
+        if (s.empty()) return {};
+        Bytes pt(s.begin(), s.end());
+        Bytes ct = m_crypto.aeadEncrypt(m_turnCredsKey, pt);
+        sodium_memzero(pt.data(), pt.size());
+        return ct;
+    };
+    if (!m_turnUserCt.empty())
+        sodium_memzero(m_turnUserCt.data(), m_turnUserCt.size());
+    if (!m_turnPassCt.empty())
+        sodium_memzero(m_turnPassCt.data(), m_turnPassCt.size());
+    m_turnUserCt = encCred(username);
+    m_turnPassCt = encCred(password);
+
     P2P_LOG("[ChatController] TURN server set: " << host << ":" << port);
 }
 #endif
@@ -583,7 +607,11 @@ void ChatController::sendGroupMessageViaMailbox(const std::string& groupId,
                                                 const std::vector<std::string>& memberPeerIds,
                                                 const std::string& text)
 {
-    m_groupProto.sendText(groupId, groupName, memberPeerIds, text);
+    // Default to the pv=2 path.  sendTextV2 internally falls back to
+    // the legacy sendText when its deps (AppDataStore + SessionManager)
+    // aren't wired — protects boot-up windows where the DB key hasn't
+    // been derived yet.
+    m_groupProto.sendTextV2(groupId, groupName, memberPeerIds, text);
 }
 
 void ChatController::sendGroupLeaveNotification(const std::string& groupId,
@@ -686,25 +714,65 @@ void ChatController::pruneSeenEnvelopes()
 // on failure.  Every outbound path should call this instead of inlining the
 // encrypt→convert→seal→prefix logic.
 // ── Sealed payload via mailbox, fail-closed ───────────────────────────────
-void ChatController::sendSealedPayload(const std::string& peerIdB64u,
-                                       const nlohmann::json& payload)
+Bytes ChatController::sendSealedPayload(const std::string& peerIdB64u,
+                                       const nlohmann::json& payload,
+                                       SendMode mode)
 {
     const std::string ptStr = payload.dump();
     const Bytes pt(ptStr.begin(), ptStr.end());
     const std::string type = payload.value("type", std::string());
 
     Bytes env = m_sealer.sealForPeer(peerIdB64u, pt);
-    if (!env.empty()) {
-        P2P_LOG("[SEND MAILBOX] " << type << " to " << peerIdB64u.substr(0, 8) << "...");
-        m_relay.sendEnvelope(env);
-        return;
+    if (env.empty()) {
+        // Fail closed.  Seal failures (hard-block, missing ratchet,
+        // unreachable peer) must not leak content — log + drop +
+        // surface a user-visible status.  Group fan-outs were silent
+        // here until we started flagging per-recipient seal errors;
+        // text + group_msg both deserve the same feedback so the user
+        // knows a message didn't reach some of their peers.
+        P2P_WARN("[SEND] BLOCKED — cannot seal " << type
+                   << " to " << p2p::peerPrefix(peerIdB64u) << "...");
+        if (onStatus) {
+            if (mode == SendMode::PreferP2P) {
+                onStatus("Message not sent — encrypted session unavailable. Try again shortly.");
+            } else if (type == "group_msg") {
+                onStatus("Group message not delivered to " +
+                           p2p::peerPrefix(peerIdB64u) +
+                           "… — encrypted session unavailable.");
+            }
+            // Other envelope types (avatars, ICE signalling, KEM announces)
+            // stay quiet — they're chatty per connect and would flood
+            // the toast channel.
+        }
+        return {};
     }
 
-    // Fail closed.  ICE messages go through the same sealed path as
-    // everything else; if the ratchet can't seal, we defer the handshake
-    // instead of leaking SDP/IP candidates.
-    P2P_WARN("[SEND] BLOCKED — cannot seal " << type
-               << " to " << peerIdB64u.substr(0, 8) << "...");
+#ifdef PEER2PEAR_P2P
+    if (mode == SendMode::PreferP2P) {
+        // Try the direct QUIC stream first; fall back to the relay
+        // mailbox + kick off ICE for next time.  Only 1:1 text uses
+        // this — other types always go through the relay (fan-outs,
+        // ICE signalling itself, KEM announces on fresh sessions).
+        auto itConn = m_p2pConnections.find(peerIdB64u);
+        if (itConn != m_p2pConnections.end() && itConn->second->isReady()) {
+            P2P_LOG("[SEND P2P] " << type << " to " << p2p::peerPrefix(peerIdB64u) << "...");
+            itConn->second->sendData(env);
+            return env;
+        }
+    }
+#endif
+
+    P2P_LOG("[SEND MAILBOX] " << type << " to " << p2p::peerPrefix(peerIdB64u) << "...");
+    m_relay.sendEnvelope(env);
+
+#ifdef PEER2PEAR_P2P
+    if (mode == SendMode::PreferP2P) {
+        // Warm up the P2P path so the *next* send to this peer can
+        // take the direct route.
+        initiateP2PConnection(peerIdB64u);
+    }
+#endif
+    return env;
 }
 
 #ifdef PEER2PEAR_P2P
@@ -714,8 +782,24 @@ QuicConnection* ChatController::setupP2PConnection(const std::string& peerIdB64u
     // Lifetime is managed by m_p2pConnections raw pointer ownership;
     // runMaintenance() deletes stale entries.
     QuicConnection* conn = new QuicConnection(*m_timerFactory);
-    if (!m_turnHost.empty())
-        conn->setTurnServer(m_turnHost, m_turnPort, m_turnUser, m_turnPass);
+    if (!m_turnHost.empty()) {
+        // Decrypt TURN creds just-in-time into scratch buffers, pass to
+        // QuicConnection, then zero.  QuicConnection is expected to copy
+        // what it needs before returning.
+        auto decCred = [this](const Bytes& ct) -> std::string {
+            if (ct.empty()) return {};
+            Bytes pt = m_crypto.aeadDecrypt(m_turnCredsKey, ct);
+            if (pt.empty()) return {};
+            std::string s(pt.begin(), pt.end());
+            sodium_memzero(pt.data(), pt.size());
+            return s;
+        };
+        std::string user = decCred(m_turnUserCt);
+        std::string pass = decCred(m_turnPassCt);
+        conn->setTurnServer(m_turnHost, m_turnPort, user, pass);
+        sodium_memzero(const_cast<char*>(user.data()), user.size());
+        sodium_memzero(const_cast<char*>(pass.data()), pass.size());
+    }
     m_p2pConnections[peerIdB64u] = conn;
     m_p2pCreatedSecs[peerIdB64u] = nowSecs();
 
@@ -745,7 +829,17 @@ QuicConnection* ChatController::setupP2PConnection(const std::string& peerIdB64u
         onP2PDataReceived(peerIdB64u, d);
     };
     conn->onFileDataReceived = [this, peerIdB64u](const Bytes& d) {
-        m_fileMgr.handleFileEnvelope(peerIdB64u, d,
+        // Arch-review #10: sender padded the frame to a bucket via
+        // SealedEnvelope::padForP2P; strip the 4-byte innerLen header
+        // + random tail padding before handing the raw chunk bytes
+        // to FileTransferManager.
+        Bytes unpadded = SealedEnvelope::unpadFromP2P(d);
+        if (unpadded.empty()) {
+            P2P_WARN("[P2P] dropping malformed chunk frame from "
+                     << p2p::peerPrefix(peerIdB64u) << "... (padForP2P unwrap failed)");
+            return;
+        }
+        m_fileMgr.handleFileEnvelope(peerIdB64u, unpadded,
             [this](const std::string& id) { return markSeen(id); },
             m_fileProto.fileKeys());
     };
@@ -761,7 +855,7 @@ void ChatController::initiateP2PConnection(const std::string& peerIdB64u)
 
 void ChatController::onP2PDataReceived(const std::string& peerIdB64u, const Bytes& data)
 {
-    P2P_LOG("[ChatController] P2P data received from " << peerIdB64u.substr(0, 8) << "..."
+    P2P_LOG("[ChatController] P2P data received from " << p2p::peerPrefix(peerIdB64u) << "..."
              << " | size: " << data.size() << "B");
 
     // P2P data proves the peer is online right now
@@ -773,13 +867,13 @@ void ChatController::onP2PDataReceived(const std::string& peerIdB64u, const Byte
     // and would let a compromised identity key retroactively decrypt prior
     // P2P text messages.
     if (bytesStartsWith(data, kSealedPrefix) || bytesStartsWith(data, kSealedFCPrefix)) {
-        P2P_LOG("[RECV P2P] sealed envelope from " << peerIdB64u.substr(0, 8) << "...");
+        P2P_LOG("[RECV P2P] sealed envelope from " << p2p::peerPrefix(peerIdB64u) << "...");
         onEnvelope(data);
         return;
     }
 
-    P2P_WARN("[RECV P2P] dropping unsealed frame from " << peerIdB64u.substr(0, 8)
-             << " (" << data.size() << "B) \u2014 sealed envelopes required (H1 fix)");
+    P2P_WARN("[RECV P2P] dropping unsealed frame from " << p2p::peerPrefix(peerIdB64u)
+             << " (" << data.size() << "B) \u2014 sealed envelopes required");
 }
 #endif // PEER2PEAR_P2P
 
@@ -841,14 +935,14 @@ void ChatController::onEnvelope(const Bytes& body)
         }
 
         std::string senderId = CryptoEngine::toBase64Url(unsealedSenderEdPub);
-        P2P_LOG("[RECV " << via << "] unsealed OK | sender: " << senderId.substr(0, 8) << "..."
+        P2P_LOG("[RECV " << via << "] unsealed OK | sender: " << p2p::peerPrefix(senderId) << "..."
                  << " | inner: " << unsealedInnerPayload.size() << "B");
 
         // Rate limit per sender to prevent CPU exhaustion via envelope flooding.
         int& count = m_envelopeCount[senderId];
         if (++count > kMaxEnvelopesPerSenderPerPoll) {
             if (count == kMaxEnvelopesPerSenderPerPoll + 1)
-                P2P_WARN("[RECV] rate limit hit for " << senderId.substr(0, 8) << "..."
+                P2P_WARN("[RECV] rate limit hit for " << p2p::peerPrefix(senderId) << "..."
                            << " — dropping further envelopes this cycle");
             return;
         }
@@ -871,12 +965,12 @@ void ChatController::onEnvelope(const Bytes& body)
                 }
             }
             if (!hasKeyFromSender) {
-                P2P_WARN("[RECV " << via << "] sealed file chunk from " << senderId.substr(0, 8) << "..."
+                P2P_WARN("[RECV " << via << "] sealed file chunk from " << p2p::peerPrefix(senderId) << "..."
                            << " — no file_key on record, dropping");
                 return;
             }
 
-            P2P_LOG("[RECV " << via << "] sealed file chunk from " << senderId.substr(0, 8) << "...");
+            P2P_LOG("[RECV " << via << "] sealed file chunk from " << p2p::peerPrefix(senderId) << "...");
             m_fileMgr.handleFileEnvelope(senderId, unsealedInnerPayload,
                 [this](const std::string& id) { return markSeen(id); },
                 m_fileProto.fileKeys());
@@ -900,7 +994,7 @@ void ChatController::onEnvelope(const Bytes& body)
             // This is expected — future messages will use the ratchet session.
             const uint8_t innerType = unsealedInnerPayload.empty() ? 0 : unsealedInnerPayload[0];
             if (innerType == SessionManager::kPreKeyResponse || innerType == SessionManager::kHybridPreKeyResp) {
-                P2P_LOG("[RECV " << via << "] handshake COMPLETED with " << senderId.substr(0, 8) << "...");
+                P2P_LOG("[RECV " << via << "] handshake COMPLETED with " << p2p::peerPrefix(senderId) << "...");
                 // Handshake succeeded — clear failure counter.
                 m_handshakeFailCount.erase(senderId);
 
@@ -908,7 +1002,7 @@ void ChatController::onEnvelope(const Bytes& body)
                 announceKemPub(senderId);
 
             } else {
-                P2P_LOG("[RECV " << via << "] session decrypt empty from " << senderId.substr(0, 8) << "...");
+                P2P_LOG("[RECV " << via << "] session decrypt empty from " << p2p::peerPrefix(senderId) << "...");
             }
             return;
         }
@@ -925,19 +1019,24 @@ void ChatController::onEnvelope(const Bytes& body)
         const int64_t tsSecs = o.value("ts", int64_t(0));
         const std::string msgId = o.value("msgId", std::string());
 
-        P2P_LOG("[RECV " << via << "] sealed type: " << type << " from " << senderId.substr(0, 8) << "...");
+        P2P_LOG("[RECV " << via << "] sealed type: " << type << " from " << p2p::peerPrefix(senderId) << "...");
 
         // Safety-numbers check on inbound.  Fires onPeerKeyChanged at
         // most once per session; the hard-block toggle then refuses to
         // deliver to the app callbacks.  Only applies to already-verified
         // peers — first-contact / unverified messages flow through.
         if (m_sealer.detectKeyChange(senderId) && m_sealer.hardBlockOnKeyChange()) {
-            P2P_WARN("[RECV] dropping message from " << senderId.substr(0, 8)
+            P2P_WARN("[RECV] dropping message from " << p2p::peerPrefix(senderId)
                      << "... — hard-block on key change");
             return;
         }
 
-        dispatchSealedPayload(o, senderId, tsSecs, msgId, via, std::move(msgKey));
+        // Pass the post-routing-strip bytes (`data`) as the outer
+        // sealed envelope so the v2 group_msg dispatch can hash it
+        // for the prev_hash chain.  This is the same byte-stream the
+        // sender hashed when caching the envelope in group_replay_cache.
+        dispatchSealedPayload(o, senderId, tsSecs, msgId, via,
+                              std::move(msgKey), data);
         return;
     }
 
@@ -954,12 +1053,54 @@ void ChatController::onEnvelope(const Bytes& body)
 // 600-line god-method.  Called for every sealed envelope whose session
 // decrypt succeeds (i.e., every inbound user message + every protocol
 // control message).  Safety-number hard-block check has already run.
+std::optional<nlohmann::json> ChatController::decryptGroupControlInner(
+    const std::string& msgType,
+    const std::string& senderId,
+    const nlohmann::json& outer,
+    bool requireAuthorizedSender)
+{
+    const std::string gid = outer.value("groupId", std::string());
+    if (requireAuthorizedSender && !gid.empty() &&
+        !m_groupProto.isAuthorizedSender(gid, senderId)) {
+        P2P_WARN("[GROUP] dropping " << msgType << " from non-member "
+                 << p2p::peerPrefix(senderId) << "... for " << p2p::peerPrefix(gid));
+        return std::nullopt;
+    }
+
+    const uint64_t    skeyEpoch = outer.value("skey_epoch", uint64_t(0));
+    const uint32_t    skeyIdx   = outer.value("skey_idx", uint32_t(0));
+    const std::string ctB64     = outer.value("ciphertext", std::string());
+    if (gid.empty() || ctB64.empty()) {
+        P2P_WARN("[GROUP] malformed " << msgType << " from "
+                 << p2p::peerPrefix(senderId) << "...");
+        return std::nullopt;
+    }
+
+    const Bytes ct = CryptoEngine::fromBase64Url(ctB64);
+    const Bytes pt = m_groupProto.decryptGroupMessage(
+        msgType, gid, senderId, skeyEpoch, skeyIdx, ct);
+    if (pt.empty()) {
+        P2P_WARN("[GROUP] decrypt failed for " << msgType << " from "
+                 << p2p::peerPrefix(senderId) << "... in "
+                 << p2p::peerPrefix(gid) << "...");
+        return std::nullopt;
+    }
+
+    try {
+        return nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+    } catch (...) {
+        P2P_WARN("[GROUP] malformed inner plaintext in " << msgType);
+        return std::nullopt;
+    }
+}
+
 void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                                             const std::string& senderId,
                                             int64_t tsSecs,
                                             const std::string& msgId,
                                             const std::string& via,
-                                            Bytes msgKey)
+                                            Bytes msgKey,
+                                            const Bytes& outerSealed)
 {
         const std::string type = o.value("type", std::string());
 
@@ -967,72 +1108,234 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             if (!msgId.empty() && !markSeen(msgId)) return;
             if (onMessageReceived) onMessageReceived(senderId,
                                  o.value("text", std::string()), tsSecs, msgId);
+        } else if (type == "group_skey_announce") {
+            // Sender-chain control message: a peer is distributing
+            // the seed for their outbound SenderChain to us.  The
+            // outer sealed envelope already authenticated the sender
+            // (via their 1:1 ratchet), so we trust the payload to
+            // identify them; we just need to install the chain so
+            // future group_msg from this peer decrypts.
+            if (!msgId.empty() && !markSeen(msgId)) return;
+
+            const std::string gid    = o.value("groupId", std::string());
+            const uint64_t    epoch  = o.value("epoch", uint64_t(0));
+            const std::string seedB64 = o.value("seed", std::string());
+            if (gid.empty() || seedB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_skey_announce from "
+                         << p2p::peerPrefix(senderId) << "...");
+                return;
+            }
+            const Bytes seed = CryptoEngine::fromBase64Url(seedB64);
+            m_groupProto.installRemoteChain(gid, senderId, epoch, seed);
+            P2P_LOG("[GROUP] installed sender chain from "
+                    << p2p::peerPrefix(senderId) << "... for "
+                    << p2p::peerPrefix(gid) << "... epoch " << epoch);
         } else if (type == "group_msg") {
             if (!msgId.empty() && !markSeen(msgId)) return;
 
-            // Sequence gap detection + reject regressions.  Any
-            // non-monotonic seq from a given (group, sender) is dropped
-            // loudly — otherwise a relay that captured an old group_msg
-            // could replay it after the msgId LRU evicted the original,
-            // and the receiver would fire onGroupMessageReceived again.
-            const std::string gid = o.value("groupId", std::string());
-            if (o.contains("seq")) {
-                const int64_t seq = o.value("seq", int64_t(0));
-                // non-monotonic seq from a given (group, sender) is a
-                // replay — drop loudly.  Gaps are logged but not fatal
-                // (legitimate traffic can skip seq values when a member
-                // goes offline mid-fanout).
-                const int64_t lastSeen = m_groupProto.recordInboundSeq(gid, senderId, seq);
-                if (lastSeen >= 0 && seq <= lastSeen) {
-                    P2P_WARN("[GROUP] dropping non-monotonic seq from "
-                             << senderId.substr(0, 8) << "... in "
-                             << gid.substr(0, 8) << "... (got " << seq
-                             << ", last " << lastSeen << ")");
+            // ── pv=2 (Causally-Linked Pairwise) branch ────────────────────
+            // The pv field is absent on legacy v1 envelopes and equals
+            // 2 on the new format.  Default of 1 means we route to the
+            // legacy SenderChain path below.
+            const int pv = o.value("pv", 1);
+            if (pv >= 2) {
+                std::string       gid       = o.value("groupId", std::string());
+                const std::string bundleB64 = o.value("bundle",  std::string());
+                const std::string sessionB64= o.value("session",  std::string());
+                const int64_t     ctr       = o.value("ctr",      int64_t(0));
+                const std::string prevB64   = o.value("prev",     std::string());
+                const std::string text      = o.value("text",     std::string());
+                const std::string innerName = o.value("groupName", std::string());
+                std::vector<std::string> memberKeys;
+                if (o.contains("members") && o["members"].is_array()) {
+                    for (const auto& v : o["members"]) {
+                        if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+                    }
+                }
+
+                // Phase 2: resolve `bundle` → local groupId.  Existing
+                // mapping wins; otherwise accept + persist the binding
+                // from this authenticated envelope.  Bundle-present /
+                // no-mapping / no-fallback-gid drops via the gid.empty()
+                // guard below — Phase 2.1 semantics.
+                resolveBundleToGroupId(bundleB64, gid, /*allowBackfill=*/true);
+
+                if (gid.empty() || sessionB64.empty() || ctr < 1) {
+                    P2P_WARN("[GROUP v2] malformed pv=2 group_msg from "
+                             << p2p::peerPrefix(senderId));
                     return;
                 }
-                if (lastSeen >= 0 && seq > lastSeen + 1) {
-                    P2P_WARN("[GROUP] seq gap from " << senderId.substr(0, 8) << "..."
-                               << " in " << gid.substr(0, 8) << "..."
-                               << " expected " << (lastSeen + 1) << " got " << seq);
+                const Bytes sessionId = CryptoEngine::fromBase64Url(sessionB64);
+                Bytes prevHash;
+                if (!prevB64.empty()) prevHash = CryptoEngine::fromBase64Url(prevB64);
+
+                // v3: ensure the conversations row exists before any
+                // group_* CRUD fires — chain_state, msg_buffer, etc.
+                // FK to conversations(id) and would silently drop the
+                // INSERT otherwise.  Idempotent.
+                if (m_appData) m_appData->ensureGroupConversation(gid);
+
+                // Trust-bootstrap the roster from the (now decrypted)
+                // envelope — same model as v1: a peer claiming
+                // membership can update our view because the outer
+                // 1:1 ratchet already authenticated them.
+                m_groupProto.upsertMembersFromTrustedMessage(
+                    gid, senderId, memberKeys);
+                if (m_appData) {
+                    m_appData->setConversationMembers(gid, memberKeys);
                 }
+
+                auto result = m_groupProto.dispatchGroupMessageV2(
+                    gid, senderId, sessionId, ctr, prevHash,
+                    text, /*senderName=*/innerName, tsSecs, msgId,
+                    outerSealed);
+
+                // Surface every delivered message (current + drained
+                // buffer entries, in counter order).
+                if (onGroupMessageReceived) {
+                    for (const auto& m : result.deliver) {
+                        onGroupMessageReceived(senderId, gid, innerName,
+                                                memberKeys, m.body,
+                                                m.ts, m.msgId);
+                    }
+                }
+                if (result.lostMessages > 0 && onGroupMessagesLost) {
+                    onGroupMessagesLost(gid, senderId, result.lostMessages);
+                }
+                if (result.blocked) {
+                    if (onGroupStreamBlocked) {
+                        onGroupStreamBlocked(gid, senderId,
+                                              result.gapFrom, result.gapTo);
+                    }
+                    // Auto-fire a gap_request to the sender for the
+                    // missing range.  Receiver-side retry/backoff is a
+                    // future increment; for now one-shot per blocked
+                    // event is enough to recover from typical drops.
+                    m_groupProto.sendGapRequest(senderId, gid, sessionId,
+                                                  result.gapFrom, result.gapTo);
+                }
+                return;
             }
 
-            std::vector<std::string> memberKeys;
-            if (o.contains("members") && o["members"].is_array())
-                for (const auto& v : o["members"])
-                    if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+            // ── pv=1 legacy SenderChain branch ────────────────────────────
+            // Wire format: ciphertext + skey_epoch + skey_idx.
+            // Replay protection lives in the AAD binding
+            // (from || gid || epoch || idx) — tampering any field
+            // makes AEAD auth fail.
+            const std::string gid      = o.value("groupId", std::string());
+            const uint64_t    skeyEpoch = o.value("skey_epoch", uint64_t(0));
+            const uint32_t    skeyIdx   = o.value("skey_idx", uint32_t(0));
+            const std::string ctB64     = o.value("ciphertext", std::string());
 
-            // A valid sealed group_msg from X about group G adds X (and
-            // the declared members) to our roster.  Known limitation:
-            // first-mover race on an unknown group (see GroupProtocol
-            // for details); UIs should call setKnownGroupMembers at
+            if (gid.empty() || ctB64.empty()) {
+                P2P_WARN("[GROUP] malformed group_msg from "
+                         << p2p::peerPrefix(senderId) << "...");
+                return;
+            }
+
+            // Decrypt the ciphertext BEFORE touching roster state.
+            // If the chain isn't installed yet (skey_announce still in
+            // flight) or decryption fails for any reason, reject the
+            // message entirely rather than bootstrap a roster from a
+            // payload we couldn't read.
+            const Bytes ct = CryptoEngine::fromBase64Url(ctB64);
+            const Bytes pt = m_groupProto.decryptGroupMessage(
+                "group_msg", gid, senderId, skeyEpoch, skeyIdx, ct);
+            if (pt.empty()) {
+                P2P_WARN("[GROUP] decrypt failed for group_msg from "
+                         << p2p::peerPrefix(senderId) << "... in "
+                         << p2p::peerPrefix(gid) << "... epoch=" << skeyEpoch
+                         << " idx=" << skeyIdx
+                         << " (chain missing or AEAD auth failed)");
+                return;
+            }
+
+            // Arch-review #3: members + groupName moved inside the
+            // sender-chain ciphertext.  Previously both rode on the
+            // outer JSON, leaking the roster to any caller who could
+            // read the 1:1 ratchet plaintext.  Pull them from the
+            // decrypted inner now.
+            std::string text;
+            std::string innerGroupName;
+            std::vector<std::string> memberKeys;
+            try {
+                auto inner = nlohmann::json::parse(std::string(pt.begin(), pt.end()));
+                text           = inner.value("text",      std::string());
+                innerGroupName = inner.value("groupName", std::string());
+                if (inner.contains("members") && inner["members"].is_array())
+                    for (const auto& v : inner["members"])
+                        if (v.is_string()) memberKeys.push_back(v.get<std::string>());
+            } catch (...) {
+                P2P_WARN("[GROUP] malformed inner plaintext in group_msg from "
+                         << p2p::peerPrefix(senderId) << "...");
+                return;
+            }
+
+            // A valid sealed group_msg from X about group G adds X
+            // (and the declared members) to our roster.  Known
+            // limitation: first-mover race on an unknown group (see
+            // GroupProtocol); UIs should call setKnownGroupMembers at
             // startup from persisted state to beat the bootstrap path.
             m_groupProto.upsertMembersFromTrustedMessage(gid, senderId, memberKeys);
 
             if (onGroupMessageReceived) onGroupMessageReceived(senderId, gid,
-                                       o.value("groupName", std::string()),
+                                       innerGroupName,
                                        memberKeys,
-                                       o.value("text", std::string()), tsSecs, msgId);
-        } else if (type == "group_leave") {
-            if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
-            const std::string gid = o.value("groupId", std::string());
-            // A leave message may ONLY be self-leave — senders can't
-            // announce that OTHER members left.  And the sender must
-            // have been a known member of the group.
-            if (!gid.empty() && !m_groupProto.isAuthorizedSender(gid, senderId)) {
-                P2P_WARN("[GROUP] dropping group_leave from non-member "
-                           << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
+                                       text, tsSecs, msgId);
+        } else if (type == "group_gap_request") {
+            // pv=2 control message: peer is asking us to replay
+            // sealed envelopes from our group_replay_cache so they
+            // can fill a gap.  Outer 1:1 ratchet already authenticated
+            // the sender; we just look up the cached bytes and
+            // re-dispatch raw (no re-seal — see setReplayRelayFn).
+            if (!msgId.empty() && !markSeen(msgId)) return;
+            std::string       gid        = o.value("groupId", std::string());
+            const std::string bundleB64  = o.value("bundle",  std::string());
+            const std::string sessionB64 = o.value("session",  std::string());
+            const int64_t     fromCtr    = o.value("from_ctr", int64_t(0));
+            const int64_t     toCtr      = o.value("to_ctr",   int64_t(0));
+
+            // Phase 2: bundle wins on the wire.  No back-fill — a
+            // gap_request is a peer asking US to replay, so the
+            // mapping should already exist locally (we minted the
+            // bundle on the original sends to this peer).
+            resolveBundleToGroupId(bundleB64, gid, /*allowBackfill=*/false);
+
+            if (gid.empty() || sessionB64.empty()
+                || fromCtr < 1 || toCtr < fromCtr) {
+                P2P_WARN("[GROUP v2] malformed group_gap_request from "
+                         << p2p::peerPrefix(senderId));
                 return;
             }
+            const Bytes sessionId = CryptoEngine::fromBase64Url(sessionB64);
+            m_groupProto.handleGapRequest(senderId, gid, sessionId,
+                                            fromCtr, toCtr);
+        } else if (type == "group_leave") {
+            if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
+            // groupName + members live inside the sender-chain
+            // ciphertext (matching every other group_* shape).  The
+            // sender must be a known group member before we'll even
+            // attempt decryption.
+            auto inner = decryptGroupControlInner(
+                "group_leave", senderId, o, /*requireAuthorizedSender=*/true);
+            if (!inner) return;
+
+            const std::string gid       = o.value("groupId", std::string());
+            const std::string groupName = inner->value("groupName", std::string());
             std::vector<std::string> memberKeys;
-            if (o.contains("members") && o["members"].is_array())
-                for (const auto& v : o["members"])
+            if (inner->contains("members") && (*inner)["members"].is_array())
+                for (const auto& v : (*inner)["members"])
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
-            // The sender left — strike them from our roster so they can't push
-            // further member-update / rename / avatar messages afterwards.
+
+            // The sender left — strike them from our roster so they
+            // can't push further member-update / rename / avatar
+            // messages afterwards.  Also drop their sender-key chain:
+            // they won't be sending new group_msg into this group and
+            // keeping their chain material around is pointless.
             m_groupProto.removeMember(gid, senderId);
+            m_groupProto.forgetRemoteChain(gid, senderId);
             if (onGroupMemberLeft) onGroupMemberLeft(senderId, gid,
-                                  o.value("groupName", std::string()),
+                                  groupName,
                                   memberKeys, tsSecs, msgId);
         } else if (type == "avatar") {
             if (onAvatarReceived) onAvatarReceived(senderId,
@@ -1040,29 +1343,36 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                                  o.value("avatar", std::string()));
         } else if (type == "group_rename") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
-            const std::string gid = o.value("groupId", std::string());
-            if (!gid.empty() && !m_groupProto.isAuthorizedSender(gid, senderId)) {
-                P2P_WARN("[GROUP] dropping group_rename from non-member "
-                           << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
-                return;
-            }
-            if (onGroupRenamed) onGroupRenamed(gid, o.value("newName", std::string()));
+            auto inner = decryptGroupControlInner(
+                "group_rename", senderId, o, /*requireAuthorizedSender=*/true);
+            if (!inner) return;
+            if (onGroupRenamed)
+                onGroupRenamed(o.value("groupId", std::string()),
+                                inner->value("newName", std::string()));
         } else if (type == "group_avatar") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
-            const std::string gid = o.value("groupId", std::string());
-            if (!gid.empty() && !m_groupProto.isAuthorizedSender(gid, senderId)) {
-                P2P_WARN("[GROUP] dropping group_avatar from non-member "
-                           << senderId.substr(0, 8) << "... for " << gid.substr(0, 8));
-                return;
-            }
-            if (onGroupAvatarReceived) onGroupAvatarReceived(gid, o.value("avatar", std::string()));
+            auto inner = decryptGroupControlInner(
+                "group_avatar", senderId, o, /*requireAuthorizedSender=*/true);
+            if (!inner) return;
+            if (onGroupAvatarReceived)
+                onGroupAvatarReceived(o.value("groupId", std::string()),
+                                       inner->value("avatar", std::string()));
         } else if (type == "group_member_update") {
             if (!msgId.empty() && !markSeen(msgId)) return;  // dedup
+            // Bootstrap-capable: skip the pre-decrypt sender check here
+            // because a brand-new group's first group_member_update will
+            // name the sender as part of the roster it proposes.  We
+            // still verify the sender's legitimacy post-decrypt (below).
+            auto inner = decryptGroupControlInner(
+                "group_member_update", senderId, o,
+                /*requireAuthorizedSender=*/false);
+            if (!inner) return;
+
             const std::string gid   = o.value("groupId", std::string());
-            const std::string gname = o.value("groupName", std::string());
+            const std::string gname = inner->value("groupName", std::string());
             std::vector<std::string> memberKeys;
-            if (o.contains("members") && o["members"].is_array())
-                for (const auto& v : o["members"])
+            if (inner->contains("members") && (*inner)["members"].is_array())
+                for (const auto& v : (*inner)["members"])
                     if (v.is_string()) memberKeys.push_back(v.get<std::string>());
 
             if (!gid.empty()) {
@@ -1078,7 +1388,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                         != memberKeys.end();
                     if (!senderInList) {
                         P2P_WARN("[GROUP] rejecting bootstrap group_member_update"
-                                   << " from " << senderId.substr(0, 8) << "..."
+                                   << " from " << p2p::peerPrefix(senderId) << "..."
                                    << " — sender not in proposed member list");
                         return;
                     }
@@ -1101,11 +1411,11 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                                       msgId.empty() ? p2p::makeUuid() : msgId);
 #ifdef PEER2PEAR_P2P
         } else if (type == "ice_offer") {
-            P2P_LOG("[RECV " << via << "] ice_offer from " << senderId.substr(0, 8) << "...");
+            P2P_LOG("[RECV " << via << "] ice_offer from " << p2p::peerPrefix(senderId) << "...");
             // Skip if we already have a working P2P connection
             auto connIt = m_p2pConnections.find(senderId);
             if (connIt != m_p2pConnections.end() && connIt->second->isReady()) {
-                P2P_LOG("[ICE] Already connected to " << senderId.substr(0, 8) << "... — ignoring ice_offer");
+                P2P_LOG("[ICE] Already connected to " << p2p::peerPrefix(senderId) << "... — ignoring ice_offer");
             } else {
                 if (connIt == m_p2pConnections.end()) {
                     setupP2PConnection(senderId, false);
@@ -1122,7 +1432,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 }
             }
         } else if (type == "ice_answer") {
-            P2P_LOG("[RECV " << via << "] ice_answer from " << senderId.substr(0, 8) << "...");
+            P2P_LOG("[RECV " << via << "] ice_answer from " << p2p::peerPrefix(senderId) << "...");
             auto connIt = m_p2pConnections.find(senderId);
             if (connIt != m_p2pConnections.end() && !connIt->second->isReady()) {
                 if (o.value("quic", false)) {
@@ -1148,6 +1458,35 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 return;
             }
 
+            // Arch-review #6: guard against retransmitted file_key.
+            // A second file_key for the same transferId with a fresh
+            // ratchet wrapping would produce a different msgKey and
+            // overwrite the one we already installed — every chunk
+            // that followed would then fail to decrypt.  Dedup on
+            // "file_key:<transferId>"; the sender-side transferId is
+            // a fresh UUID per logical transfer, so this is stable.
+            const std::string fileKeyDedup = "file_key:" + transferId;
+            if (!markSeen(fileKeyDedup)) {
+                sodium_memzero(msgKey.data(), msgKey.size());
+                return;
+            }
+
+            // Arch-review #4: derive the per-file AEAD key from the
+            // ratchet msgKey via HKDF bound to the transferId.  Replace
+            // msgKey in-place so every downstream consumer (announce,
+            // pending stash, fileKeys map) sees the derived key, and
+            // the raw ratchet key is zeroed here.
+            {
+                Bytes derived = CryptoEngine::deriveFileKey(msgKey, transferId);
+                CryptoEngine::secureZero(msgKey);
+                if (derived.size() != 32) {
+                    P2P_WARN("[FILE] deriveFileKey failed for "
+                             << p2p::peerPrefix(transferId) << "...");
+                    return;
+                }
+                msgKey = std::move(derived);
+            }
+
             const std::string compoundKey = senderId + ":" + transferId;
 
             // Evaluate global size policy.  The same thresholds apply
@@ -1166,7 +1505,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
 
             if (autoDecline) {
                 P2P_LOG("[FILE] auto-decline " << fileName << " (" << fileSizeMB << "MB)"
-                         << " from " << senderId.substr(0, 8) << "... — exceeds hard max");
+                         << " from " << p2p::peerPrefix(senderId) << "... — exceeds hard max");
                 json declineMsg = json::object();
                 declineMsg["type"]       = "file_decline";
                 declineMsg["transferId"] = transferId;
@@ -1182,7 +1521,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
 
                 if (announcedHash.size() != 32 || announcedChunkCount <= 0) {
                     P2P_WARN("[FILE] missing fileHash/chunkCount on file_key for "
-                               << transferId.substr(0, 8) << " — dropping");
+                               << p2p::peerPrefix(transferId) << " — dropping");
                     sodium_memzero(msgKey.data(), msgKey.size());
                     return;
                 }
@@ -1195,8 +1534,10 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                     return;
                 }
 
-                // Install key so chunks can decrypt.
-                m_fileProto.fileKeys()[compoundKey] = msgKey;
+                // Install key so chunks can decrypt.  Arch-review
+                // #5: go through FileProtocol's installer instead of
+                // mutating the internal map directly.
+                m_fileProto.installIncomingKey(senderId, transferId, msgKey);
                 sodium_memzero(msgKey.data(), msgKey.size());
 
                 json acceptMsg = json::object();
@@ -1206,7 +1547,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 m_fileProto.sendControlMessage(senderId, acceptMsg);
 
                 P2P_LOG("[FILE] auto-accept " << fileName << " (" << fileSizeMB << "MB)"
-                         << " from " << senderId.substr(0, 8) << "...");
+                         << " from " << p2p::peerPrefix(senderId) << "...");
             } else {
                 // Stash in pending — don't install key yet.  User will
                 // accept/decline.  Lock announced hash/chunkCount/ts now
@@ -1217,7 +1558,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 const int64_t announcedTs     = o.value("ts", int64_t(0));
                 if (announcedHash.size() != 32 || announcedChunkCount <= 0) {
                     P2P_WARN("[FILE] missing fileHash/chunkCount on file_key for "
-                               << transferId.substr(0, 8) << " — dropping");
+                               << p2p::peerPrefix(transferId) << " — dropping");
                     sodium_memzero(msgKey.data(), msgKey.size());
                     return;
                 }
@@ -1237,7 +1578,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                     sodium_memzero(oldest->second.fileKey.data(),
                                    oldest->second.fileKey.size());
                     P2P_WARN("[FILE] pending-incoming cap hit — evicting "
-                             << oldest->first.substr(0, 8) << "... to make room");
+                             << p2p::peerPrefix(oldest->first) << "... to make room");
                     m_fileProto.pendingIncoming().erase(oldest);
                 }
 
@@ -1256,7 +1597,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 sodium_memzero(msgKey.data(), msgKey.size());
 
                 P2P_LOG("[FILE] prompt needed for " << fileName << " (" << fileSizeMB << "MB)"
-                         << " from " << senderId.substr(0, 8) << "...");
+                         << " from " << p2p::peerPrefix(senderId) << "...");
                 if (onFileAcceptRequested) onFileAcceptRequested(senderId, transferId, fileName, fileSize);
             }
 
@@ -1264,6 +1605,10 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             // Sender-side: receiver agreed to the transfer.
             const std::string transferId = o.value("transferId", std::string());
             const bool requireP2P        = o.value("requireP2P", false);
+            // Arch-review #6: dedup on (type, transferId).  A retransmit
+            // would otherwise restart the outbound stream mid-flight.
+            if (!transferId.empty() && !markSeen("file_accept:" + transferId))
+                return;
             if (!transferId.empty()) {
                 // Sender's side of the "no relay" preference (global toggle).
                 // Desktop surfaces this via the "Require direct connection"
@@ -1283,7 +1628,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                 if (!m_fileMgr.startOutboundStream(transferId, requireP2P,
                                                     senderRequiresP2P, p2pReady)) {
                     P2P_WARN("[FILE] file_accept for unknown transferId "
-                               << transferId.substr(0, 8));
+                               << p2p::peerPrefix(transferId));
                     return;
                 }
 
@@ -1297,6 +1642,10 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
         } else if (type == "file_decline") {
             // Sender-side: receiver refused. Drop outbound state, notify UI.
             const std::string transferId = o.value("transferId", std::string());
+            // Arch-review #6: dedup so a retransmit doesn't fire the
+            // "declined by recipient" UI status twice.
+            if (!transferId.empty() && !markSeen("file_decline:" + transferId))
+                return;
             if (!transferId.empty()) {
                 m_fileMgr.abandonOutboundTransfer(transferId);
                 if (onFileTransferCanceled) onFileTransferCanceled(transferId, true); // byReceiver
@@ -1306,6 +1655,10 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
         } else if (type == "file_ack") {
             // Sender-side: receiver confirmed delivery + hash ok.
             const std::string transferId = o.value("transferId", std::string());
+            // Arch-review #6: dedup so double-ack doesn't fire the
+            // delivered callback twice.
+            if (!transferId.empty() && !markSeen("file_ack:" + transferId))
+                return;
             if (!transferId.empty()) {
                 if (onFileTransferDelivered) onFileTransferDelivered(transferId);
                 // Drop sender-side state now that the transfer is acked.
@@ -1327,7 +1680,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             // file_request at most a few times per session.
             const size_t kMaxChunksPerRequest = 1024;
             if (o["chunks"].size() > kMaxChunksPerRequest) {
-                P2P_WARN("[FILE] file_request from " << senderId.substr(0, 8) << "..."
+                P2P_WARN("[FILE] file_request from " << p2p::peerPrefix(senderId) << "..."
                            << " has " << int(o["chunks"].size())
                            << " indices (cap " << int(kMaxChunksPerRequest) << ") — dropping");
                 return;
@@ -1337,7 +1690,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             if (++rcount > kMaxFileRequestsPerPoll) {
                 if (rcount == kMaxFileRequestsPerPoll + 1) {
                     P2P_WARN("[FILE] file_request rate limit hit for "
-                             << senderId.substr(0, 8) << "... — dropping further"
+                             << p2p::peerPrefix(senderId) << "... — dropping further"
                              << " requests this cycle");
                 }
                 return;
@@ -1353,13 +1706,17 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             }
             if (!m_fileMgr.resendChunks(transferId, indices)) {
                 P2P_WARN("[FILE] file_request for unknown transferId "
-                           << transferId.substr(0, 8) << "...");
+                           << p2p::peerPrefix(transferId) << "...");
             }
 
         } else if (type == "file_cancel") {
             // Either side: the peer canceled. Figure out which role we're in.
             const std::string transferId = o.value("transferId", std::string());
             if (transferId.empty()) return;
+            // Arch-review #6: dedup on (type, transferId).  Retransmits
+            // would otherwise fire onFileTransferCanceled multiple
+            // times and repeat the DB cleanup.
+            if (!markSeen("file_cancel:" + transferId)) return;
 
             // Outbound (we're the sender)?
             if (!m_fileMgr.outboundPeerFor(transferId).empty()) {
@@ -1392,7 +1749,7 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
             Bytes kemPub = CryptoEngine::fromBase64Url(o.value("kem_pub_b64u", std::string()));
             if (kemPub.size() == 1184) {  // ML-KEM-768 pub key size
                 m_sealer.saveKemPub(senderId, kemPub);
-                P2P_LOG("[PQ] Stored ML-KEM-768 pub from " << senderId.substr(0, 8) << "..."
+                P2P_LOG("[PQ] Stored ML-KEM-768 pub from " << p2p::peerPrefix(senderId) << "..."
                          << " | hybrid sealing now active for this peer");
                 // Reciprocate: send our KEM pub back if we haven't already
                 if (m_crypto.hasPQKeys() && !m_sealer.lookupPeerKemPub(senderId).empty()) {
@@ -1400,14 +1757,14 @@ void ChatController::dispatchSealedPayload(const nlohmann::json& o,
                     announceKemPub(senderId);
                 }
             } else {
-                P2P_WARN("[PQ] Invalid kem_pub_announce from " << senderId.substr(0, 8) << "..."
+                P2P_WARN("[PQ] Invalid kem_pub_announce from " << p2p::peerPrefix(senderId) << "..."
                            << " | size: " << kemPub.size() << " (expected 1184)");
             }
         } else if (type == "file_chunk") {
             // Sealed file_chunk in JSON payload shouldn't happen — file chunks
             // use SEALEDFC: prefix and are handled above before session decrypt.
             P2P_WARN("[RECV " << via << "] unexpected file_chunk in session payload from "
-                       << senderId.substr(0, 8) << "...");
+                       << p2p::peerPrefix(senderId) << "...");
         }
 }
 
@@ -1437,7 +1794,7 @@ void ChatController::resetSession(const std::string& peerIdB64u)
 {
     if (m_sessionMgr) {
         m_sessionMgr->deleteSession(peerIdB64u);
-        P2P_LOG("[SESSION] Reset ratchet session for " << peerIdB64u.substr(0, 8) << "...");
+        P2P_LOG("[SESSION] Reset ratchet session for " << p2p::peerPrefix(peerIdB64u) << "...");
         if (onStatus) onStatus("Session reset — next message will establish a fresh handshake.");
     }
 }
@@ -1459,6 +1816,14 @@ void ChatController::setKnownGroupMembers(const std::string& groupId,
                                            const std::vector<std::string>& members)
 {
     m_groupProto.setKnownMembers(groupId, members);
+    // v3: persist the conversation row + members so group_* CRUD
+    // (which FKs to conversations(id)) finds the parent, and so the
+    // chat list surfaces the group on next launch.  No-op when
+    // m_appData is null (legacy callers without the data store).
+    if (m_appData) {
+        m_appData->ensureGroupConversation(groupId);
+        m_appData->setConversationMembers(groupId, members);
+    }
 }
 
 // ── Post-Quantum KEM pub exchange ───────────────────────────────────────────
@@ -1481,5 +1846,5 @@ void ChatController::announceKemPub(const std::string& peerIdB64u)
     payload["ts"] = nowSecs();
 
     sendSealedPayload(peerIdB64u, payload);
-    P2P_LOG("[PQ] Announced ML-KEM-768 pub to " << peerIdB64u.substr(0, 8) << "...");
+    P2P_LOG("[PQ] Announced ML-KEM-768 pub to " << p2p::peerPrefix(peerIdB64u) << "...");
 }

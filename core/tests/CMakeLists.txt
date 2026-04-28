@@ -42,10 +42,12 @@ endfunction()
 
 peer2pear_add_test(test_crypto_engine)
 peer2pear_add_test(test_sqlcipher_db)
+peer2pear_add_test(test_app_data_store)
 peer2pear_add_test(test_sealed_envelope)
 peer2pear_add_test(test_ratchet_session)
 peer2pear_add_test(test_session_manager)
 peer2pear_add_test(test_session_sealer)
+peer2pear_add_test(test_sender_chain)
 peer2pear_add_test(test_group_protocol)
 peer2pear_add_test(test_file_protocol)
 peer2pear_add_test(test_file_transfer)
@@ -53,6 +55,8 @@ peer2pear_add_test(test_e2e_two_clients)
 peer2pear_add_test(test_c_api)
 peer2pear_add_test(test_c_api_e2e)
 peer2pear_add_test(test_relay_cover_traffic)
+peer2pear_add_test(test_onion_wrap)
+peer2pear_add_test(test_std_timer)
 
 # test_c_api + test_c_api_e2e + test_e2e_two_clients all instantiate
 # ChatController, which — when built with PEER2PEAR_P2P=ON — has

@@ -1,12 +1,15 @@
 #pragma once
 
+#include "types.hpp"
+
 #include <cstdint>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
-#include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 class CryptoEngine;
@@ -33,7 +36,6 @@ class SqlCipherDb;
  */
 class FileTransferManager {
 public:
-    using Bytes = std::vector<uint8_t>;
 
     /// Return the sealed envelope to dispatch for a file chunk.  Empty = seal failed.
     using SealFn = std::function<Bytes(const std::string& peerIdB64u,
@@ -252,6 +254,11 @@ public:
                        const std::string& groupName)>  onFileChunkSent;
 
 private:
+    // Insert a transfer ID into the bounded aborted-transfers set,
+    // evicting the oldest entry if the cap is hit.  Idempotent on
+    // already-present IDs (no double-insert into the order deque).
+    void rememberAborted(const std::string& transferId);
+
     /// Per-incoming-transfer state. Backed by a file on disk.
     struct IncomingTransfer {
         std::string fromId;
@@ -329,7 +336,17 @@ private:
     };
     std::map<std::string, OutboundTransfer> m_outboundPending;
 
-    std::set<std::string> m_abortedTransfers;
+    // Bounded FIFO of cancelled / abandoned transfer IDs.  The
+    // active-send loop checks membership before fanning out the next
+    // chunk; a long-lived process that's seen many cancels doesn't
+    // need to remember every one indefinitely.  kMaxAbortedTransfers
+    // is generous: a transfer that resumes after the ID has been
+    // evicted from this cache simply pays one extra encrypt+seal
+    // before the recipient drops it.  The deque carries insertion
+    // order so we can pop the oldest when the set is full.
+    static constexpr size_t kMaxAbortedTransfers = 256;
+    std::unordered_set<std::string> m_abortedTransfers;
+    std::deque<std::string>         m_abortedTransfersOrder;
 
     bool m_senderRequiresP2PLive = false;
 
