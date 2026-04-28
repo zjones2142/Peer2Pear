@@ -200,7 +200,7 @@ struct TransferReceiveView: View {
                 }
                 .padding(.horizontal, 16)
 
-                Text("Both devices need to be on the same Wi-Fi or close enough for Bluetooth.  After scanning / pasting, you'll enter the same passphrase on this device.")
+                Text("Both devices need to be on the same Wi-Fi or LAN.  After scanning / pasting, you'll enter the same passphrase on this device.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -440,6 +440,15 @@ struct TransferReceiveView: View {
                 }
             }
 
+            // Cache the verifier on success so the lock overlay
+            // can re-unlock without re-deriving Argon2id.  Mirrors
+            // OnboardingView's unlock path.  Done before bouncing
+            // to main so it's in place by the time SwiftUI starts
+            // routing.
+            if !client.myPeerId.isEmpty {
+                client.recordVerifier(passphrase: pass)
+            }
+
             DispatchQueue.main.async {
                 if !client.myPeerId.isEmpty {
                     if let err = snapshotApplyError {
@@ -633,11 +642,9 @@ struct TransferSendView: View {
                 }
                 .padding(.horizontal, 24)
 
-                // What-transfers preview.  Honest scope: the
-                // app's worth of state, not raw saved-file
-                // bytes.  Files-don't-transfer is named
-                // explicitly so users can plan ahead (use
-                // AirDrop / Quick Transfer for bulk file moves).
+                // What-transfers preview — honest scope so the
+                // user sees what's about to land on the new
+                // device before committing.
                 VStack(alignment: .leading, spacing: 4) {
                     Text("What transfers:")
                         .font(.caption.bold())
@@ -651,7 +658,7 @@ struct TransferSendView: View {
                     Text("What does NOT transfer:")
                         .font(.caption.bold())
                         .padding(.top, 6)
-                    Text("• Saved files (downloaded attachments).  Move those with AirDrop, iCloud Drive, or your normal device-transfer flow — Peer2Pear isn't a file-sync layer.")
+                    Text("Saved files (downloaded attachments).  Use AirDrop or iCloud Drive to move those between devices.")
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .font(.caption2)
@@ -660,7 +667,7 @@ struct TransferSendView: View {
                 .padding(.horizontal, 32)
                 .padding(.top, 8)
 
-                Text("Encrypted transfer over MultipeerConnectivity — the blob never touches Apple's servers or any third party.")
+                Text("Encrypted transfer over your LAN — the blob never touches Apple's servers or any third party.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -750,8 +757,8 @@ struct TransferSendView: View {
         switch phaseObserver.observedPhase {
         case .idle, .browsing:
             statusBody(systemImage: "wave.3.right",
-                        title: "Looking for your new device…",
-                        body: "Both devices need to be on the same Wi-Fi or close enough for Bluetooth.")
+                        title: "Connecting to your new device…",
+                        body: "Both devices need to be on the same Wi-Fi or LAN.")
         case .connecting:
             statusBody(systemImage: "arrow.left.arrow.right",
                         title: "Connecting…",
@@ -1063,7 +1070,7 @@ struct TransferSendView: View {
         // Curated in MigrationSettings.migratedKeys; per-device
         // counters like failedUnlockAttempts intentionally don't
         // travel.
-        let settings = MigrationSettings.snapshot()
+        let settings = MigrationSettings.snapshot(client: client)
 
         let payload = MigrationPayload(
             version:         MigrationPayload.currentVersion,

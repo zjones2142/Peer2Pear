@@ -20,17 +20,12 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_p2p-migration._tcp</string>
-		<string>_p2p-migration._udp</string>
-	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Peer2Pear uses the camera to scan other users' QR codes so you can add them as contacts without typing a 43-character key.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Peer2Pear uses Face ID to unlock your passphrase from the iOS Keychain so you don't have to type it on every launch.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Peer2Pear may use your local network to establish direct peer-to-peer connections for faster, more private messaging.</string>
+	<string>Peer2Pear uses your local network to securely transfer your account data when migrating to a new device, and may use it for direct peer-to-peer messaging in future versions.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

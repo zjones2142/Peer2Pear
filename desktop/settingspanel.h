@@ -11,6 +11,8 @@
 #include <QSpinBox>
 #include <QComboBox>
 
+#include <string>
+
 class AppDataStore;
 
 class SettingsPanel : public QWidget
@@ -29,6 +31,39 @@ public:
         SenderOnly = 1,   // "<senderName> sent a new message"
         Full       = 2    // "<senderName>: <message text>"
     };
+
+    // Lock mode — desktop equivalent of iOS Peer2PearClient.LockMode.
+    // Strict on desktop = quit-and-relaunch posture (the app process
+    // exits on lock; user re-enters passphrase via PassphraseDialog
+    // on next launch).  Quick + QuickWithEviction stay in-process and
+    // cover the chat with LockOverlay; QuickWithEviction additionally
+    // clears ChatView's currently-displayed message buffer so a quick
+    // peek behind the overlay (e.g. via Qt accessibility tooling)
+    // can't recover the most-recent thread.  See
+    // project_lock_modes.md for the full design + threat model.
+    enum class LockMode {
+        Strict             = 0,
+        QuickWithEviction  = 1,   // default
+        Quick              = 2
+    };
+
+    // Persistence + UI helpers for LockMode.  Single source of
+    // truth for the persisted string keys ("strict" / "quick" /
+    // "quickWithEviction") and the user-facing strings.  Free
+    // functions in the SettingsPanel namespace so MainWindow can
+    // call them without instantiating a SettingsPanel.
+    static const char *lockModeToKey(LockMode mode);
+    static LockMode    lockModeFromKey(const std::string &key,
+                                        LockMode fallback = LockMode::QuickWithEviction);
+    static QString     lockModeDisplayName(LockMode mode);
+    static QString     lockModeExplainer(LockMode mode);
+
+    /// Cached values exposed for MainWindow so it doesn't have to
+    /// re-read m_store (each load is a SQLCipher AES-GCM decrypt).
+    /// Updated when the user mutates the picker and on initial
+    /// load via setAppDataStore().
+    LockMode lockMode()        const { return m_lockMode; }
+    int      autoLockMinutes() const { return m_autoLockMinutes; }
 
     explicit SettingsPanel(QWidget *parent = nullptr);
 
@@ -97,6 +132,24 @@ signals:
     // MainWindow forwards to m_controller.relay().setMultiHopEnabled.
     void multiHopToggled(bool on);
 
+    // Lock-mode picker changed.  MainWindow updates m_lockMode +
+    // persists the new value to QSettings.
+    void lockModeChanged(SettingsPanel::LockMode mode);
+
+    // Auto-lock idle minutes.  -1 = never; 0 = lock immediately on
+    // backgrounding.  MainWindow re-arms its idle timer.
+    void autoLockMinutesChanged(int minutes);
+
+    // Manual "Lock now" — MainWindow calls its own lock() slot.
+    // Surfaced through a signal rather than a direct call so the
+    // settings panel doesn't need to know about MainWindow.
+    void lockNowClicked();
+
+    // "Transfer to new device" — MainWindow opens the sender
+    // dialog (which knows the keys directory + does the LAN TCP
+    // handshake).  Same signal-shaped indirection as lockNowClicked.
+    void transferToNewDeviceClicked();
+
 private slots:
     void onToggleNotifications();
     void onToggleDnd();
@@ -128,6 +181,15 @@ private:
     QWidget *makeArchivedChatsSection();
     QWidget *makeAboutHelpSection();
     QWidget *makeFactoryResetSection();
+    // App Lock section — Lock Mode picker + Auto-Lock minutes
+    // spinner + "Lock Now" button.  Mirrors iOS LockSection in
+    // SettingsView.swift.
+    QWidget *makeLockSection();
+
+    // Transfer-to-new-device section — single button that emits
+    // transferToNewDeviceClicked.  MainWindow opens the
+    // MigrationSendDialog from there.
+    QWidget *makeTransferSection();
 
     // Profile
     QLabel      *m_displayNameLabel     = nullptr;
@@ -196,6 +258,19 @@ private:
     QPushButton *m_multiHopToggleBtn           = nullptr;
     QLabel      *m_multiHopStatusLbl           = nullptr;
     void applyMultiHopState();
+
+    // App Lock section state.  m_lockMode + m_autoLockMinutes are
+    // both persisted to QSettings (keys "lockMode" and
+    // "autoLockMinutes") so they survive across launches.  Loaded
+    // in setAppDataStore() — same lifecycle hook as the other
+    // settings — and emitted up to MainWindow on user changes via
+    // lockModeChanged / autoLockMinutesChanged.
+    LockMode     m_lockMode             = LockMode::QuickWithEviction;
+    int          m_autoLockMinutes      = 5;          // default 5 min
+    QComboBox   *m_lockModeCombo        = nullptr;
+    QLabel      *m_lockModeHelp         = nullptr;
+    QSpinBox    *m_autoLockSpin         = nullptr;
+    void applyLockModeHelp();
 
     // Appearance — three buttons styled like the privacy level picker.
     // The selected preference itself lives on ThemeManager (single

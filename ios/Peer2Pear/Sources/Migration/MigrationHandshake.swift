@@ -39,19 +39,36 @@ struct MigrationHandshake: Codable {
     /// migration sessions — each fresh QR derives different keys
     /// even from the same pubkey hash.
     let nonce: Data
+
+    /// LAN IPv4 address the receiver is listening on (v2+).  When
+    /// present the sender connects directly via TCP — no Bonjour /
+    /// MultipeerConnectivity discovery, no relay.  v1 handshakes
+    /// from older receivers omit the field; senders fall back to
+    /// platform-native discovery (iOS MPC).
+    let addr: String?
+
+    /// TCP port the receiver's listener bound (v2+).  Paired with
+    /// `addr`; either both are present (v2 cross-platform path) or
+    /// both absent (v1 iOS-MPC-only path).
+    let port: Int?
 }
 
 extension MigrationHandshake {
-    /// Bumped on incompatible QR-format changes — switching hash
-    /// algorithm, changing fingerprint length, etc.  Forward-
-    /// compatible additions (extra optional fields) don't bump.
-    static let currentVersion = 1
+    /// Wire-format versions the decoder accepts.  v1 (no addr/port)
+    /// is the legacy MPC-era handshake, kept for backward decode
+    /// only — modern receivers always emit v2 once their TCP
+    /// listener is up and they know their addr+port.
+    static let supportedVersions: Set<Int> = [1, 2]
 
-    /// Build a handshake for a freshly-generated keypair pair.
-    /// `fingerprint` should come from `MigrationCryptoBridge
-    /// .fingerprint(x25519Pub:mlkemPub:)`; the matching private
-    /// keys stay in receiver-process memory for the duration of
-    /// the migration, then are wiped.
+    /// Build an INTERNAL v1 placeholder for a freshly-generated
+    /// keypair.  Receiver sessions create this at construction time
+    /// (when the keypair fingerprint + nonce are known) and replace
+    /// it with a v2 handshake (with addr + port) once the
+    /// `NWListener` transitions to .ready.  The placeholder is
+    /// never emitted on the wire — `MigrationReceiveSession.start`
+    /// only flips phase to `.advertising` after the v2 upgrade, and
+    /// the QR-rendering view watches phase before reading the
+    /// handshake.
     static func make(fingerprint: Data) -> MigrationHandshake {
         precondition(fingerprint.count == 16,
                       "fingerprint must be 16 bytes")
@@ -62,9 +79,11 @@ extension MigrationHandshake {
             _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
         }
         return MigrationHandshake(
-            version:     currentVersion,
+            version:     1,
             fingerprint: fingerprint,
-            nonce:       nonce)
+            nonce:       nonce,
+            addr:        nil,
+            port:        nil)
     }
 
     /// Encode for QR display.  Base64url-of-JSON keeps the payload
@@ -102,9 +121,15 @@ extension MigrationHandshake {
                 MigrationHandshake.self, from: data) else {
             return nil
         }
-        guard h.version == currentVersion        else { return nil }
-        guard h.fingerprint.count == 16          else { return nil }
-        guard h.nonce.count == 16                else { return nil }
+        guard supportedVersions.contains(h.version) else { return nil }
+        guard h.fingerprint.count == 16             else { return nil }
+        guard h.nonce.count == 16                   else { return nil }
+        // v2 sanity: if either of addr/port is present, both must
+        // be — a half-populated handshake means a sender produced
+        // a malformed payload.  v1 senders omit both, which is
+        // also valid.
+        if (h.addr != nil) != (h.port != nil)       { return nil }
+        if let p = h.port, p <= 0 || p > 65535      { return nil }
         return h
     }
 

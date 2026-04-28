@@ -2,6 +2,10 @@
 #include "./ui_mainwindow.h"
 #include "dialogs.h"        // openArchivedChatsDialog
 #include "onboardingdialog.h"
+#include "passphrasedialog.h"
+#include "lockoverlay.h"
+#include "migrationsenddialog.h"
+#include "migrationsettings.h"
 #include "qt_interop.hpp"  // Qt↔std boundary helpers for CryptoEngine calls
 #include "bytes_util.hpp"  // strBytes helper (Qt-free)
 #include "peer2pear.h"     // P2P_MIN_PASSPHRASE_BYTES — single source of truth
@@ -26,6 +30,9 @@
 #include <QIODevice>
 #include <QMessageBox>
 #include <QLineEdit>
+#include <QAction>
+#include <QIcon>
+#include <QSystemTrayIcon>
 #include <QToolButton>
 #include <QMenu>
 #include <QWidgetAction>
@@ -242,24 +249,50 @@ MainWindow::MainWindow(QWidget *parent)
         // correctly use the unlock wording rather than the create wording.
         const bool firstRun = !QFile::exists(keysDirForCheck + "/db_salt.bin");
 
-        bool ok = false;
-        const QString title = firstRun ? "Create Passphrase" : "Unlock Identity";
-        const QString prompt = firstRun
-            ? QStringLiteral(
-                "Welcome to Peer2Pear.\n\n"
-                "Create a passphrase to protect your identity and local data.\n"
-                "This passphrase cannot be recovered if you forget it \u2014 write it "
-                "down somewhere safe.")
-            : QStringLiteral(
-                "Enter passphrase to unlock this device identity:");
+        PassphraseDialog dlg(firstRun ? PassphraseDialog::CreateNew
+                                       : PassphraseDialog::Unlock,
+                              this);
+        const int dlgResult = dlg.exec();
 
-        QString pass = QInputDialog::getText(this, title, prompt,
-                                             QLineEdit::Password, "", &ok);
-        if (!ok) { QTimer::singleShot(0, qApp, &QCoreApplication::quit); return; }
-        if (pass.isEmpty()) {
-            QMessageBox::warning(this, "Passphrase Required", "Passphrase cannot be empty.");
+        // Forgot Password recovery path: dialog already wiped the
+        // app data directory + cleared QSettings.  Loop back to the
+        // top - firstRun=true now, so the next iteration shows the
+        // CreateNew branch and the user can start fresh.
+        if (dlg.wasReset()) {
             continue;
         }
+
+        // User picked "Transfer from another device".  Phase 2 hook:
+        // dialog already showed a "Coming soon" message, didn't
+        // accept().  Fall through with empty passphrase -> handle
+        // like a cancel (quit).  Once the migration receiver lands,
+        // branch into it here instead.
+        if (dlg.wasTransferRequested() && dlg.passphrase().isEmpty()) {
+            QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+            return;
+        }
+
+        // Plain dismissal - Cancel / X / Esc.  Quit cleanly so the
+        // user doesn't end up at a half-initialised main window.
+        if (dlgResult != QDialog::Accepted || dlg.passphrase().isEmpty()) {
+            QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+            return;
+        }
+
+        // Migration arrived — stash the snapshot + settings on
+        // MainWindow-scope buffers so a wrong-passphrase retry
+        // loop doesn't lose them.  Files are already on disk;
+        // user just needs to derive the right key.
+        if (dlg.wasMigrationApplied()) {
+            if (!dlg.pendingAppDataSnapshot().isEmpty()) {
+                m_pendingMigrationSnapshot = dlg.pendingAppDataSnapshot();
+            }
+            if (!dlg.pendingUserDefaults().isEmpty()) {
+                m_pendingMigrationSettings = dlg.pendingUserDefaults();
+            }
+        }
+
+        QString pass = dlg.passphrase();
         // Enforce the same byte-length floor the core does in
         // p2p_set_passphrase_v2.  Surface the reason inline instead of
         // letting the core silently reject it a few lines down.  The
@@ -274,26 +307,6 @@ MainWindow::MainWindow(QWidget *parent)
             continue;
         }
 
-        // First-run: require double-entry.  A mismatched confirm is far cheaper
-        // to recover from than a silent typo the user will never type again.
-        if (firstRun) {
-            QString confirm = QInputDialog::getText(this, "Confirm Passphrase",
-                "Re-enter the passphrase to confirm:",
-                QLineEdit::Password, "", &ok);
-            if (!ok) {
-                p2p::bridge::secureZeroQ(pass);
-                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
-                return;
-            }
-            if (confirm != pass) {
-                QMessageBox::warning(this, "Passphrases Don't Match",
-                    "The two passphrases didn't match. Please try again.");
-                p2p::bridge::secureZeroQ(pass);
-                p2p::bridge::secureZeroQ(confirm);
-                continue;
-            }
-            p2p::bridge::secureZeroQ(confirm);
-        }
         try {
             // ── Unified key derivation (single Argon2id call) ────────────────
             const QString keysDir = QStandardPaths::writableLocation(
@@ -394,6 +407,35 @@ MainWindow::MainWindow(QWidget *parent)
             // returns std::map directly so no Qt-bridge conversion needed.
             m_controller.setGroupSeqCounters(m_store.loadGroupSeqOut(),
                                               m_store.loadGroupSeqIn());
+
+            // If migration just landed an AppDataSnapshot, apply
+            // it now — the DB is keyed + bound + the controller
+            // sees the store, so bulk inserts are safe.  Apply
+            // before recordVerifier / break so a partial-failure
+            // log surfaces alongside the unlock progress, not
+            // mid-chat-list-render.
+            if (!m_pendingMigrationSnapshot.isEmpty()) {
+                applyMigrationAppDataSnapshot(m_pendingMigrationSnapshot);
+                m_pendingMigrationSnapshot.clear();
+            }
+            // Apply migrated settings (relayUrl, lockMode, theme,
+            // etc.) — translates iOS UserDefaults keys to
+            // desktop's m_store keys.  Must run BEFORE the
+            // settingspanel.setAppDataStore() call further down
+            // (line ~518) so the panel's initial-load picks up
+            // the migrated values rather than the desktop
+            // defaults.
+            if (!m_pendingMigrationSettings.isEmpty()) {
+                MigrationSettings::applySnapshot(
+                    m_pendingMigrationSettings, m_store);
+                m_pendingMigrationSettings = {};
+            }
+
+            // Cache the verifier so the lock overlay can re-unlock
+            // without re-running Argon2id.  Mirrors iOS
+            // OnboardingView's `client.recordVerifier(passphrase:)`
+            // call after a successful start().
+            recordVerifier(pass);
 
             p2p::bridge::secureZeroQ(pass);
             break;
@@ -507,6 +549,17 @@ MainWindow::MainWindow(QWidget *parent)
     m_mainStack->addWidget(m_settingsPanel);    // index 1 – settings
 
     rootLayout->addWidget(m_mainStack);
+
+    // ── Lock overlay ──────────────────────────────────────────────────────────
+    // Parented to centralWidget() so it can cover both the chat
+    // pane and the settings pane (different stack indexes).
+    // Hidden on creation; shown on lock() via showLockOverlay().
+    // Geometry tracks the centralWidget via resizeEvent +
+    // showLockOverlay's setGeometry call.
+    m_lockOverlay = new LockOverlay(centralWidget());
+    m_lockOverlay->hide();
+    connect(m_lockOverlay, &LockOverlay::unlockRequested,
+            this, &MainWindow::quickUnlock);
 
     // ── ChatView ──────────────────────────────────────────────────────────────
     m_chatView = new ChatView(ui, &m_controller, &m_store, this);
@@ -748,6 +801,55 @@ MainWindow::MainWindow(QWidget *parent)
         m_controller.setHardBlockOnKeyChange(on);
     });
 
+    // ── Lock-mode wiring ─────────────────────────────────────────────────────
+    // lockMode + autoLockMinutes are cached on SettingsPanel and
+    // read on demand in lock() / onApplicationStateChanged via its
+    // getters, so we don't observe lockModeChanged.  We DO observe
+    // autoLockMinutesChanged so a longer/never threshold cancels
+    // any timer armed against the older shorter value — otherwise
+    // a stale fire would lock the user out mid-session.
+    connect(m_settingsPanel, &SettingsPanel::autoLockMinutesChanged,
+            this, [this](int /*mins*/) {
+        m_autoLockTimer.stop();
+    });
+    connect(m_settingsPanel, &SettingsPanel::lockNowClicked,
+            this, &MainWindow::lock);
+
+    // ── Transfer to new device ──────────────────────────────────────────────
+    // Receiver-side scaffolding lives behind the unlock-screen
+    // PassphraseDialog (footer "Transfer from another device"
+    // button); the SENDER side belongs in Settings on the
+    // already-unlocked source device.  Reads identity files
+    // straight from disk via the keys directory; the user has
+    // already proven passphrase ownership by virtue of being
+    // unlocked, so no extra prompt is needed here.
+    connect(m_settingsPanel, &SettingsPanel::transferToNewDeviceClicked,
+            this, [this]() {
+        const QString keysDir = QStandardPaths::writableLocation(
+            QStandardPaths::AppDataLocation) + "/keys";
+        // Pre-build the snapshot + settings here (we have m_store
+        // + SettingsPanel; the dialog doesn't).  Empty payloads
+        // would degrade to identity-only migration; the receiver
+        // tolerates either.
+        const QByteArray snapshotJson = buildMigrationAppDataSnapshot();
+        const QJsonObject userDefaults =
+            MigrationSettings::buildSnapshotJson(m_store);
+        MigrationSendDialog dlg(keysDir, snapshotJson,
+                                  userDefaults, this);
+        dlg.exec();
+    });
+
+    // QApplication::applicationStateChanged drives the auto-lock
+    // timer.  Connected through qApp because it's an app-level
+    // signal, not window-level.  Kicks the timer when the app
+    // leaves Active and cancels it on return.
+    connect(qApp, &QApplication::applicationStateChanged,
+            this, &MainWindow::onApplicationStateChanged);
+
+    m_autoLockTimer.setSingleShot(true);
+    connect(&m_autoLockTimer, &QTimer::timeout,
+            this, &MainWindow::onAutoLockTimerExpired);
+
     // Surface safety-number mismatches as a status message + rebuild
     // the chat list so the warning badge appears next to the display
     // name.  UI will pick up details from peerTrust() on next render.
@@ -785,6 +887,58 @@ MainWindow::MainWindow(QWidget *parent)
     connect(&m_resizeDebounce, &QTimer::timeout, this, [this]() {
         if (m_chatView) m_chatView->reloadCurrentChat();
     });
+
+    // ── System tray icon ──────────────────────────────────────────────────────
+    // Stay-running-in-background pattern: closing the main window
+    // hides it to the tray instead of quitting, so the relay
+    // connection + ChatController stay live and inbound messages
+    // keep arriving + posting notifications.  Same posture as
+    // Slack / Discord / Element / Signal-desktop.  Real quit goes
+    // through the tray menu's "Quit Peer2Pear" item or
+    // QApplication::quit() (e.g. Cmd-Q on macOS, Alt-F4 on Linux
+    // when the tray isn't available).
+    if (QSystemTrayIcon::isSystemTrayAvailable()) {
+        m_tray = new QSystemTrayIcon(this);
+        // Resource icon falls back to the app's own window icon if
+        // the asset isn't bundled (covers headless / first-run
+        // builds where resources.qrc didn't pick up icons/).
+        QIcon trayIcon(":/icons/peer2pear.png");
+        if (trayIcon.isNull()) {
+            trayIcon = windowIcon();
+        }
+        m_tray->setIcon(trayIcon);
+        m_tray->setToolTip("Peer2Pear");
+
+        auto *menu = new QMenu(this);
+        QAction *showAct = menu->addAction("Show Peer2Pear");
+        connect(showAct, &QAction::triggered,
+                this, &MainWindow::showFromTray);
+
+        QAction *lockAct = menu->addAction("Lock now");
+        connect(lockAct, &QAction::triggered, this, [this]() {
+            // Bring the window forward first so the user lands on
+            // the lock overlay (or the unlock prompt after a
+            // Strict-mode relaunch) instead of "the tray icon
+            // changed but nothing else seems to have happened".
+            showFromTray();
+            lock();
+        });
+
+        menu->addSeparator();
+        QAction *quitAct = menu->addAction("Quit Peer2Pear");
+        connect(quitAct, &QAction::triggered, this, [this]() {
+            // Mark the quit path so closeEvent below lets the
+            // event through instead of hiding-to-tray.
+            m_bypassHideToTray = true;
+            close();   // triggers closeEvent → real quit
+            qApp->quit();
+        });
+
+        m_tray->setContextMenu(menu);
+        connect(m_tray, &QSystemTrayIcon::activated,
+                this, &MainWindow::onTrayActivated);
+        m_tray->show();
+    }
 }
 
 MainWindow::~MainWindow() {
@@ -802,6 +956,467 @@ void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
     m_resizeDebounce.start(); // coalesce rapid resize events
+    // Keep the lock overlay tracking the central widget's size so
+    // resizing the window doesn't expose the chat behind it.
+    if (m_isUILocked) updateLockOverlayGeometry();
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    // Without a tray icon (Linux desktop without status notifier,
+    // headless test runner, etc.) there's nowhere to hide-to —
+    // accept the close and let the app quit normally.
+    if (!m_tray || m_bypassHideToTray) {
+        QMainWindow::closeEvent(event);
+        return;
+    }
+
+    // Hide-to-tray.  Stay-running posture so inbound messages keep
+    // arriving + posting notifications while the window is closed.
+    // First time only, surface a balloon explaining what just
+    // happened so the user doesn't think we crashed.  QSettings
+    // tracks the gate across launches.
+    QSettings s;
+    if (!s.value("ui.shownTrayHint", false).toBool()) {
+        m_tray->showMessage(
+            "Peer2Pear is still running",
+            "Closing the window keeps the app in the tray so you "
+            "still get messages.  Right-click the tray icon to "
+            "fully quit.",
+            QSystemTrayIcon::Information,
+            6000);
+        s.setValue("ui.shownTrayHint", true);
+        m_shownTrayHint = true;
+    }
+    hide();
+    event->ignore();
+}
+
+void MainWindow::onTrayActivated(QSystemTrayIcon::ActivationReason reason)
+{
+    // macOS routes single-clicks on the status bar straight to
+    // the context menu, so only Trigger (left click on Linux /
+    // Windows) toggles visibility there.  DoubleClick remains a
+    // common idiom on KDE / Windows — handle both.
+    switch (reason) {
+    case QSystemTrayIcon::Trigger:
+    case QSystemTrayIcon::DoubleClick:
+        showFromTray();
+        break;
+    default:
+        break;
+    }
+}
+
+void MainWindow::showFromTray()
+{
+    // raise() + activateWindow() because just calling show() on a
+    // window that was minimised-then-hidden leaves it behind other
+    // windows on some compositors (notably KWin).  isMinimized()
+    // check restores from the dock too.
+    if (isMinimized()) {
+        showNormal();
+    } else {
+        show();
+    }
+    raise();
+    activateWindow();
+}
+
+// ── Lock-mode plumbing ──────────────────────────────────────────────────────
+// recordVerifier / verifyPassphrase use libsodium's SHA-256 to
+// match iOS's CryptoKit.SHA256 byte-for-byte (same salt format,
+// same hash construction).
+
+namespace {
+constexpr int kVerifierSaltBytes = 16;
+
+QByteArray sha256Verifier(const QByteArray &salt, const QString &passphrase)
+{
+    const QByteArray passUtf8 = passphrase.toUtf8();
+    QByteArray combined;
+    combined.reserve(salt.size() + passUtf8.size());
+    combined.append(salt);
+    combined.append(passUtf8);
+    QByteArray hash(crypto_hash_sha256_BYTES, '\0');
+    crypto_hash_sha256(
+        reinterpret_cast<unsigned char*>(hash.data()),
+        reinterpret_cast<const unsigned char*>(combined.constData()),
+        combined.size());
+    return hash;
+}
+}  // namespace
+
+void MainWindow::recordVerifier(const QString &passphrase)
+{
+    QByteArray salt(kVerifierSaltBytes, '\0');
+    randombytes_buf(salt.data(), salt.size());
+    m_verifierSalt = salt;
+    m_verifierHash = sha256Verifier(salt, passphrase);
+}
+
+bool MainWindow::verifyPassphrase(const QString &passphrase) const
+{
+    if (m_verifierSalt.isEmpty() || m_verifierHash.isEmpty()) {
+        return false;
+    }
+    const QByteArray candidate = sha256Verifier(m_verifierSalt, passphrase);
+    // Constant-time compare so a timing leak doesn't turn the
+    // verifier into a passphrase oracle.
+    return sodium_memcmp(
+        candidate.constData(), m_verifierHash.constData(),
+        crypto_hash_sha256_BYTES) == 0;
+}
+
+void MainWindow::lock()
+{
+    if (!m_settingsPanel) return;   // unlock loop hasn't completed yet
+    // SettingsPanel::lockMode() returns the cached parsed enum —
+    // no SQLCipher round-trip on each call (unlike the earlier
+    // m_store.loadSetting path).
+    switch (m_settingsPanel->lockMode()) {
+    case SettingsPanel::LockMode::Strict:
+        // Full teardown on desktop = process exit.  Re-running the
+        // app re-runs the unlock loop fresh.  Equivalent to iOS
+        // .strict's "myPeerId="" + back to OnboardingView" since
+        // both rebuild from a cold start.
+        m_bypassHideToTray = true;
+        qApp->quit();
+        return;
+
+    case SettingsPanel::LockMode::QuickWithEviction:
+    case SettingsPanel::LockMode::Quick:
+        // On desktop, Quick + QuickWithEviction land at the same
+        // behavioural place: an opaque overlay covers the chat
+        // pane (chat list + bubble area + composer) so neither
+        // visual state nor pixel-level screen capture sees
+        // plaintext.  iOS's eviction semantics — clearing the
+        // SwiftUI @Published mirrors so the rendered view tree
+        // doesn't hold message bodies — don't translate cleanly
+        // to Qt's QWidget tree, which keeps content in widget
+        // properties regardless of overlay z-order.  Properly
+        // evicting on desktop would require destroying the chat
+        // widgets and rebuilding from m_store on unlock — too
+        // invasive for this phase.  The eviction setting still
+        // round-trips with iOS via migration, and the option is
+        // surfaced in Settings so users on cross-platform
+        // accounts see consistent explainers.
+        showLockOverlay();
+        break;
+    }
+
+    m_isUILocked = true;
+    // Cancel any pending auto-lock fire — we just locked manually
+    // (or via the auto-lock timer itself); double-fire would be a
+    // no-op but stop() avoids a stale timer ticking under us.
+    m_autoLockTimer.stop();
+}
+
+void MainWindow::quickUnlock(const QString &passphrase)
+{
+    if (!m_isUILocked) return;
+    if (!verifyPassphrase(passphrase)) {
+        if (m_lockOverlay) m_lockOverlay->showWrongPassphrase();
+        return;
+    }
+    m_isUILocked = false;
+    hideLockOverlay();
+
+    // QuickWithEviction cleared the visible buffer in lock(); the
+    // overlay was over the chat-pane while it was reloading, so
+    // calling reloadCurrentChat() again here is a no-op for that
+    // mode and harmless for Quick mode.  Leaving it out so that
+    // Quick mode (full mirror retained) doesn't pay an unnecessary
+    // re-render on every unlock.
+}
+
+void MainWindow::showLockOverlay()
+{
+    if (!m_lockOverlay) return;
+    m_lockOverlay->prepareForShow();
+    updateLockOverlayGeometry();
+    m_lockOverlay->raise();
+    m_lockOverlay->show();
+}
+
+void MainWindow::hideLockOverlay()
+{
+    if (!m_lockOverlay) return;
+    m_lockOverlay->hide();
+}
+
+void MainWindow::updateLockOverlayGeometry()
+{
+    if (!m_lockOverlay) return;
+    if (auto *cw = centralWidget()) {
+        m_lockOverlay->setGeometry(cw->rect());
+    }
+}
+
+void MainWindow::onApplicationStateChanged(Qt::ApplicationState state)
+{
+    if (!m_settingsPanel) return;   // unlock loop hasn't completed yet
+    const int autoLockMinutes = m_settingsPanel->autoLockMinutes();
+
+    if (state == Qt::ApplicationActive) {
+        // Coming back from background — cancel any armed timer so
+        // it doesn't fire late once the window is foreground again.
+        m_autoLockTimer.stop();
+        return;
+    }
+
+    // Any other state means the window isn't the user-focused
+    // surface (Suspended on macOS when minimised, Hidden on
+    // Linux/Windows when minimised or behind another window).
+    // Don't lock if already locked — re-arming would just push
+    // the timer out further with no behavioural change.
+    if (m_isUILocked) return;
+
+    if (autoLockMinutes < 0) {
+        // -1 = never; user opted out of idle locking.
+        return;
+    }
+    if (autoLockMinutes == 0) {
+        // Lock immediately on backgrounding — banking-app posture
+        // even within the chosen mode.
+        lock();
+        return;
+    }
+
+    m_autoLockTimer.start(autoLockMinutes * 60 * 1000);
+}
+
+void MainWindow::onAutoLockTimerExpired()
+{
+    if (m_isUILocked) return;          // raced with a manual lock
+    if (isActiveWindow()) return;       // user came back; race-safe
+    lock();
+}
+
+// ── Migration snapshot build / apply ───────────────────────────────────────
+// Wire format matches iOS `MigrationAppDataSnapshot` v1
+// (ios/Peer2Pear/Sources/Migration/MigrationAppDataSnapshot.swift):
+//
+//   { "version": 1,
+//     "contacts": [{peerId, name, subtitle, avatarB64, muted, lastActiveSecs}, ...],
+//     "conversations": [{id, kind, directPeerId, groupName, groupAvatarB64,
+//                         muted, lastActiveSecs, inChatList}, ...],
+//     "conversationMembers": [{conversationId, peerIds: [...]}, ...],
+//     "messages": [{conversationId, message: {sent, text, timestampSecs,
+//                                              msgId, senderId, senderName,
+//                                              sendFailed}}, ...],
+//     "blockedKeys": ["peerId", ...] }
+//
+// Cross-platform: emitted byte-identically on iOS + desktop senders;
+// accepted byte-identically on iOS + desktop receivers.
+
+QByteArray MainWindow::buildMigrationAppDataSnapshot() const
+{
+    QJsonObject out;
+    out.insert("version", 1);
+
+    QJsonArray contactsArr;
+    m_store.loadAllContacts([&](const AppDataStore::Contact &c) {
+        QJsonObject o;
+        o.insert("peerId",         QString::fromStdString(c.peerIdB64u));
+        o.insert("name",           QString::fromStdString(c.name));
+        o.insert("subtitle",       QString::fromStdString(c.subtitle));
+        o.insert("avatarB64",      QString::fromStdString(c.avatarB64));
+        o.insert("muted",          c.muted);
+        o.insert("lastActiveSecs", static_cast<qint64>(c.lastActiveSecs));
+        contactsArr.append(o);
+    });
+    out.insert("contacts", contactsArr);
+
+    // Conversations + members snapshot in one walk: collect rows
+    // first, then walk the group rows again to fetch their member
+    // rosters.  Two-pass since loadConversationMembers can't run
+    // inside loadAllConversations' callback (potential cursor reuse).
+    std::vector<AppDataStore::Conversation> convList;
+    m_store.loadAllConversations([&](const AppDataStore::Conversation &c) {
+        convList.push_back(c);
+    });
+
+    QJsonArray convArr;
+    QJsonArray membersArr;
+    for (const auto &c : convList) {
+        QJsonObject o;
+        o.insert("id",             QString::fromStdString(c.id));
+        o.insert("kind",
+                  c.kind == AppDataStore::ConversationKind::Group
+                  ? "group" : "direct");
+        o.insert("directPeerId",   QString::fromStdString(c.directPeerId));
+        o.insert("groupName",      QString::fromStdString(c.groupName));
+        o.insert("groupAvatarB64", QString::fromStdString(c.groupAvatarB64));
+        o.insert("muted",          c.muted);
+        o.insert("lastActiveSecs", static_cast<qint64>(c.lastActiveSecs));
+        o.insert("inChatList",     c.inChatList);
+        convArr.append(o);
+
+        if (c.kind == AppDataStore::ConversationKind::Group) {
+            QJsonArray peersArr;
+            m_store.loadConversationMembers(c.id,
+                [&](const std::string &peerId) {
+                    peersArr.append(QString::fromStdString(peerId));
+                });
+            QJsonObject m;
+            m.insert("conversationId", QString::fromStdString(c.id));
+            m.insert("peerIds",        peersArr);
+            membersArr.append(m);
+        }
+    }
+    out.insert("conversations",       convArr);
+    out.insert("conversationMembers", membersArr);
+
+    QJsonArray msgsArr;
+    for (const auto &c : convList) {
+        m_store.loadMessages(c.id, [&](const AppDataStore::Message &m) {
+            QJsonObject mo;
+            mo.insert("sent",          m.sent);
+            mo.insert("text",          QString::fromStdString(m.text));
+            mo.insert("timestampSecs", static_cast<qint64>(m.timestampSecs));
+            mo.insert("msgId",         QString::fromStdString(m.msgId));
+            mo.insert("senderId",      QString::fromStdString(m.senderId));
+            mo.insert("senderName",    QString::fromStdString(m.senderName));
+            mo.insert("sendFailed",    m.sendFailed);
+            QJsonObject row;
+            row.insert("conversationId", QString::fromStdString(c.id));
+            row.insert("message",        mo);
+            msgsArr.append(row);
+        });
+    }
+    out.insert("messages", msgsArr);
+
+    QJsonArray blockedArr;
+    m_store.loadAllBlockedKeys(
+        [&](const std::string &peerId, int64_t /*blockedAt*/) {
+            blockedArr.append(QString::fromStdString(peerId));
+        });
+    out.insert("blockedKeys", blockedArr);
+
+    return QJsonDocument(out).toJson(QJsonDocument::Compact);
+}
+
+bool MainWindow::applyMigrationAppDataSnapshot(const QByteArray &snapshotJson)
+{
+    QJsonParseError perr{};
+    const QJsonDocument doc = QJsonDocument::fromJson(snapshotJson, &perr);
+    if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
+        QMessageBox::warning(this, "Migration Apply Failed",
+            QStringLiteral("Migrated data is malformed: %1.  Your "
+                            "identity was migrated but chat history "
+                            "couldn't be restored.").arg(perr.errorString()));
+        return false;
+    }
+    const QJsonObject root = doc.object();
+    if (root.value("version").toInt(-1) != 1) {
+        QMessageBox::warning(this, "Migration Apply Failed",
+            "Migrated data uses an incompatible format.  Your "
+            "identity was migrated but chat history couldn't be "
+            "restored.  Update both devices to the same Peer2Pear "
+            "release and try again.");
+        return false;
+    }
+
+    int firstFailureRows = 0;
+    QString firstFailureStage;
+    auto recordFailure = [&](const char *stage) {
+        ++firstFailureRows;
+        if (firstFailureStage.isEmpty()) firstFailureStage = stage;
+    };
+
+    // 1. Conversations FIRST — messages + members FK off of them.
+    for (const QJsonValue &v : root.value("conversations").toArray()) {
+        const QJsonObject o = v.toObject();
+        AppDataStore::Conversation c;
+        c.id           = o.value("id").toString().toStdString();
+        c.kind         = (o.value("kind").toString() == "group")
+                         ? AppDataStore::ConversationKind::Group
+                         : AppDataStore::ConversationKind::Direct;
+        c.directPeerId   = o.value("directPeerId").toString().toStdString();
+        c.groupName      = o.value("groupName").toString().toStdString();
+        c.groupAvatarB64 = o.value("groupAvatarB64").toString().toStdString();
+        c.muted          = o.value("muted").toBool(false);
+        c.lastActiveSecs = static_cast<int64_t>(
+            o.value("lastActiveSecs").toVariant().toLongLong());
+        c.inChatList     = o.value("inChatList").toBool(true);
+        if (!m_store.saveConversation(c)) recordFailure("conversations");
+    }
+
+    // 2. Conversation members (group rosters).
+    for (const QJsonValue &v : root.value("conversationMembers").toArray()) {
+        const QJsonObject o = v.toObject();
+        const std::string convId = o.value("conversationId").toString().toStdString();
+        std::vector<std::string> peers;
+        for (const QJsonValue &p : o.value("peerIds").toArray()) {
+            peers.push_back(p.toString().toStdString());
+        }
+        if (!m_store.setConversationMembers(convId, peers)) {
+            recordFailure("conversation_members");
+        }
+    }
+
+    // 3. Contacts.
+    for (const QJsonValue &v : root.value("contacts").toArray()) {
+        const QJsonObject o = v.toObject();
+        AppDataStore::Contact c;
+        c.peerIdB64u     = o.value("peerId").toString().toStdString();
+        c.name           = o.value("name").toString().toStdString();
+        c.subtitle       = o.value("subtitle").toString().toStdString();
+        c.avatarB64      = o.value("avatarB64").toString().toStdString();
+        c.muted          = o.value("muted").toBool(false);
+        c.lastActiveSecs = static_cast<int64_t>(
+            o.value("lastActiveSecs").toVariant().toLongLong());
+        if (!m_store.saveContact(c)) recordFailure("contacts");
+    }
+
+    // 4. Blocked keys — desktop's addBlockedKey takes a timestamp
+    //    that iOS doesn't carry on the wire.  Use 0 ("blocked at
+    //    unknown time") rather than fabricating "now" — it doesn't
+    //    affect the runtime block check, only the display order
+    //    in any future "blocked" picker.
+    for (const QJsonValue &v : root.value("blockedKeys").toArray()) {
+        const std::string peerId = v.toString().toStdString();
+        if (!m_store.addBlockedKey(peerId, /*whenSecs=*/0)) {
+            recordFailure("blocked_keys");
+        }
+    }
+
+    // 5. Messages last (bulkiest).  Per-row failures are counted
+    //    but don't abort the whole apply — partial history beats
+    //    none for the user.
+    for (const QJsonValue &v : root.value("messages").toArray()) {
+        const QJsonObject row = v.toObject();
+        const std::string convId =
+            row.value("conversationId").toString().toStdString();
+        const QJsonObject mo = row.value("message").toObject();
+        AppDataStore::Message m;
+        m.sent          = mo.value("sent").toBool(false);
+        m.text          = mo.value("text").toString().toStdString();
+        m.timestampSecs = static_cast<int64_t>(
+            mo.value("timestampSecs").toVariant().toLongLong());
+        m.msgId         = mo.value("msgId").toString().toStdString();
+        m.senderId      = mo.value("senderId").toString().toStdString();
+        m.senderName    = mo.value("senderName").toString().toStdString();
+        m.sendFailed    = mo.value("sendFailed").toBool(false);
+        if (!m_store.saveMessage(convId, m)) recordFailure("messages");
+    }
+
+    // ChatView reload happens later in the constructor flow after
+    // m_chatView is constructed + wired (it's not built yet at the
+    // moment apply runs).  buildChatList in ChatView's existing
+    // construction path naturally picks up the migrated rows.
+
+    if (firstFailureRows > 0) {
+        QMessageBox::warning(this, "Migration partially applied",
+            QStringLiteral("Some migrated data couldn't be written "
+                            "(first failure: %1; %2 rows total).  "
+                            "Your identity is in place; you may see "
+                            "missing chat history.")
+                .arg(firstFailureStage)
+                .arg(firstFailureRows));
+    }
+    return true;
 }
 
 void MainWindow::onSettingsClicked()    { m_mainStack->setCurrentIndex(1); }

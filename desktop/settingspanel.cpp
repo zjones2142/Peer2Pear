@@ -113,6 +113,17 @@ void SettingsPanel::buildUI()
     // want it back.  Empty most of the time; one-row card stays compact.
     bodyLayout->addWidget(makeArchivedChatsSection());
 
+    // ── App Lock (mode + auto-lock + manual lock) ──────────────────────────
+    // Mirrors iOS LockSection.  Sits above Factory Reset because it's
+    // session-lifecycle (lock/unlock posture) which sits in the same
+    // mental category as the destructive reset action below it.
+    bodyLayout->addWidget(makeLockSection());
+
+    // ── Transfer to new device ──────────────────────────────────────────────
+    // Mirrors iOS Settings → Transfer to new device.  Sits between
+    // Lock and Factory Reset since it's a one-time lifecycle action.
+    bodyLayout->addWidget(makeTransferSection());
+
     // ── About section ─────────────────────────────────────────────────────────
     // Version    = app version (matches project(Peer2Pear VERSION ...) in CMakeLists.txt)
     // Protocol   = wire-protocol version (matches the relay's /healthz "version" field
@@ -302,6 +313,30 @@ void SettingsPanel::setAppDataStore(AppDataStore *store)
     m_multiHopEnabled =
         (m_store->loadSetting("multiHopEnabled", "false") == "true");
     applyMultiHopState();
+
+    // App-Lock settings.  Default lockMode = QuickWithEviction
+    // (recommended for everyday use); default autoLockMinutes =
+    // 5 (matches iOS).  Persisted as plain strings in
+    // AppDataStore so they ride QSettings/the SQLCipher-backed
+    // settings table the rest of the panel uses.
+    {
+        m_lockMode = lockModeFromKey(
+            m_store->loadSetting("lockMode", "quickWithEviction"));
+        if (m_lockModeCombo) {
+            QSignalBlocker blocker(m_lockModeCombo);
+            m_lockModeCombo->setCurrentIndex(static_cast<int>(m_lockMode));
+        }
+        applyLockModeHelp();
+        emit lockModeChanged(m_lockMode);
+    }
+    {
+        m_autoLockMinutes = parseIntSetting("autoLockMinutes", 5);
+        if (m_autoLockSpin) {
+            QSignalBlocker blocker(m_autoLockSpin);
+            m_autoLockSpin->setValue(m_autoLockMinutes);
+        }
+        emit autoLockMinutesChanged(m_autoLockMinutes);
+    }
 
     // Emit initial values so MainWindow/ChatController sync up.
     emit fileAutoAcceptMaxChanged(softMB);
@@ -980,6 +1015,252 @@ QWidget *SettingsPanel::makeAboutHelpSection()
     cardLayout->addWidget(guideLabel);
 
     return card;
+}
+
+// ── App Lock section ────────────────────────────────────────────────────────
+// Lock Mode picker + Auto-Lock minutes spinner + Lock Now button.
+// Mirrors iOS LockSection in SettingsView.swift but laid out for
+// Qt's QFormLayout-style stacked rows.  Lock Mode help text
+// updates live via applyLockModeHelp() to match the picker.
+QWidget *SettingsPanel::makeLockSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    QLabel *heading = new QLabel("APP LOCK");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;"
+        );
+    cardLayout->addWidget(heading);
+
+    QWidget *body = new QWidget();
+    body->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *bv = new QVBoxLayout(body);
+    bv->setContentsMargins(16, 6, 16, 14);
+    bv->setSpacing(10);
+
+    // ── Lock Mode picker ────────────────────────────────────────
+    {
+        QLabel *label = new QLabel("Lock Mode");
+        label->setStyleSheet(
+            "color: #e0e0e0; font-size: 13px; "
+            "background: transparent; border: none;");
+        bv->addWidget(label);
+
+        m_lockModeCombo = new QComboBox();
+        // Items added in declaration order so the combo's index
+        // matches static_cast<int>(LockMode) — load + save paths
+        // both rely on this for round-tripping the user's choice.
+        for (const auto m : { LockMode::Strict,
+                               LockMode::QuickWithEviction,
+                               LockMode::Quick }) {
+            m_lockModeCombo->addItem(lockModeDisplayName(m),
+                                      static_cast<int>(m));
+        }
+        m_lockModeCombo->setStyleSheet(
+            "QComboBox { background-color: #1a1a1a; color: #f0f0f0; "
+            "  border: 1px solid #2a2a2a; border-radius: 6px; "
+            "  padding: 6px 10px; font-size: 13px; }"
+            "QComboBox::drop-down { border: none; }");
+        connect(m_lockModeCombo,
+                qOverload<int>(&QComboBox::currentIndexChanged),
+                this, [this](int idx) {
+            const auto mode = static_cast<LockMode>(idx);
+            m_lockMode = mode;
+            applyLockModeHelp();
+            if (m_store) {
+                m_store->saveSetting("lockMode", lockModeToKey(mode));
+            }
+            emit lockModeChanged(mode);
+        });
+        bv->addWidget(m_lockModeCombo);
+
+        m_lockModeHelp = new QLabel();
+        m_lockModeHelp->setWordWrap(true);
+        m_lockModeHelp->setStyleSheet(
+            "color: #888888; font-size: 11px; "
+            "background: transparent; border: none;");
+        bv->addWidget(m_lockModeHelp);
+        applyLockModeHelp();
+    }
+
+    // ── Auto-Lock minutes ───────────────────────────────────────
+    {
+        QLabel *label = new QLabel("Auto-Lock");
+        label->setStyleSheet(
+            "color: #e0e0e0; font-size: 13px; "
+            "background: transparent; border: none;");
+        bv->addWidget(label);
+
+        m_autoLockSpin = new QSpinBox();
+        m_autoLockSpin->setMinimum(-1);    // -1 = never
+        m_autoLockSpin->setMaximum(120);   // 2 hours upper bound
+        m_autoLockSpin->setValue(5);
+        m_autoLockSpin->setSuffix(" min");
+        m_autoLockSpin->setSpecialValueText("Never (-1)");
+        m_autoLockSpin->setStyleSheet(
+            "QSpinBox { background-color: #1a1a1a; color: #f0f0f0; "
+            "  border: 1px solid #2a2a2a; border-radius: 6px; "
+            "  padding: 6px 10px; font-size: 13px; }");
+        connect(m_autoLockSpin, qOverload<int>(&QSpinBox::valueChanged),
+                this, [this](int mins) {
+            m_autoLockMinutes = mins;
+            if (m_store) {
+                m_store->saveSetting("autoLockMinutes",
+                                      std::to_string(mins));
+            }
+            emit autoLockMinutesChanged(mins);
+        });
+        bv->addWidget(m_autoLockSpin);
+
+        QLabel *help = new QLabel(
+            "Locks the app after this many minutes of inactivity.  "
+            "0 = lock immediately when the window hides; -1 = never "
+            "(rely on the Lock Now button only).");
+        help->setWordWrap(true);
+        help->setStyleSheet(
+            "color: #888888; font-size: 11px; "
+            "background: transparent; border: none;");
+        bv->addWidget(help);
+    }
+
+    // ── Lock Now button ─────────────────────────────────────────
+    QPushButton *lockBtn = new QPushButton("Lock Now");
+    lockBtn->setStyleSheet(
+        "QPushButton { background-color: #2e8b3a; color: #ffffff; "
+        "  border: none; border-radius: 8px; padding: 10px 16px; "
+        "  font-size: 13px; font-weight: bold; }"
+        "QPushButton:hover { background-color: #38a844; }");
+    connect(lockBtn, &QPushButton::clicked,
+            this, &SettingsPanel::lockNowClicked);
+    bv->addWidget(lockBtn);
+
+    cardLayout->addWidget(body);
+    return card;
+}
+
+QWidget *SettingsPanel::makeTransferSection()
+{
+    QWidget *card = new QWidget();
+    card->setStyleSheet(
+        "background-color: #111111;"
+        "border: 1px solid #1e1e1e;"
+        "border-radius: 10px;"
+        );
+
+    QVBoxLayout *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(0, 0, 0, 0);
+    cardLayout->setSpacing(0);
+
+    QLabel *heading = new QLabel("TRANSFER TO NEW DEVICE");
+    heading->setStyleSheet(
+        "color: #4caf50;"
+        "font-size: 11px;"
+        "font-weight: bold;"
+        "padding: 12px 16px 6px 16px;"
+        "background: transparent;"
+        "border: none;");
+    cardLayout->addWidget(heading);
+
+    QWidget *body = new QWidget();
+    body->setStyleSheet("background: transparent; border: none;");
+    QVBoxLayout *bv = new QVBoxLayout(body);
+    bv->setContentsMargins(16, 6, 16, 14);
+    bv->setSpacing(8);
+
+    QLabel *desc = new QLabel(
+        "Move your identity, contacts, and history to another "
+        "Peer2Pear device on the same Wi-Fi or LAN.  Direct "
+        "device-to-device — no servers in the data path.");
+    desc->setWordWrap(true);
+    desc->setStyleSheet("color: #cccccc; font-size: 12px; "
+                         "background: transparent; border: none;");
+    bv->addWidget(desc);
+
+    QPushButton *btn = new QPushButton("Transfer to New Device");
+    btn->setStyleSheet(
+        "QPushButton { background-color: #2e8b3a; color: #ffffff; "
+        "  border: none; border-radius: 8px; padding: 10px 16px; "
+        "  font-size: 13px; font-weight: bold; }"
+        "QPushButton:hover { background-color: #38a844; }");
+    connect(btn, &QPushButton::clicked,
+            this, &SettingsPanel::transferToNewDeviceClicked);
+    bv->addWidget(btn);
+
+    cardLayout->addWidget(body);
+    return card;
+}
+
+void SettingsPanel::applyLockModeHelp()
+{
+    if (m_lockModeHelp) {
+        m_lockModeHelp->setText(lockModeExplainer(m_lockMode));
+    }
+}
+
+const char *SettingsPanel::lockModeToKey(LockMode mode)
+{
+    switch (mode) {
+    case LockMode::Strict:            return "strict";
+    case LockMode::Quick:              return "quick";
+    case LockMode::QuickWithEviction: return "quickWithEviction";
+    }
+    return "quickWithEviction";  // unreachable; satisfies compilers
+}
+
+SettingsPanel::LockMode
+SettingsPanel::lockModeFromKey(const std::string &key, LockMode fallback)
+{
+    if (key == "strict") return LockMode::Strict;
+    if (key == "quick")  return LockMode::Quick;
+    if (key == "quickWithEviction") return LockMode::QuickWithEviction;
+    return fallback;
+}
+
+QString SettingsPanel::lockModeDisplayName(LockMode mode)
+{
+    switch (mode) {
+    case LockMode::Strict:            return "Strict";
+    case LockMode::QuickWithEviction: return "Quick (recommended)";
+    case LockMode::Quick:              return "Quick (no eviction)";
+    }
+    return {};
+}
+
+QString SettingsPanel::lockModeExplainer(LockMode mode)
+{
+    switch (mode) {
+    case LockMode::Strict:
+        return "Quits the app on lock.  You'll need to re-enter your "
+               "passphrase on next launch.  No notifications while quit.";
+    case LockMode::QuickWithEviction:
+        return "Lock overlay covers the chat; encryption keys stay in "
+               "memory so notifications keep working.  Quick re-unlock.  "
+               "Recommended for everyday use.";
+    case LockMode::Quick:
+        // On desktop, eviction is a mobile-only refinement; the
+        // overlay covers the chat regardless.  Disclose this so a
+        // user setting Quick (no eviction) on desktop knows they
+        // got the same outcome.
+        return "Same as Quick (recommended) on desktop — both show an "
+               "overlay over the chat.  The eviction option mainly "
+               "matters on mobile, where it also clears recent message "
+               "bodies from rendered view state.";
+    }
+    return {};
 }
 
 // ── Factory reset (always at the bottom) ────────────────────────────────────

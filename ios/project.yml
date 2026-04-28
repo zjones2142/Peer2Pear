@@ -53,20 +53,14 @@ targets:
           UIColorName: ""
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
-        # iOS 14+ requires this to call local network APIs.  Even though we
-        # relay through a server for now, Bonjour/ICE may come later.
+        # iOS 14+ requires this to call local network APIs.  Triggers the
+        # Local Network privacy prompt the first time the user runs
+        # device-to-device migration (NWListener / NWConnection on a
+        # LAN address).
         NSLocalNetworkUsageDescription: >-
-          Peer2Pear may use your local network to establish direct peer-to-peer
-          connections for faster, more private messaging.
-        # MultipeerConnectivity for device-to-device migration (Phase 4
-        # backup-strategy step 2 / "Transfer to new device").  iOS
-        # requires every Bonjour service the app advertises or browses
-        # to be listed here verbatim — MPC publishes both _tcp and _udp
-        # variants under the hood.  Service name MUST stay in sync
-        # with kMigrationServiceType in MigrationSession.swift.
-        NSBonjourServices:
-          - _p2p-migration._tcp
-          - _p2p-migration._udp
+          Peer2Pear uses your local network to securely transfer your
+          account data when migrating to a new device, and may use it
+          for direct peer-to-peer messaging in future versions.
         # QRScannerView opens AVCaptureSession to read peer-ID QR codes from
         # MyKeyView on a counterpart device.  iOS hard-aborts capture-session
         # start without this string.

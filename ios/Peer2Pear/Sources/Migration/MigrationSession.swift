@@ -1,45 +1,47 @@
 import Foundation
-import MultipeerConnectivity
+import Network
 
-// Device-to-device migration transport.  MultipeerConnectivity is
-// the right primitive for "two phones near each other" — Apple
-// handles peer discovery (Bluetooth + AWDL + Wi-Fi), connection
-// setup, and TLS-protected transit; we layer our own AEAD on top
-// so plaintext never touches the MPC layer in case of bugs there.
+// Device-to-device migration transport.  Pure LAN TCP via
+// Network.framework — `NWListener` on the receiver, `NWConnection`
+// on the sender.  Replaces the previous MultipeerConnectivity
+// transport; same wire format on the socket as the desktop
+// implementation so cross-platform pairs (iOS↔desktop in either
+// direction, plus future Android) work over a single uniform
+// protocol.  See project_backup_strategy.md "Cross-platform
+// requirement / Transport decision (2026-04-28)" for the design
+// trade-offs vs. MPC + relay alternatives.
 //
 // Two roles, both observable from SwiftUI via @Published `phase`:
 //
 //   * MigrationReceiveSession — new device, generates keypairs,
-//     advertises on Bonjour with the fingerprint hex in
-//     discoveryInfo (so multiple migration pairs on the same LAN
-//     don't collide).  Accepts incoming invitations, sends
-//     pubkeys, receives envelope, decrypts, surfaces decrypted
-//     payload to the caller for application.
+//     opens an `NWListener` on an OS-picked TCP port, picks the
+//     primary RFC1918 IPv4, embeds both into a v2 handshake
+//     (`addr` + `port`) the QR/paste exposes.  Accepts the first
+//     incoming connection (rejects strays so a network scanner
+//     can't disrupt an in-flight transfer), sends pubkeys,
+//     receives envelope, decrypts, surfaces decrypted payload to
+//     the caller for application.
 //
-//   * MigrationSendSession — old device, takes a scanned-or-
-//     pasted MigrationHandshake, browses, filters for the peer
-//     whose advertised fingerprint matches.  After MPC connects,
-//     receives pubkeys, verifies SHA-256(received) matches
-//     handshake.fingerprint (catches a MITM that forged
-//     discoveryInfo), seals the caller's payload, sends.
+//   * MigrationSendSession — old device, takes a parsed
+//     MigrationHandshake (from QR scan / paste — both routes call
+//     MigrationHandshake.decode), opens an `NWConnection` to the
+//     handshake's `addr:port`, receives pubkeys, recomputes
+//     SHA-256(pubkeys) constant-time-equals `handshake.fingerprint`
+//     (catches a MITM redirecting the QR code's address), seals
+//     the caller's payload, sends.
 //
-// Wire format over MPC: 1-byte type tag + payload.
+// Wire format on the socket: `[1 byte tag][4 byte BE length][body]`.
 //   0x01 PubkeysOffer (JSON-encoded {x25519Pub, mlkemPub})
 //   0x02 Envelope     (raw bytes from MigrationCryptoBridge.seal)
 //
-// Both classes are NOT @MainActor — MCSession delegates fire on a
-// session-private background queue + we explicitly DispatchQueue
-// .main.async around @Published mutations.  Mixing @MainActor
-// with framework callbacks that don't await is a recipe for
-// subtle reentrancy bugs.
+// Both classes are NOT @MainActor — `NWListener` / `NWConnection`
+// callbacks fire on the queue we hand them; @Published mutations
+// explicitly DispatchQueue.main.async around to keep SwiftUI
+// reads on the main actor.
 
-/// Bonjour service name.  MUST match the strings listed in
-/// Info.plist's NSBonjourServices (project.yml builds them).
-/// Bonjour limits service names to 15 chars + lowercase + dashes;
-/// "p2p-migration" is 13.
-let kMigrationServiceType = "p2p-migration"
+// MARK: - Wire framing
 
-private enum MpcMessageTag: UInt8 {
+private enum WireMessageTag: UInt8 {
     case pubkeysOffer = 0x01
     case envelope     = 0x02
 }
@@ -49,37 +51,131 @@ private struct PubkeysOffer: Codable {
     let mlkemPub:  Data   // 1184 bytes
 }
 
-// MARK: - Helpers
+/// Frame body cap (256 MB) — bounds memory for a malicious peer
+/// that announces a multi-GB length on the wire.  Real-world
+/// payloads (identity + salt + DB snapshot + saved files) cap
+/// around 100 MB; 256 MB leaves headroom.  Matches the desktop
+/// implementation's bound so neither end is the weakest link.
+private let kMaxFrameBody: UInt32 = 256 * 1024 * 1024
 
-private extension Data {
-    /// Lowercase hex-encoded representation.  Used for
-    /// MPC discoveryInfo + safety-comparison logging.
-    func hexEncoded() -> String {
-        map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-private func tagged(_ tag: MpcMessageTag, _ body: Data) -> Data {
-    var out = Data(count: 1 + body.count)
-    out[0] = tag.rawValue
-    out.replaceSubrange(1..<(1 + body.count), with: body)
+private func framed(_ tag: WireMessageTag, _ body: Data) -> Data {
+    let len = UInt32(body.count)
+    var out = Data(capacity: 1 + 4 + body.count)
+    out.append(tag.rawValue)
+    out.append(UInt8((len >> 24) & 0xff))
+    out.append(UInt8((len >> 16) & 0xff))
+    out.append(UInt8((len >>  8) & 0xff))
+    out.append(UInt8((len      ) & 0xff))
+    out.append(body)
     return out
 }
 
-private func untag(_ msg: Data) -> (MpcMessageTag, Data)? {
-    guard let firstByte = msg.first,
-          let tag = MpcMessageTag(rawValue: firstByte) else { return nil }
-    return (tag, msg.dropFirst())
+// MARK: - LAN IPv4 picker
+
+/// True if `ip` is in one of the RFC1918 private ranges
+/// (10/8, 172.16/12, 192.168/16).  Operates on the numeric IPv4
+/// value rather than string prefixes — `"172.2"` would falsely
+/// include 172.2.x.x and 172.250.x.x.  Mirrors the desktop
+/// `migrationreceivedialog.cpp::isRFC1918`.
+private func isRFC1918(_ a: UInt8, _ b: UInt8) -> Bool {
+    if a == 10 { return true }                                  // 10.0.0.0/8
+    if a == 192 && b == 168 { return true }                     // 192.168.0.0/16
+    if a == 172 && (16...31).contains(b) { return true }        // 172.16.0.0/12
+    return false
+}
+
+/// Walk every active non-loopback interface, pick the most-
+/// likely-routable IPv4 address.  RFC1918 wins; public IPv4
+/// only used as last resort (and a v2 handshake QR should
+/// never be carrying a public IP across the internet — the
+/// design is same-LAN).  Returns nil if no usable address.
+private func pickLanIPv4() -> String? {
+    var ifaddr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddr) == 0 else { return nil }
+    defer { freeifaddrs(ifaddr) }
+
+    var publicCandidate: String?
+    var ptr = ifaddr
+    while let cur = ptr {
+        defer { ptr = cur.pointee.ifa_next }
+        let p = cur.pointee
+        guard let sa = p.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else {
+            continue
+        }
+        // Filter by ifa_flags — must be UP + RUNNING + not LOOPBACK.
+        let flags = Int32(p.ifa_flags)
+        if (flags & IFF_UP) == 0 || (flags & IFF_RUNNING) == 0 { continue }
+        if (flags & IFF_LOOPBACK) != 0 { continue }
+
+        var addrBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let rc = getnameinfo(sa, socklen_t(sa.pointee.sa_len),
+                              &addrBuf, socklen_t(addrBuf.count),
+                              nil, 0, NI_NUMERICHOST)
+        guard rc == 0 else { continue }
+        let s = String(cString: addrBuf)
+
+        // Skip link-local (169.254.x.x) — auto-assigned when no
+        // DHCP, useless for cross-device pairing.
+        if s.hasPrefix("169.254.") { continue }
+
+        // Parse the four octets to test RFC1918 cleanly.
+        let parts = s.split(separator: ".").compactMap { UInt8($0) }
+        guard parts.count == 4 else { continue }
+        if isRFC1918(parts[0], parts[1]) {
+            return s
+        }
+        if publicCandidate == nil {
+            publicCandidate = s
+        }
+    }
+    return publicCandidate
+}
+
+// MARK: - Frame reader
+
+/// Buffered TCP reader that parses `[1 tag][4 BE length][body]`
+/// frames out of a stream of `Data` chunks.  TCP delivers bytes,
+/// not message boundaries, so callers feed bytes via `append`
+/// and pull complete frames via `nextFrame`.
+private final class FrameReader {
+    private var buf = Data()
+
+    func append(_ chunk: Data) { buf.append(chunk) }
+
+    enum FrameError: Error {
+        case oversized            // body length exceeds kMaxFrameBody
+        case unknownTag(UInt8)
+    }
+
+    /// Try to consume a complete frame.  Returns nil if the
+    /// buffer doesn't yet hold a full frame (caller should keep
+    /// reading from the socket); throws on protocol errors.
+    func nextFrame() throws -> (tag: WireMessageTag, body: Data)? {
+        if buf.count < 5 { return nil }
+        let tagByte = buf[0]
+        let len = (UInt32(buf[1]) << 24)
+                | (UInt32(buf[2]) << 16)
+                | (UInt32(buf[3]) <<  8)
+                |  UInt32(buf[4])
+        if len > kMaxFrameBody { throw FrameError.oversized }
+        if buf.count < 5 + Int(len) { return nil }
+        guard let tag = WireMessageTag(rawValue: tagByte) else {
+            throw FrameError.unknownTag(tagByte)
+        }
+        let body = buf.subdata(in: 5..<(5 + Int(len)))
+        buf.removeSubrange(0..<(5 + Int(len)))
+        return (tag, body)
+    }
 }
 
 // MARK: - Receive session (new device)
 
-final class MigrationReceiveSession: NSObject, ObservableObject {
+final class MigrationReceiveSession: ObservableObject {
 
     enum Phase: Equatable {
         case idle                       // not started yet
-        case advertising                // QR / paste-string visible, awaiting invite
-        case paired                     // MPC connected, sent pubkeys, awaiting envelope
+        case advertising                // QR / paste-string visible, awaiting connect
+        case paired                     // sender connected, sent pubkeys, awaiting envelope
         case applying                   // envelope decrypted, caller is now applying
         case success                    // payload delivered to caller successfully
         case error(String)              // anything went wrong, message for UI
@@ -87,34 +183,33 @@ final class MigrationReceiveSession: NSObject, ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
 
-    /// Handshake the UI should render as a QR + display as
-    /// paste-able text (`handshake.encodeForQR()`).
-    let handshake: MigrationHandshake
+    /// Handshake the UI renders as a QR + displays as paste-able
+    /// text.  Initially v1 (fingerprint + nonce only); start()
+    /// upgrades to v2 (adds addr + port) once the listener is
+    /// .ready.  The view watches phase — only renders the QR
+    /// after .advertising — so the user never sees the v1
+    /// placeholder.
+    private(set) var handshake: MigrationHandshake
 
     /// Decrypted payload.  Only populated when phase moves to
     /// .applying / .success — UI/caller picks it up + applies.
     @Published private(set) var receivedPayload: Data?
 
     private let keypairs: MigrationKeypairs
-    private let peerID: MCPeerID
-    private var session: MCSession?
-    private var advertiser: MCNearbyServiceAdvertiser?
+    private let queue = DispatchQueue(label: "p2p.migration.receive")
+    private var listener: NWListener?
+    private var activeConnection: NWConnection?
+    private let reader = FrameReader()
 
-    /// Designated initializer — private, always populated by
-    /// `make()`.  NSObject's init() is non-failable so we route
-    /// the "C-side keypair generation failed" case through a
-    /// static factory instead.
+    /// Designated initializer.  Synchronous, populates the v1
+    /// handshake from the keypair fingerprint + a fresh nonce.
+    /// addr/port are filled in by start() once the listener is
+    /// .ready.
     private init(keypairs: MigrationKeypairs,
                   handshake: MigrationHandshake)
     {
         self.keypairs  = keypairs
         self.handshake = handshake
-        // MPC peer-ID display name is shown in some UI surfaces;
-        // a generic "Peer2Pear" string keeps it neutral.  The
-        // routing happens via discoveryInfo + advertiser service
-        // name, not the display name.
-        self.peerID = MCPeerID(displayName: "Peer2Pear")
-        super.init()
     }
 
     /// Factory — returns nil if the C-side keypair generation
@@ -134,48 +229,39 @@ final class MigrationReceiveSession: NSObject, ObservableObject {
             handshake: MigrationHandshake.make(fingerprint: fp))
     }
 
-    /// Begin advertising on MPC.  Caller renders `handshake` as
-    /// a QR + paste-string in the UI and waits for `phase` to
-    /// transition to .applying.
+    /// Begin advertising on TCP.  Caller observes phase until it
+    /// transitions to .advertising — at that point handshake has
+    /// addr+port set and the view renders the QR.
     func start() {
         guard phase == .idle else { return }
-
-        let s = MCSession(peer: peerID,
-                          securityIdentity: nil,
-                          encryptionPreference: .required)
-        s.delegate = self
-        self.session = s
-
-        // discoveryInfo carries the fingerprint hex so the
-        // sender's browser can filter matching peers without
-        // inviting every Peer2Pear advertiser on the LAN.
-        let info: [String: String] = [
-            "fp": handshake.fingerprint.hexEncoded(),
-            "v":  String(MigrationHandshake.currentVersion),
-        ]
-        let adv = MCNearbyServiceAdvertiser(peer: peerID,
-                                             discoveryInfo: info,
-                                             serviceType: kMigrationServiceType)
-        adv.delegate = self
-        adv.startAdvertisingPeer()
-        self.advertiser = adv
-
-        DispatchQueue.main.async { [weak self] in
-            self?.phase = .advertising
+        do {
+            // OS picks an ephemeral port via `.any`.  We capture
+            // the actual value once .stateUpdateHandler fires
+            // .ready below.
+            let l = try NWListener(using: .tcp)
+            l.newConnectionHandler = { [weak self] conn in
+                self?.acceptConnection(conn)
+            }
+            l.stateUpdateHandler = { [weak self] state in
+                self?.onListenerStateChanged(state)
+            }
+            l.start(queue: queue)
+            self.listener = l
+        } catch {
+            fail("Couldn't start migration listener: \(error.localizedDescription)")
         }
     }
 
-    /// Cancel mid-flight.  Tears down MPC; UI should pop the
-    /// migration sheet on completion of this call.
+    /// Cancel mid-flight.  Tears down the listener + any active
+    /// connection.  UI pops the migration sheet on completion.
     func cancel() {
-        advertiser?.stopAdvertisingPeer()
-        advertiser = nil
-        session?.disconnect()
-        session = nil
+        listener?.cancel()
+        listener = nil
+        activeConnection?.cancel()
+        activeConnection = nil
         DispatchQueue.main.async { [weak self] in
             // Don't overwrite a terminal state with .idle —
-            // success / error stays so the UI can show the
-            // outcome.
+            // success / error stays so the UI can show the outcome.
             switch self?.phase {
             case .success, .error: break
             default:               self?.phase = .idle
@@ -183,30 +269,143 @@ final class MigrationReceiveSession: NSObject, ObservableObject {
         }
     }
 
-    // Send pubkeys to the just-connected sender.  Called from the
-    // session-stateChanged delegate when the peer transitions to
-    // .connected.
-    private func sendPubkeysOffer(to peer: MCPeerID) {
-        guard let s = session else { return }
-        let offer = PubkeysOffer(x25519Pub: keypairs.x25519Pub,
-                                  mlkemPub:  keypairs.mlkemPub)
-        do {
-            let body = try JSONEncoder().encode(offer)
-            try s.send(tagged(.pubkeysOffer, body),
-                       toPeers: [peer],
-                       with: .reliable)
-            DispatchQueue.main.async { [weak self] in
-                self?.phase = .paired
+    // MARK: Listener state
+
+    private func onListenerStateChanged(_ state: NWListener.State) {
+        switch state {
+        case .ready:
+            guard let port = listener?.port?.rawValue else {
+                fail("Listener reported ready without a port — internal error.")
+                return
             }
-        } catch {
-            fail("Couldn't send pubkeys to other device: \(error.localizedDescription)")
+            // pickLanIPv4 falls back to nil if no interface is up.
+            // Surface that as an error rather than emitting a
+            // useless v1 handshake the sender can't connect to.
+            guard let addr = pickLanIPv4() else {
+                fail("Couldn't find a LAN IP address for this device.  " +
+                     "Connect to a Wi-Fi network and try again.")
+                return
+            }
+            // Re-build the handshake with addr+port.  Same
+            // fingerprint/nonce, just bumped to v2.
+            self.handshake = MigrationHandshake(
+                version:     2,
+                fingerprint: self.handshake.fingerprint,
+                nonce:       self.handshake.nonce,
+                addr:        addr,
+                port:        Int(port))
+            DispatchQueue.main.async { [weak self] in
+                self?.phase = .advertising
+            }
+
+        case .failed(let error):
+            // Most likely cause: NSLocalNetworkUsageDescription
+            // permission denied.  Surface honestly so the user
+            // can re-enable it in Settings → Privacy & Security
+            // → Local Network → Peer2Pear.
+            fail("Couldn't start the migration listener (\(error)).  " +
+                 "Check Settings → Privacy & Security → Local Network " +
+                 "and make sure Peer2Pear is allowed.")
+
+        default: break
         }
     }
 
-    // Decrypt a received envelope using own keypairs + the
-    // handshake nonce we generated.  On success, surface the
-    // payload via @Published so the caller (B.5 apply path) can
-    // pick it up.
+    // MARK: Connection lifecycle
+
+    private func acceptConnection(_ conn: NWConnection) {
+        // Reject stray second-and-later connections — only one
+        // migration session at a time.  A scanner / browser
+        // hitting the listener mid-flow doesn't get to disrupt
+        // the in-flight transfer.
+        if activeConnection != nil {
+            conn.cancel()
+            return
+        }
+        self.activeConnection = conn
+        conn.stateUpdateHandler = { [weak self] state in
+            self?.onConnectionStateChanged(state)
+        }
+        conn.start(queue: queue)
+    }
+
+    private func onConnectionStateChanged(_ state: NWConnection.State) {
+        switch state {
+        case .ready:
+            sendPubkeysOffer()
+            scheduleRead()
+        case .failed(let error):
+            fail("Migration connection failed: \(error.localizedDescription)")
+        case .cancelled:
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch self.phase {
+                case .applying, .success, .error: break
+                default: self.phase = .error("Other device disconnected before transfer completed.")
+                }
+            }
+        default: break
+        }
+    }
+
+    private func sendPubkeysOffer() {
+        let offer = PubkeysOffer(x25519Pub: keypairs.x25519Pub,
+                                  mlkemPub:  keypairs.mlkemPub)
+        guard let body = try? JSONEncoder().encode(offer) else {
+            fail("Couldn't encode pubkeys offer."); return
+        }
+        let frame = framed(.pubkeysOffer, body)
+        activeConnection?.send(content: frame,
+                                completion: .contentProcessed { [weak self] error in
+            if let error {
+                self?.fail("Couldn't send pubkeys: \(error.localizedDescription)")
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.phase = .paired
+            }
+        })
+    }
+
+    private func scheduleRead() {
+        activeConnection?.receive(minimumIncompleteLength: 1,
+                                    maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            if let error {
+                self.fail("Read error: \(error.localizedDescription)")
+                return
+            }
+            if let data, !data.isEmpty {
+                self.reader.append(data)
+                do {
+                    while let frame = try self.reader.nextFrame() {
+                        self.handleFrame(tag: frame.tag, body: frame.body)
+                    }
+                } catch {
+                    self.fail("Malformed frame from sender: \(error).")
+                    return
+                }
+            }
+            if isComplete {
+                // Sender closed the connection — fine if envelope
+                // already arrived, otherwise surface as error.
+                return
+            }
+            self.scheduleRead()
+        }
+    }
+
+    private func handleFrame(tag: WireMessageTag, body: Data) {
+        switch tag {
+        case .envelope:
+            openEnvelope(body)
+        case .pubkeysOffer:
+            // Receiver shouldn't see this — it's the message we
+            // SEND, not receive.  Bug or attempted attack.
+            fail("Unexpected pubkeys offer from other device.")
+        }
+    }
+
     private func openEnvelope(_ envelope: Data) {
         guard let plaintext = MigrationCryptoBridge.open(
                 envelope:           envelope,
@@ -226,105 +425,27 @@ final class MigrationReceiveSession: NSObject, ObservableObject {
     }
 
     private func fail(_ message: String) {
-        advertiser?.stopAdvertisingPeer()
-        session?.disconnect()
+        listener?.cancel()
+        listener = nil
+        activeConnection?.cancel()
+        activeConnection = nil
         DispatchQueue.main.async { [weak self] in
             self?.phase = .error(message)
         }
     }
 }
 
-// MARK: - Receive session — MPC delegates
-
-extension MigrationReceiveSession: MCNearbyServiceAdvertiserDelegate {
-
-    func advertiser(_ advertiser: MCNearbyServiceAdvertiser,
-                     didReceiveInvitationFromPeer peerID: MCPeerID,
-                     withContext context: Data?,
-                     invitationHandler: @escaping (Bool, MCSession?) -> Void) {
-        // Auto-accept — sender already filtered by our
-        // advertised fingerprint.  Final security check happens
-        // on the SENDER side post-pairing (re-hash received
-        // pubkeys, compare to QR/paste fingerprint).
-        invitationHandler(true, session)
-    }
-
-    func advertiser(_ advertiser: MCNearbyServiceAdvertiser,
-                     didNotStartAdvertisingPeer error: Error) {
-        fail("Couldn't start migration advertiser: \(error.localizedDescription)")
-    }
-}
-
-extension MigrationReceiveSession: MCSessionDelegate {
-
-    func session(_ session: MCSession,
-                  peer peerID: MCPeerID,
-                  didChange state: MCSessionState) {
-        switch state {
-        case .connected:
-            sendPubkeysOffer(to: peerID)
-        case .notConnected:
-            // If we hit notConnected before applying, the sender
-            // disconnected unexpectedly — surface as error unless
-            // we already finished.
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                switch self.phase {
-                case .applying, .success, .error: break
-                default:
-                    self.phase = .error("Other device disconnected before transfer completed.")
-                }
-            }
-        default: break
-        }
-    }
-
-    func session(_ session: MCSession, didReceive data: Data,
-                  fromPeer peerID: MCPeerID) {
-        guard let (tag, body) = untag(data) else {
-            fail("Received malformed migration message.")
-            return
-        }
-        switch tag {
-        case .envelope:
-            openEnvelope(body)
-        case .pubkeysOffer:
-            // Receiver shouldn't see this — that's the message it
-            // sends, not receives.  Bug or attempted attack;
-            // either way, abort.
-            fail("Unexpected pubkeys offer from other device.")
-        }
-    }
-
-    // Streams + resources unused — we send everything as a single
-    // .reliable Data chunk (the envelope is small enough; saved-
-    // files trailer in B.6+ may switch to streams).
-    func session(_ session: MCSession,
-                  didReceive stream: InputStream,
-                  withName streamName: String,
-                  fromPeer peerID: MCPeerID) {}
-    func session(_ session: MCSession,
-                  didStartReceivingResourceWithName resourceName: String,
-                  fromPeer peerID: MCPeerID,
-                  with progress: Progress) {}
-    func session(_ session: MCSession,
-                  didFinishReceivingResourceWithName resourceName: String,
-                  fromPeer peerID: MCPeerID,
-                  at localURL: URL?,
-                  withError error: Error?) {}
-}
-
 // MARK: - Send session (old device, unlocked, has identity)
 
-final class MigrationSendSession: NSObject, ObservableObject {
+final class MigrationSendSession: ObservableObject {
 
     enum Phase: Equatable {
         case idle                       // not started yet
-        case browsing                   // looking for the matching receiver
-        case connecting                 // invited, waiting on connect
+        case browsing                   // dialed, awaiting connect
+        case connecting                 // ↑ alias retained for UI back-compat
         case verifying                  // connected, awaiting pubkeys offer
         case sending                    // fingerprint verified, shipping envelope
-        case success                    // envelope acknowledged at MPC layer
+        case success                    // envelope acknowledged
         case error(String)
     }
 
@@ -332,9 +453,10 @@ final class MigrationSendSession: NSObject, ObservableObject {
 
     private let handshake: MigrationHandshake
     private let payload: Data
-    private let peerID: MCPeerID
-    private var session: MCSession?
-    private var browser: MCNearbyServiceBrowser?
+    private let queue = DispatchQueue(label: "p2p.migration.send")
+    private var connection: NWConnection?
+    private let reader = FrameReader()
+    private var didSendEnvelope = false
 
     /// Construct with the parsed handshake (from QR scan or manual
     /// paste — both routes call MigrationHandshake.decode and yield
@@ -343,35 +465,37 @@ final class MigrationSendSession: NSObject, ObservableObject {
     init(handshake: MigrationHandshake, payload: Data) {
         self.handshake = handshake
         self.payload   = payload
-        self.peerID    = MCPeerID(displayName: "Peer2Pear")
-        super.init()
     }
 
     func start() {
         guard phase == .idle else { return }
-
-        let s = MCSession(peer: peerID,
-                          securityIdentity: nil,
-                          encryptionPreference: .required)
-        s.delegate = self
-        self.session = s
-
-        let b = MCNearbyServiceBrowser(peer: peerID,
-                                        serviceType: kMigrationServiceType)
-        b.delegate = self
-        b.startBrowsingForPeers()
-        self.browser = b
+        // v1 handshakes don't carry addr/port — the receiver is on
+        // an older Peer2Pear build that hasn't migrated to the LAN
+        // TCP transport.  Refuse honestly rather than guessing.
+        guard let addr = handshake.addr,
+              let portInt = handshake.port,
+              let port = NWEndpoint.Port(rawValue: UInt16(portInt)) else {
+            fail("The other device's pairing code doesn't include " +
+                 "connection details.  Both devices need to be on the " +
+                 "latest version of Peer2Pear.")
+            return
+        }
+        let host = NWEndpoint.Host(addr)
+        let conn = NWConnection(host: host, port: port, using: .tcp)
+        conn.stateUpdateHandler = { [weak self] state in
+            self?.onConnectionStateChanged(state)
+        }
+        conn.start(queue: queue)
+        self.connection = conn
 
         DispatchQueue.main.async { [weak self] in
-            self?.phase = .browsing
+            self?.phase = .browsing   // "dialing"; renamed in spirit, kept for view back-compat
         }
     }
 
     func cancel() {
-        browser?.stopBrowsingForPeers()
-        browser = nil
-        session?.disconnect()
-        session = nil
+        connection?.cancel()
+        connection = nil
         DispatchQueue.main.async { [weak self] in
             switch self?.phase {
             case .success, .error: break
@@ -380,31 +504,83 @@ final class MigrationSendSession: NSObject, ObservableObject {
         }
     }
 
-    // After receiving the receiver's pubkeys, verify the
-    // fingerprint matches what we have from the QR/paste, then
-    // seal the payload and ship.
-    private func verifyAndSend(offer: PubkeysOffer, to peer: MCPeerID) {
-        // 1. Re-derive fingerprint from received pubkeys.
+    // MARK: Connection lifecycle
+
+    private func onConnectionStateChanged(_ state: NWConnection.State) {
+        switch state {
+        case .ready:
+            DispatchQueue.main.async { [weak self] in
+                self?.phase = .verifying
+            }
+            scheduleRead()
+        case .failed(let error):
+            fail("Couldn't connect to the new device: \(error.localizedDescription).  " +
+                 "Make sure both devices are on the same Wi-Fi or LAN.")
+        case .cancelled:
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch self.phase {
+                case .success, .error: break
+                default: self.phase = .error("Disconnected before transfer completed.")
+                }
+            }
+        default: break
+        }
+    }
+
+    private func scheduleRead() {
+        connection?.receive(minimumIncompleteLength: 1,
+                              maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            if let error {
+                self.fail("Read error: \(error.localizedDescription)")
+                return
+            }
+            if let data, !data.isEmpty {
+                self.reader.append(data)
+                do {
+                    while let frame = try self.reader.nextFrame() {
+                        self.handleFrame(tag: frame.tag, body: frame.body)
+                    }
+                } catch {
+                    self.fail("Malformed frame from receiver: \(error).")
+                    return
+                }
+            }
+            if isComplete { return }
+            self.scheduleRead()
+        }
+    }
+
+    private func handleFrame(tag: WireMessageTag, body: Data) {
+        switch tag {
+        case .pubkeysOffer:
+            do {
+                let offer = try JSONDecoder().decode(PubkeysOffer.self, from: body)
+                verifyAndSend(offer: offer)
+            } catch {
+                fail("Other device sent unparseable pubkeys: \(error.localizedDescription)")
+            }
+        case .envelope:
+            // Sender shouldn't see this — that's the message it
+            // sends, not receives.
+            fail("Unexpected envelope from other device.")
+        }
+    }
+
+    private func verifyAndSend(offer: PubkeysOffer) {
         guard let recomputed = MigrationCryptoBridge.fingerprint(
                 x25519Pub: offer.x25519Pub,
                 mlkemPub:  offer.mlkemPub) else {
             fail("Couldn't compute fingerprint from received keys.")
             return
         }
-
-        // 2. Compare in constant-ish time (Data equality is
-        //    typically constant-time on iOS, but this is a one-
-        //    shot check on a 16-byte hash — even non-CT comparison
-        //    leaks at most "match / no match" which is the signal
-        //    we're going to surface anyway).
         guard recomputed == handshake.fingerprint else {
             fail("Verification failed — the other device sent " +
                  "different keys than the QR / pasted handshake described.  " +
                  "Possible MITM; aborting.")
             return
         }
-
-        // 3. Seal payload + ship.
         guard let envelope = MigrationCryptoBridge.seal(
                 payload:           payload,
                 receiverX25519Pub: offer.x25519Pub,
@@ -413,134 +589,27 @@ final class MigrationSendSession: NSObject, ObservableObject {
             fail("Couldn't encrypt migration data.")
             return
         }
-
         DispatchQueue.main.async { [weak self] in
             self?.phase = .sending
         }
-
-        do {
-            try session?.send(tagged(.envelope, envelope),
-                               toPeers: [peer],
-                               with: .reliable)
+        let frame = framed(.envelope, envelope)
+        didSendEnvelope = true
+        connection?.send(content: frame,
+                          completion: .contentProcessed { [weak self] error in
+            if let error {
+                self?.fail("Couldn't send envelope: \(error.localizedDescription)")
+                return
+            }
             DispatchQueue.main.async { [weak self] in
                 self?.phase = .success
             }
-        } catch {
-            fail("Couldn't send migration envelope: \(error.localizedDescription)")
-        }
+        })
     }
 
     private func fail(_ message: String) {
-        browser?.stopBrowsingForPeers()
-        session?.disconnect()
+        connection?.cancel()
         DispatchQueue.main.async { [weak self] in
             self?.phase = .error(message)
         }
     }
-}
-
-// MARK: - Send session — MPC delegates
-
-extension MigrationSendSession: MCNearbyServiceBrowserDelegate {
-
-    func browser(_ browser: MCNearbyServiceBrowser,
-                  foundPeer peerID: MCPeerID,
-                  withDiscoveryInfo info: [String: String]?) {
-        // Filter by advertised fingerprint hex.  Same fingerprint
-        // = same handshake = our intended receiver.  Mismatched
-        // fingerprints from other migration pairs on the same LAN
-        // are silently ignored.
-        guard let advertisedFp = info?["fp"] else { return }
-        let ourFp = handshake.fingerprint.hexEncoded()
-        guard advertisedFp == ourFp else { return }
-
-        // Only invite once — once we've moved past .browsing,
-        // ignore further matching peers (could be a duplicate
-        // from a re-advertising cycle).
-        let shouldInvite: Bool = {
-            switch phase {
-            case .browsing: return true
-            default:        return false
-            }
-        }()
-        guard shouldInvite, let s = session else { return }
-
-        DispatchQueue.main.async { [weak self] in
-            self?.phase = .connecting
-        }
-        // 30s timeout — generous for slow Bluetooth pair-ups
-        // before falling back to AWDL.
-        browser.invitePeer(peerID, to: s, withContext: nil, timeout: 30)
-    }
-
-    func browser(_ browser: MCNearbyServiceBrowser,
-                  lostPeer peerID: MCPeerID) {
-        // The peer's advertiser stopped — fine, harmless.  Don't
-        // surface as error unless we were already mid-handshake
-        // with this specific peer.
-    }
-
-    func browser(_ browser: MCNearbyServiceBrowser,
-                  didNotStartBrowsingForPeers error: Error) {
-        fail("Couldn't start migration browser: \(error.localizedDescription)")
-    }
-}
-
-extension MigrationSendSession: MCSessionDelegate {
-
-    func session(_ session: MCSession,
-                  peer peerID: MCPeerID,
-                  didChange state: MCSessionState) {
-        switch state {
-        case .connected:
-            DispatchQueue.main.async { [weak self] in
-                self?.phase = .verifying
-            }
-        case .notConnected:
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                switch self.phase {
-                case .success, .error: break
-                default:
-                    self.phase = .error("Other device disconnected before transfer completed.")
-                }
-            }
-        default: break
-        }
-    }
-
-    func session(_ session: MCSession, didReceive data: Data,
-                  fromPeer peerID: MCPeerID) {
-        guard let (tag, body) = untag(data) else {
-            fail("Received malformed migration message.")
-            return
-        }
-        switch tag {
-        case .pubkeysOffer:
-            do {
-                let offer = try JSONDecoder().decode(PubkeysOffer.self, from: body)
-                verifyAndSend(offer: offer, to: peerID)
-            } catch {
-                fail("Other device sent unparseable pubkeys: \(error.localizedDescription)")
-            }
-        case .envelope:
-            // Sender shouldn't see this — that's the message it
-            // sends, not receives.  Bug or attempted attack.
-            fail("Unexpected envelope from other device.")
-        }
-    }
-
-    func session(_ session: MCSession,
-                  didReceive stream: InputStream,
-                  withName streamName: String,
-                  fromPeer peerID: MCPeerID) {}
-    func session(_ session: MCSession,
-                  didStartReceivingResourceWithName resourceName: String,
-                  fromPeer peerID: MCPeerID,
-                  with progress: Progress) {}
-    func session(_ session: MCSession,
-                  didFinishReceivingResourceWithName resourceName: String,
-                  fromPeer peerID: MCPeerID,
-                  at localURL: URL?,
-                  withError error: Error?) {}
 }

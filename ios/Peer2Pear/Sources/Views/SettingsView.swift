@@ -856,6 +856,32 @@ private struct LockSection: View {
                     .font(.headline)
             }
 
+            // ── Lock mode ───────────────────────────────────────────
+            // Controls what the lock action actually does — full
+            // teardown (Strict, banking-app posture) vs UI-only
+            // overlay with mirrors cleared (Quick recommended) vs
+            // pure UI overlay (Quick no-eviction).  See LockMode
+            // explainer strings for the full trade-off summary.
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Lock Mode")
+                    .font(.subheadline)
+                Picker("Lock Mode", selection: Binding(
+                    get: { client.lockMode },
+                    set: { client.lockMode = $0 }
+                )) {
+                    ForEach(Peer2PearClient.LockMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text(client.lockMode.explainer)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
             // ── Auto-lock delay ─────────────────────────────────────
             VStack(alignment: .leading, spacing: 4) {
                 Text("Auto-Lock")

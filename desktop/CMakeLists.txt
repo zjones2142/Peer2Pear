@@ -13,6 +13,11 @@ set(DESKTOP_SOURCES
     settingspanel.cpp    settingspanel.h
     theme.cpp            theme.h
     onboardingdialog.cpp onboardingdialog.h
+    passphrasedialog.cpp passphrasedialog.h
+    lockoverlay.cpp      lockoverlay.h
+    migrationreceivedialog.cpp migrationreceivedialog.h
+    migrationsenddialog.cpp    migrationsenddialog.h
+    migrationsettings.cpp      migrationsettings.h
     ChatNotifier.h
     QtWebSocket.hpp
     QtHttpClient.hpp

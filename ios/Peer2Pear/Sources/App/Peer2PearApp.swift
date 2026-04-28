@@ -35,6 +35,18 @@ struct Peer2PearApp: App {
                     // notes.
                     ChatListView(client: client)
                         .overlay { InAppCaptureRedaction() }
+                        // Quick-unlock overlay — covers ChatListView
+                        // when the session is locked but the C
+                        // context is still alive (lockMode .quick or
+                        // .quickWithEviction).  Strict mode never
+                        // hits this branch because lock() clears
+                        // myPeerId, sending us to OnboardingView
+                        // above instead.
+                        .overlay {
+                            if client.isUILocked {
+                                LockOverlay(client: client)
+                            }
+                        }
                 }
             }
             // App-switcher snapshot overlay.  Wraps the entire
@@ -147,6 +159,108 @@ private struct SnapshotOverlay: View {
                 Text("Peer2Pear")
                     .font(.title.bold())
             }
+        }
+    }
+}
+
+// LockOverlay — quick-unlock screen shown when the user has locked
+// the app but the underlying session is still alive (lockMode
+// .quick or .quickWithEviction).  The .strict mode never reaches
+// here because lock() empties myPeerId, routing the WindowGroup
+// back to OnboardingView (full Argon2 re-derive on unlock).
+//
+// In .quickWithEviction (the default), the C context, ratchet
+// state, and DB key all stay in RAM so silent push notifications
+// can still decrypt incoming messages while the UI is locked —
+// only the @Published plaintext mirrors are wiped.  Quick-unlock
+// verifies via the in-memory SHA-256 verifier (~1ms) and rehydrates
+// the mirrors from the still-open SQLCipher store.
+//
+// In .quick, even the mirrors stay — the lock is a pure UI overlay
+// and the unlock just toggles isUILocked back to false.
+//
+// Wrong passphrase surfaces inline.  No failed-attempt counter is
+// applied here because the verifier compare doesn't burn Argon2
+// cycles — wipe-on-failed-attempts is reserved for the OnboardingView
+// path which actually unlocks the SQLCipher key.  An attacker who
+// already has process memory access has the keys directly anyway.
+private struct LockOverlay: View {
+    @ObservedObject var client: Peer2PearClient
+    @State private var passphrase: String  = ""
+    @State private var error:      String? = nil
+    @FocusState private var fieldFocused:  Bool
+
+    var body: some View {
+        ZStack {
+            Color(.systemBackground)
+                .ignoresSafeArea()
+            VStack(spacing: 24) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 64))
+                    .foregroundStyle(.green)
+
+                Text("Peer2Pear is locked")
+                    .font(.title2.bold())
+
+                Text("Enter your passphrase to unlock.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+
+                SecureField("Passphrase", text: $passphrase)
+                    .textContentType(.password)
+                    .submitLabel(.go)
+                    .focused($fieldFocused)
+                    .padding(12)
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(10)
+                    .padding(.horizontal, 32)
+                    .onSubmit(submit)
+
+                if let error {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+
+                Button(action: submit) {
+                    Text("Unlock")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(passphrase.isEmpty
+                                    ? Color.gray.opacity(0.4)
+                                    : Color.green)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+                .padding(.horizontal, 32)
+                .disabled(passphrase.isEmpty)
+            }
+        }
+        .task {
+            // Auto-focus so the user can start typing immediately.
+            // Run via .task so SwiftUI cancels the work if the
+            // overlay disappears before focus settles (e.g. user
+            // unlocks via biometric / external trigger), instead
+            // of firing into a torn-down @FocusState binding.
+            fieldFocused = true
+        }
+    }
+
+    private func submit() {
+        guard !passphrase.isEmpty else { return }
+        let success = client.quickUnlock(passphrase: passphrase)
+        if success {
+            // Wipe local @State as soon as the verifier accepts —
+            // no reason to keep the passphrase around in SwiftUI
+            // state once isUILocked has flipped.
+            passphrase = ""
+            error      = nil
+        } else {
+            error = "Wrong passphrase."
+            passphrase = ""
         }
     }
 }

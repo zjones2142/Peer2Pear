@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 import Network
 import UIKit
 import UserNotifications
@@ -156,18 +157,8 @@ final class Peer2PearClient: ObservableObject {
     // explainer reflects that honestly.
     static let kBackupRelayUrlsKey = "p2p.backupRelayUrls"
 
-    @Published var backupRelayUrls: [String] = {
-        guard let data = UserDefaults.standard
-                .data(forKey: Peer2PearClient.kBackupRelayUrlsKey),
-              let arr = try? JSONDecoder().decode([String].self, from: data)
-        else { return [] }
-        return arr
-    }() {
-        didSet {
-            if let data = try? JSONEncoder().encode(backupRelayUrls) {
-                UserDefaults.standard.set(data, forKey: Self.kBackupRelayUrlsKey)
-            }
-        }
+    @Published var backupRelayUrls: [String] = [] {
+        didSet { saveSettingIfReady(Self.kBackupRelayUrlsKey, backupRelayUrls) }
     }
 
     /// Validate + append a backup relay URL.  Returns false when the URL
@@ -866,6 +857,165 @@ final class Peer2PearClient: ObservableObject {
         return pass.isEmpty ? nil : pass
     }
 
+    // MARK: - Lock mode (Strict / Quick+Eviction / Quick)
+    //
+    // Three lock postures, picking different points on the
+    // privacy-vs-UX trade-off curve:
+    //
+    //   * .strict — full session teardown.  rawContext destroyed,
+    //     SQLCipher key + ratchet state + identity privates wiped
+    //     from RAM, @Published mirrors cleared.  Unlock requires
+    //     re-running Argon2id (~1.3s).  Best privacy, no real-time
+    //     notifications while locked, banking-app posture.
+    //
+    //   * .quickWithEviction — DEFAULT.  rawContext + ratchet state
+    //     + DB key STAY in RAM (so silent push can decrypt incoming
+    //     messages while UI is locked), but @Published plaintext
+    //     mirrors (messages, groupMessages, contactNicknames, etc.)
+    //     are cleared.  Memory-extraction-while-locked recovers
+    //     keys but not conversation history.  Quick re-unlock —
+    //     SHA-256 verifier compare, ~1ms — no Argon2 re-derive.
+    //
+    //   * .quick — keys + plaintext mirrors all stay.  Lock is
+    //     purely a UI overlay.  Best UX, weakest privacy.
+    //
+    // See project_lock_modes.md for the full design + threat model.
+    enum LockMode: String, CaseIterable, Codable, Identifiable {
+        case strict
+        case quickWithEviction
+        case quick
+
+        var id: String { rawValue }
+
+        /// Display label for the Settings picker.
+        var displayName: String {
+            switch self {
+            case .strict:            return "Strict"
+            case .quickWithEviction: return "Quick (recommended)"
+            case .quick:             return "Quick (no eviction)"
+            }
+        }
+
+        /// One-line explainer shown under the picker.
+        var explainer: String {
+            switch self {
+            case .strict:
+                return "Full teardown on lock.  Re-enter passphrase + ~1s key derivation to unlock.  No notifications while locked.  Banking-app posture."
+            case .quickWithEviction:
+                return "Conversation history clears from memory on lock; encryption keys stay so notifications keep working.  Quick re-unlock.  Recommended for everyday use."
+            case .quick:
+                return "Lock is just a UI overlay — everything stays in memory.  Fastest re-unlock, weakest in-memory privacy."
+            }
+        }
+    }
+
+    static let kLockModeKey = "p2p.lockMode"
+
+    @Published var lockMode: LockMode = .quickWithEviction {
+        didSet { saveSettingIfReady(Self.kLockModeKey, lockMode.rawValue) }
+    }
+
+    /// True when the UI is locked but the underlying session may
+    /// or may not be torn down (depends on `lockMode`).  Distinct
+    /// from `myPeerId.isEmpty` (which signals full teardown):
+    ///
+    ///   * .strict mode lock → myPeerId="" + isUILocked=true
+    ///   * Quick mode lock → myPeerId="<id>" + isUILocked=true
+    ///                       (session still alive, UI hidden)
+    ///   * Unlocked → myPeerId="<id>" + isUILocked=false
+    ///
+    /// Peer2PearApp's WindowGroup uses BOTH: if myPeerId.isEmpty,
+    /// route to OnboardingView (no identity loaded).  Else if
+    /// isUILocked, render LockOverlay over ChatListView.  Else,
+    /// normal ChatListView.
+    @Published var isUILocked: Bool = false
+
+    /// In-memory passphrase verifier — populated on successful
+    /// Argon2id unlock, used by quickUnlock to verify the user
+    /// retyped the same passphrase without re-running Argon2.
+    /// Cleared on .strict lock so a memory dump from a torn-down
+    /// session has nothing to brute-force against.
+    ///
+    /// Threat note: under Quick modes the verifier salt + hash
+    /// stay in RAM alongside the actual session keys.  An
+    /// attacker dumping process memory has both anyway, so a
+    /// fast SHA-256 verifier doesn't materially worsen the
+    /// in-memory exposure.
+    private var verifierSalt: Data?
+    private var verifierHash: Data?
+
+    /// Flipped true by clearAllSessionMirrors() so quickUnlock
+    /// knows whether it actually needs to re-walk the SQLCipher
+    /// store on the unlock tap.  Cleared back to false after
+    /// loadStateFromDb() runs.
+    private var mirrorsWereCleared: Bool = false
+
+    /// True while `loadAllSettingsFromDB()` is hydrating the
+    /// settings @Published properties from the AppDataStore.
+    /// Each setting's didSet observes this flag — when true, the
+    /// didSet skips the dbSaveSetting write-back, so the load
+    /// path doesn't trigger a redundant save loop.  See
+    /// `Peer2PearClient+Settings.swift`.
+    var loadingSettingsFromDB: Bool = false
+
+    /// Compute + cache the verifier for a freshly-unlocked
+    /// passphrase.  Call after Argon2id has succeeded.
+    func recordVerifier(passphrase: String) {
+        var salt = Data(count: 16)
+        salt.withUnsafeMutableBytes { ptr in
+            _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
+        }
+        let combined = salt + Data(passphrase.utf8)
+        let hash = Data(SHA256.hash(data: combined))
+        verifierSalt = salt
+        verifierHash = hash
+    }
+
+    /// Verify a typed passphrase against the cached verifier.
+    /// Returns false if no verifier is set (means lock mode is
+    /// .strict OR no successful unlock yet) — caller falls back
+    /// to the full Argon2id unlock path in that case.
+    private func verifyPassphrase(_ pass: String) -> Bool {
+        guard let salt = verifierSalt,
+              let stored = verifierHash else { return false }
+        let combined = salt + Data(pass.utf8)
+        let candidate = Data(SHA256.hash(data: combined))
+        // Constant-time-ish compare via Data == — Swift's
+        // implementation isn't strictly CT, but for a one-shot
+        // lock-screen check the timing leak is bounded to
+        // "same / different" which is the signal we'd surface
+        // to the user anyway.
+        return candidate == stored
+    }
+
+    /// Quick-unlock path used when the lock mode is .quick or
+    /// .quickWithEviction.  Verifies the typed passphrase
+    /// against the in-memory hash and, if matching, flips
+    /// isUILocked = false + (for eviction mode) reloads
+    /// @Published mirrors from the still-open SQLCipher store.
+    /// Returns true on success.
+    @discardableResult
+    func quickUnlock(passphrase: String) -> Bool {
+        guard isUILocked else { return true }   // already unlocked
+        guard verifyPassphrase(passphrase) else { return false }
+
+        // Only rehydrate when the mirrors were actually wiped —
+        // .quick mode lock leaves them populated, so re-running
+        // loadStateFromDb (which walks contacts + conversations +
+        // messages + transfers) would be a wasted SQLCipher round-
+        // trip on every unlock-tap.  mirrorsWereCleared is set in
+        // clearAllSessionMirrors() and consumed below.
+        if mirrorsWereCleared {
+            loadStateFromDb()
+            mirrorsWereCleared = false
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.isUILocked = false
+        }
+        return true
+    }
+
     // MARK: - Internal
 
     /// Raw C context pointer — accessed by platform adapters
@@ -1134,6 +1284,12 @@ final class Peer2PearClient: ObservableObject {
         // roster authorization gate before any inbound control
         // messages arrive on the new socket.
         loadStateFromDb()
+        // Same pattern for user-settings — read from AppDataStore
+        // (SQLCipher-encrypted) into the @Published vars.  Must run
+        // BEFORE the file/relay config-apply calls below so they
+        // pick up persisted values rather than the hardcoded
+        // init defaults.  See `Peer2PearClient+Settings.swift`.
+        loadAllSettingsFromDB()
 
         // Re-apply file-policy preferences each unlock so a setting the
         // user changed in a prior session takes effect now.  Network
@@ -1188,6 +1344,13 @@ final class Peer2PearClient: ObservableObject {
         // case any straggler escaped that path.
         wsPool.reset()
         isConnected = false
+        // Wipe the in-memory verifier alongside the C context — a
+        // teardown that goes through stop() (instead of the lock()
+        // .strict branch) has the same threat surface; leaving the
+        // hash resident here would defeat the guarantee that .strict
+        // gives.
+        verifierSalt = nil
+        verifierHash = nil
     }
 
     /// Tear down the unlocked session and bounce back to OnboardingView.
@@ -1211,46 +1374,94 @@ final class Peer2PearClient: ObservableObject {
     /// they're durable preferences, not session state.
     func lock() {
         _ = consumeUnlockPassphrase()  // belt-and-braces — also wiped on background
-        stop()
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.myPeerId          = ""
-            self.statusMessage     = ""
-            // Toast string can carry "Couldn't deliver message to
-            // <prefix>…" — short-lived but still session content.
-            self.toastMessage      = nil
-            self.messages          = []
-            self.groupMessages     = []
-            self.groups            = [:]
-            self.groupAvatars      = [:]
-            // Group v2 chain-state surface — counter ranges and
-            // per-(group,sender) pairings.  Not plaintext message
-            // bodies, but it does trace the user's group activity.
-            self.groupBlockedStreams        = [:]
-            self.groupLostMessages          = []
-            self.knownPeerContacts          = []
-            self.contactNicknames           = [:]
-            self.blockedPeerIds             = []
-            self.mutedPeerIds               = []
-            self.archivedDirectPeerIds      = []
-            // Pending nav target carries a peer ID — clear so a
-            // post-unlock re-render doesn't auto-navigate into a
-            // thread the user didn't reopen this session.
-            self.pendingDirectChatPeerId    = nil
-            self.unreadChatIds              = []
-            self.failedMessageIds           = []
-            self.activeChatId               = nil
-            self.peerPresence               = [:]
-            self.peerAvatars                = [:]
-            self.pendingFileRequests        = []
-            self.transfers                  = [:]
-            self.keyChanges                 = [:]
-            self.directConversationIdByPeer = [:]
-            // Auto-wipe alert flag.  If a wipe DOES fire, it sets
-            // this true after lock() teardown — the OnboardingView
-            // alert shows on the next render, not the current one.
-            self.dataWipedNotice            = false
+
+        switch lockMode {
+        case .strict:
+            // p2p_destroy() drops ratchet keys + DB key from RAM,
+            // @Published mirrors clear, myPeerId="" routes the
+            // WindowGroup back to OnboardingView.  Verifier
+            // wiped too — a memory dump from this state has
+            // nothing to brute-force against.
+            stop()
+            verifierSalt = nil
+            verifierHash = nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.myPeerId          = ""
+                self.isUILocked        = false   // OnboardingView shows
+                self.clearAllSessionMirrors()
+            }
+
+        case .quickWithEviction:
+            // Keep the C context alive (rawContext, ratchet
+            // state, DB key) so silent push can still decrypt
+            // incoming messages while the UI is locked.  But
+            // wipe the @Published plaintext mirrors so a
+            // memory-extraction-while-locked attack recovers
+            // keys but NOT the conversation log itself.  On
+            // quickUnlock, loadStateFromDb rehydrates from the
+            // still-open SQLCipher store.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isUILocked = true
+                self.clearAllSessionMirrors()
+            }
+
+        case .quick:
+            // Pure UI overlay.  Nothing structural changes —
+            // not even the mirrors.  Best UX, weakest in-RAM
+            // privacy.  Opt-in for users who explicitly value
+            // never seeing reload latency over privacy.
+            DispatchQueue.main.async { [weak self] in
+                self?.isUILocked = true
+            }
         }
+    }
+
+    /// Wipe every @Published mirror that holds plaintext-derived
+    /// data.  Shared between .strict (full teardown) and
+    /// .quickWithEviction (keys-stay-history-goes) paths.
+    /// Settings-shaped fields (autoLockMinutes, fileHardMaxMB,
+    /// privacyLevel, colorScheme, backupRelayUrls, lockMode
+    /// itself, etc.) are intentionally NOT cleared — durable
+    /// preferences, not session state.
+    private func clearAllSessionMirrors() {
+        mirrorsWereCleared = true
+        statusMessage     = ""
+        // Toast string can carry "Couldn't deliver message to
+        // <prefix>…" — short-lived but still session content.
+        toastMessage      = nil
+        messages          = []
+        groupMessages     = []
+        groups            = [:]
+        groupAvatars      = [:]
+        // Group v2 chain-state surface — counter ranges and
+        // per-(group,sender) pairings.  Not plaintext message
+        // bodies, but it does trace the user's group activity.
+        groupBlockedStreams        = [:]
+        groupLostMessages          = []
+        knownPeerContacts          = []
+        contactNicknames           = [:]
+        blockedPeerIds             = []
+        mutedPeerIds               = []
+        archivedDirectPeerIds      = []
+        // Pending nav target carries a peer ID — clear so a
+        // post-unlock re-render doesn't auto-navigate into a
+        // thread the user didn't reopen this session.
+        pendingDirectChatPeerId    = nil
+        unreadChatIds              = []
+        failedMessageIds           = []
+        activeChatId               = nil
+        peerPresence               = [:]
+        peerAvatars                = [:]
+        pendingFileRequests        = []
+        transfers                  = [:]
+        keyChanges                 = [:]
+        directConversationIdByPeer = [:]
+        // Auto-wipe alert flag.  If a wipe DOES fire, it sets
+        // this true after lock() teardown — the OnboardingView
+        // alert shows on the next render, not the current one.
+        dataWipedNotice            = false
     }
 
     /// Stashed APNs token waiting to be forwarded once `rawContext` is live.
@@ -1278,12 +1489,8 @@ final class Peer2PearClient: ObservableObject {
     static let kAutoLockMinutesKey = "p2p.autoLockMinutes"
     static let kDefaultAutoLockMinutes = 5
 
-    @Published var autoLockMinutes: Int = {
-        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kAutoLockMinutesKey) as? Int
-        return v ?? Peer2PearClient.kDefaultAutoLockMinutes
-    }() {
-        didSet { UserDefaults.standard.set(autoLockMinutes,
-                                            forKey: Peer2PearClient.kAutoLockMinutesKey) }
+    @Published var autoLockMinutes: Int = Peer2PearClient.kDefaultAutoLockMinutes {
+        didSet { saveSettingIfReady(Self.kAutoLockMinutesKey, autoLockMinutes) }
     }
 
     /// When enabled, 12 consecutive failed unlock attempts wipe every
@@ -1322,30 +1529,23 @@ final class Peer2PearClient: ObservableObject {
     static let kDefaultFileAutoAcceptMB = 100
     static let kDefaultFileHardMaxMB    = 100
 
-    @Published var fileAutoAcceptMB: Int = {
-        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kFileAutoAcceptMBKey) as? Int
-        return v ?? Peer2PearClient.kDefaultFileAutoAcceptMB
-    }() {
+    @Published var fileAutoAcceptMB: Int = Peer2PearClient.kDefaultFileAutoAcceptMB {
         didSet {
-            UserDefaults.standard.set(fileAutoAcceptMB, forKey: Self.kFileAutoAcceptMBKey)
+            saveSettingIfReady(Self.kFileAutoAcceptMBKey, fileAutoAcceptMB)
             setFileAutoAcceptMB(fileAutoAcceptMB)
         }
     }
 
-    @Published var fileHardMaxMB: Int = {
-        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kFileHardMaxMBKey) as? Int
-        return v ?? Peer2PearClient.kDefaultFileHardMaxMB
-    }() {
+    @Published var fileHardMaxMB: Int = Peer2PearClient.kDefaultFileHardMaxMB {
         didSet {
-            UserDefaults.standard.set(fileHardMaxMB, forKey: Self.kFileHardMaxMBKey)
+            saveSettingIfReady(Self.kFileHardMaxMBKey, fileHardMaxMB)
             setFileHardMaxMB(fileHardMaxMB)
         }
     }
 
-    @Published var fileRequireP2P: Bool =
-        UserDefaults.standard.bool(forKey: Peer2PearClient.kFileRequireP2PKey) {
+    @Published var fileRequireP2P: Bool = false {
         didSet {
-            UserDefaults.standard.set(fileRequireP2P, forKey: Self.kFileRequireP2PKey)
+            saveSettingIfReady(Self.kFileRequireP2PKey, fileRequireP2P)
             setFileRequireP2P(fileRequireP2P)
         }
     }
@@ -1354,11 +1554,10 @@ final class Peer2PearClient: ObservableObject {
     /// hasn't been confirmed.  Pure iOS-side filter (the core still
     /// receives the envelope; we just send back a decline before the
     /// user is even prompted).
-    @Published var fileRequireVerifiedContact: Bool =
-        UserDefaults.standard.bool(forKey: Peer2PearClient.kFileVerifiedOnlyKey) {
+    @Published var fileRequireVerifiedContact: Bool = false {
         didSet {
-            UserDefaults.standard.set(fileRequireVerifiedContact,
-                                       forKey: Self.kFileVerifiedOnlyKey)
+            saveSettingIfReady(Self.kFileVerifiedOnlyKey,
+                                fileRequireVerifiedContact)
         }
     }
 
@@ -1379,13 +1578,9 @@ final class Peer2PearClient: ObservableObject {
 
     static let kPrivacyLevelKey = "p2p.privacyLevel"
 
-    @Published var privacyLevel: PrivacyLevel = {
-        let raw = UserDefaults.standard.object(forKey: Peer2PearClient.kPrivacyLevelKey) as? Int
-        return PrivacyLevel(rawValue: raw ?? 0) ?? .standard
-    }() {
+    @Published var privacyLevel: PrivacyLevel = .standard {
         didSet {
-            UserDefaults.standard.set(privacyLevel.rawValue,
-                                       forKey: Self.kPrivacyLevelKey)
+            saveSettingIfReady(Self.kPrivacyLevelKey, privacyLevel.rawValue)
             setPrivacyLevel(privacyLevel.rawValue)
             // Sync the independent toggle state so the slider and the
             // advanced toggles stay coherent.  Each assignment fires
@@ -1421,25 +1616,18 @@ final class Peer2PearClient: ObservableObject {
     /// Send each outbound message envelope to multiple configured
     /// relays simultaneously.  File chunks are exempt (handled in
     /// core).  Improves reliability — does not improve anonymity.
-    @Published var parallelFanOutEnabled: Bool =
-        UserDefaults.standard.bool(forKey: Peer2PearClient.kParallelFanOutKey) {
+    @Published var parallelFanOutEnabled: Bool = false {
         didSet {
-            UserDefaults.standard.set(parallelFanOutEnabled,
-                                       forKey: Self.kParallelFanOutKey)
+            saveSettingIfReady(Self.kParallelFanOutKey, parallelFanOutEnabled)
             setParallelFanOut(parallelFanOutEnabled)
         }
     }
 
     /// 0 = all configured send relays.  K > 0 picks K random relays
     /// per send.  Ignored when parallelFanOutEnabled is false.
-    @Published var parallelFanOutK: Int = {
-        let raw = UserDefaults.standard.object(
-            forKey: Peer2PearClient.kParallelFanOutKKey) as? Int
-        return raw ?? 0
-    }() {
+    @Published var parallelFanOutK: Int = 0 {
         didSet {
-            UserDefaults.standard.set(parallelFanOutK,
-                                       forKey: Self.kParallelFanOutKKey)
+            saveSettingIfReady(Self.kParallelFanOutKKey, parallelFanOutK)
             setParallelFanOutK(parallelFanOutK)
         }
     }
@@ -1448,11 +1636,9 @@ final class Peer2PearClient: ObservableObject {
     /// single relay sees both sender and recipient.  Improves
     /// anonymity — does not improve reliability.  Adds latency
     /// per hop.  Wins over parallel fan-out in the dispatch path.
-    @Published var multiHopEnabled: Bool =
-        UserDefaults.standard.bool(forKey: Peer2PearClient.kMultiHopKey) {
+    @Published var multiHopEnabled: Bool = false {
         didSet {
-            UserDefaults.standard.set(multiHopEnabled,
-                                       forKey: Self.kMultiHopKey)
+            saveSettingIfReady(Self.kMultiHopKey, multiHopEnabled)
             setMultiHopEnabled(multiHopEnabled)
         }
     }
@@ -1464,11 +1650,9 @@ final class Peer2PearClient: ObservableObject {
     /// block at seal/unseal time so the UI never has to render the
     /// warning state, mirroring desktop's policy of the same name.
     static let kHardBlockOnKeyChangeKey = "p2p.hardBlockOnKeyChange"
-    @Published var hardBlockOnKeyChange: Bool =
-        UserDefaults.standard.bool(forKey: Peer2PearClient.kHardBlockOnKeyChangeKey) {
+    @Published var hardBlockOnKeyChange: Bool = false {
         didSet {
-            UserDefaults.standard.set(hardBlockOnKeyChange,
-                                       forKey: Self.kHardBlockOnKeyChangeKey)
+            saveSettingIfReady(Self.kHardBlockOnKeyChangeKey, hardBlockOnKeyChange)
             setHardBlockOnKeyChange(hardBlockOnKeyChange)
         }
     }
@@ -1481,13 +1665,9 @@ final class Peer2PearClient: ObservableObject {
     /// than an extra tap.  Doesn't affect the hard cap or any other
     /// policy — only auto-accept.
     static let kFileAutoAcceptWifiOnlyKey = "p2p.file.autoAcceptWifiOnly"
-    @Published var fileAutoAcceptWifiOnly: Bool = {
-        let v = UserDefaults.standard.object(forKey: Peer2PearClient.kFileAutoAcceptWifiOnlyKey) as? Bool
-        return v ?? true
-    }() {
+    @Published var fileAutoAcceptWifiOnly: Bool = true {
         didSet {
-            UserDefaults.standard.set(fileAutoAcceptWifiOnly,
-                                       forKey: Self.kFileAutoAcceptWifiOnlyKey)
+            saveSettingIfReady(Self.kFileAutoAcceptWifiOnlyKey, fileAutoAcceptWifiOnly)
             applyEffectiveAutoAcceptThreshold()
         }
     }
@@ -1573,14 +1753,10 @@ final class Peer2PearClient: ObservableObject {
 
     static let kNotificationModeKey = "p2p.notificationContentMode"
 
-    @Published var notificationContentMode: NotificationContentMode = {
-        let raw = UserDefaults.standard.string(forKey: kNotificationModeKey)
-               ?? NotificationContentMode.hidden.rawValue
-        return NotificationContentMode(rawValue: raw) ?? .hidden
-    }() {
+    @Published var notificationContentMode: NotificationContentMode = .hidden {
         didSet {
-            UserDefaults.standard.set(notificationContentMode.rawValue,
-                                       forKey: Self.kNotificationModeKey)
+            saveSettingIfReady(Self.kNotificationModeKey,
+                                notificationContentMode.rawValue)
         }
     }
 

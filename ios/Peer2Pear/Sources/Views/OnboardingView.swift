@@ -383,6 +383,13 @@ struct OnboardingView: View {
                 // wipes it after first read.
                 if !client.myPeerId.isEmpty {
                     client.setLastUnlockPassphrase(pass)
+                    // Cache the verifier so the lock overlay can
+                    // re-unlock without re-deriving Argon2id (~1s) —
+                    // matters in .quick / .quickWithEviction modes
+                    // where the rawContext is staying alive across
+                    // the lock.  No-op for .strict (the verifier
+                    // gets wiped on lock anyway).
+                    client.recordVerifier(passphrase: pass)
                     client.resetFailedUnlockCounter()
                     // Drop our @State copies as soon as the session
                     // is live — no reason to keep the passphrase in
