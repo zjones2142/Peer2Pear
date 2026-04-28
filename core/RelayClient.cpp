@@ -995,6 +995,103 @@ void RelayClient::refreshRelayInfo()
     for (const std::string& url : m_sendRelays) fetchOne(url);
 }
 
+// ── Identity-bundle endpoints ────────────────────────────────────────────────
+//
+// POST publishes our own bundle.  GET fetches a peer's so we
+// can run hybrid PQ Noise IK on msg1 instead of waiting for
+// the in-band kem_pub_announce reciprocation.  Both async via
+// IHttpClient — same shape as sendEnvelope's POST.  The
+// callback parsing on GET runs locally:
+//   1. Decode JSON.
+//   2. Verify Ed25519 sig under the requested ed25519_id
+//      (catches relay substitution: relay can suppress to 404
+//      but can't forge a different bundle for our request).
+//   3. Verify response.ed25519_id_b64u == requested id.
+//   4. Verify kem_pub size == 1184.
+// Any failure → empty Bytes; caller falls back to
+// classical-msg1 + the existing kem_pub_announce path for msg2+.
+
+void RelayClient::publishIdentityBundle(const std::string& ed25519IdB64u,
+                                          const Bytes& kemPub,
+                                          uint64_t tsDay,
+                                          const Bytes& sig,
+                                          PublishIdentityCallback cb)
+{
+    if (m_relayUrl.empty()) {
+        if (cb) cb(false);
+        return;
+    }
+    json body = {
+        {"v",                1},
+        {"ed25519_id_b64u",  ed25519IdB64u},
+        {"kem_pub_b64u",     CryptoEngine::toBase64Url(kemPub)},
+        {"ts_day",           tsDay},
+        {"sig_b64u",         CryptoEngine::toBase64Url(sig)},
+    };
+    const std::string serialized = body.dump();
+    Bytes payload(serialized.begin(), serialized.end());
+
+    IHttpClient::Headers headers = {{"Content-Type", "application/json"}};
+
+    m_http.post(m_relayUrl + "/v1/identity",
+                 payload, headers,
+                 [cb = std::move(cb)](const IHttpClient::Response& r) {
+        if (cb) cb(r.error.empty() && r.status == 200);
+    });
+}
+
+void RelayClient::fetchIdentityBundle(const std::string& ed25519IdB64u,
+                                        FetchIdentityCallback cb)
+{
+    if (m_relayUrl.empty() || ed25519IdB64u.empty()) {
+        if (cb) cb({});
+        return;
+    }
+    const std::string url = m_relayUrl + "/v1/identity/" + ed25519IdB64u;
+    m_http.get(url, {},
+                [requestedId = ed25519IdB64u, cb = std::move(cb)]
+                (const IHttpClient::Response& r) {
+        if (!cb) return;
+        if (!r.error.empty() || r.status != 200) { cb({}); return; }
+
+        // Parse JSON.
+        json obj;
+        try {
+            obj = json::parse(r.body.begin(), r.body.end());
+        } catch (...) {
+            cb({});
+            return;
+        }
+        if (!obj.is_object()) { cb({}); return; }
+
+        // Substitution check #1: returned id must match what we
+        // asked for.  A relay swapping bundles for a different id
+        // gets caught here even if its signature is valid for
+        // the substituted id.
+        const std::string respId = obj.value("ed25519_id_b64u", "");
+        if (respId != requestedId) { cb({}); return; }
+
+        const std::string kemPubB64u = obj.value("kem_pub_b64u", "");
+        const std::string sigB64u    = obj.value("sig_b64u", "");
+        const uint64_t    tsDay      = obj.value("ts_day", uint64_t{0});
+
+        const Bytes kemPub = CryptoEngine::fromBase64Url(kemPubB64u);
+        const Bytes sig    = CryptoEngine::fromBase64Url(sigB64u);
+        if (kemPub.size() != 1184 || sig.size() != 64) { cb({}); return; }
+
+        // Substitution check #2: signature must verify under the
+        // requested id (which acts as the Ed25519 pub).  A relay
+        // returning a kem_pub it doesn't have a valid sig for
+        // gets caught here.
+        if (!CryptoEngine::verifyIdentityBundle(
+                requestedId, kemPub, tsDay, sig)) {
+            cb({});
+            return;
+        }
+        cb(kemPub);
+    });
+}
+
 void RelayClient::setPrivacyLevel(int level)
 {
     // Preset matrix.  Maps the 3-tier slider onto the four orthogonal

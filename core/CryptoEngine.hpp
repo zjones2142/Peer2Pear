@@ -165,6 +165,30 @@ public:
     static bool verifySignature(const Bytes& sig, const Bytes& message,
                                 const Bytes& edPub);
 
+    // ── Identity-bundle signatures (Tier 1 of project_pq_messaging.md) ────
+    //
+    // Sign / verify the (ed25519_id, kem_pub, ts_day) tuple a peer
+    // publishes via POST /v1/identity so a fetcher (or the relay) can
+    // confirm the bundle wasn't substituted.  Canonical message format
+    // is byte-exact with `relay-go/relay.go::canonicalIdentityMessage`:
+    //
+    //   "P2P_IDENTITY_v1|" + ed25519_id_b64u + "|" + kem_pub_b64u + "|"
+    //                      + std::to_string(ts_day)
+    //
+    // Returns empty on failure.  Verifier is static — it pulls the
+    // Ed25519 pub out of the supplied id_b64u, so a relay-side
+    // substitution attack (returning a bundle signed by someone else
+    // for a different id) fails the signature check OR the
+    // requested-id-vs-bundle-id match check that callers do alongside.
+    Bytes signIdentityBundle(const std::string& ed25519IdB64u,
+                              const Bytes& kemPub,
+                              uint64_t tsDay) const;
+
+    static bool verifyIdentityBundle(const std::string& ed25519IdB64u,
+                                       const Bytes& kemPub,
+                                       uint64_t tsDay,
+                                       const Bytes& sig);
+
     // ML-DSA-65 operations (static)
     static std::pair<Bytes, Bytes> generateDsaKeypair();  // (pub, priv)
     static Bytes dsaSign(const Bytes& message, const Bytes& dsaPriv);

@@ -61,6 +61,13 @@ struct ConversationView: View {
         .onAppear {
             activeFileRequest = pendingRequestsForPeer.first
             client.enterChat(id: peerId)
+            // Tier 1 PQ — kick an async bundle fetch so the
+            // peer's ML-KEM-768 pub is in our DB by the time the
+            // user types + sends msg1.  ChatController dedupes
+            // when already-cached / in-flight.  Falls back to the
+            // existing in-band kem_pub_announce path if the
+            // fetch hasn't returned by send time.
+            client.requestIdentityBundleFetch(peerId)
         }
         .onDisappear {
             client.exitChat(id: peerId)

@@ -207,6 +207,41 @@ public:
     void setHardBlockOnKeyChange(bool on) { m_sealer.setHardBlockOnKeyChange(on); }
     bool hardBlockOnKeyChange() const     { return m_sealer.hardBlockOnKeyChange(); }
 
+    // ── Identity-bundle plumbing (Tier 1 of project_pq_messaging.md) ─────────
+
+    /// Publish our own (ed25519_id, kem_pub, ts_day, sig) tuple to
+    /// the relay so peers can fetch it pre-msg1 and run hybrid
+    /// PQ Noise IK from byte one.
+    ///
+    /// Throttled: skips when the local AppDataStore record shows
+    /// a publish within the last `kIdentityRepublishMinSecs`
+    /// window (default 14 days, leaving a 16-day cushion below
+    /// the relay's 30-day TTL) AND the kem_pub hash hasn't
+    /// changed.  KEM key rotation forces an immediate re-publish
+    /// regardless of last-publish time.
+    ///
+    /// Async: the actual HTTP POST happens via RelayClient on a
+    /// background path; this call returns immediately.  On 200
+    /// the lastPublish state in AppDataStore is updated.
+    /// Returns true if a publish was actually kicked off (i.e.,
+    /// the gate decided we needed one), false if skipped.
+    bool maybePublishIdentityBundle();
+
+    /// Kick off a background fetch of `peerIdB64u`'s bundle from
+    /// the relay.  Idempotent + de-duped: skips if the local
+    /// `contacts.kem_pub` is already populated, OR a fetch for
+    /// the same peer is currently in flight.  On success the
+    /// returned kem_pub is verified (signature + id-match) and
+    /// stored in `contacts.kem_pub` via `m_sealer.saveKemPub`.
+    ///
+    /// Designed to be called when a conversation surface opens
+    /// (iOS ChatView .onAppear, desktop ChatView::onChatSelected)
+    /// so that by the time the user types + sends msg1, the
+    /// kem_pub is in place + msg1 goes hybrid PQ.  Falls back to
+    /// the existing in-band kem_pub_announce path if the fetch
+    /// hasn't completed by send-time.
+    void requestIdentityBundleFetch(const std::string& peerIdB64u);
+
     // Restore/persist group sequence counters across restarts.  Delegates
     // to GroupProtocol — the counters themselves live there.
     void setGroupSeqCounters(const std::map<std::string, int64_t>& seqOut,
@@ -502,6 +537,26 @@ private:
     std::unique_ptr<SessionManager> m_sessionMgr;
     SqlCipherDb* m_dbPtr = nullptr;  // kept for group / file / seen-envelopes tables
     AppDataStore* m_appData = nullptr;  // optional, for v2 group send path
+
+    // Tier 1 PQ — track in-flight bundle fetches to dedupe rapid
+    // requestIdentityBundleFetch calls (e.g., user opening the
+    // same conversation twice in quick succession).  Cleared
+    // when the async callback fires.
+    std::set<std::string> m_inFlightBundleFetches;
+    // Re-publish cadence: we kick a fresh /v1/identity POST only
+    // when KEM keys have rotated OR more than this much time has
+    // passed since the last accepted publish.  14 days leaves
+    // 16 days of slack below the relay's 30-day TTL — peers
+    // can still fetch our bundle while we're "between
+    // republishes."
+    static constexpr int64_t kIdentityRepublishMinSecs =
+        14LL * 24 * 60 * 60;  // 14 days
+    // AppDataStore keys.  Read/written via m_appData->saveSetting /
+    // loadSetting so the cadence state survives app relaunches.
+    static constexpr const char* kSettingLastIdentityPublishTs =
+        "p2p.lastIdentityBundlePublishTs";
+    static constexpr const char* kSettingLastIdentityPublishKemHash =
+        "p2p.lastIdentityBundleKemPubHash";
 
     std::vector<std::string> m_selfKeys;
 

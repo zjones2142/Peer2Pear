@@ -303,6 +303,17 @@ extension Peer2PearClient {
         return String(cString: cstr)
     }
 
+    /// Tier 1 PQ — kick an async fetch of `peerId`'s ML-KEM-768
+    /// pub from the relay so msg1 to that peer goes hybrid.
+    /// SwiftUI calls this in `ConversationView.onAppear` so the
+    /// fetch races against user typing.  Idempotent (deduped by
+    /// ChatController on already-cached + in-flight).  Safe to
+    /// call before the C context is alive — it no-ops.
+    func requestIdentityBundleFetch(_ peerId: String) {
+        guard let ctx = rawContext else { return }
+        peerId.withCString { p2p_request_identity_bundle_fetch(ctx, $0) }
+    }
+
     @discardableResult
     func dbSaveFileRecord(_ r: DBFileRecord) -> Bool {
         guard let ctx = rawContext else { return false }

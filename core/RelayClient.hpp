@@ -93,6 +93,33 @@ public:
     void registerPushToken(const std::string& platform,
                              const std::string& token);
 
+    // ── Identity-bundle endpoints (Tier 1 of project_pq_messaging.md) ───────
+    //
+    // Publish own (ed25519_id, kem_pub, ts_day, sig) tuple so peers
+    // can fetch it pre-msg1 + run hybrid PQ Noise IK from byte one.
+    //
+    // `cb` is invoked with `true` on 200 from the relay, `false`
+    // otherwise.  Async over IHttpClient.post — callback fires on
+    // whatever thread the HTTP backend uses (URLSession delegate
+    // queue / Qt main loop).
+    using PublishIdentityCallback = std::function<void(bool ok)>;
+    void publishIdentityBundle(const std::string& ed25519IdB64u,
+                                 const Bytes& kemPub,
+                                 uint64_t tsDay,
+                                 const Bytes& sig,
+                                 PublishIdentityCallback cb);
+
+    // Fetch a peer's bundle.  On success the callback delivers the
+    // 1184-byte ML-KEM-768 pub (caller stores in `contacts.kem_pub`
+    // for sub­sequent hybrid sealing).  On any failure (404,
+    // network error, signature verification fails, response
+    // ed25519_id doesn't match the requested one) the callback
+    // receives an empty Bytes — caller's existing `kem_pub.empty()`
+    // → classical-msg1 fallback path stays intact.
+    using FetchIdentityCallback = std::function<void(const Bytes& kemPub)>;
+    void fetchIdentityBundle(const std::string& ed25519IdB64u,
+                               FetchIdentityCallback cb);
+
     // ── DAITA: client-side traffic analysis defense ─────────────────────────
     void setJitterRange(int minMs, int maxMs);
     void setCoverTrafficInterval(int seconds);

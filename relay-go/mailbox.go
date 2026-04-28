@@ -33,6 +33,14 @@ const (
 	defaultTTLMs  = 14 * 24 * 60 * 60 * 1000 // 14 days
 	maxTTLMs      = 14 * 24 * 60 * 60 * 1000
 	maxQueueItems = 5000
+	// Identity-bundle retention.  Set longer than envelope TTL because
+	// publishes are infrequent (clients re-publish every ~14 days, see
+	// `ChatController::maybePublishIdentityBundle`) — a 30-day window
+	// covers the case where a client unlocks once a fortnight without
+	// the bundle expiring out from under their peers.  When clients go
+	// silent (uninstalled / offline beyond the retention) the bundle
+	// ages out, shrinking the enumeration target.
+	identityTTLMs = 30 * 24 * 60 * 60 * 1000 // 30 days
 	// Two-phase delivery: FetchAll marks rows as in-flight (delivered_at =
 	// now) instead of deleting; the caller DELETEs each row only after the
 	// WS write succeeds.  If the relay crashes between mark and confirm,
@@ -185,6 +193,24 @@ func NewMailbox(dbPath string) (*Mailbox, error) {
 		);
 		CREATE INDEX IF NOT EXISTS idx_seen_auth_expiry
 		ON seen_auth_nonces (expiry_ms);
+
+		-- Per-peer identity bundles for hybrid PQ Noise IK (Tier 1
+		-- of project_pq_messaging.md).  Holds the (kem_pub, sig,
+		-- ts_day) tuple a peer published via POST /v1/identity so
+		-- a sender can fetch it BEFORE msg1 and run hybrid PQ
+		-- from the first byte instead of waiting for the in-band
+		-- kem_pub_announce reciprocation.  peer_hash is the same
+		-- HMAC-SHA256-truncated form used by the envelopes table
+		-- so a disk snapshot doesn't reveal raw peer IDs.
+		CREATE TABLE IF NOT EXISTS identities (
+			peer_hash    TEXT PRIMARY KEY,
+			kem_pub      BLOB NOT NULL,
+			sig          BLOB NOT NULL,
+			ts_day       INTEGER NOT NULL,
+			expiry_ms    INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_identities_expiry
+		ON identities (expiry_ms);
 	`)
 	if err != nil {
 		db.Close()
@@ -246,6 +272,88 @@ func (m *Mailbox) PurgeExpiredAuthNonces() int {
 	n, _ := res.RowsAffected()
 	return int(n)
 }
+
+// PutIdentity upserts the (kem_pub, sig, ts_day) bundle for a peer
+// who just published via POST /v1/identity.  Atomic under the
+// mutex; rejects out-of-order or replayed publishes (newTsDay
+// must be strictly greater than any stored value).  Returns
+// ErrIdentityReplay on the replay/out-of-order case so the
+// handler can surface 400 vs the generic 500 from raw DB errors.
+//
+// The peer ID is hashed via hashPeerID so a disk snapshot doesn't
+// reveal raw IDs of users who've published bundles.
+func (m *Mailbox) PutIdentity(idB64u string, kemPub, sig []byte, tsDay int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	hashedKey := hashPeerID(idB64u)
+
+	var existingTsDay int64
+	err := m.db.QueryRow(
+		"SELECT ts_day FROM identities WHERE peer_hash=?", hashedKey,
+	).Scan(&existingTsDay)
+	if err == nil && existingTsDay >= tsDay {
+		return ErrIdentityReplay
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("identities lookup: %w", err)
+	}
+
+	expiryMs := nowMs() + identityTTLMs
+	_, err = m.db.Exec(
+		`INSERT INTO identities (peer_hash, kem_pub, sig, ts_day, expiry_ms)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(peer_hash) DO UPDATE SET
+		   kem_pub=excluded.kem_pub,
+		   sig=excluded.sig,
+		   ts_day=excluded.ts_day,
+		   expiry_ms=excluded.expiry_ms`,
+		hashedKey, kemPub, sig, tsDay, expiryMs,
+	)
+	if err != nil {
+		return fmt.Errorf("identities upsert: %w", err)
+	}
+	return nil
+}
+
+// GetIdentity fetches the most recent bundle for a peer (by raw
+// peer ID; we hash internally).  Returns sql.ErrNoRows if no
+// bundle has been published OR the row has expired.  The TTL
+// check happens in the SELECT so callers don't need to guard
+// against stale rows.
+func (m *Mailbox) GetIdentity(idB64u string) (kemPub, sig []byte, tsDay int64, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	hashedKey := hashPeerID(idB64u)
+	err = m.db.QueryRow(
+		`SELECT kem_pub, sig, ts_day FROM identities
+		 WHERE peer_hash=? AND expiry_ms > ?`,
+		hashedKey, nowMs(),
+	).Scan(&kemPub, &sig, &tsDay)
+	return
+}
+
+// PurgeExpiredIdentities drops any identity row whose expiry has
+// passed.  Called from the same hourly purge goroutine as
+// PurgeExpired (envelopes) and PurgeExpiredAuthNonces.
+func (m *Mailbox) PurgeExpiredIdentities() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	res, err := m.db.Exec("DELETE FROM identities WHERE expiry_ms < ?", nowMs())
+	if err != nil {
+		return 0
+	}
+	n, _ := res.RowsAffected()
+	return int(n)
+}
+
+// ErrIdentityReplay is returned by PutIdentity when the submitted
+// ts_day is not strictly greater than what we already have stored
+// for that peer (defends against a relay-mediated replay of an
+// older signed bundle).
+var ErrIdentityReplay = fmt.Errorf("identity bundle ts_day not advancing")
 
 func (m *Mailbox) Close() {
 	m.db.Close()

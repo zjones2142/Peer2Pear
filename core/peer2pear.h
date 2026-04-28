@@ -1058,6 +1058,41 @@ int         p2p_app_save_setting(p2p_context* ctx, const char* key, const char* 
 const char* p2p_app_load_setting(p2p_context* ctx, const char* key,
                                   const char* default_value);
 
+/* ── Identity-bundle plumbing (Tier 1 of project_pq_messaging.md) ────────
+ *
+ * Both calls are safe to invoke at any time post-unlock; before
+ * unlock they no-op.  Both run async via the existing IHttpClient
+ * wired into RelayClient — caller doesn't block.  Failures (network
+ * errors / 404 / sig-mismatch on fetch) silently fall back to the
+ * existing in-band kem_pub_announce path: msg1 stays classical,
+ * msg2+ goes hybrid via the existing reciprocation flow.
+ *
+ * publish: kicks a fresh POST /v1/identity if either (a) the local
+ * device has never published, (b) the KEM key has rotated since
+ * the last publish, or (c) more than 14 days have passed since the
+ * last accepted publish.  Caller invokes once per unlock + once
+ * per relay reconnect; ChatController gates on the AppDataStore-
+ * tracked last-publish state so back-to-back calls dedupe to a
+ * single POST.  Returns 1 if a publish was kicked off, 0 if the
+ * gate decided to skip, -1 on internal error (no PQ keys / no
+ * AppDataStore).
+ */
+int p2p_maybe_publish_identity_bundle(p2p_context* ctx);
+
+/* fetch: kicks an async GET /v1/identity/{peer_id_b64u} if the
+ * local DB has no kem_pub for that peer AND a fetch isn't already
+ * in-flight.  On 200 + signature verify success, the fetched
+ * kem_pub lands in `contacts.kem_pub` so subsequent sealForPeer
+ * calls activate hybrid PQ Noise IK.
+ *
+ * Caller wires this into the conversation-open path on each
+ * platform (iOS ChatView .onAppear, desktop ChatView::onChatSelected)
+ * so the fetch races against user typing — bundle is typically
+ * cached by the time msg1 sends.
+ */
+void p2p_request_identity_bundle_fetch(p2p_context* ctx,
+                                          const char* peer_id_b64u);
+
 /** File transfer record persistence — mirrors FileTransferRecord. */
 int p2p_app_save_file_record(p2p_context* ctx,
                               const char* transfer_id,

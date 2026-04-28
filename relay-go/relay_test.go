@@ -35,6 +35,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,8 @@ func newTestRelayOpt(t *testing.T, trustProxy bool) *testRelay {
 	mux.HandleFunc("POST /v1/forward", hub.HandleForward)
 	mux.HandleFunc("GET /v1/relay_info", hub.HandleRelayInfo)
 	mux.HandleFunc("POST /v1/forward-onion", hub.HandleForwardOnion)
+	mux.HandleFunc("POST /v1/identity", hub.HandlePostIdentity)
+	mux.HandleFunc("GET /v1/identity/{id}", hub.HandleGetIdentity)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "impl": "go"})
 	})
@@ -1337,5 +1340,314 @@ func TestHub_SecondConnectionReplacesFirst(t *testing.T) {
 		if mt == websocket.BinaryMessage && bytes.Equal(body, env) {
 			return
 		}
+	}
+}
+
+// ── Identity-bundle endpoints ──────────────────────────────────────────
+//
+// Tier 1 of project_pq_messaging.md.  Tests the publish/fetch
+// surface, signature verification, replay defense, rate-limit,
+// and TTL purge.  Identity bundles are independent of the
+// envelope path — each test stands up a fresh relay so DB
+// state is hermetic.
+
+// signIdentityBundle reproduces the canonical-message format used
+// by the Go handler + the C++ CryptoEngine helper.  Kept here
+// rather than depending on test internals so a wire-format
+// regression in either side trips this test.
+func signIdentityBundleForTest(p testPeer, kemPub []byte, tsDay int64) (string, string) {
+	kemPubB64 := base64.RawURLEncoding.EncodeToString(kemPub)
+	msg := "P2P_IDENTITY_v1|" + p.idB64 + "|" + kemPubB64 + "|" +
+		strconv.FormatInt(tsDay, 10)
+	sig := ed25519.Sign(p.priv, []byte(msg))
+	return kemPubB64, base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// fakeKemPub returns an arbitrary 1184-byte ML-KEM-768-shaped
+// blob.  Tests don't actually decapsulate (that's exercised in
+// the C-side tests); the relay just stores opaque bytes.
+func fakeKemPub(t *testing.T) []byte {
+	t.Helper()
+	out := make([]byte, mlKem768PubLen)
+	cryptorand.Read(out)
+	return out
+}
+
+func postIdentity(t *testing.T, srvURL, body string) (*http.Response, []byte) {
+	t.Helper()
+	resp, err := http.Post(srvURL+"/v1/identity",
+		"application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/identity: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp, respBody
+}
+
+func TestIdentity_PostFetchRoundTrip(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	kemPub := fakeKemPub(t)
+	tsDay := time.Now().Unix() / 86400
+	kemPubB64, sigB64 := signIdentityBundleForTest(alice, kemPub, tsDay)
+
+	body := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, kemPubB64, tsDay, sigB64)
+	resp, _ := postIdentity(t, r.srv.URL, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish status: got %d, want 200", resp.StatusCode)
+	}
+
+	getResp, err := http.Get(r.srv.URL + "/v1/identity/" + alice.idB64)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("fetch status: got %d (%s), want 200", getResp.StatusCode, getBody)
+	}
+
+	var got struct {
+		V             int    `json:"v"`
+		Ed25519IDB64u string `json:"ed25519_id_b64u"`
+		KemPubB64u    string `json:"kem_pub_b64u"`
+		TsDay         int64  `json:"ts_day"`
+		SigB64u       string `json:"sig_b64u"`
+	}
+	if err := json.Unmarshal(getBody, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.V != 1 || got.Ed25519IDB64u != alice.idB64 ||
+		got.KemPubB64u != kemPubB64 || got.TsDay != tsDay ||
+		got.SigB64u != sigB64 {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+func TestIdentity_RejectsBadSignature(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	kemPub := fakeKemPub(t)
+	tsDay := time.Now().Unix() / 86400
+	kemPubB64, _ := signIdentityBundleForTest(alice, kemPub, tsDay)
+
+	// Sign with a DIFFERENT keypair → relay should reject.
+	bob := newTestPeer(t)
+	msg := "P2P_IDENTITY_v1|" + alice.idB64 + "|" + kemPubB64 + "|" +
+		strconv.FormatInt(tsDay, 10)
+	wrongSig := base64.RawURLEncoding.EncodeToString(
+		ed25519.Sign(bob.priv, []byte(msg)))
+
+	body := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, kemPubB64, tsDay, wrongSig)
+	resp, _ := postIdentity(t, r.srv.URL, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on bad sig, got %d", resp.StatusCode)
+	}
+}
+
+func TestIdentity_RejectsBadKemPubSize(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	tsDay := time.Now().Unix() / 86400
+	kemPubB64 := base64.RawURLEncoding.EncodeToString([]byte("not-1184-bytes"))
+	msg := "P2P_IDENTITY_v1|" + alice.idB64 + "|" + kemPubB64 + "|" +
+		strconv.FormatInt(tsDay, 10)
+	sig := base64.RawURLEncoding.EncodeToString(
+		ed25519.Sign(alice.priv, []byte(msg)))
+
+	body := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, kemPubB64, tsDay, sig)
+	resp, _ := postIdentity(t, r.srv.URL, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on bad kem_pub size, got %d", resp.StatusCode)
+	}
+}
+
+func TestIdentity_RejectsExpiredTsDay(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	kemPub := fakeKemPub(t)
+	// 30 days ago — well past the 7-day past-skew window.
+	tsDay := time.Now().Unix()/86400 - 30
+	kemPubB64, sigB64 := signIdentityBundleForTest(alice, kemPub, tsDay)
+
+	body := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, kemPubB64, tsDay, sigB64)
+	resp, _ := postIdentity(t, r.srv.URL, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on stale ts_day, got %d", resp.StatusCode)
+	}
+}
+
+func TestIdentity_RejectsReplay(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	kemPub := fakeKemPub(t)
+	tsDay := time.Now().Unix() / 86400
+	kemPubB64, sigB64 := signIdentityBundleForTest(alice, kemPub, tsDay)
+
+	body := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, kemPubB64, tsDay, sigB64)
+
+	resp1, _ := postIdentity(t, r.srv.URL, body)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first publish: got %d, want 200", resp1.StatusCode)
+	}
+
+	// Same ts_day — must reject as not strictly advancing.
+	resp2, _ := postIdentity(t, r.srv.URL, body)
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("replay: got %d, want 400", resp2.StatusCode)
+	}
+}
+
+func TestIdentity_AllowsRotation(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	kemPub1 := fakeKemPub(t)
+	kemPub2 := fakeKemPub(t)
+	tsDay1 := time.Now().Unix() / 86400
+	tsDay2 := tsDay1 + 1
+	pub1B64, sig1 := signIdentityBundleForTest(alice, kemPub1, tsDay1)
+	pub2B64, sig2 := signIdentityBundleForTest(alice, kemPub2, tsDay2)
+
+	body1 := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, pub1B64, tsDay1, sig1)
+	resp, _ := postIdentity(t, r.srv.URL, body1)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish1: got %d", resp.StatusCode)
+	}
+
+	body2 := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, pub2B64, tsDay2, sig2)
+	resp, _ = postIdentity(t, r.srv.URL, body2)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotation publish: got %d, want 200", resp.StatusCode)
+	}
+
+	// GET should return the rotated bundle.
+	getResp, err := http.Get(r.srv.URL + "/v1/identity/" + alice.idB64)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	var got struct {
+		KemPubB64u string `json:"kem_pub_b64u"`
+		TsDay      int64  `json:"ts_day"`
+	}
+	json.Unmarshal(getBody, &got)
+	if got.KemPubB64u != pub2B64 || got.TsDay != tsDay2 {
+		t.Fatalf("GET after rotation: got kem=%s/ts=%d, want kem=%s/ts=%d",
+			got.KemPubB64u, got.TsDay, pub2B64, tsDay2)
+	}
+}
+
+func TestIdentity_GetNotFound(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	ghost := newTestPeer(t)
+	resp, err := http.Get(r.srv.URL + "/v1/identity/" + ghost.idB64)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestIdentity_PerIdRateLimit(t *testing.T) {
+	// Trust X-Forwarded-For so distinct IPs don't share the per-IP
+	// limit — we want to exercise the per-id cap in isolation.
+	r := newTestRelayOpt(t, true)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	kemPub := fakeKemPub(t)
+	tsDay := time.Now().Unix() / 86400
+	kemPubB64, sigB64 := signIdentityBundleForTest(alice, kemPub, tsDay)
+	body := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, kemPubB64, tsDay, sigB64)
+	postIdentity(t, r.srv.URL, body)
+
+	// Burst >limit GETs from rotating IPs — per-IP cap is bypassed
+	// (trustProxy=true), per-id cap should kick in at
+	// identityFetchRateLimitPerMin.
+	hit429 := false
+	for i := 0; i < identityFetchRateLimitPerMin+10; i++ {
+		req, _ := http.NewRequest("GET",
+			r.srv.URL+"/v1/identity/"+alice.idB64, nil)
+		req.Header.Set("X-Forwarded-For",
+			fmt.Sprintf("10.0.0.%d", (i%250)+1))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET[%d]: %v", i, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			hit429 = true
+			break
+		}
+	}
+	if !hit429 {
+		t.Fatalf("expected per-id rate-limit kick-in; never hit 429")
+	}
+}
+
+func TestIdentity_PurgeExpired(t *testing.T) {
+	r := newTestRelay(t)
+	defer r.Close()
+
+	alice := newTestPeer(t)
+	kemPub := fakeKemPub(t)
+	tsDay := time.Now().Unix() / 86400
+	kemPubB64, sigB64 := signIdentityBundleForTest(alice, kemPub, tsDay)
+	body := fmt.Sprintf(
+		`{"v":1,"ed25519_id_b64u":"%s","kem_pub_b64u":"%s","ts_day":%d,"sig_b64u":"%s"}`,
+		alice.idB64, kemPubB64, tsDay, sigB64)
+	postIdentity(t, r.srv.URL, body)
+
+	// Force the row's expiry into the past so PurgeExpiredIdentities
+	// catches it.  Reaches into the mailbox DB directly because the
+	// public API doesn't expose a way to hand-wave the clock.
+	_, err := r.mbox.db.Exec(
+		"UPDATE identities SET expiry_ms = ?", 1)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if removed := r.mbox.PurgeExpiredIdentities(); removed != 1 {
+		t.Fatalf("PurgeExpiredIdentities: got %d, want 1", removed)
+	}
+
+	// GET should now 404 — the purge actually deleted the row.
+	resp, _ := http.Get(r.srv.URL + "/v1/identity/" + alice.idB64)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("after purge: got %d, want 404", resp.StatusCode)
 	}
 }

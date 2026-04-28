@@ -63,7 +63,7 @@ func main() {
 	hub.relayX25519Priv = priv
 	hub.InitPush(priv)
 
-	// Background purge of expired envelopes
+	// Background purge of expired envelopes + auth nonces + identity bundles
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
@@ -71,6 +71,12 @@ func main() {
 			removed, remaining := mbox.PurgeExpired()
 			if removed > 0 {
 				log.Printf("purge: removed %d expired envelopes, %d remaining", removed, remaining)
+			}
+			if n := mbox.PurgeExpiredAuthNonces(); n > 0 {
+				log.Printf("purge: removed %d expired auth nonces", n)
+			}
+			if n := mbox.PurgeExpiredIdentities(); n > 0 {
+				log.Printf("purge: removed %d expired identity bundles", n)
 			}
 		}
 	}()
@@ -85,6 +91,15 @@ func main() {
 	// Onion routing endpoints.
 	mux.HandleFunc("GET /v1/relay_info", hub.HandleRelayInfo)
 	mux.HandleFunc("POST /v1/forward-onion", hub.HandleForwardOnion)
+	// Identity-bundle publish/fetch — Tier 1 of project_pq_messaging.md.
+	// Lets a sender fetch the recipient's ML-KEM-768 pub before msg1 so
+	// hybrid PQ Noise IK activates from the first byte.  Bundle is
+	// signed by the publisher's Ed25519 priv; relay just stores +
+	// serves opaque bytes.  Fetch is unauthenticated + rate-limited
+	// (per-IP + per-recipient) — same posture as Signal's
+	// /v1/profile/{phone} and iMessage's pre-key endpoints.
+	mux.HandleFunc("POST /v1/identity",     hub.HandlePostIdentity)
+	mux.HandleFunc("GET /v1/identity/{id}", hub.HandleGetIdentity)
 	// NOTE: /v1/peers removed — exposing connected peer IDs is a privacy leak.
 	// NOTE: Legacy /mbox/* and /rvz/* endpoints removed.  The Qt client uses
 	// /v1/send exclusively; rendezvous is replaced by WS presence + P2P ICE.

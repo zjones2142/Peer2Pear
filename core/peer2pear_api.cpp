@@ -1888,6 +1888,25 @@ const char* p2p_app_load_setting(p2p_context* ctx, const char* key,
     return ctx->scratch.c_str();
 }
 
+// Tier 1 PQ — identity-bundle plumbing exposed to platform code.
+
+int p2p_maybe_publish_identity_bundle(p2p_context* ctx)
+{
+    if (!ctx) return -1;
+    P2P_CTX_GUARD(ctx);
+    if (!ctx->controller) return -1;
+    return ctx->controller->maybePublishIdentityBundle() ? 1 : 0;
+}
+
+void p2p_request_identity_bundle_fetch(p2p_context* ctx,
+                                          const char* peer_id_b64u)
+{
+    if (!ctx || !peer_id_b64u || !*peer_id_b64u) return;
+    P2P_CTX_GUARD(ctx);
+    if (!ctx->controller) return;
+    ctx->controller->requestIdentityBundleFetch(peer_id_b64u);
+}
+
 int p2p_app_save_file_record(p2p_context* ctx,
                               const char* transfer_id,
                               const char* chat_key,

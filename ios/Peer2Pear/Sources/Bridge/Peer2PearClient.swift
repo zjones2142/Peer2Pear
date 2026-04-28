@@ -1291,6 +1291,15 @@ final class Peer2PearClient: ObservableObject {
         // init defaults.  See `Peer2PearClient+Settings.swift`.
         loadAllSettingsFromDB()
 
+        // Tier 1 PQ — publish our identity bundle so peers can
+        // fetch our ML-KEM-768 pub before sending msg1 to us.
+        // ChatController gates by 14-day window + KEM-key-rotation
+        // detector so back-to-back unlocks don't spam the relay.
+        // Async + non-blocking; failures retry on next unlock.
+        if let ctx = rawContext {
+            _ = p2p_maybe_publish_identity_bundle(ctx)
+        }
+
         // Re-apply file-policy preferences each unlock so a setting the
         // user changed in a prior session takes effect now.  Network
         // monitor decides the effective auto-accept value (0 on

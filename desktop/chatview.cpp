@@ -1140,6 +1140,18 @@ void ChatView::onChatSelected(int index)
         rebuildChatList();
     }
 
+    // Tier 1 PQ — kick an async fetch of the peer's identity
+    // bundle so the kem_pub is in our DB by the time the user
+    // types + sends msg1.  ChatController dedupes on (a) already-
+    // cached and (b) in-flight, so this is safe to call on every
+    // chat selection.  Group conversations don't have a single
+    // direct peer; we fetch only for direct chats.
+    const auto& conv = m_chats[index];
+    if (conv.kind == AppDataStore::ConversationKind::Direct &&
+        !conv.directPeerId.empty() && m_controller) {
+        m_controller->requestIdentityBundleFetch(conv.directPeerId);
+    }
+
     // Re-apply search highlights when switching chats
     if (!m_searchQuery.isEmpty()) {
         m_searchMatchIndices.clear();

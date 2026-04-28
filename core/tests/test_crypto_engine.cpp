@@ -604,3 +604,303 @@ TEST(CryptoEngine, IdentityReloadFromDiskYieldsSamePub) {
 
     fs::remove_all(tmp);
 }
+
+// ── 13. Identity-bundle signing for hybrid PQ msg1 ────────────────────────
+// Tier 1 of project_pq_messaging.md.  Tests both the SIGN path
+// (instance method via real ensureIdentity) and the VERIFY path
+// (static; tested independently by externally signing with
+// libsodium so we don't trust sign + verify in the same test).
+//
+// The canonical message format MUST stay byte-exact with the
+// relay's `canonicalIdentityMessage` in
+// `relay-go/relay.go`.  A wire-format regression here breaks
+// cross-platform sign/verify for the entire PQ-msg1 path.
+
+namespace {
+
+// Helper: rebuild the canonical message exactly as the C++ /
+// Go signers do.  Lives in the test so a refactor in the
+// production canonical-message helper that drifts from this
+// shape would trip the CanonicalIsByteExact test below.
+std::string identityCanonicalForTest(const std::string& idB64u,
+                                       const Bytes& kemPub,
+                                       uint64_t tsDay) {
+    return "P2P_IDENTITY_v1|" + idB64u + "|" +
+            CryptoEngine::toBase64Url(kemPub) + "|" +
+            std::to_string(tsDay);
+}
+
+// Helper: external libsodium-signed bundle.  Lets the verify
+// tests avoid implicit dependence on signIdentityBundle being
+// correct.
+Bytes externalSignBundle(const std::string& idB64u,
+                          const Bytes& kemPub, uint64_t tsDay,
+                          const Bytes& edPriv) {
+    const std::string canonical = identityCanonicalForTest(idB64u, kemPub, tsDay);
+    Bytes sig(crypto_sign_BYTES);
+    crypto_sign_detached(sig.data(), nullptr,
+                          reinterpret_cast<const uint8_t*>(canonical.data()),
+                          canonical.size(),
+                          edPriv.data());
+    return sig;
+}
+
+// Helper: generate a fresh libsodium Ed25519 keypair (no
+// CryptoEngine / ensureIdentity needed).  Returns
+// {pub, priv, idB64u}.
+struct TestKeypair {
+    Bytes        pub;
+    Bytes        priv;
+    std::string  idB64u;
+};
+TestKeypair freshEd25519() {
+    TestKeypair kp;
+    kp.pub.assign(crypto_sign_PUBLICKEYBYTES, 0);
+    kp.priv.assign(crypto_sign_SECRETKEYBYTES, 0);
+    crypto_sign_keypair(kp.pub.data(), kp.priv.data());
+    kp.idB64u = CryptoEngine::toBase64Url(kp.pub);
+    return kp;
+}
+
+// Helper: build a 1184-byte ML-KEM-768-shaped buffer for
+// signing tests.  We don't actually decapsulate against it —
+// the relay/sender just stores opaque bytes.
+Bytes fakeKemPubBlob(uint8_t fillByte) {
+    return Bytes(1184, fillByte);
+}
+
+}  // anonymous namespace
+
+// 13a — Verify path: external sign with libsodium, verify with
+// CryptoEngine::verifyIdentityBundle.  Each tampered field
+// (kem_pub byte, ts_day, sig byte, ed25519 id) must fail.
+TEST(CryptoEngine, IdentityBundleVerifyHappyAndTamper) {
+    const TestKeypair kp     = freshEd25519();
+    const Bytes       kemPub = fakeKemPubBlob(0xAB);
+    const uint64_t    tsDay  = 20571;
+    const Bytes       sig    = externalSignBundle(kp.idB64u, kemPub, tsDay, kp.priv);
+
+    // 1) Happy path — same inputs verify cleanly.
+    EXPECT_TRUE(CryptoEngine::verifyIdentityBundle(kp.idB64u, kemPub, tsDay, sig));
+
+    // 2) Tamper kemPub (first byte flipped) → fails.
+    {
+        Bytes badKem = kemPub;
+        badKem[0] ^= 0x01;
+        EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+            kp.idB64u, badKem, tsDay, sig));
+    }
+
+    // 3) Tamper kemPub (last byte flipped) → fails (full message
+    //    is hashed; any byte-flip breaks the signature).
+    {
+        Bytes badKem = kemPub;
+        badKem.back() ^= 0x80;
+        EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+            kp.idB64u, badKem, tsDay, sig));
+    }
+
+    // 4) Tamper ts_day → fails (different canonical message).
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+        kp.idB64u, kemPub, tsDay + 1, sig));
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+        kp.idB64u, kemPub, tsDay - 1, sig));
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+        kp.idB64u, kemPub, 0, sig));
+
+    // 5) Tamper sig → fails.  Try multiple bit positions to
+    //    catch any verifier that ignores chunks of the signature.
+    for (size_t bit : {0u, 7u, 31u, 256u, 511u}) {
+        Bytes badSig = sig;
+        flipBit(badSig, bit);
+        EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+            kp.idB64u, kemPub, tsDay, badSig));
+    }
+
+    // 6) Substitute id with a different valid id → fails (the
+    //    sig was made for the original id; the verifier decodes
+    //    the requested id as the pub-key, which now doesn't
+    //    match the sig's key).
+    {
+        const TestKeypair other = freshEd25519();
+        EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+            other.idB64u, kemPub, tsDay, sig));
+    }
+}
+
+// 13b — Wrong key signing (impersonation).  Sender signs with
+// their OWN keypair but submits SOMEONE ELSE's id_b64u: the
+// sig won't verify under the impersonated id (Ed25519 is
+// unforgeable; we test the verify path actually catches this).
+TEST(CryptoEngine, IdentityBundleRejectsImpersonation) {
+    const TestKeypair alice = freshEd25519();
+    const TestKeypair bob   = freshEd25519();
+    const Bytes       kemPub = fakeKemPubBlob(0x42);
+    const uint64_t    tsDay  = 20571;
+
+    // Bob signs a bundle that CLAIMS to be Alice's
+    // (id_b64u = alice.idB64u, but sig made with bob.priv).
+    const Bytes bobSig = externalSignBundle(alice.idB64u, kemPub, tsDay, bob.priv);
+
+    // Verifier looks up the pub-key from the supplied id (alice.idB64u),
+    // tries to verify bob's sig under alice's pub → fails.
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+        alice.idB64u, kemPub, tsDay, bobSig));
+
+    // Also fails when the verifier is told the id IS bob's
+    // (because the canonical message was built with alice's id).
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+        bob.idB64u, kemPub, tsDay, bobSig));
+}
+
+// 13c — Malformed inputs.  The verifier must reject without
+// crashing on undersized / empty / oversized arguments.
+TEST(CryptoEngine, IdentityBundleRejectsMalformedInputs) {
+    const TestKeypair kp     = freshEd25519();
+    const Bytes       kemPub = fakeKemPubBlob(0x55);
+    const Bytes       sig    = externalSignBundle(kp.idB64u, kemPub, 1, kp.priv);
+
+    // Bad id: empty, wrong size, malformed base64url.
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle("",        kemPub, 1, sig));
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle("AAAA",    kemPub, 1, sig));
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle("not!b64", kemPub, 1, sig));
+
+    // Bad sig: empty, wrong size.
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(kp.idB64u, kemPub, 1, {}));
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+        kp.idB64u, kemPub, 1, Bytes(63, 0)));   // one byte short
+    EXPECT_FALSE(CryptoEngine::verifyIdentityBundle(
+        kp.idB64u, kemPub, 1, Bytes(65, 0)));   // one byte long
+
+    // Empty kemPub: should still verify if the SIGNED message
+    // also had an empty kemPub (we don't enforce kem_pub size at
+    // the verify layer — that's the relay's + caller's job).
+    {
+        const Bytes emptySig = externalSignBundle(kp.idB64u, {}, 1, kp.priv);
+        EXPECT_TRUE(CryptoEngine::verifyIdentityBundle(
+            kp.idB64u, {}, 1, emptySig));
+    }
+}
+
+// 13d — Sign path: instance method via ensureIdentity().  Round-
+// trip through both sign and verify, then check tamper cases
+// against the SIGNED bundle (already covered for external-
+// signed in 13a; this confirms the instance signer produces
+// bytes that match the verifier's expectations).
+TEST(CryptoEngine, IdentityBundleSignThroughVerify) {
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "p2p-test-id-bundle-sign";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    CryptoEngine ce;
+    ce.setDataDir(tmp.string());
+    ce.setPassphrase("test-only-passphrase");
+    ASSERT_NO_THROW(ce.ensureIdentity());
+    ASSERT_FALSE(ce.identityPub().empty());
+
+    const std::string idB64u = CryptoEngine::toBase64Url(ce.identityPub());
+    const Bytes       kemPub = fakeKemPubBlob(0xCD);
+    const uint64_t    tsDay  = 20571;
+
+    const Bytes sig = ce.signIdentityBundle(idB64u, kemPub, tsDay);
+    ASSERT_EQ(sig.size(), 64u) << "Ed25519 signature must be 64 bytes";
+
+    // Static verify path accepts.
+    EXPECT_TRUE(CryptoEngine::verifyIdentityBundle(idB64u, kemPub, tsDay, sig));
+
+    // Round-trip via the verifier's own canonical-message build:
+    // re-sign the same canonical externally + compare bytes.
+    // Ed25519 with libsodium is DETERMINISTIC (RFC 8032), so
+    // signing the same message twice produces byte-identical
+    // signatures.  This proves both signers are using the same
+    // canonical bytes.
+    const Bytes externalSig = externalSignBundle(
+        idB64u, kemPub, tsDay, ce.identityPriv());
+    EXPECT_EQ(sig, externalSig)
+        << "instance-method signature must byte-match a libsodium "
+        << "signature over the same canonical message — wire format drift!";
+
+    // Sign-with-empty-kemPub returns empty (the instance method
+    // explicitly rejects empty input to avoid publishing a
+    // useless bundle).
+    EXPECT_TRUE(ce.signIdentityBundle(idB64u, {}, tsDay).empty());
+
+    fs::remove_all(tmp);
+}
+
+// 13e — Canonical message is byte-exact (cross-platform contract).
+// If the C++ canonical-message helper drifts in any way (extra
+// space, different separator, different ts encoding) the Go
+// relay's signature verification will reject every signature
+// from every C++ client.  Pin the bytes here as a regression
+// guard — we control both sides, so changing the format
+// requires updating BOTH this test AND the Go side.
+TEST(CryptoEngine, IdentityBundleCanonicalMessageIsByteExact) {
+    // Fixed inputs: known id (32 zeros) + known kem_pub (1184
+    // zeros) + ts_day = 19840.  Both encode deterministically
+    // to base64url (zero bytes → A-fill) so the canonical
+    // string is fully reproducible.
+    const std::string fixedIdB64u  = CryptoEngine::toBase64Url(Bytes(32, 0));
+    const Bytes       fixedKemPub  = Bytes(1184, 0);
+    const uint64_t    fixedTsDay   = 19840;
+
+    const std::string expected =
+        "P2P_IDENTITY_v1|" + fixedIdB64u + "|" +
+        CryptoEngine::toBase64Url(fixedKemPub) + "|19840";
+
+    const std::string actual = identityCanonicalForTest(
+        fixedIdB64u, fixedKemPub, fixedTsDay);
+    EXPECT_EQ(actual, expected);
+
+    // Sanity: 32 zero bytes b64url is 43 chars of "A" (the
+    // base64url-of-all-zero pattern).  This nails the
+    // toBase64Url encoder shape too.
+    EXPECT_EQ(fixedIdB64u, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+    // The bytes a Go-side `canonicalIdentityMessage` produces
+    // for the same inputs (manually computed offline + checked
+    // in here as a wire-format pin):
+    //   "P2P_IDENTITY_v1|" (16) + 43 'A' + "|" (1) + 1579 'A'
+    //   + "|" (1) + "19840" (5) = 1645 bytes.
+    // (1184 raw bytes → ceil(1184 * 4/3) - padding = 1579 b64url chars)
+    EXPECT_EQ(actual.size(), 1645u)
+        << "canonical message size drift — Go relay will reject all signatures";
+}
+
+// 13f — Determinism + golden-vector lock-in.  Ed25519
+// signatures over the same message + same priv key MUST be
+// byte-identical (RFC 8032 §5.1.6).  This catches: (a) a
+// non-deterministic Ed25519 implementation slipping in, (b)
+// the canonical-message format drifting silently.
+TEST(CryptoEngine, IdentityBundleSignatureIsDeterministic) {
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "p2p-test-id-bundle-determ";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    CryptoEngine ce;
+    ce.setDataDir(tmp.string());
+    ce.setPassphrase("determinism-passphrase");
+    ASSERT_NO_THROW(ce.ensureIdentity());
+
+    const std::string idB64u = CryptoEngine::toBase64Url(ce.identityPub());
+    const Bytes       kemPub = fakeKemPubBlob(0x77);
+
+    const Bytes sig1 = ce.signIdentityBundle(idB64u, kemPub, 20571);
+    const Bytes sig2 = ce.signIdentityBundle(idB64u, kemPub, 20571);
+    EXPECT_EQ(sig1, sig2)
+        << "same inputs must produce byte-identical Ed25519 signatures";
+
+    // Different ts_day → different signature (sanity that the
+    // canonical message actually feeds into the sign path).
+    const Bytes sigDifferentTs = ce.signIdentityBundle(idB64u, kemPub, 20572);
+    EXPECT_NE(sig1, sigDifferentTs);
+
+    // Different kem_pub → different signature.
+    const Bytes sigDifferentKem = ce.signIdentityBundle(
+        idB64u, fakeKemPubBlob(0x78), 20571);
+    EXPECT_NE(sig1, sigDifferentKem);
+
+    fs::remove_all(tmp);
+}

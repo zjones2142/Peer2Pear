@@ -1096,6 +1096,53 @@ bool CryptoEngine::verifySignature(const Bytes& sig, const Bytes& message,
         edPub.data()) == 0;
 }
 
+// ── Identity-bundle signatures ──────────────────────────────────────────────
+//
+// Canonical message must stay byte-exact with the relay's
+// `canonicalIdentityMessage` in `relay-go/relay.go` so all three parties
+// (publisher, relay, fetcher) compute the same bytes for verify.
+
+namespace {
+Bytes identityBundleCanonical(const std::string& ed25519IdB64u,
+                                const Bytes& kemPub, uint64_t tsDay) {
+    const std::string kemPubB64u = CryptoEngine::toBase64Url(kemPub);
+    std::string s = "P2P_IDENTITY_v1|";
+    s.reserve(16 + ed25519IdB64u.size() + 1 + kemPubB64u.size() + 1 + 20);
+    s += ed25519IdB64u;
+    s += '|';
+    s += kemPubB64u;
+    s += '|';
+    s += std::to_string(tsDay);
+    return Bytes(s.begin(), s.end());
+}
+}  // anonymous namespace
+
+Bytes CryptoEngine::signIdentityBundle(const std::string& ed25519IdB64u,
+                                         const Bytes& kemPub,
+                                         uint64_t tsDay) const {
+    if (m_edPriv.size() != crypto_sign_SECRETKEYBYTES) return {};
+    if (kemPub.empty()) return {};
+
+    const Bytes msg = identityBundleCanonical(ed25519IdB64u, kemPub, tsDay);
+    Bytes sig(crypto_sign_BYTES);
+    if (crypto_sign_detached(sig.data(), nullptr,
+                              msg.data(), msg.size(),
+                              m_edPriv.data()) != 0) {
+        return {};
+    }
+    return sig;
+}
+
+bool CryptoEngine::verifyIdentityBundle(const std::string& ed25519IdB64u,
+                                          const Bytes& kemPub,
+                                          uint64_t tsDay,
+                                          const Bytes& sig) {
+    const Bytes edPub = fromBase64Url(ed25519IdB64u);
+    if (edPub.size() != crypto_sign_PUBLICKEYBYTES) return false;
+    const Bytes msg = identityBundleCanonical(ed25519IdB64u, kemPub, tsDay);
+    return verifySignature(sig, msg, edPub);
+}
+
 // ---------------------------
 // Master key derivation (Argon2id)
 // ---------------------------

@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1008,6 +1010,180 @@ func verifyEd25519(peerIDB64, sigB64, message string) bool {
 		return false
 	}
 	return ed25519.Verify(ed25519.PublicKey(pubBytes), []byte(message), sigBytes)
+}
+
+// ── Identity-bundle endpoints ────────────────────────────────────────────────
+//
+// Tier 1 of project_pq_messaging.md.  POST publishes a peer's
+// (ed25519_id, kem_pub, ts_day, sig) tuple — Ed25519-signed
+// over a canonical domain-separated message so the relay can't
+// forge or reorder.  GET serves the stored tuple verbatim;
+// fetcher re-runs the signature check locally before trusting
+// the kem_pub.
+//
+// Rate-limiting: per-IP for both verbs; per-recipient for GET
+// (defends against a sweep of registered IDs).  Same posture
+// as Signal's /v1/profile/{phone} and iMessage pre-key
+// endpoints — industry-accepted as the necessary trade-off
+// for hybrid-PQ-from-msg1.
+
+const (
+	// ML-KEM-768 public key length, libsodium / liboqs constant.
+	mlKem768PubLen = 1184
+	// Generous upper bound for the JSON body — id (43) + kem_pub
+	// b64u (~1580) + sig b64u (86) + key strings + JSON overhead.
+	maxIdentityBodyBytes = 4 << 10
+	// Per-id GET cap.  60/min keeps legitimate add-contact /
+	// first-message flows fast (one fetch per send) while making
+	// a per-id sweep costly (60 fetches/min/IP * 1/id = need
+	// many IPs to enumerate at speed).
+	identityFetchRateLimitPerMin = 60
+	// ts_day acceptance window.  Reject if more than 1 day in
+	// the future (clock skew tolerance) or more than 7 days in
+	// the past (reasonable bound for delayed publishes).
+	identityFutureSkewDays = 1
+	identityPastSkewDays   = 7
+)
+
+func canonicalIdentityMessage(idB64u, kemPubB64u string, tsDay int64) string {
+	return "P2P_IDENTITY_v1|" + idB64u + "|" + kemPubB64u + "|" +
+		strconv.FormatInt(tsDay, 10)
+}
+
+// HandlePostIdentity — POST /v1/identity
+//
+// Body:
+//   { "v": 1,
+//     "ed25519_id_b64u": "...",
+//     "kem_pub_b64u":    "...",
+//     "ts_day":          <int>,
+//     "sig_b64u":        "..." }
+//
+// Steps: rate-limit → parse → size/window checks →
+// signature verify → mailbox upsert (which does its own
+// monotonic-ts replay defense).
+func (h *Hub) HandlePostIdentity(w http.ResponseWriter, r *http.Request) {
+	if !h.rl.allow(hashIP(h.clientIP(r))) {
+		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxIdentityBodyBytes)+1))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "read error")
+		return
+	}
+	if len(body) > maxIdentityBodyBytes {
+		httpError(w, http.StatusRequestEntityTooLarge, "identity body too large")
+		return
+	}
+
+	var req struct {
+		V             int    `json:"v"`
+		Ed25519IDB64u string `json:"ed25519_id_b64u"`
+		KemPubB64u    string `json:"kem_pub_b64u"`
+		TsDay         int64  `json:"ts_day"`
+		SigB64u       string `json:"sig_b64u"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.V != 1 {
+		httpError(w, http.StatusBadRequest, "unsupported v")
+		return
+	}
+
+	idBytes, err := b64urlDecode(req.Ed25519IDB64u)
+	if err != nil || len(idBytes) != ed25519.PublicKeySize {
+		httpError(w, http.StatusBadRequest, "invalid ed25519_id_b64u")
+		return
+	}
+	kemPub, err := b64urlDecode(req.KemPubB64u)
+	if err != nil || len(kemPub) != mlKem768PubLen {
+		httpError(w, http.StatusBadRequest, "invalid kem_pub_b64u")
+		return
+	}
+	sig, err := b64urlDecode(req.SigB64u)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		httpError(w, http.StatusBadRequest, "invalid sig_b64u")
+		return
+	}
+
+	todayDay := nowMs() / 86400000
+	if req.TsDay > todayDay+identityFutureSkewDays ||
+		req.TsDay < todayDay-identityPastSkewDays {
+		httpError(w, http.StatusBadRequest, "ts_day out of acceptance window")
+		return
+	}
+
+	// Verify signature over the canonical domain-separated message.
+	// Reuses verifyEd25519 — same pattern as WebSocket auth.
+	msg := canonicalIdentityMessage(req.Ed25519IDB64u, req.KemPubB64u, req.TsDay)
+	if !verifyEd25519(req.Ed25519IDB64u, req.SigB64u, msg) {
+		httpError(w, http.StatusBadRequest, "signature verification failed")
+		return
+	}
+
+	if err := h.mbox.PutIdentity(req.Ed25519IDB64u, kemPub, sig, req.TsDay); err != nil {
+		if err == ErrIdentityReplay {
+			httpError(w, http.StatusBadRequest, "ts_day not advancing (replay)")
+			return
+		}
+		httpError(w, http.StatusInternalServerError, "store error")
+		return
+	}
+
+	log.Printf("identity published: id=%s… ts_day=%d", truncID(req.Ed25519IDB64u), req.TsDay)
+	writeJSON(w, http.StatusOK, map[string]any{"published": true})
+}
+
+// HandleGetIdentity — GET /v1/identity/{id}
+//
+// Returns the most recent (kem_pub, sig, ts_day) tuple for the
+// peer, or 404 if not registered or expired.  Unauthenticated
+// (pubkeys are public by definition); rate-limited per-IP +
+// per-id.  No `last_updated` or other freshness metadata —
+// `ts_day` is per-day buckets so timing analysis can't
+// pinpoint publish moments to better than 24h.
+func (h *Hub) HandleGetIdentity(w http.ResponseWriter, r *http.Request) {
+	if !h.rl.allow(hashIP(h.clientIP(r))) {
+		httpError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
+	idB64u := r.PathValue("id")
+	idBytes, err := b64urlDecode(idB64u)
+	if err != nil || len(idBytes) != ed25519.PublicKeySize {
+		httpError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	// Per-recipient enumeration cap.  Same pattern as /v1/send's
+	// `recipientRateLimitPerMin` but tighter — fetches are
+	// idempotent so legitimate clients only need a few.
+	if !h.rlRecip.allowWithLimit(idB64u, identityFetchRateLimitPerMin) {
+		httpError(w, http.StatusTooManyRequests, "identity fetch rate limit exceeded")
+		return
+	}
+
+	kemPub, sig, tsDay, err := h.mbox.GetIdentity(idB64u)
+	if err == sql.ErrNoRows {
+		httpError(w, http.StatusNotFound, "identity not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "lookup error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"v":                1,
+		"ed25519_id_b64u":  idB64u,
+		"kem_pub_b64u":     b64urlEncode(kemPub),
+		"ts_day":           tsDay,
+		"sig_b64u":         b64urlEncode(sig),
+	})
 }
 
 func b64urlEncode(data []byte) string {

@@ -437,6 +437,16 @@ MainWindow::MainWindow(QWidget *parent)
             // call after a successful start().
             recordVerifier(pass);
 
+            // Tier 1 PQ — publish our identity bundle so peers can
+            // fetch our ML-KEM-768 pub before sending msg1 to us.
+            // Gated by ChatController on a 14-day window + KEM key
+            // rotation so a per-unlock call doesn't spam the relay.
+            // Async; doesn't block.  Failures (offline relay, network
+            // hiccup) are silently retried on next unlock — peers can
+            // still reach hybrid PQ via the existing in-band
+            // kem_pub_announce path while our bundle is missing.
+            m_controller.maybePublishIdentityBundle();
+
             p2p::bridge::secureZeroQ(pass);
             break;
         } catch (const std::exception &e) {

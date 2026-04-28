@@ -326,6 +326,101 @@ void ChatController::setAppDataStore(AppDataStore* appData)
     m_groupProto.setAppDataStore(appData);
 }
 
+// ── Identity-bundle plumbing (Tier 1 of project_pq_messaging.md) ─────────────
+
+namespace {
+// 16-byte BLAKE2b digest of `kemPub`, hex-encoded.  Used as a
+// rotation-detector — `maybePublishIdentityBundle` compares the
+// current hash to the last-published one; if they differ, the
+// keys rotated and we re-publish immediately regardless of the
+// time-window gate.  16 bytes is overkill for collision purposes
+// (we only need "did the bytes change?") but keeps the format
+// future-proof in case we ever need to compare across processes.
+std::string kemPubHashHex(const Bytes& kemPub) {
+    if (kemPub.empty()) return "";
+    uint8_t digest[16];
+    crypto_generichash(digest, sizeof(digest),
+                        kemPub.data(), kemPub.size(),
+                        nullptr, 0);
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(sizeof(digest) * 2);
+    for (unsigned char b : digest) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0xF]);
+    }
+    return out;
+}
+}  // anonymous namespace
+
+bool ChatController::maybePublishIdentityBundle()
+{
+    // Need keys to sign + a place to remember the last publish.
+    if (!m_crypto.hasPQKeys())                return false;
+    if (m_crypto.identityPriv().empty())      return false;
+    if (!m_appData)                            return false;
+
+    const Bytes&      kemPub = m_crypto.kemPub();
+    const std::string curHash = kemPubHashHex(kemPub);
+    const std::string lastHash =
+        m_appData->loadSetting(kSettingLastIdentityPublishKemHash, "");
+    int64_t lastTs = 0;
+    try {
+        lastTs = std::stoll(
+            m_appData->loadSetting(kSettingLastIdentityPublishTs, "0"));
+    } catch (...) {
+        lastTs = 0;
+    }
+
+    const int64_t  now      = nowSecs();
+    const bool     rotated  = (curHash != lastHash);
+    const bool     dueAgain = (now - lastTs > kIdentityRepublishMinSecs);
+
+    if (!rotated && !dueAgain && lastTs > 0) {
+        return false;   // recent enough + same keys → skip
+    }
+
+    const std::string idB64u = CryptoEngine::toBase64Url(m_crypto.identityPub());
+    const uint64_t    tsDay  = static_cast<uint64_t>(now / 86400);
+    const Bytes       sig    = m_crypto.signIdentityBundle(idB64u, kemPub, tsDay);
+    if (sig.empty()) return false;
+
+    // Async: callback writes the success state.  We pass curHash
+    // by value so it survives the closure even if m_crypto's
+    // kem_pub later rotates (rare but defensive).
+    m_relay.publishIdentityBundle(
+        idB64u, kemPub, tsDay, sig,
+        [this, curHash, now](bool ok) {
+            if (!ok || !m_appData) return;
+            m_appData->saveSetting(kSettingLastIdentityPublishTs,
+                                     std::to_string(now));
+            m_appData->saveSetting(kSettingLastIdentityPublishKemHash,
+                                     curHash);
+        });
+    return true;
+}
+
+void ChatController::requestIdentityBundleFetch(const std::string& peerIdB64u)
+{
+    if (peerIdB64u.empty())                              return;
+    // Already have it locally → nothing to do.
+    if (!m_sealer.lookupPeerKemPub(peerIdB64u).empty())  return;
+    // Already fetching for this peer → don't double-fire.
+    if (m_inFlightBundleFetches.count(peerIdB64u))       return;
+    m_inFlightBundleFetches.insert(peerIdB64u);
+
+    m_relay.fetchIdentityBundle(
+        peerIdB64u,
+        [this, peerIdB64u](const Bytes& kemPub) {
+            m_inFlightBundleFetches.erase(peerIdB64u);
+            // Empty == fetch failed (network error, 404, sig
+            // mismatch, etc.).  In-band kem_pub_announce path
+            // remains the fallback for msg2+.
+            if (kemPub.size() != 1184) return;
+            m_sealer.saveKemPub(peerIdB64u, kemPub);
+        });
+}
+
 void ChatController::resolveBundleToGroupId(const std::string& bundleB64,
                                               std::string& gid,
                                               bool allowBackfill)
